@@ -2264,10 +2264,10 @@ class RigidEntity(Entity):
 
         all_collision_pairs = self._solver.detect_collision(env_idx)
         collision_pairs = all_collision_pairs[
-            np.logical_and(
+            torch.logical_and(
                 all_collision_pairs >= self.geom_start,
                 all_collision_pairs < self.geom_end,
-            ).any(axis=1)
+            ).any(dim=1)
         ]
         return collision_pairs
 

@@ -1272,9 +1272,9 @@ class RigidSolver(Solver):
         # TODO: support batching
         self._kernel_detect_collision()
         n_collision = self.collider.n_contacts.to_numpy()[env_idx]
-        collision_pairs = np.empty((n_collision, 2), dtype=np.int32)
-        collision_pairs[:, 0] = self.collider.contact_data.geom_a.to_numpy()[:n_collision, env_idx]
-        collision_pairs[:, 1] = self.collider.contact_data.geom_b.to_numpy()[:n_collision, env_idx]
+        collision_pairs = torch.empty(n_collision, 2, dtype=torch.int32, device=gs.device)
+        collision_pairs[:, 0] = self.collider.contact_data.geom_a.to_torch(gs.device)[:n_collision, env_idx]
+        collision_pairs[:, 1] = self.collider.contact_data.geom_b.to_torch(gs.device)[:n_collision, env_idx]
         return collision_pairs
 
     @ti.kernel
