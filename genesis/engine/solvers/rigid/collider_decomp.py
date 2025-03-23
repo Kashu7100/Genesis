@@ -1,8 +1,10 @@
+import time
 import numpy as np
 import taichi as ti
 
 import genesis as gs
 import genesis.utils.geom as gu
+from genesis.styles import colors, formats
 
 from .mpr_decomp import MPR
 
@@ -106,6 +108,7 @@ class Collider:
                 n_possible_pairs += 1
 
         self._n_contacts_per_pair = 5
+        self._max_possible_pairs = n_possible_pairs
         self._max_collision_pairs = min(n_possible_pairs, self._solver._max_collision_pairs)
         self._max_contact_pairs = self._max_collision_pairs * self._n_contacts_per_pair
 
@@ -733,6 +736,8 @@ class Collider:
                         for j in range(n_active):
                             i_ga = self.active_buffer[j, i_b]
                             i_gb = self.sort_buffer[i, i_b].i_g
+                            if i_ga > i_gb:
+                                i_ga, i_gb = i_gb, i_ga
 
                             if not self._func_is_geom_aabbs_overlap(i_ga, i_gb, i_b):
                                 continue
@@ -740,6 +745,13 @@ class Collider:
                             if not self._func_check_collision_valid(i_ga, i_gb, i_b):
                                 continue
 
+                            if self.n_broad_pairs[i_b] == self._max_collision_pairs:
+                                print(
+                                    f"{colors.YELLOW}[Genesis] [00:00:00] [WARNING] Ignoring collision pair to avoid "
+                                    f"exceeding max ({self._max_collision_pairs}). Please increase the value of "
+                                    f"RigidSolver's option 'max_collision_pairs'.{formats.RESET}"
+                                )
+                                break
                             self.broad_collision_pairs[self.n_broad_pairs[i_b], i_b][0] = i_ga
                             self.broad_collision_pairs[self.n_broad_pairs[i_b], i_b][1] = i_gb
                             self.n_broad_pairs[i_b] = self.n_broad_pairs[i_b] + 1
@@ -771,6 +783,8 @@ class Collider:
                             for j in range(n_active_awake):
                                 i_ga = self.active_buffer_awake[j, i_b]
                                 i_gb = self.sort_buffer[i, i_b].i_g
+                                if i_ga > i_gb:
+                                    i_ga, i_gb = i_gb, i_ga
 
                                 if not self._func_is_geom_aabbs_overlap(i_ga, i_gb, i_b):
                                     continue
@@ -787,6 +801,8 @@ class Collider:
                                 for j in range(n_active_hib):
                                     i_ga = self.active_buffer_hib[j, i_b]
                                     i_gb = self.sort_buffer[i, i_b].i_g
+                                    if i_ga > i_gb:
+                                        i_ga, i_gb = i_gb, i_ga
 
                                     if not self._func_is_geom_aabbs_overlap(i_ga, i_gb, i_b):
                                         continue
@@ -874,7 +890,7 @@ class Collider:
                     if ti.static(self._solver._box_box_detection):
                         if (
                             self._solver.geoms_info[i_ga].type == gs.GEOM_TYPE.BOX
-                            and self._solver.geoms_info[i_ga].type == gs.GEOM_TYPE.BOX
+                            and self._solver.geoms_info[i_gb].type == gs.GEOM_TYPE.BOX
                         ):
                             self._func_box_box_contact(i_ga, i_gb, i_b)
                         else:
@@ -1048,24 +1064,31 @@ class Collider:
     def _func_add_contact(self, i_ga, i_gb, normal, contact_pos, penetration, i_b):
         i_col = self.n_contacts[i_b]
 
-        ga_info = self._solver.geoms_info[i_ga]
-        gb_info = self._solver.geoms_info[i_gb]
+        if i_col == self._max_contact_pairs:
+            print(
+                f"{colors.YELLOW}[Genesis] [00:00:00] [WARNING] Ignoring contact pair to avoid exceeding max "
+                f"({self._max_contact_pairs}). Please increase the value of RigidSolver's option "
+                f"'max_collision_pairs'.{formats.RESET}"
+            )
+        else:
+            ga_info = self._solver.geoms_info[i_ga]
+            gb_info = self._solver.geoms_info[i_gb]
 
-        friction_a = ga_info.friction * self._solver.geoms_state[i_ga, i_b].friction_ratio
-        friction_b = gb_info.friction * self._solver.geoms_state[i_gb, i_b].friction_ratio
+            friction_a = ga_info.friction * self._solver.geoms_state[i_ga, i_b].friction_ratio
+            friction_b = gb_info.friction * self._solver.geoms_state[i_gb, i_b].friction_ratio
 
-        # b to a
-        self.contact_data[i_col, i_b].geom_a = i_ga
-        self.contact_data[i_col, i_b].geom_b = i_gb
-        self.contact_data[i_col, i_b].normal = normal
-        self.contact_data[i_col, i_b].pos = contact_pos
-        self.contact_data[i_col, i_b].penetration = penetration
-        self.contact_data[i_col, i_b].friction = ti.max(ti.max(friction_a, friction_b), 1e-2)
-        self.contact_data[i_col, i_b].sol_params = 0.5 * (ga_info.sol_params + gb_info.sol_params)
-        self.contact_data[i_col, i_b].link_a = ga_info.link_idx
-        self.contact_data[i_col, i_b].link_b = gb_info.link_idx
+            # b to a
+            self.contact_data[i_col, i_b].geom_a = i_ga
+            self.contact_data[i_col, i_b].geom_b = i_gb
+            self.contact_data[i_col, i_b].normal = normal
+            self.contact_data[i_col, i_b].pos = contact_pos
+            self.contact_data[i_col, i_b].penetration = penetration
+            self.contact_data[i_col, i_b].friction = ti.max(ti.max(friction_a, friction_b), 1e-2)
+            self.contact_data[i_col, i_b].sol_params = 0.5 * (ga_info.sol_params + gb_info.sol_params)
+            self.contact_data[i_col, i_b].link_a = ga_info.link_idx
+            self.contact_data[i_col, i_b].link_b = gb_info.link_idx
 
-        self.n_contacts[i_b] = i_col + 1
+            self.n_contacts[i_b] = i_col + 1
 
     @ti.func
     def _func_compute_tolerance(self, i_ga, i_gb, i_b):
@@ -1174,7 +1197,7 @@ class Collider:
     @ti.func
     def _func_box_box_contact(self, i_ga: ti.i32, i_gb: ti.i32, i_b: ti.i32):
         """
-        Use Mujoco's box-box contact detection algorithm for more stable collision detction.
+        Use Mujoco's box-box contact detection algorithm for more stable collision detection.
 
         The compilation and running time of this function is longer than the MPR-based contact detection.
 
@@ -1217,7 +1240,7 @@ class Collider:
         rottabs = ti.abs(rott)
 
         plen2 = rotabs @ size2
-        plen1 = rottabs.transpose() @ size1
+        plen1 = rotabs.transpose() @ size1
         penetration = margin
         for i in range(3):
             penetration = penetration + size1[i] * 3 + size2[i] * 3
@@ -1274,20 +1297,13 @@ class Collider:
                         penetration = c3
                         cle1 = 0
                         for k in range(3):
-                            if k != i:
-                                if (tmp2[k] > 0) != (c2 < 0):
-                                    cle1 = cle1 + 1 << k
+                            if (k != i) and ((tmp2[k] > 0) ^ (c2 < 0)):
+                                cle1 = cle1 + (1 << k)
 
                         cle2 = 0
                         for k in range(3):
-                            if k != j:
-                                val = rot[i, 3 - k - j]
-                                cond1 = val > 0
-                                cond2 = c2 < 0
-                                cond3 = ((k - j + 3) % 3) == 1
-                                xor_all = (cond1 != cond2) != cond3
-                                if xor_all:
-                                    cle2 = cle2 + 1 << k
+                            if (k != j) and (rot[i, 3 - k - j] > 0) ^ (c2 < 0) ^ (((k - j + 3) % 3) == 1):
+                                cle2 = cle2 + (1 << k)
 
                         code = 12 + i * 3 + j
                         clnorm = tmp2
@@ -1662,7 +1678,6 @@ class Collider:
                                                 (self.box_linesu[i, i_b][2] + self.box_linesu[i, i_b][5] * c1) * innorm
                                                 <= margin
                                             ):
-
                                                 self.box_points[n, i_b] = (
                                                     self.box_linesu[i, i_b][0:3] * 0.5
                                                     + c1 * 0.5 * self.box_linesu[i, i_b][3:6]
@@ -1695,9 +1710,8 @@ class Collider:
                             if nl == 0:
                                 if (u < 0 or u > 1) and (v < 0 or v > 1):
                                     continue
-                            else:
-                                if u < 0 or u > 1 or v < 0 or v > 1:
-                                    continue
+                            elif u < 0 or u > 1 or v < 0 or v > 1:
+                                continue
 
                             u = ti.math.clamp(u, 0, 1)
                             v = ti.math.clamp(v, 0, 1)
@@ -1708,13 +1722,13 @@ class Collider:
 
                             tmp2 = self.box_points[n, i_b] - tmp1
 
-                            c1 = tmp2.dot(tmp2)
-                            if not (tmp1[2] > 0 and c1 > margin2):
+                            c2 = tmp2.dot(tmp2)
 
+                            if not (tmp1[2] > 0 and c2 > margin2):
                                 self.box_points[n, i_b] = self.box_points[n, i_b] + tmp1
                                 self.box_points[n, i_b] = self.box_points[n, i_b] * 0.5
 
-                                self.box_depth[n, i_b] = ti.sqrt(c1) * (-1 if tmp1[2] < 0 else 1)
+                                self.box_depth[n, i_b] = ti.sqrt(c2) * (-1 if tmp1[2] < 0 else 1)
                                 n = n + 1
 
                     nf = n
@@ -1724,11 +1738,10 @@ class Collider:
                             x, y = self.box_ppts2[i, 0, i_b], self.box_ppts2[i, 1, i_b]
 
                             if nl == 0:
-                                if (not (nf == 0)) and (x < -lx or x > lx) and (y < -ly or y > ly):
+                                if (nf != 0) and (x < -lx or x > lx) and (y < -ly or y > ly):
                                     continue
-                            else:
-                                if x < -lx or x > lx or y < -ly or y > ly:
-                                    continue
+                            elif x < -lx or x > lx or y < -ly or y > ly:
+                                continue
 
                             c1 = 0
                             for j in range(2):
@@ -1737,7 +1750,7 @@ class Collider:
                                 elif self.box_ppts2[i, j, i_b] > s[j]:
                                     c1 = c1 + (self.box_ppts2[i, j, i_b] - s[j]) ** 2
 
-                            c1 = c1 + self.box_pu[i, i_b][2] * self.box_pu[i, i_b][2] * innorm * innorm
+                            c1 = c1 + (self.box_pu[i, i_b][2] * innorm) ** 2
 
                             if self.box_pu[i, i_b][2] > 0 and c1 > margin2:
                                 continue
@@ -1773,13 +1786,14 @@ class Collider:
             for i in range(n):
                 self.box_valid[i, i_b] = True
 
+            # remove duplicates
             for i in range(n - 1):
                 for j in range(i + 1, n):
                     col_i = self.n_contacts[i_b] - n + i
                     col_j = self.n_contacts[i_b] - n + j
                     pos_i = self.contact_data[col_i, i_b].pos
                     pos_j = self.contact_data[col_j, i_b].pos
-                    if pos_i[0] == pos_j[0] and pos_i[1] == pos_j[1] and pos_i[2] == pos_j[2]:
+                    if (ti.abs(pos_i - pos_j) < gs.EPS).all():
                         self.box_valid[i, i_b] = False
                         break
             i = 0
@@ -1792,7 +1806,5 @@ class Collider:
 
                         self.contact_data[col_i, i_b].pos = self.contact_data[col_j, i_b].pos
                         self.contact_data[col_i, i_b].penetration = self.contact_data[col_j, i_b].penetration
-                    if i_ga == 20:
-                        col_i = self.n_contacts[i_b] - n + i
                     i = i + 1
             self.n_contacts[i_b] = self.n_contacts[i_b] - n + i

@@ -9,7 +9,7 @@ name = "genesis-world"
 version = "0.2.1"
 description = "A universal and generative physics engine"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10,<3.13"
 dependencies = [
     "psutil",
     "scikit-image",
@@ -22,7 +22,9 @@ dependencies = [
     "pyglet>=1.5",
     "libigl",
     "pygltflib == 1.16.0",
-    "mujoco == 3.2.5",
+    # * Mujoco 3.3 made Native CCD an opt-out option instead of opt-in,
+    #   which requires setting the disableflags 'mjDSBL_NATIVECCD'.
+    "mujoco >= 3.3.0, < 3.4.0",
     "pycollada",
     "opencv-python",
     "lxml",
@@ -35,6 +37,7 @@ dependencies = [
     "OpenEXR",
     "black",
     "pytest",
+    "pytest-xdist",
     "scipy >= 1.14",
 ]
 
@@ -52,10 +55,24 @@ genesis = [
 
 [tool.black]
 line-length = 120
+force-exclude = '''
+/(
+    genesis/ext
+)/
+'''
 
 [tool.pytest.ini_options]
 addopts = [
     "--import-mode=importlib",
+    "--pdbcls=IPython.terminal.debugger:TerminalPdb",
+    "--exitfirst",
+    "--strict-markers",
+    "--numprocesses=auto",
+    "--dist=loadgroup",
+    "-m not benchmarks",
+]
+markers = [
+    "benchmarks: marks benchmarks (executed independently and sequentially).",
 ]
 log_cli_level = "WARNING"
 

@@ -469,9 +469,9 @@ class Scene(RBC):
         GUI : bool
             Whether to display the camera's rendered image in a separate GUI window.
         spp : int, optional
-            Samples per pixel. Defaults to 256.
+            Samples per pixel. Only available when using RayTracer renderer. Defaults to 256.
         denoise : bool
-            Whether to denoise the camera's rendered image.
+            Whether to denoise the camera's rendered image. Only available when using the RayTracer renderer.. Defaults to True. If OptiX denoiser is not available in your platform, consider enabling the OIDN denoiser option when building the RayTracer.
 
         Returns
         -------
@@ -701,7 +701,7 @@ class Scene(RBC):
         return self._get_state()
 
     @gs.assert_built
-    def step(self, update_visualizer=True):
+    def step(self, update_visualizer=True, refresh_visualizer=True):
         """
         Runs a simulation step forward in time.
         """
@@ -713,7 +713,7 @@ class Scene(RBC):
         self._t += 1
 
         if update_visualizer:
-            self._visualizer.update(force=False)
+            self._visualizer.update(force=False, auto=refresh_visualizer)
 
         if self._show_FPS:
             self.FPS_tracker.step()
