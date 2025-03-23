@@ -1591,9 +1591,9 @@ class RigidSolver(Solver):
 
     @ti.kernel
     def _kernel_step_1(self):
+        self._func_forward_kinematics()
         ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
         for i_b in range(self._B):
-            self._func_forward_kinematics(i_b)
             self._func_transform_COM(i_b)
             self._func_forward_velocity(i_b)
             self._func_update_geoms(i_b)
