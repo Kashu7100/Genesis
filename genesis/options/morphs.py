@@ -332,6 +332,28 @@ class FileMorph(Morph):
     def __init__(self, **data):
         super().__init__(**data)
 
+        if self.decompose_nonconvex is not None:
+            if self.decompose_nonconvex:
+                self.convexify = True
+                self.decompose_error_threshold = 0.0
+            else:
+                self.convexify = False
+                self.decompose_error_threshold = float("inf")
+            gs.warning(
+                "`decompose_nonconvex` is deprecated. Please use 'convexify' and 'decompose_error_threshold' instead."
+            )
+
+        # Make sure that this threshold is positive to avoid decomposition of convex and primivie shapes
+        self.decompose_error_threshold = max(self.decompose_error_threshold, gs.EPS)
+
+        if self.decimate and self.decimate_face_num < 100:
+            gs.raise_exception(
+                "`decimate_face_num` should be greater than 100 to ensure sufficient geometry details are preserved."
+            )
+
+        if self.coacd_options is None:
+            self.coacd_options = CoacdOptions()
+
         if isinstance(self.file, str):
             file = os.path.abspath(self.file)
 
