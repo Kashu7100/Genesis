@@ -299,7 +299,18 @@ class FileMorph(Morph):
     quat : tuple, shape (4,), optional
         The quaternion (w-x-y-z convention) of the entity. If specified, `euler` will be ignored. Defaults to None.
     convexify : bool, optional
-        Whether to convexify the entity. When convexify is True, all the meshes in the entity will each be converted to a convex hull. If not given, it defaults to `True` for `RigidEntity` and `False` for other deformable entities.
+        Whether to convexify the entity. When convexify is True, all the meshes in the entity will each be converted
+        to a set of convex hulls. The mesh with be decomposed into multiple convex components if a single one is not
+        sufficient to met the desired accuracy (see 'decompose_error_threshold' documentation). The module 'coacd' is
+        used for this decomposition process. If not given, it defaults to `True` for `RigidEntity` and `False` for
+        other deformable entities.
+    decompose_nonconvex: bool, optional
+        This parameter is deprecated. Please refers to 'convexify' and 'decompose_error_threshold' instead.
+    decompose_error_threshold : bool, optional:
+        Skip decompose if the relative difference between the volume of original mesh and its convex hull is lower than
+        this threashold. 0.0 to enforce decomposition, float("inf") to disable it completly. Defaults to 0.15 (15%).
+    coacd_options : CoacdOptions, optional
+        Options for configuring coacd convex decomposition. Needs to be a `gs.options.CoacdOptions` object.
     visualization : bool, optional
         Whether the entity needs to be visualized. Set it to False if you need a invisible object only for collision purposes. Defaults to True. `visualization` and `collision` cannot both be False. **This is only used for RigidEntity.**
     collision : bool, optional
@@ -310,7 +321,12 @@ class FileMorph(Morph):
 
     file: Any = ""
     scale: Union[float, tuple] = 1.0
-    convexify: Optional[bool] = None
+    decimate: bool = False
+    decimate_face_num: int = 500
+    convexify: bool = True
+    decompose_nonconvex: Optional[bool] = None
+    decompose_error_threshold: float = 0.15
+    coacd_options: Optional[CoacdOptions] = None
     recompute_inertia: bool = False
 
     def __init__(self, **data):
@@ -359,9 +375,16 @@ class Mesh(FileMorph):
     quat : tuple, shape (4,), optional
         The quaternion (w-x-y-z convention) of the entity. If specified, `euler` will be ignored. Defaults to None.
     convexify : bool, optional
-        Whether to convexify the entity. When convexify is True, all the meshes in the entity will be converted to a convex hull. If not given, it defaults to `True` for `RigidEntity` and `False` for other deformable entities.
-    decompose_nonconvex : bool, optional
-        Whether to decompose meshes into convex components, if input mesh is nonconvex and `convexify=False`. We use coacd for this decomposition process. If not given, it defaults to `True` for `RigidEntity` and `False` for other deformable entities.
+        Whether to convexify the entity. When convexify is True, all the meshes in the entity will each be converted
+        to a set of convex hulls. The mesh with be decomposed into multiple convex components if a single one is not
+        sufficient to met the desired accuracy (see 'decompose_error_threshold' documentation). The module 'coacd' is
+        used for this decomposition process. If not given, it defaults to `True` for `RigidEntity` and `False` for
+        other deformable entities.
+    decompose_nonconvex: bool, optional
+        This parameter is deprecated. Please refers to 'convexify' and 'decompose_error_threshold' instead.
+    decompose_error_threshold : bool, optional:
+        Skip decompose if the relative difference between the volume of original mesh and its convex hull is lower than
+        this threashold. 0.0 to enforce decomposition, float("inf") to disable it completly. Defaults to 0.15 (15%).
     coacd_options : CoacdOptions, optional
         Options for configuring coacd convex decomposition. Needs to be a `gs.options.CoacdOptions` object.
     visualization : bool, optional
@@ -465,7 +488,18 @@ class MJCF(FileMorph):
     quat : tuple, shape (4,), optional
         The quaternion (w-x-y-z convention) of the entity's baselink. If specified, `euler` will be ignored. Defaults to None.
     convexify : bool, optional
-        Whether to convexify the entity. When convexify is True, all the meshes in the entity will be converted to a convex hull. If not given, it defaults to `True` for `RigidEntity` and `False` for other deformable entities.
+        Whether to convexify the entity. When convexify is True, all the meshes in the entity will each be converted
+        to a set of convex hulls. The mesh with be decomposed into multiple convex components if a single one is not
+        sufficient to met the desired accuracy (see 'decompose_error_threshold' documentation). The module 'coacd' is
+        used for this decomposition process. If not given, it defaults to `True` for `RigidEntity` and `False` for
+        other deformable entities.
+    decompose_nonconvex: bool, optional
+        This parameter is deprecated. Please refers to 'convexify' and 'decompose_error_threshold' instead.
+    decompose_error_threshold : bool, optional:
+        Skip decompose if the relative difference between the volume of original mesh and its convex hull is lower than
+        this threashold. 0.0 to enforce decomposition, float("inf") to disable it completly. Defaults to 0.15 (15%).
+    coacd_options : CoacdOptions, optional
+        Options for configuring coacd convex decomposition. Needs to be a `gs.options.CoacdOptions` object.
     visualization : bool, optional
         Whether the entity needs to be visualized. Set it to False if you need a invisible object only for collision purposes. Defaults to True. `visualization` and `collision` cannot both be False.
     collision : bool, optional
@@ -508,7 +542,18 @@ class URDF(FileMorph):
     quat : tuple, shape (4,), optional
         The quaternion (w-x-y-z convention) of the entity. If specified, `euler` will be ignored. Defaults to None.
     convexify : bool, optional
-        Whether to convexify the entity. When convexify is True, all the meshes in the entity will be converted to a convex hull. If not given, it defaults to `True` for `RigidEntity` and `False` for other deformable entities.
+        Whether to convexify the entity. When convexify is True, all the meshes in the entity will each be converted
+        to a set of convex hulls. The mesh with be decomposed into multiple convex components if a single one is not
+        sufficient to met the desired accuracy (see 'decompose_error_threshold' documentation). The module 'coacd' is
+        used for this decomposition process. If not given, it defaults to `True` for `RigidEntity` and `False` for
+        other deformable entities.
+    decompose_nonconvex: bool, optional
+        This parameter is deprecated. Please refers to 'convexify' and 'decompose_error_threshold' instead.
+    decompose_error_threshold : bool, optional:
+        Skip decompose if the relative difference between the volume of original mesh and its convex hull is lower than
+        this threashold. 0.0 to enforce decomposition, float("inf") to disable it completly. Defaults to 0.15 (15%).
+    coacd_options : CoacdOptions, optional
+        Options for configuring coacd convex decomposition. Needs to be a `gs.options.CoacdOptions` object.
     visualization : bool, optional
         Whether the entity needs to be visualized. Set it to False if you need a invisible object only for collision purposes. Defaults to True. `visualization` and `collision` cannot both be False.
     collision : bool, optional
@@ -558,7 +603,18 @@ class Drone(FileMorph):
     quat : tuple, shape (4,), optional
         The quaternion (w-x-y-z convention) of the entity. If specified, `euler` will be ignored. Defaults to None.
     convexify : bool, optional
-        Whether to convexify the entity. When convexify is True, all the meshes in the entity will be converted to a convex hull. If not given, it defaults to `True` for `RigidEntity` and `False` for other deformable entities.
+        Whether to convexify the entity. When convexify is True, all the meshes in the entity will each be converted
+        to a set of convex hulls. The mesh with be decomposed into multiple convex components if a single one is not
+        sufficient to met the desired accuracy (see 'decompose_error_threshold' documentation). The module 'coacd' is
+        used for this decomposition process. If not given, it defaults to `True` for `RigidEntity` and `False` for
+        other deformable entities.
+    decompose_nonconvex: bool, optional
+        This parameter is deprecated. Please refers to 'convexify' and 'decompose_error_threshold' instead.
+    decompose_error_threshold : bool, optional:
+        Skip decompose if the relative difference between the volume of original mesh and its convex hull is lower than
+        this threashold. 0.0 to enforce decomposition, float("inf") to disable it completly. Defaults to 0.15 (15%).
+    coacd_options : CoacdOptions, optional
+        Options for configuring coacd convex decomposition. Needs to be a `gs.options.CoacdOptions` object.
     visualization : bool, optional
         Whether the entity needs to be visualized. Set it to False if you need a invisible object only for collision purposes. Defaults to True. `visualization` and `collision` cannot both be False.
     collision : bool, optional
