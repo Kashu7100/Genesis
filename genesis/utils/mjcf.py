@@ -233,15 +233,17 @@ def parse_geom(mj, i_g, scale, convexify, surface, xml_path):
 
     visual = None
     if mj_geom.type == mujoco.mjtGeom.mjGEOM_PLANE:
-        plan_size = 100.0
-        r = plan_size / 2.0
+        length, width, _ = geom_size
+        length = length or 1e3
+        width = width or 1e3
+
         tmesh = trimesh.Trimesh(
-            vertices=np.array([[-r, r, 0.0], [r, r, 0.0], [-r, -r, 0.0], [r, -r, 0.0]]),
+            vertices=np.array(
+                [[-length, width, 0.0], [length, width, 0.0], [-length, -width, 0.0], [length, -width, 0.0]]
+            ),
             faces=np.array([[0, 2, 3], [0, 3, 1]]),
             face_normals=np.array(
                 [
-                    [0, 0, 1],
-                    [0, 0, 1],
                     [0, 0, 1],
                     [0, 0, 1],
                 ]
@@ -259,7 +261,7 @@ def parse_geom(mj, i_g, scale, convexify, surface, xml_path):
 
     elif mj_geom.type == mujoco.mjtGeom.mjGEOM_ELLIPSOID:
         if is_col:
-            tmesh = trimesh.creation.icosphere(subdivisions=2)
+            tmesh = trimesh.creation.icosphere(radius=1.0, subdivisions=2)
         else:
             tmesh = trimesh.creation.icosphere(radius=1.0)
         tmesh.apply_transform(np.diag([*geom_size, 1]))
@@ -287,7 +289,7 @@ def parse_geom(mj, i_g, scale, convexify, surface, xml_path):
         geom_size *= 2
         gs_type = gs.GEOM_TYPE.BOX
         if mj_geom.matid >= 0:
-            mj_mat = mj.mat(mj_geom.matid)
+            mj_mat = mj.mat(mj_geom.matid[0])
             tex_id_RGB = mj_mat.texid[mujoco.mjtTextureRole.mjTEXROLE_RGB]
             tex_id_RGBA = mj_mat.texid[mujoco.mjtTextureRole.mjTEXROLE_RGBA]
             tex_id = tex_id_RGB if tex_id_RGB >= 0 else tex_id_RGBA
@@ -304,14 +306,14 @@ def parse_geom(mj, i_g, scale, convexify, surface, xml_path):
                 tmesh.visual = visual
 
     elif mj_geom.type == mujoco.mjtGeom.mjGEOM_MESH:
-        mj_mesh = mj.mesh(int(mj_geom.dataid))
+        mj_mesh = mj.mesh(mj_geom.dataid[0])
 
-        vert_start = int(mj_mesh.vertadr)
-        vert_num = int(mj_mesh.vertnum)
+        vert_start = mj_mesh.vertadr[0]
+        vert_num = mj_mesh.vertnum[0]
         vert_end = vert_start + vert_num
 
-        face_start = int(mj_mesh.faceadr)
-        face_num = int(mj_mesh.facenum)
+        face_start = mj_mesh.faceadr[0]
+        face_num = mj_mesh.facenum[0]
         face_end = face_start + face_num
 
         vertices = mj.mesh_vert[vert_start:vert_end]
@@ -320,7 +322,7 @@ def parse_geom(mj, i_g, scale, convexify, surface, xml_path):
         visual = None
 
         if mj_geom.matid >= 0:
-            mj_mat = mj.mat(mj_geom.matid)
+            mj_mat = mj.mat(mj_geom.matid[0])
             tex_id_RGB = mj_mat.texid[mujoco.mjtTextureRole.mjTEXROLE_RGB]
             tex_id_RGBA = mj_mat.texid[mujoco.mjtTextureRole.mjTEXROLE_RGBA]
             tex_id = tex_id_RGB if tex_id_RGB >= 0 else tex_id_RGBA
@@ -358,16 +360,24 @@ def parse_geom(mj, i_g, scale, convexify, surface, xml_path):
         gs.logger.warning(f"Unsupported MJCF geom type: {mj_geom.type}")
         return None
 
+    # Turn on convexify for all primitive shapes
+    if mj_geom.type != mujoco.mjtGeom.mjGEOM_MESH:
+        convexify = True
+
+    # Disable convexify for visual geometries
+    if not is_col:
+        convexify = False
+
     mesh = gs.Mesh.from_trimesh(
         tmesh,
         scale=scale,
-        convexify=is_col and convexify,
+        convexify=convexify,
         surface=gs.surfaces.Collision() if is_col else surface,
     )
 
     if surface.diffuse_texture is None and visual is None:  # user input will override mjcf color
         if mj_geom.matid >= 0:
-            mesh.set_color(mj.mat(mj_geom.matid).rgba)
+            mesh.set_color(mj.mat(mj_geom.matid[0]).rgba)
         else:
             mesh.set_color(mj_geom.rgba)
 
@@ -375,14 +385,17 @@ def parse_geom(mj, i_g, scale, convexify, surface, xml_path):
         "type": gs_type,
         "pos": mj_geom.pos * scale,
         "quat": mj_geom.quat,
-        "mesh": mesh,
         "contype": mj_geom.contype[0],
         "conaffinity": mj_geom.conaffinity[0],
-        "is_convex": True,
+        "is_convex": convexify,
         "data": geom_size,
         "friction": mj_geom.friction[0],
         "sol_params": np.concatenate((mj_geom.solref, mj_geom.solimp)),
     }
+    if is_col:
+        info["mesh"] = mesh
+    else:
+        info["vmesh"] = mesh
 
     return info
 
