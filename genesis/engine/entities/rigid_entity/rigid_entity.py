@@ -1854,7 +1854,7 @@ class RigidEntity(Entity):
     @gs.assert_built
     def set_pos(self, pos, envs_idx=None, *, zero_velocity=True, unsafe=False):
         """
-        Set position of the entity's base link.
+        Set position of the entity's base free-floating link.
 
         Parameters
         ----------
@@ -1866,8 +1866,6 @@ class RigidEntity(Entity):
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
 
-        if self.base_link.is_fixed:
-            gs.logger.warning("Base link is fixed. Overriding base link pose.")
         self._solver.set_base_links_pos(
             pos.unsqueeze(-2), self._base_links_idx, envs_idx, unsafe=unsafe, skip_forward=zero_velocity
         )
@@ -1877,7 +1875,7 @@ class RigidEntity(Entity):
     @gs.assert_built
     def set_quat(self, quat, envs_idx=None, *, zero_velocity=True, unsafe=False):
         """
-        Set quaternion of the entity's base link.
+        Set quaternion of the entity's base free-floating link.
 
         Parameters
         ----------
@@ -1889,8 +1887,6 @@ class RigidEntity(Entity):
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
 
-        if self.base_link.is_fixed:
-            gs.logger.warning("Base link is fixed. Overriding base link pose.")
         self._solver.set_base_links_quat(
             quat.unsqueeze(-2), self._base_links_idx, envs_idx, unsafe=unsafe, skip_forward=zero_velocity
         )

@@ -158,6 +158,24 @@ def check_mujoco_model_consistency(
     gs_dof_idcs = _gs_search_by_joint_names(gs_sim.scene, joint_names)
     gs_body_idcs = _gs_search_by_link_names(gs_sim.scene, body_names)
 
+    gs_maps = (gs_body_idcs, gs_jnt_idcs, gs_q_idcs, gs_dof_idcs, gs_act_idcs)
+    mj_maps = (mj_body_idcs, mj_jnt_idcs, mj_q_idcs, mj_dof_idcs, mj_act_idcs)
+    return gs_maps, mj_maps
+
+
+def check_mujoco_model_consistency(
+    gs_sim,
+    mj_sim,
+    joint_names: list[str] | None = None,
+    body_names: list[str] | None = None,
+    *,
+    atol: float,
+):
+    # Get mapping between Mujoco and Genesis
+    gs_maps, mj_maps = _get_model_mappings(gs_sim, mj_sim, joint_names, body_names)
+    (gs_body_idcs, gs_jnt_idcs, gs_q_idcs, gs_dof_idcs, gs_act_idcs) = gs_maps
+    (mj_body_idcs, mj_jnt_idcs, mj_q_idcs, mj_dof_idcs, mj_act_idcs) = mj_maps
+
     # solver
     gs_gravity = gs_sim.rigid_solver.scene.gravity
     mj_gravity = mj_sim.model.opt.gravity
@@ -273,27 +291,41 @@ def check_mujoco_model_consistency(
     # np.testing.assert_allclose(gs_kv[gs_dof_idcs], mj_kv[mj_act_idcs], atol=atol)
 
 
-def _mj_get_mass_matrix_from_sparse(mj_model, mj_data):
-    is_, js, madr_ijs = [], [], []
-    for i in range(mj_model.nv):
-        madr_ij, j = mj_model.dof_Madr[i], i
-        while True:
-            madr_ij, j = madr_ij + 1, mj_model.dof_parentid[j]
-            if j == -1:
-                break
-            is_, js, madr_ijs = (
-                is_ + [i],
-                js + [j],
-                madr_ijs + [madr_ij],
-            )
-    i, j, madr_ij = (np.array(x, dtype=np.int32) for x in (is_, js, madr_ijs))
-    mat = np.zeros((mj_model.nv, mj_model.nv))
-    mat[i, j] = mj_data.qM[madr_ij]
-    mat = np.diag(mj_data.qM[np.array(mj_model.dof_Madr)]) + mat + mat.T
-    return mat
+def check_mujoco_data_consistency(
+    gs_sim,
+    mj_sim,
+    joint_names: list[str] | None = None,
+    body_names: list[str] | None = None,
+    *,
+    qvel_prev: np.ndarray | None = None,
+    atol: float,
+):
+    # Get mapping between Mujoco and Genesis
+    gs_maps, mj_maps = _get_model_mappings(gs_sim, mj_sim, joint_names, body_names)
+    (gs_body_idcs, gs_jnt_idcs, gs_q_idcs, gs_dof_idcs, gs_act_idcs) = gs_maps
+    (mj_body_idcs, mj_jnt_idcs, mj_q_idcs, mj_dof_idcs, mj_act_idcs) = mj_maps
 
+    # crb
+    gs_crb_inertial = gs_sim.rigid_solver.links_state.crb_inertial.to_numpy()[:, 0].reshape([-1, 9])[
+        :, [0, 4, 8, 1, 2, 5]
+    ]
+    mj_crb_inertial = mj_sim.data.crb[:, :6]  # upper-triangular part
+    np.testing.assert_allclose(gs_crb_inertial[gs_body_idcs], mj_crb_inertial[mj_body_idcs], atol=atol)
+    gs_crb_pos = gs_sim.rigid_solver.links_state.crb_pos.to_numpy()[:, 0]
+    mj_crb_pos = mj_sim.data.crb[:, 6:9]
+    np.testing.assert_allclose(gs_crb_pos[gs_body_idcs], mj_crb_pos[mj_body_idcs], atol=atol)
+    gs_crb_mass = gs_sim.rigid_solver.links_state.crb_mass.to_numpy()[:, 0]
+    mj_crb_mass = mj_sim.data.crb[:, 9]
+    np.testing.assert_allclose(gs_crb_mass[gs_body_idcs], mj_crb_mass[mj_body_idcs], atol=atol)
 
-def check_mujoco_data_consistency(gs_sim, mj_sim, is_first_step, qvel_prev, atol: float = 1e-9):
+    gs_mass_mat_damped = gs_sim.rigid_solver.mass_mat.to_numpy()[:, :, 0]
+    mj_mass_mat_damped = np.zeros((mj_sim.model.nv, mj_sim.model.nv))
+    mujoco.mj_fullM(mj_sim.model, mj_mass_mat_damped, mj_sim.data.qM)
+    mj_mass_mat_damped[np.diag_indices(mj_sim.model.nv)] += mj_sim.model.dof_damping * mj_sim.model.opt.timestep
+    np.testing.assert_allclose(
+        gs_mass_mat_damped[gs_dof_idcs][:, gs_dof_idcs], mj_mass_mat_damped[mj_dof_idcs][:, mj_dof_idcs], atol=atol
+    )
+
     gs_meaninertia = gs_sim.rigid_solver.meaninertia.to_numpy()[0]
     mj_meaninertia = mj_sim.model.stat.meaninertia
     np.testing.assert_allclose(gs_meaninertia, mj_meaninertia, atol=atol)
@@ -463,7 +495,7 @@ def check_mujoco_data_consistency(gs_sim, mj_sim, is_first_step, qvel_prev, atol
     np.testing.assert_allclose(gs_cinr_mass, mj_cinr_mass, atol=atol)
 
 
-def simulate_and_check_mujoco_consistency(gs_sim, mj_sim, qpos=None, qvel=None, *, num_steps):
+def simulate_and_check_mujoco_consistency(gs_sim, mj_sim, qpos=None, qvel=None, *, atol, num_steps):
     # Get mapping between Mujoco and Genesis
     _, (_, _, mj_q_idcs, mj_dof_idcs, _) = _get_model_mappings(gs_sim, mj_sim)
 

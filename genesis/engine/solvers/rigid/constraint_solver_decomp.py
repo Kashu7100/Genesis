@@ -27,6 +27,8 @@ class ConstraintSolver:
             + self._solver.n_equalities * 3
         )
         self.len_constraints_ = max(1, self.len_constraints)
+        self.ti_n_equalities = ti.field(gs.ti_int, shape=self._solver._batch_shape())
+        self.ti_n_equalities.from_numpy(np.full((self._solver._B,), self._solver.n_equalities, dtype=gs.np_int))
 
         self.jac = ti.field(
             dtype=gs.ti_float, shape=self._solver._batch_shape((self.len_constraints_, self._solver.n_dofs_))
