@@ -14,6 +14,10 @@ import genesis as gs
 from genesis.constants import backend as gs_backend
 
 
+class DeprecationError(Exception):
+    pass
+
+
 def raise_exception(msg="Something went wrong."):
     gs.logger._error_msg = msg
     raise gs.GenesisException(msg)
@@ -127,6 +131,7 @@ def get_device(backend: gs_backend):
             device_name = device_property.name
             total_mem = device_property.total_memory / 1024**3
         else:  # pytorch tensors on cpu
+            gs.logger.warning("Vulkan support only available on Intel XPU device. Falling back to CPU.")
             device, device_name, total_mem, _ = get_device(gs_backend.cpu)
 
     elif backend == gs_backend.gpu:
