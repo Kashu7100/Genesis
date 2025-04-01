@@ -1214,12 +1214,7 @@ class Viewer(pyglet.window.Window):
         else:
             self.refresh()
 
-    def run(self):
-        if self._run_in_thread:
-            raise RuntimeError("'Viewer.run' can only be called manually if the viewer is already running in thread.")
-        elif threading.main_thread() != threading.current_thread():
-            raise RuntimeError("'Viewer.run' can only be called manually from main thread on MacOS.")
-
+    def _run(self):
         while self._is_active:
             try:
                 self.refresh()

@@ -1,14 +1,8 @@
-import os
-from itertools import chain
 from enum import Enum
 
 import pytest
-import pyglet
-import numpy as np
-
 import mujoco
 import genesis as gs
-from genesis.utils.mesh import get_assets_dir
 
 from .utils import MjSim
 
@@ -30,18 +24,13 @@ def show_viewer(pytestconfig):
 
 
 @pytest.fixture
-def backend(pytestconfig, request):
+def backend(request):
     if hasattr(request, "param"):
         backend = request.param
         if isinstance(backend, str):
             return getattr(gs.constants.backend, backend)
         return backend
     return pytestconfig.getoption("--backend")
-
-
-@pytest.fixture(scope="session")
-def asset_tmp_path(tmp_path_factory):
-    return tmp_path_factory.mktemp("assets")
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -55,7 +44,6 @@ def initialize_genesis(request, backend):
         debug = False
     gs.init(backend=backend, precision=precision, debug=debug, seed=0, logging_level=logging_level)
     yield
-    pyglet.app.exit()
     gs.destroy()
 
 
@@ -74,29 +62,18 @@ def mj_sim(xml_path, gs_solver, gs_integrator):
     else:
         raise ValueError(f"Integrator '{gs_integrator}' not supported")
 
-    if not os.path.isabs(xml_path):
-        xml_path = os.path.join(get_assets_dir(), xml_path)
+    mj_sim.model = mujoco.MjModel.from_xml_path(xml_path)
+    mj_sim.model.opt.solver = mj_solver
+    mj_sim.model.opt.integrator = mj_integrator
+    mj_sim.model.opt.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
+    mj_sim.data = mujoco.MjData(mj_sim.model)
 
-    model = mujoco.MjModel.from_xml_path(xml_path)
-    model.opt.solver = mj_solver
-    model.opt.integrator = mj_integrator
-    model.opt.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
-    model.opt.disableflags &= ~np.uint32(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
-    model.opt.disableflags &= ~np.uint32(mujoco.mjtDisableBit.mjDSBL_REFSAFE)
-    model.opt.disableflags &= ~np.uint32(mujoco.mjtDisableBit.mjDSBL_GRAVITY)
-    model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_NATIVECCD
-    model.opt.enableflags |= mujoco.mjtEnableBit.mjENBL_MULTICCD
-    data = mujoco.MjData(model)
-
-    # Joint damping is not properly supported in Genesis for now
-    model.dof_damping[:] = 0.0
-
-    return MjSim(model, data)
+    return MjSim(mj_sim.model, mj_sim.data)
 
 
 @pytest.fixture
 def gs_sim(xml_path, gs_solver, gs_integrator, show_viewer, mj_sim):
-    scene = gs.Scene(
+    gs_sim.scene = gs.Scene(
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(3, -1, 1.5),
             camera_lookat=(0.0, 0.0, 0.5),
@@ -124,18 +101,10 @@ def gs_sim(xml_path, gs_solver, gs_integrator, show_viewer, mj_sim):
         show_viewer=show_viewer,
         show_FPS=False,
     )
-    gs_robot = scene.add_entity(
+    gs_robot = gs_sim.scene.add_entity(
         gs.morphs.MJCF(file=xml_path),
-        visualize_contact=True,
+        visualize_contact=False,
     )
+    gs_sim.scene.build()
 
-    # Joint damping is not properly supported in Genesis for now
-    for joint in chain.from_iterable(gs_robot.joints):
-        joint.dofs_damping[:] = 0.0
-
-    scene.build()
-
-    yield scene.sim
-
-    if show_viewer:
-        scene.viewer.stop()
+    return gs_sim.scene.sim

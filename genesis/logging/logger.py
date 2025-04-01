@@ -149,7 +149,3 @@ class Logger:
     @property
     def last_output(self):
         return self._formatter.last_output
-
-    @property
-    def level(self):
-        return self._logger.level
