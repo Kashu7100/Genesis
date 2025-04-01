@@ -16,6 +16,13 @@ from .constraint_solver_decomp_island import ConstraintSolverIsland
 from .sdf_decomp import SDF
 
 
+# minimum constraint impedance
+IMP_MIN = 0.0001
+# maximum constraint impedance
+IMP_MAX = 0.9999
+
+
+
 @ti.data_oriented
 class RigidSolver(Solver):
     # ------------------------------------------------------------------------------------
