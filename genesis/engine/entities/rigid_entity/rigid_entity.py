@@ -365,7 +365,7 @@ class RigidEntity(Entity):
                     # in this case, l_info['pos'] and l_info['quat'] are actually not used in solver, but this initial value will be reflected
                     j_info["init_qpos"] = np.concatenate([l_info["pos"], l_info["quat"]])
 
-            self._add_by_info(l_info, j_info, links_g_info[i_l], morph, surface)
+            self._add_by_info(l_info, (j_info,), links_g_info[i_l], morph, surface)
 
         if world_g_info:
             l_world_info, j_world_info = mju.parse_link(mj, 0, q_offset, dof_offset, qpos0_offset, morph.scale)
@@ -375,7 +375,7 @@ class RigidEntity(Entity):
             if morph.quat is not None:
                 l_world_info["quat"] = np.array(morph.quat)
                 gs.logger.warning("Overriding base link's quat with user provided value in morph.")
-            self._add_by_info(l_world_info, j_world_info, world_g_info, morph, surface)
+            self._add_by_info(l_world_info, (j_world_info,), world_g_info, morph, surface)
 
         for i_e in range(mj.neq):
             e_info = mju.parse_equality(mj, i_e, morph.scale, ordered_links_idx)
