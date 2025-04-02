@@ -22,8 +22,6 @@ IMP_MIN = 0.0001
 IMP_MAX = 0.9999
 
 
-
-
 def _sanitize_sol_params(sol_params, substep_dt, default_resolve_time=None):
     timeconst, dampratio, dmin, dmax, width, mid, power = sol_params.T
     if default_resolve_time is not None:
@@ -3879,7 +3877,7 @@ class RigidSolver(Solver):
             for j in ti.static(range(7)):
                 self.dofs_info[I].sol_params[j] = sol_params[j]
 
-            self.dofs_info[I].sol_params[0] = self._substep_dt * 2
+            self.dofs_info[I].sol_params[0] = ti.max(self.dofs_info[I].sol_params[0], 2 * self._substep_dt)
 
     def _set_dofs_info(self, tensor_list, dofs_idx, name, envs_idx=None):
         if self._options.batch_dofs_info:
