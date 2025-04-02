@@ -18,9 +18,12 @@ class RigidEquality(RBC):
         name,
         idx,
         type,
-        eq_obj1id,
-        eq_obj2id,
-        eq_data,
+        link1_idx,
+        link2_idx,
+        anchor1_pos,
+        anchor2_pos,
+        rel_pose,
+        torque_scale,
         sol_params,
     ):
         self._name = name
@@ -31,9 +34,12 @@ class RigidEquality(RBC):
         self._idx = idx
         self._type = type
 
-        self._eq_obj1id = eq_obj1id
-        self._eq_obj2id = eq_obj2id
-        self._eq_data = eq_data
+        self._link1_idx = link1_idx
+        self._link2_idx = link2_idx
+        self._anchor1_pos = anchor1_pos
+        self._anchor2_pos = anchor2_pos
+        self._rel_pose = rel_pose
+        self._torque_scale = torque_scale
         self._sol_params = sol_params
 
     # ------------------------------------------------------------------------------------
@@ -90,25 +96,46 @@ class RigidEquality(RBC):
         return self._type
 
     @property
-    def eq_obj1id(self):
+    def link1_idx(self):
         """
         Returns the index of the first link.
         """
-        return self._eq_obj1id
+        return self._link1_idx
 
     @property
-    def eq_obj2id(self):
+    def link2_idx(self):
         """
         Returns the index of the second link.
         """
-        return self._eq_obj2id
+        return self._link2_idx
 
     @property
-    def eq_data(self):
+    def anchor1_pos(self):
         """
-        Returns the eq_data of this equality constraint.
+        Returns the position of the first anchor.
         """
-        return self._eq_data
+        return self._anchor1_pos
+
+    @property
+    def anchor2_pos(self):
+        """
+        Returns the position of the second anchor.
+        """
+        return self._anchor2_pos
+
+    @property
+    def rel_pose(self):
+        """
+        Returns the relative pose between the two links.
+        """
+        return self._rel_pose
+
+    @property
+    def torque_scale(self):
+        """
+        Returns the torque scale of the equality.
+        """
+        return self._torque_scale
 
     @property
     def sol_params(self):
