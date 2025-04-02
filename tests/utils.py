@@ -131,8 +131,13 @@ def check_mujoco_model_consistency(
             for joint in entity.joints
             if joint.name != "world" and joint.type != gs.JOINT_TYPE.FIXED
         ]
-    if body_names is None:
-        body_names = [body.name for entity in gs_sim.entities for body in entity.links]
+    body_names = [
+        body.name for entity in gs_sim.entities for body in entity.links if not (body.is_fixed and body.parent_idx < 0)
+    ]
+
+    act_names: list[str] = []
+    mj_jnt_idcs: list[int] = []
+    mj_q_idcs: list[int] = []
     mj_dof_idcs: list[int] = []
     for joint_name in joint_names:
         mj_joint_j = mj_sim.model.joint(joint_name)
@@ -160,6 +165,16 @@ def check_mujoco_model_consistency(
     assert mj_sim.model.opt.timestep == gs_sim.rigid_solver.substep_dt
     assert mj_sim.model.opt.tolerance == gs_sim.rigid_solver._options.tolerance
     assert mj_sim.model.opt.iterations == gs_sim.rigid_solver._options.iterations
+    assert not (mj_sim.model.opt.disableflags & mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
+    assert not (mj_sim.model.opt.disableflags & mujoco.mjtDisableBit.mjDSBL_REFSAFE)
+    assert not (mj_sim.model.opt.disableflags & mujoco.mjtDisableBit.mjDSBL_GRAVITY)
+    assert mj_sim.model.opt.disableflags & mujoco.mjtDisableBit.mjDSBL_NATIVECCD
+    assert mj_sim.model.opt.enableflags & mujoco.mjtEnableBit.mjENBL_MULTICCD
+    assert not (mj_sim.model.opt.enableflags & mujoco.mjtEnableBit.mjENBL_FWDINV)
+
+    mj_adj_collision = bool(mj_sim.model.opt.disableflags & mujoco.mjtDisableBit.mjDSBL_FILTERPARENT)
+    gs_adj_collision = gs_sim.rigid_solver._options.enable_adjacent_collision
+    assert gs_adj_collision == mj_adj_collision
 
     mj_solver = mujoco.mjtSolver(mj_sim.model.opt.solver)
     if mj_solver.name == "mjSOL_PGS":
@@ -217,6 +232,9 @@ def check_mujoco_model_consistency(
     gs_dof_damping = gs_sim.rigid_solver.dofs_info.damping.to_numpy()
     mj_dof_damping = mj_sim.model.dof_damping
     np.testing.assert_allclose(gs_dof_damping[gs_dof_idcs], mj_dof_damping[mj_dof_idcs], atol=atol)
+
+    # FIXME: DoF damping implementation in Genesis is not consistent with Mujoco (for efficiency)
+    # np.testing.assert_allclose(mj_sim.model.dof_damping, 0.0)
 
     gs_dof_armature = gs_sim.rigid_solver.dofs_info.armature.to_numpy()
     mj_dof_armature = mj_sim.model.dof_armature
@@ -460,5 +478,5 @@ def simulate_and_check_mujoco_consistency(gs_sim, mj_sim, qpos, qvel, num_steps)
         qvel_prev = mj_sim.data.qvel.copy()
         mujoco.mj_step(mj_sim.model, mj_sim.data)
         gs_sim.scene.step()
-        if gs_sim.scene.visualizer:
-            gs_sim.scene.visualizer.update()
+        # if gs_sim.scene.visualizer:
+        #     gs_sim.scene.visualizer.update()

@@ -3,7 +3,7 @@ import taichi as ti
 import torch
 
 import genesis as gs
-from genesis.ext import trimesh
+import trimesh
 from genesis.repr_base import RBC
 from genesis.utils import geom as gu
 
@@ -93,7 +93,7 @@ class RigidLink(RBC):
         is_fixed = all(joint.type is gs.JOINT_TYPE.FIXED for joint in self.joints)
         while link.parent_idx > -1:
             link = solver_links[link.parent_idx]
-            if all(joint.type is gs.JOINT_TYPE.FIXED for joint in link.joints):
+            if not all(joint.type is gs.JOINT_TYPE.FIXED for joint in link.joints):
                 is_fixed = False
         self.root_idx = gs.np_int(link.idx)
         self.is_fixed = gs.np_int(is_fixed)
