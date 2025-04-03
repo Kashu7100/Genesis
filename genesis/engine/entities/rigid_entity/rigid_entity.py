@@ -11,7 +11,7 @@ from genesis.utils import mesh as mu
 from genesis.utils import mjcf as mju
 from genesis.utils import terrain as tu
 from genesis.utils import urdf as uu
-from genesis.utils.misc import tensor_to_array
+from genesis.utils.misc import tensor_to_array, ti_mat_field_to_torch
 
 from ..base_entity import Entity
 from .rigid_joint import RigidJoint
@@ -67,6 +67,8 @@ class RigidEntity(Entity):
         self._vvert_start = vvert_start
         self._vface_start = vface_start
         self._equality_start = equality_start
+
+        self._base_links_idx = torch.tensor([self.base_link_idx], dtype=gs.tc_int, device=gs.device)
 
         self._visualize_contact = visualize_contact
 
@@ -661,7 +663,7 @@ class RigidEntity(Entity):
 
         self._kernel_get_jacobian(link.idx)
 
-        jacobian = self._jacobian.to_torch(gs.device).permute(2, 0, 1)
+        jacobian = self._jacobian.to_torch(gs.device).transpose(1, 0)
         if self._solver.n_envs == 0:
             jacobian = jacobian.squeeze(0)
 
@@ -815,7 +817,7 @@ class RigidEntity(Entity):
             Pose error for each target. The 6-vector is [err_pos_x, err_pos_y, err_pos_z, err_rot_x, err_rot_y, err_rot_z]. Only returned if `return_error` is True.
         """
         if self._solver.n_envs > 0:
-            envs_idx = self._solver._get_envs_idx(envs_idx)
+            envs_idx = self._solver._sanitize_envs_idx(envs_idx)
 
             if pos is not None:
                 if pos.shape[0] != len(envs_idx):
@@ -917,7 +919,7 @@ class RigidEntity(Entity):
             Pose error for each target. The 6-vector is [err_pos_x, err_pos_y, err_pos_z, err_rot_x, err_rot_y, err_rot_z]. Only returned if `return_error` is True.
         """
         if self._solver.n_envs > 0:
-            envs_idx = self._solver._get_envs_idx(envs_idx)
+            envs_idx = self._solver._sanitize_envs_idx(envs_idx)
 
         if not self._requires_jac_and_IK:
             gs.raise_exception(
@@ -1015,7 +1017,7 @@ class RigidEntity(Entity):
             ]
         )
 
-        dofs_idx = self._get_dofs_idx_local(dofs_idx_local)
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs)
         n_dofs = len(dofs_idx)
         if n_dofs == 0:
             gs.raise_exception("Target dofs not provided.")
@@ -1033,7 +1035,7 @@ class RigidEntity(Entity):
                     links_idx_by_dofs.append(v.idx_local)  # converted to global later
                     break
 
-        links_idx_by_dofs = self._get_ls_idx(links_idx_by_dofs)
+        links_idx_by_dofs = self._get_idx(links_idx_by_dofs, self.n_links, self._link_start)
         n_links_by_dofs = len(links_idx_by_dofs)
 
         if envs_idx is None:
@@ -1063,16 +1065,15 @@ class RigidEntity(Entity):
             respect_joint_limit,
             envs_idx,
         )
+        qpos = self._IK_qpos_best.to_torch(gs.device).transpose(1, 0)
         if self._solver.n_envs > 0:
-            qpos = self._IK_qpos_best.to_torch(gs.device).permute(1, 0)[envs_idx]
+            qpos = qpos[envs_idx]
         else:
-            qpos = self._IK_qpos_best.to_torch(gs.device).permute(1, 0).squeeze(0)
+            qpos = qpos.squeeze(0)
 
         if return_error:
             error_pose = (
-                self._IK_err_pose_best.to_torch(gs.device)
-                .reshape([self._IK_n_tgts, 6, -1])[:n_links]
-                .permute([2, 0, 1])
+                self._IK_err_pose_best.to_torch(gs.device).reshape((self._IK_n_tgts, 6, -1))[:n_links].transpose(1, 0)
             )
             if self._solver.n_envs == 0:
                 error_pose = error_pose.squeeze(0)
@@ -1337,9 +1338,9 @@ class RigidEntity(Entity):
             qpos = qpos.unsqueeze(0)
             envs_idx = torch.zeros(1, dtype=gs.tc_int)
         else:
-            envs_idx = self._solver._get_envs_idx(envs_idx)
+            envs_idx = self._solver._sanitize_envs_idx(envs_idx)
 
-        links_idx = self._get_ls_idx(ls_idx_local)
+        links_idx = self._get_idx(ls_idx_local, self.n_links, self._link_start)
         links_pos = torch.empty((len(envs_idx), len(links_idx), 3), dtype=gs.tc_float, device=gs.device)
         links_quat = torch.empty((len(envs_idx), len(links_idx), 4), dtype=gs.tc_float, device=gs.device)
 
@@ -1347,7 +1348,7 @@ class RigidEntity(Entity):
             links_pos,
             links_quat,
             qpos,
-            self._get_qs_idx(qs_idx_local),
+            self._get_idx(qs_idx_local, self.n_qs, self._q_start),
             links_idx,
             envs_idx,
         )
@@ -1639,7 +1640,7 @@ class RigidEntity(Entity):
             gs.raise_exception("Neither `name` nor `uid` is provided.")
 
     @gs.assert_built
-    def get_pos(self, envs_idx=None):
+    def get_pos(self, envs_idx=None, *, unsafe=False):
         """
         Returns position of the entity's base link.
 
@@ -1653,10 +1654,10 @@ class RigidEntity(Entity):
         pos : torch.Tensor, shape (3,) or (n_envs, 3)
             The position of the entity's base link.
         """
-        return self._solver.get_links_pos([self.base_link_idx], envs_idx).squeeze(-2)
+        return self._solver.get_links_pos(self._base_links_idx, envs_idx, unsafe=unsafe).squeeze(-2)
 
     @gs.assert_built
-    def get_quat(self, envs_idx=None):
+    def get_quat(self, envs_idx=None, *, unsafe=False):
         """
         Returns quaternion of the entity's base link.
 
@@ -1670,10 +1671,10 @@ class RigidEntity(Entity):
         quat : torch.Tensor, shape (4,) or (n_envs, 4)
             The quaternion of the entity's base link.
         """
-        return self._solver.get_links_quat([self.base_link_idx], envs_idx).squeeze(-2)
+        return self._solver.get_links_quat(self._base_links_idx, envs_idx, unsafe=unsafe).squeeze(-2)
 
     @gs.assert_built
-    def get_vel(self, envs_idx=None):
+    def get_vel(self, envs_idx=None, *, unsafe=False):
         """
         Returns linear velocity of the entity's base link.
 
@@ -1687,10 +1688,10 @@ class RigidEntity(Entity):
         vel : torch.Tensor, shape (3,) or (n_envs, 3)
             The linear velocity of the entity's base link.
         """
-        return self._solver.get_links_vel([self.base_link_idx], envs_idx).squeeze(-2)
+        return self._solver.get_links_vel(self._base_links_idx, envs_idx, unsafe=unsafe).squeeze(-2)
 
     @gs.assert_built
-    def get_ang(self, envs_idx=None):
+    def get_ang(self, envs_idx=None, *, unsafe=False):
         """
         Returns angular velocity of the entity's base link.
 
@@ -1704,10 +1705,10 @@ class RigidEntity(Entity):
         ang : torch.Tensor, shape (3,) or (n_envs, 3)
             The angular velocity of the entity's base link.
         """
-        return self._solver.get_links_ang([self.base_link_idx], envs_idx).squeeze(-2)
+        return self._solver.get_links_ang(self._base_links_idx, envs_idx, unsafe=unsafe).squeeze(-2)
 
     @gs.assert_built
-    def get_links_pos(self, ls_idx_local=None, envs_idx=None):
+    def get_links_pos(self, ls_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Returns position of all the entity's links.
 
@@ -1723,10 +1724,11 @@ class RigidEntity(Entity):
         pos : torch.Tensor, shape (n_links, 3) or (n_envs, n_links, 3)
             The position of all the entity's links.
         """
-        return self._solver.get_links_pos(self._get_ls_idx(ls_idx_local), envs_idx)
+        links_idx = self._get_idx(ls_idx_local, self.n_links, self._link_start, unsafe=True)
+        return self._solver.get_links_pos(links_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_links_quat(self, ls_idx_local=None, envs_idx=None):
+    def get_links_quat(self, ls_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Returns quaternion of all the entity's links.
 
@@ -1742,10 +1744,11 @@ class RigidEntity(Entity):
         quat : torch.Tensor, shape (n_links, 4) or (n_envs, n_links, 4)
             The quaternion of all the entity's links.
         """
-        return self._solver.get_links_quat(self._get_ls_idx(ls_idx_local), envs_idx)
+        links_idx = self._get_idx(ls_idx_local, self.n_links, self._link_start, unsafe=True)
+        return self._solver.get_links_quat(links_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_links_vel(self, ls_idx_local=None, envs_idx=None):
+    def get_links_vel(self, ls_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Returns linear velocity of all the entity's links.
 
@@ -1761,10 +1764,11 @@ class RigidEntity(Entity):
         vel : torch.Tensor, shape (n_links, 3) or (n_envs, n_links, 3)
             The linear velocity of all the entity's links.
         """
-        return self._solver.get_links_vel(self._get_ls_idx(ls_idx_local), envs_idx)
+        links_idx = self._get_idx(ls_idx_local, self.n_links, self._link_start, unsafe=True)
+        return self._solver.get_links_vel(links_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_links_ang(self, ls_idx_local=None, envs_idx=None):
+    def get_links_ang(self, ls_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Returns angular velocity of all the entity's links.
 
@@ -1780,10 +1784,11 @@ class RigidEntity(Entity):
         ang : torch.Tensor, shape (n_links, 3) or (n_envs, n_links, 3)
             The angular velocity of all the entity's links.
         """
-        return self._solver.get_links_ang(self._get_ls_idx(ls_idx_local), envs_idx)
+        links_idx = self._get_idx(ls_idx_local, self.n_links, self._link_start, unsafe=True)
+        return self._solver.get_links_ang(links_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_links_acc(self, ls_idx_local=None, envs_idx=None):
+    def get_links_acc(self, ls_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Returns linear acceleration of the specified entity's links. (Mimicking accelerometer)
 
@@ -1799,18 +1804,21 @@ class RigidEntity(Entity):
         acc : torch.Tensor, shape (n_links, 3) or (n_envs, n_links, 3)
             The linear acceleration of the specified entity's links.
         """
-        return self._solver.get_links_acc(self._get_ls_idx(ls_idx_local), envs_idx)
+        links_idx = self._get_idx(ls_idx_local, self.n_links, self._link_start, unsafe=True)
+        return self._solver.get_links_acc(links_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_links_inertial_mass(self, ls_idx_local=None, envs_idx=None):
-        return self._solver.get_links_inertial_mass(self._get_ls_idx(ls_idx_local), envs_idx)
+    def get_links_inertial_mass(self, ls_idx_local=None, envs_idx=None, *, unsafe=False):
+        links_idx = self._get_idx(ls_idx_local, self.n_links, self._link_start, unsafe=True)
+        return self._solver.get_links_inertial_mass(links_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_links_invweight(self, ls_idx_local=None, envs_idx=None):
-        return self._solver.get_links_invweight(self._get_ls_idx(ls_idx_local), envs_idx)
+    def get_links_invweight(self, ls_idx_local=None, envs_idx=None, *, unsafe=False):
+        links_idx = self._get_idx(ls_idx_local, self.n_links, self._link_start, unsafe=True)
+        return self._solver.get_links_invweight(links_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def set_pos(self, pos, zero_velocity=True, envs_idx=None):
+    def set_pos(self, pos, envs_idx=None, *, zero_velocity=True, unsafe=False):
         """
         Set position of the entity's base link.
 
@@ -1826,22 +1834,14 @@ class RigidEntity(Entity):
 
         if self.base_link.is_fixed:
             gs.logger.warning("Base link is fixed. Overriding base link pose.")
-
-        pos = torch.as_tensor(pos)
-        if self._solver.n_envs == 0:
-            if pos.ndim != 1:
-                gs.raise_exception("`pos` must be a 1D tensor for unparallelized scene.")
-        else:
-            if pos.ndim != 2:
-                gs.raise_exception("`pos` must be a 2D tensor for parallelized scene.")
-
-        self._solver.set_links_pos(pos.unsqueeze(-2), [self.base_link_idx], envs_idx)
-
+        self._solver.set_base_links_pos(
+            pos.unsqueeze(-2), self._base_links_idx, envs_idx, unsafe=unsafe, skip_forward=zero_velocity
+        )
         if zero_velocity:
-            self.zero_all_dofs_velocity(envs_idx)
+            self.zero_all_dofs_velocity(envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def set_quat(self, quat, zero_velocity=True, envs_idx=None):
+    def set_quat(self, quat, envs_idx=None, *, zero_velocity=True, unsafe=False):
         """
         Set quaternion of the entity's base link.
 
@@ -1857,19 +1857,11 @@ class RigidEntity(Entity):
 
         if self.base_link.is_fixed:
             gs.logger.warning("Base link is fixed. Overriding base link pose.")
-
-        quat = torch.as_tensor(quat)
-        if self._solver.n_envs == 0:
-            if quat.ndim != 1:
-                gs.raise_exception("`quat` must be a 1D tensor for unparallelized scene.")
-        else:
-            if quat.ndim != 2:
-                gs.raise_exception("`quat` must be a 2D tensor for parallelized scene.")
-
-        self._solver.set_links_quat(torch.as_tensor(quat).unsqueeze(-2), [self.base_link_idx], envs_idx)
-
+        self._solver.set_base_links_quat(
+            quat.unsqueeze(-2), self._base_links_idx, envs_idx, unsafe=unsafe, skip_forward=zero_velocity
+        )
         if zero_velocity:
-            self.zero_all_dofs_velocity(envs_idx)
+            self.zero_all_dofs_velocity(envs_idx, unsafe=unsafe)
 
     @gs.assert_built
     def get_verts(self):
@@ -1934,44 +1926,46 @@ class RigidEntity(Entity):
         )
         return AABB
 
-    def _get_qs_idx_local(self, qs_idx_local=None):
-        if qs_idx_local is None:
-            qs_idx_local = torch.arange(self.n_qs, dtype=torch.int32, device=gs.device)
+    def _get_idx(self, idx_local, idx_local_max, idx_global_start=0, *, unsafe=False):
+        # Handling default argument and special cases
+        if idx_local is None:
+            if unsafe:
+                idx_global = slice(idx_global_start, idx_local_max + idx_global_start)
+            else:
+                idx_global = range(idx_global_start, idx_local_max + idx_global_start)
+        elif isinstance(idx_local, (range, slice)):
+            idx_global = range(
+                (idx_local.start or 0) + idx_global_start,
+                (idx_local.stop if idx_local.stop is not None else idx_local_max) + idx_global_start,
+                idx_local.step or 1,
+            )
+        elif isinstance(idx_local, int):
+            idx_global = idx_local + idx_global_start
+        elif isinstance(idx_local, (list, tuple)):
+            idx_global = [i + idx_global_start for i in idx_local]
         else:
-            qs_idx_local = torch.as_tensor(qs_idx_local, dtype=gs.tc_int)
-            if (qs_idx_local < 0).any() or (qs_idx_local >= self.n_qs).any():
-                gs.raise_exception("`qs_idx_local` exceeds valid range.")
-        return qs_idx_local
+            # Increment may be slow when dealing with heterogenuous data, so it must be avoided if possible
+            if idx_global_start > 0:
+                idx_global = idx_local + idx_global_start
+            else:
+                idx_global = idx_local
 
-    def _get_qs_idx(self, qs_idx_local=None):
-        return self._get_qs_idx_local(qs_idx_local) + self._q_start
+        # Early return if unsafe
+        if unsafe:
+            return idx_global
 
-    def _get_dofs_idx_local(self, dofs_idx_local=None):
-        if dofs_idx_local is None:
-            dofs_idx_local = torch.arange(self.n_dofs, dtype=torch.int32, device=gs.device)
-        else:
-            dofs_idx_local = torch.as_tensor(dofs_idx_local, dtype=gs.tc_int, device=gs.device)
-            if (dofs_idx_local < 0).any() or (dofs_idx_local >= self.n_dofs).any():
-                gs.raise_exception("`dofs_idx_local` exceeds valid range.")
-        return dofs_idx_local
+        # Perform a bunch of sanity checks
+        idx_global = torch.as_tensor(idx_global, dtype=gs.tc_int, device=gs.device).contiguous()
 
-    def _get_dofs_idx(self, dofs_idx_local=None):
-        return self._get_dofs_idx_local(dofs_idx_local) + self._dof_start
+        if idx_global.ndim != 1:
+            gs.raise_exception("Expecting a 1D tensor for `idx_local`.")
+        if (idx_global < 0).any() or (idx_global >= idx_global_start + idx_local_max).any():
+            gs.raise_exception("`idx_local` exceeds valid range.")
 
-    def _get_ls_idx_local(self, ls_idx_local=None):
-        if ls_idx_local is None:
-            ls_idx_local = torch.arange(self.n_links, dtype=torch.int32, device=gs.device)
-        else:
-            ls_idx_local = torch.as_tensor(ls_idx_local, dtype=gs.tc_int)
-            if (ls_idx_local < 0).any() or (ls_idx_local >= self.n_links).any():
-                gs.raise_exception("`ls_idx_local` exceeds valid range.")
-        return ls_idx_local
-
-    def _get_ls_idx(self, ls_idx_local=None):
-        return self._get_ls_idx_local(ls_idx_local) + self._link_start
+        return idx_global
 
     @gs.assert_built
-    def set_qpos(self, qpos, qs_idx_local=None, zero_velocity=True, envs_idx=None):
+    def set_qpos(self, qpos, qs_idx_local=None, envs_idx=None, *, zero_velocity=True, unsafe=False):
         """
         Set the entity's qpos.
 
@@ -1981,18 +1975,18 @@ class RigidEntity(Entity):
             The qpos to set.
         qs_idx_local : None | array_like, optional
             The indices of the qpos to set. If None, all qpos will be set. Note that here this uses the local `q_idx`, not the scene-level one. Defaults to None.
-        zero_velocity : bool, optional
-            Whether to zero the velocity of all the entity's dofs. Defaults to True. This is a safety measure after a sudden change in entity pose.
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
+        zero_velocity : bool, optional
+            Whether to zero the velocity of all the entity's dofs. Defaults to True. This is a safety measure after a sudden change in entity pose.
         """
-        self._solver.set_qpos(qpos, self._get_qs_idx(qs_idx_local), envs_idx)
-
+        qs_idx = self._get_idx(qs_idx_local, self.n_qs, self._q_start, unsafe=True)
+        self._solver.set_qpos(qpos, qs_idx, envs_idx, unsafe=unsafe, skip_forward=zero_velocity)
         if zero_velocity:
-            self.zero_all_dofs_velocity(envs_idx)
+            self.zero_all_dofs_velocity(envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def set_dofs_kp(self, kp, dofs_idx_local=None, envs_idx=None):
+    def set_dofs_kp(self, kp, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Set the entity's dofs' positional gains for the PD controller.
 
@@ -2005,11 +1999,11 @@ class RigidEntity(Entity):
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
-
-        self._solver.set_dofs_kp(kp, self._get_dofs_idx(dofs_idx_local), envs_idx)
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        self._solver.set_dofs_kp(kp, dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def set_dofs_kv(self, kv, dofs_idx_local=None, envs_idx=None):
+    def set_dofs_kv(self, kv, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Set the entity's dofs' velocity gains for the PD controller.
 
@@ -2022,10 +2016,11 @@ class RigidEntity(Entity):
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
-        self._solver.set_dofs_kv(kv, self._get_dofs_idx(dofs_idx_local), envs_idx)
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        self._solver.set_dofs_kv(kv, dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def set_dofs_force_range(self, lower, upper, dofs_idx_local=None, envs_idx=None):
+    def set_dofs_force_range(self, lower, upper, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Set the entity's dofs' force range.
 
@@ -2040,43 +2035,48 @@ class RigidEntity(Entity):
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
-
-        self._solver.set_dofs_force_range(lower, upper, self._get_dofs_idx(dofs_idx_local), envs_idx)
-
-    @gs.assert_built
-    def set_dofs_stiffness(self, stiffness, dofs_idx_local=None, envs_idx=None):
-        self._solver.set_dofs_stiffness(stiffness, self._get_dofs_idx(dofs_idx_local), envs_idx)
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        self._solver.set_dofs_force_range(lower, upper, dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def set_dofs_invweight(self, invweight, dofs_idx_local=None, envs_idx=None):
-        self._solver.set_dofs_invweight(invweight, self._get_dofs_idx(dofs_idx_local), envs_idx)
+    def set_dofs_stiffness(self, stiffness, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        self._solver.set_dofs_stiffness(stiffness, dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def set_dofs_armature(self, armature, dofs_idx_local=None, envs_idx=None):
-        self._solver.set_dofs_armature(armature, self._get_dofs_idx(dofs_idx_local), envs_idx)
+    def set_dofs_invweight(self, invweight, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        self._solver.set_dofs_invweight(invweight, dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def set_dofs_damping(self, damping, dofs_idx_local=None, envs_idx=None):
-        self._solver.set_dofs_damping(damping, self._get_dofs_idx(dofs_idx_local), envs_idx)
+    def set_dofs_armature(self, armature, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        self._solver.set_dofs_armature(armature, dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def set_dofs_velocity(self, velocity, dofs_idx_local=None, envs_idx=None):
+    def set_dofs_damping(self, damping, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        self._solver.set_dofs_damping(damping, dofs_idx, envs_idx, unsafe=unsafe)
+
+    @gs.assert_built
+    def set_dofs_velocity(self, velocity=None, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Set the entity's dofs' velocity.
 
         Parameters
         ----------
-        velocity : array_like
-            The velocity to set.
+        velocity : array_like | None
+            The velocity to set. Zero if not specified.
         dofs_idx_local : None | array_like, optional
             The indices of the dofs to set. If None, all dofs will be set. Note that here this uses the local `q_idx`, not the scene-level one. Defaults to None.
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
-        self._solver.set_dofs_velocity(velocity, self._get_dofs_idx(dofs_idx_local), envs_idx)
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        self._solver.set_dofs_velocity(velocity, dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def set_dofs_position(self, position, dofs_idx_local=None, zero_velocity=True, envs_idx=None):
+    def set_dofs_position(self, position, dofs_idx_local=None, envs_idx=None, *, zero_velocity=True, unsafe=False):
         """
         Set the entity's dofs' position.
 
@@ -2086,18 +2086,18 @@ class RigidEntity(Entity):
             The position to set.
         dofs_idx_local : None | array_like, optional
             The indices of the dofs to set. If None, all dofs will be set. Note that here this uses the local `q_idx`, not the scene-level one. Defaults to None.
-        zero_velocity : bool, optional
-            Whether to zero the velocity of all the entity's dofs. Defaults to True. This is a safety measure after a sudden change in entity pose.
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
+        zero_velocity : bool, optional
+            Whether to zero the velocity of all the entity's dofs. Defaults to True. This is a safety measure after a sudden change in entity pose.
         """
-        self._solver.set_dofs_position(position, self._get_dofs_idx(dofs_idx_local), envs_idx)
-
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        self._solver.set_dofs_position(position, dofs_idx, envs_idx, unsafe=unsafe, skip_forward=zero_velocity)
         if zero_velocity:
-            self.zero_all_dofs_velocity(envs_idx)
+            self.zero_all_dofs_velocity(envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def control_dofs_force(self, force, dofs_idx_local=None, envs_idx=None):
+    def control_dofs_force(self, force, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Control the entity's dofs' motor force. This is used for force/torque control.
 
@@ -2110,11 +2110,11 @@ class RigidEntity(Entity):
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
-
-        self._solver.control_dofs_force(force, self._get_dofs_idx(dofs_idx_local), envs_idx)
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        self._solver.control_dofs_force(force, dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def control_dofs_velocity(self, velocity, dofs_idx_local=None, envs_idx=None):
+    def control_dofs_velocity(self, velocity, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Set the PD controller's target velocity for the entity's dofs. This is used for velocity control.
 
@@ -2127,10 +2127,11 @@ class RigidEntity(Entity):
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
-        self._solver.control_dofs_velocity(velocity, self._get_dofs_idx(dofs_idx_local), envs_idx)
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        self._solver.control_dofs_velocity(velocity, dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def control_dofs_position(self, position, dofs_idx_local=None, envs_idx=None):
+    def control_dofs_position(self, position, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Set the PD controller's target position for the entity's dofs. This is used for position control.
 
@@ -2143,11 +2144,11 @@ class RigidEntity(Entity):
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
-
-        self._solver.control_dofs_position(position, self._get_dofs_idx(dofs_idx_local), envs_idx)
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        self._solver.control_dofs_position(position, dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_qpos(self, qs_idx_local=None, envs_idx=None):
+    def get_qpos(self, qs_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Get the entity's qpos.
 
@@ -2163,10 +2164,11 @@ class RigidEntity(Entity):
         qpos : torch.Tensor, shape (n_qs,) or (n_envs, n_qs)
             The entity's qpos.
         """
-        return self._solver.get_qpos(self._get_qs_idx(qs_idx_local), envs_idx)
+        qs_idx = self._get_idx(qs_idx_local, self.n_qs, self._q_start, unsafe=True)
+        return self._solver.get_qpos(qs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_dofs_control_force(self, dofs_idx_local=None, envs_idx=None):
+    def get_dofs_control_force(self, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Get the entity's dofs' internal control force, computed based on the position/velocity control command.
 
@@ -2182,10 +2184,11 @@ class RigidEntity(Entity):
         control_force : torch.Tensor, shape (n_dofs,) or (n_envs, n_dofs)
             The entity's dofs' internal control force.
         """
-        return self._solver.get_dofs_control_force(self._get_dofs_idx(dofs_idx_local), envs_idx)
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        return self._solver.get_dofs_control_force(dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_dofs_force(self, dofs_idx_local=None, envs_idx=None):
+    def get_dofs_force(self, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Get the entity's dofs' internal force at the current time step.
 
@@ -2205,10 +2208,11 @@ class RigidEntity(Entity):
         force : torch.Tensor, shape (n_dofs,) or (n_envs, n_dofs)
             The entity's dofs' force.
         """
-        return self._solver.get_dofs_force(self._get_dofs_idx(dofs_idx_local), envs_idx)
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        return self._solver.get_dofs_force(dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_dofs_velocity(self, dofs_idx_local=None, envs_idx=None):
+    def get_dofs_velocity(self, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Get the entity's dofs' velocity.
 
@@ -2224,10 +2228,11 @@ class RigidEntity(Entity):
         velocity : torch.Tensor, shape (n_dofs,) or (n_envs, n_dofs)
             The entity's dofs' velocity.
         """
-        return self._solver.get_dofs_velocity(self._get_dofs_idx(dofs_idx_local), envs_idx)
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        return self._solver.get_dofs_velocity(dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_dofs_position(self, dofs_idx_local=None, envs_idx=None):
+    def get_dofs_position(self, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Get the entity's dofs' position.
 
@@ -2243,10 +2248,11 @@ class RigidEntity(Entity):
         position : torch.Tensor, shape (n_dofs,) or (n_envs, n_dofs)
             The entity's dofs' position.
         """
-        return self._solver.get_dofs_position(self._get_dofs_idx(dofs_idx_local), envs_idx)
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        return self._solver.get_dofs_position(dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_dofs_kp(self, dofs_idx_local=None, envs_idx=None):
+    def get_dofs_kp(self, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Get the positional gain (kp) for the entity's dofs used by the PD controller.
 
@@ -2262,10 +2268,11 @@ class RigidEntity(Entity):
         kp : torch.Tensor, shape (n_dofs,) or (n_envs, n_dofs)
             The positional gain (kp) for the entity's dofs.
         """
-        return self._solver.get_dofs_kp(self._get_dofs_idx(dofs_idx_local), envs_idx)
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        return self._solver.get_dofs_kp(dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_dofs_kv(self, dofs_idx_local=None, envs_idx=None):
+    def get_dofs_kv(self, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Get the velocity gain (kv) for the entity's dofs used by the PD controller.
 
@@ -2281,10 +2288,11 @@ class RigidEntity(Entity):
         kv : torch.Tensor, shape (n_dofs,) or (n_envs, n_dofs)
             The velocity gain (kv) for the entity's dofs.
         """
-        return self._solver.get_dofs_kv(self._get_dofs_idx(dofs_idx_local), envs_idx)
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        return self._solver.get_dofs_kv(dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_dofs_force_range(self, dofs_idx_local=None, envs_idx=None):
+    def get_dofs_force_range(self, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Get the force range (min and max limits) for the entity's dofs.
 
@@ -2302,10 +2310,11 @@ class RigidEntity(Entity):
         upper_limit : torch.Tensor, shape (n_dofs,) or (n_envs, n_dofs)
             The upper limit of the force range for the entity's dofs.
         """
-        return self._solver.get_dofs_force_range(self._get_dofs_idx(dofs_idx_local), envs_idx)
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        return self._solver.get_dofs_force_range(dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_dofs_limit(self, dofs_idx_local=None, envs_idx=None):
+    def get_dofs_limit(self, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Get the positional limits (min and max) for the entity's dofs.
 
@@ -2323,26 +2332,31 @@ class RigidEntity(Entity):
         upper_limit : torch.Tensor, shape (n_dofs,) or (n_envs, n_dofs)
             The upper limit of the positional limits for the entity's dofs.
         """
-        return self._solver.get_dofs_limit(self._get_dofs_idx(dofs_idx_local), envs_idx)
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        return self._solver.get_dofs_limit(dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_dofs_stiffness(self, dofs_idx_local=None, envs_idx=None):
-        return self._solver.get_dofs_stiffness(self._get_dofs_idx(dofs_idx_local), envs_idx)
+    def get_dofs_stiffness(self, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        return self._solver.get_dofs_stiffness(dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_dofs_invweight(self, dofs_idx_local=None, envs_idx=None):
-        return self._solver.get_dofs_invweight(self._get_dofs_idx(dofs_idx_local), envs_idx)
+    def get_dofs_invweight(self, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        return self._solver.get_dofs_invweight(dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_dofs_armature(self, dofs_idx_local=None, envs_idx=None):
-        return self._solver.get_dofs_armature(self._get_dofs_idx(dofs_idx_local), envs_idx)
+    def get_dofs_armature(self, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        return self._solver.get_dofs_armature(dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def get_dofs_damping(self, dofs_idx_local=None, envs_idx=None):
-        return self._solver.get_dofs_damping(self._get_dofs_idx(dofs_idx_local), envs_idx)
+    def get_dofs_damping(self, dofs_idx_local=None, envs_idx=None, *, unsafe=False):
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        return self._solver.get_dofs_damping(dofs_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def zero_all_dofs_velocity(self, envs_idx=None):
+    def zero_all_dofs_velocity(self, envs_idx=None, *, unsafe=False):
         """
         Zero the velocity of all the entity's dofs.
 
@@ -2351,16 +2365,7 @@ class RigidEntity(Entity):
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
-
-        envs_idx = self._solver._get_envs_idx(envs_idx)
-        if self._solver.n_envs == 0:
-            qvel = torch.zeros(self.n_dofs, dtype=gs.tc_float, device=gs.device)
-            self.set_dofs_velocity(qvel)
-        else:
-            qvel = torch.zeros(
-                self._solver._batch_shape(self.n_dofs, True, B=len(envs_idx)), dtype=gs.tc_float, device=gs.device
-            )
-            self.set_dofs_velocity(qvel, envs_idx=envs_idx)
+        self.set_dofs_velocity(None, envs_idx=envs_idx)
 
     @gs.assert_built
     def detect_collision(self, env_idx=0):
@@ -2469,14 +2474,14 @@ class RigidEntity(Entity):
                 "geom_b": scene_contact_info["geom_b"][:max_env_collisions].t(),
                 "link_a": scene_contact_info["link_a"][:max_env_collisions].t(),
                 "link_b": scene_contact_info["link_b"][:max_env_collisions].t(),
-                "position": scene_contact_info["pos"][:max_env_collisions].permute(1, 0, 2),
-                "force_a": -scene_contact_info["force"][:max_env_collisions].permute(1, 0, 2),
-                "force_b": scene_contact_info["force"][:max_env_collisions].permute(1, 0, 2),
+                "position": scene_contact_info["pos"][:max_env_collisions].transpose(1, 0),
+                "force_a": -scene_contact_info["force"][:max_env_collisions].transpose(1, 0),
+                "force_b": scene_contact_info["force"][:max_env_collisions].transpose(1, 0),
                 "valid_mask": valid_mask[:max_env_collisions].t(),
             }
         return contact_info
 
-    def get_links_net_contact_force(self, envs_idx=None):
+    def get_links_net_contact_force(self, envs_idx=None, *, unsafe=False):
         """
         Returns net force applied on each links due to direct external contacts.
 
@@ -2485,16 +2490,10 @@ class RigidEntity(Entity):
         entity_links_force : torch.Tensor, shape (n_links, 3) or (n_envs, n_links, 3)
             The net force applied on each links due to direct external contacts.
         """
-        scene_links_force = (
-            self._solver.links_state.contact_force.to_torch(gs.device).clone().detach().permute([1, 0, 2])
+        tensor = ti_mat_field_to_torch(
+            self._solver.links_state.contact_force, envs_idx, slice(self.link_start, self.link_end), transpose=True
         )
-        entity_links_force = scene_links_force[:, self.link_start : self.link_end]
-
-        if self._solver.n_envs == 0:
-            entity_links_force = entity_links_force.squeeze(0)
-        elif not envs_idx is None:
-            entity_links_force = entity_links_force[envs_idx]
-        return entity_links_force
+        return tensor.squeeze(0) if self._solver.n_envs == 0 else tensor
 
     def set_friction_ratio(self, friction_ratio, ls_idx_local, envs_idx=None):
         """
@@ -2545,7 +2544,7 @@ class RigidEntity(Entity):
         for link in self._links:
             link.set_friction(friction)
 
-    def set_mass_shift(self, mass_shift, ls_idx_local, envs_idx=None):
+    def set_mass_shift(self, mass_shift, ls_idx_local=None, envs_idx=None, *, unsafe=False):
         """
         Set the mass shift of specified links.
         Parameters
@@ -2557,9 +2556,10 @@ class RigidEntity(Entity):
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
-        self._solver.set_links_mass_shift(mass_shift, self._get_ls_idx(ls_idx_local), envs_idx)
+        links_idx = self._get_idx(ls_idx_local, self.n_links, self._link_start, unsafe=True)
+        self._solver.set_links_mass_shift(mass_shift, links_idx, envs_idx, unsafe=unsafe)
 
-    def set_COM_shift(self, com_shift, ls_idx_local, envs_idx=None):
+    def set_COM_shift(self, com_shift, ls_idx_local, envs_idx=None, *, unsafe=False):
         """
         Set the center of mass (COM) shift of specified links.
         Parameters
@@ -2571,15 +2571,18 @@ class RigidEntity(Entity):
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
-        self._solver.set_links_COM_shift(com_shift, self._get_ls_idx(ls_idx_local), envs_idx)
+        links_idx = self._get_idx(ls_idx_local, self.n_links, self._link_start, unsafe=True)
+        self._solver.set_links_COM_shift(com_shift, links_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def set_links_inertial_mass(self, inertial_mass, ls_idx_local=None, envs_idx=None):
-        self._solver.set_links_inertial_mass(inertial_mass, self._get_ls_idx(ls_idx_local), envs_idx)
+    def set_links_inertial_mass(self, inertial_mass, ls_idx_local=None, envs_idx=None, *, unsafe=False):
+        links_idx = self._get_idx(ls_idx_local, self.n_links, self._link_start, unsafe=True)
+        self._solver.set_links_inertial_mass(inertial_mass, links_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
-    def set_links_invweight(self, invweight, ls_idx_local=None, envs_idx=None):
-        self._solver.set_links_invweight(invweight, self._get_ls_idx(ls_idx_local), envs_idx)
+    def set_links_invweight(self, invweight, ls_idx_local=None, envs_idx=None, *, unsafe=False):
+        links_idx = self._get_idx(ls_idx_local, self.n_links, self._link_start, unsafe=True)
+        self._solver.set_links_invweight(invweight, links_idx, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
     def set_mass(self, mass):

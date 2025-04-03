@@ -69,6 +69,10 @@ addopts = [
     "--dist=loadgroup",
     "-m not benchmarks",
 ]
+filterwarnings = [
+    "ignore:.*PytestUnknownMarkWarning",
+    "ignore::DeprecationWarning",
+]
 markers = [
     "benchmarks: marks benchmarks (executed independently and sequentially).",
 ]
