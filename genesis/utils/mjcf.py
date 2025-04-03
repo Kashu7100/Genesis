@@ -163,7 +163,7 @@ def parse_link(mj, i_l, q_offset, dof_offset, qpos0_offset, scale):
 
             elif mj_type == mujoco.mjtJoint.mjJNT_FREE:
                 if mj_stiffness > 0:
-                    raise gs.raise_exception("does not support stiffness for free joints")
+                    gs.raise_exception("does not support stiffness for free joints")
 
                 j_info["dofs_motion_ang"] = np.eye(6, 3, -3)
                 j_info["dofs_motion_vel"] = np.eye(6, 3)
@@ -216,19 +216,6 @@ def parse_link(mj, i_l, q_offset, dof_offset, qpos0_offset, scale):
         final_joint_list.append(j_info)
 
     j_info = add_more_joint_info(final_joint_list[0])
-
-    return l_info, j_info
-
-
-def parse_links(mj, scale):
-    l_infos = []
-    j_infos = []
-
-    for i_l in range(mj.nbody):
-        l_info, j_info = parse_link(mj, i_l, scale)
-
-        l_infos.append(l_info)
-        j_infos.append(j_info)
 
     return l_info, j_info
 
@@ -423,6 +410,6 @@ def parse_equality(mj, i_e, scale, ordered_links_idx):
     elif mj.eq_type[i_e] == mujoco.mjtEq.mjEQ_JOINT:
         e_info["type"] = gs.EQUALITY_TYPE.JOINT
     else:
-        raise gs.raise_exception(f"Unsupported MJCF equality type: {mj.eq_type[i_e]}")
+        gs.raise_exception(f"Unsupported MJCF equality type: {mj.eq_type[i_e]}")
 
     return e_info
