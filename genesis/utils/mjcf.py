@@ -1,4 +1,5 @@
 import os
+from bisect import bisect_right
 
 import numpy as np
 import trimesh
