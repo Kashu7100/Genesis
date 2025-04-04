@@ -1,3 +1,4 @@
+from typing import Literal
 import numpy as np
 import taichi as ti
 import torch
@@ -251,7 +252,7 @@ class RigidLink(RBC):
         return self._solver.get_links_quat([self._idx], envs_idx).squeeze(-2)
 
     @gs.assert_built
-    def get_vel(self, envs_idx=None):
+    def get_vel(self, envs_idx=None, ref: Literal["world_origin", "link_origin", "link_com"] = "link_origin"):
         """
         Get the linear velocity of the link in the world frame.
 
@@ -260,7 +261,7 @@ class RigidLink(RBC):
         envs_idx : int or array of int, optional
             The indices of the environments to get the linear velocity. If None, get the linear velocity of all environments. Default is None.
         """
-        return self._solver.get_links_vel([self._idx], envs_idx).squeeze(-2)
+        return self._solver.get_links_vel([self._idx], envs_idx, ref=ref).squeeze(-2)
 
     @gs.assert_built
     def get_ang(self, envs_idx=None):

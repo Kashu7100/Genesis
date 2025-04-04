@@ -4356,16 +4356,19 @@ class RigidSolver(Solver):
         links_idx=None,
         envs_idx=None,
         *,
-        ref: Literal["link_origin", "link_com"] = "link_origin",
+        ref: Literal["world_origin", "link_origin", "link_com"] = "link_origin",
         unsafe: bool = False,
     ):
         _tensor, links_idx, envs_idx = self._sanitize_2D_io_variables(
             None, links_idx, self.n_links, 3, envs_idx, idx_name="links_idx", unsafe=unsafe
         )
-        tensor = _tensor.unsqueeze(0) if self.n_envs == 0 else _tensor
-        assert ref in ("link_origin", "link_com")
-        self._kernel_get_links_vel(tensor, links_idx, envs_idx, ref=int(ref == "link_origin"))
-        return _tensor
+        assert ref in ("world_origin", "link_origin", "link_com")
+        REF_MAP = {"world_origin": 2, "link_origin": 1, "link_com": 0}
+        if self.n_envs == 0 :
+            _tensor = _tensor.unsqueeze(0)
+        self._kernel_get_links_vel(_tensor, links_idx, envs_idx, ref=REF_MAP[ref])
+        tensor = _tensor.squeeze(0) if self.n_envs == 0 else _tensor
+        return tensor
 
     @ti.kernel
     def _kernel_get_links_vel(
@@ -4382,10 +4385,10 @@ class RigidSolver(Solver):
         for i_l_, i_b_ in ti.ndrange(links_idx.shape[0], envs_idx.shape[0]):
             l_state = self.links_state[links_idx[i_l_], envs_idx[i_b_]]
             xvel = l_state.vel
-            if ti.static(ref == 1):  # link's origin
-                xvel = xvel + l_state.ang.cross(l_state.pos - l_state.COM)
-            else:  # link's CoM
+            if ti.static(ref == 0):  # link's CoM
                 xvel = xvel + l_state.ang.cross(l_state.i_pos)
+            elif ti.static(ref == 1):  # link's origin
+                xvel = xvel + l_state.ang.cross(l_state.pos - l_state.COM)
             for i in ti.static(range(3)):
                 tensor[i_b_, i_l_, i] = xvel[i]
 
@@ -4404,9 +4407,11 @@ class RigidSolver(Solver):
             None, links_idx, self.n_links, 3, envs_idx, idx_name="links_idx", unsafe=unsafe
         )
         self._kernel_inverse_dynamics_for_sensors()
-        tensor = _tensor.unsqueeze(0) if self.n_envs == 0 else _tensor
-        self._kernel_get_links_acc(tensor, links_idx, envs_idx)
-        return _tensor
+        if self.n_envs == 0 :
+            _tensor = _tensor.unsqueeze(0)
+        self._kernel_get_links_acc(_tensor, links_idx, envs_idx)
+        tensor = _tensor.squeeze(0) if self.n_envs == 0 else _tensor
+        return tensor
 
     @ti.kernel
     def _kernel_get_links_acc(
