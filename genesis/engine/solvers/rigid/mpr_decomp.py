@@ -17,7 +17,9 @@ class MPR:
         self._para_level = rigid_solver._para_level
 
         if gs.ti_float == ti.f32:
-            self.CCD_EPS = 1e-6
+            # It has been observed in practice that increasing this threshold makes collision detection instable,
+            # which is surprising since 1e-8 is above single precision (which has only 7 digits of precision).
+            self.CCD_EPS = 1e-8
         else:
             self.CCD_EPS = 1e-10
 
@@ -90,12 +92,11 @@ class MPR:
         t = AP_AB / AB_AB
         if t < 0.0:
             t = gs.ti_float(0.0)
-        elif t > 1.0:
+        elif t > 1.0 or ti.abs(t - 1.0) < self.CCD_EPS:
             t = gs.ti_float(1.0)
         Q = A + AB * t
-        pdir = Q
 
-        return (P - Q).norm() ** 2, pdir
+        return ((P - Q) ** 2).sum(), Q
 
     @ti.func
     def mpr_point_tri_depth(self, P, x0, B, C):
@@ -126,9 +127,8 @@ class MPR:
             and (ti.abs(t + s - 1.0) < gs.EPS or t + s < 1.0)
         ):
             pdir = x0 + d1 * s + d2 * t
-            dist = (P - pdir).norm() ** 2
+            dist = ((P - pdir) ** 2).sum()
         else:
-
             dist, pdir = self.mpr_point_segment_dist2(P, x0, B)
             dist2, pdir2 = self.mpr_point_segment_dist2(P, x0, C)
             if dist2 < dist:
@@ -179,6 +179,33 @@ class MPR:
         sphere_center = self._solver.geoms_state[i_g, i_b].pos
         sphere_radius = self._solver.geoms_info[i_g].data[0]
         return sphere_center + direction * sphere_radius
+
+    @ti.func
+    def support_ellipsoid(self, direction, i_g, i_b):
+        g_state = self._solver.geoms_state[i_g, i_b]
+        ellipsoid_center = g_state.pos
+        ellipsoid_scaled_axis = ti.Vector(
+            [
+                self._solver.geoms_info[i_g].data[0] ** 2,
+                self._solver.geoms_info[i_g].data[1] ** 2,
+                self._solver.geoms_info[i_g].data[2] ** 2,
+            ],
+            dt=gs.ti_float,
+        )
+        ellipsoid_scaled_axis = gu.ti_transform_by_quat(ellipsoid_scaled_axis, g_state.quat)
+        dist = ellipsoid_scaled_axis / ti.sqrt(direction.dot(1.0 / ellipsoid_scaled_axis))
+        return ellipsoid_center + direction * dist
+
+    @ti.func
+    def support_capsule(self, direction, i_g, i_b):
+        g_state = self._solver.geoms_state[i_g, i_b]
+        capule_center = g_state.pos
+        capsule_axis = gu.ti_transform_by_quat(ti.Vector([0.0, 0.0, 1.0], dt=gs.ti_float), g_state.quat)
+        capule_radius = self._solver.geoms_info[i_g].data[0]
+        capule_halflength = 0.5 * self._solver.geoms_info[i_g].data[1]
+        capule_endpoint_side = ti.math.sign(direction.dot(capsule_axis))
+        capule_endpoint = capule_center + capule_halflength * capule_endpoint_side * capsule_axis
+        return capule_endpoint + direction * capule_radius
 
     # @ti.func
     # def support_prism(self, direction, i_g, i_b):
@@ -233,6 +260,10 @@ class MPR:
         geom_type = self._solver.geoms_info[i_g].type
         if geom_type == gs.GEOM_TYPE.SPHERE:
             v = self.support_sphere(direction, i_g, i_b)
+        if geom_type == gs.GEOM_TYPE.ELLIPSOID:
+            v = self.support_ellipsoid(direction, i_g, i_b)
+        elif geom_type == gs.GEOM_TYPE.CAPSULE:
+            v = self.support_capsule(direction, i_g, i_b)
         elif geom_type == gs.GEOM_TYPE.BOX:
             v, vid = self.support_box(direction, i_g, i_b)
         elif geom_type == gs.GEOM_TYPE.TERRAIN:
