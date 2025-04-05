@@ -514,10 +514,10 @@ class RigidSolver(Solver):
             hibernated=gs.ti_int,
         )
 
-        links_info_shape = self._batch_shape(self.n_links) if self._options.batch_links_info else self.n_links
+        links_info_shape = self._batch_shape(self.n_links_) if self._options.batch_links_info else self.n_links_
         self.links_info = struct_link_info.field(shape=links_info_shape, needs_grad=False, layout=ti.Layout.SOA)
         self.links_state = struct_link_state.field(
-            shape=self._batch_shape(self.n_links), needs_grad=False, layout=ti.Layout.SOA
+            shape=self._batch_shape(self.n_links_), needs_grad=False, layout=ti.Layout.SOA
         )
 
         links = self.links
@@ -541,7 +541,7 @@ class RigidSolver(Solver):
             links_entity_idx=np.array([link._entity_idx_in_solver for link in links], dtype=gs.np_int),
         )
 
-        joints_info_shape = self._batch_shape(self.n_joints) if self._options.batch_joints_info else self.n_joints
+        joints_info_shape = self._batch_shape(self.n_joints_) if self._options.batch_joints_info else self.n_joints_
         self.joints_info = struct_joint_info.field(shape=joints_info_shape, needs_grad=False, layout=ti.Layout.SOA)
 
         struct_joint_state = ti.types.struct(
@@ -550,7 +550,7 @@ class RigidSolver(Solver):
         )
 
         self.joints_state = struct_joint_state.field(
-            shape=self._batch_shape(self.n_joints), needs_grad=False, layout=ti.Layout.SOA
+            shape=self._batch_shape(self.n_joints_), needs_grad=False, layout=ti.Layout.SOA
         )
 
         # Make sure that the constraints parameters are valid
