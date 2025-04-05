@@ -4362,8 +4362,8 @@ class RigidSolver(Solver):
         _tensor, links_idx, envs_idx = self._sanitize_2D_io_variables(
             None, links_idx, self.n_links, 3, envs_idx, idx_name="links_idx", unsafe=unsafe
         )
-        assert ref in ("world_origin", "link_origin", "link_com")
         REF_MAP = {"world_origin": 2, "link_origin": 1, "link_com": 0}
+        assert ref in REF_MAP.keys()
         if self.n_envs == 0 :
             _tensor = _tensor.unsqueeze(0)
         self._kernel_get_links_vel(_tensor, links_idx, envs_idx, ref=REF_MAP[ref])
@@ -4384,11 +4384,11 @@ class RigidSolver(Solver):
         ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
         for i_l_, i_b_ in ti.ndrange(links_idx.shape[0], envs_idx.shape[0]):
             l_state = self.links_state[links_idx[i_l_], envs_idx[i_b_]]
-            xvel = l_state.vel
-            if ti.static(ref == 0):  # link's CoM
-                xvel = xvel + l_state.ang.cross(l_state.i_pos)
-            elif ti.static(ref == 1):  # link's origin
-                xvel = xvel + l_state.ang.cross(l_state.pos - l_state.COM)
+            xvel = l_state.vel        # world origin
+            if ti.static(ref == 0):   # link's CoM
+                xvel += l_state.ang.cross(l_state.i_pos)
+            elif ti.static(ref == 1): # link's origin
+                xvel += l_state.ang.cross(l_state.pos - l_state.COM)
             for i in ti.static(range(3)):
                 tensor[i_b_, i_l_, i] = xvel[i]
 
@@ -4511,10 +4511,10 @@ class RigidSolver(Solver):
                 field = self.dofs_state.pos
             else:
                 gs.raise_exception()
-            _tensor = ti_mat_field_to_torch(field, envs_idx, dofs_idx, transpose=True, unsafe=unsafe)
+            tensor = ti_mat_field_to_torch(field, envs_idx, dofs_idx, transpose=True, unsafe=unsafe)
             if self.n_envs == 0:
-                _tensor = _tensor.squeeze(0)
-        return _tensor
+                tensor = tensor.squeeze(0)
+        return tensor
 
     @ti.kernel
     def _kernel_get_dofs_control_force(
