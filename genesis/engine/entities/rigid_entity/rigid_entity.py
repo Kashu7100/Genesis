@@ -387,12 +387,9 @@ class RigidEntity(Entity):
                 self._add_equality(
                     name=e_info["name"],
                     type=e_info["type"],
-                    link1_idx=e_info["link1_idx"],
-                    link2_idx=e_info["link2_idx"],
-                    anchor1_pos=e_info["anchor1_pos"],
-                    anchor2_pos=e_info["anchor2_pos"],
-                    rel_pose=e_info["rel_pose"],
-                    torque_scale=e_info["torque_scale"],
+                    eq_obj1id=e_info["eq_obj1id"],
+                    eq_obj2id=e_info["eq_obj2id"],
+                    eq_data=e_info["eq_data"],
                     sol_params=e_info["sol_params"],
                 )
             else:
@@ -633,12 +630,9 @@ class RigidEntity(Entity):
             name=name,
             idx=self.n_equalities + self._equality_start,
             type=type,
-            link1_idx=link1_idx + self._link_start,
-            link2_idx=link2_idx + self._link_start,
-            anchor1_pos=anchor1_pos,
-            anchor2_pos=anchor2_pos,
-            rel_pose=rel_pose,
-            torque_scale=torque_scale,
+            eq_obj1id=eq_obj1id,
+            eq_obj2id=eq_obj2id,
+            eq_data=eq_data,
             sol_params=sol_params,
         )
         self._equalities.append(equality)
