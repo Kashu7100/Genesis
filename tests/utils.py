@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 import mujoco
 import genesis as gs
+import genesis.utils.geom as gu
 
 
 @dataclass
@@ -438,9 +439,27 @@ def check_mujoco_data_consistency(gs_sim, mj_sim, is_first_step, qvel_prev, atol
     # ------------------------------------------------------------------------
     mujoco.mj_fwdPosition(mj_sim.model, mj_sim.data)
 
-    gs_xpos = gs_sim.rigid_solver.links_state.pos.to_numpy()[:-1, 0]
-    mj_xpos = mj_sim.data.xpos[1:]
-    np.testing.assert_allclose(gs_xpos, mj_xpos, atol=atol)
+    gs_xipos = gs_sim.rigid_solver.links_state.i_pos.to_numpy()[:, 0]
+    mj_xipos = mj_sim.data.xipos - mj_sim.data.subtree_com[0]
+    np.testing.assert_allclose(gs_xipos[gs_body_idcs], mj_xipos[mj_body_idcs], atol=atol)
+
+    gs_xpos = gs_sim.rigid_solver.links_state.pos.to_numpy()[:, 0]
+    mj_xpos = mj_sim.data.xpos
+    np.testing.assert_allclose(gs_xpos[gs_body_idcs], mj_xpos[mj_body_idcs], atol=atol)
+
+    gs_xquat = gs_sim.rigid_solver.links_state.quat.to_numpy()[:, 0]
+    gs_xmat = gu.quat_to_R(gs_xquat).reshape([-1, 9])
+    mj_xmat = mj_sim.data.xmat
+    np.testing.assert_allclose(gs_xmat[gs_body_idcs], mj_xmat[mj_body_idcs], atol=atol)
+
+    gs_cd_vel = gs_sim.rigid_solver.links_state.cd_vel.to_numpy()[:, 0]
+    gs_cd_vel_ = gs_sim.rigid_solver.links_state.vel.to_numpy()[:, 0]
+    np.testing.assert_allclose(gs_cd_vel, gs_cd_vel_, atol=atol)
+    mj_cd_vel = mj_sim.data.cvel[:, 3:]
+    np.testing.assert_allclose(gs_cd_vel[gs_body_idcs], mj_cd_vel[mj_body_idcs], atol=atol)
+    gs_cd_ang = gs_sim.rigid_solver.links_state.cd_ang.to_numpy()[:, 0]
+    mj_cd_ang = mj_sim.data.cvel[:, :3]
+    np.testing.assert_allclose(gs_cd_ang[gs_body_idcs], mj_cd_ang[mj_body_idcs], atol=atol)
 
     gs_cdof_vel = gs_sim.rigid_solver.dofs_state.cdof_vel.to_numpy()[:, 0]
     mj_cdof_vel = mj_sim.data.cdof[:, 3:]
@@ -473,6 +492,7 @@ def simulate_and_check_mujoco_consistency(gs_sim, mj_sim, qpos=None, qvel=None, 
     init_simulators(gs_sim, mj_sim, qpos, qvel)
 
     qvel_prev = None
+
     for i in range(num_steps):
         # Make sure that all "dynamic" quantities are matching before stepping
         check_mujoco_data_consistency(gs_sim, mj_sim, qvel_prev=qvel_prev)

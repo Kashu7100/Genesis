@@ -383,7 +383,7 @@ class RigidEntity(Entity):
 
         for i_e in range(mj.neq):
             e_info = mju.parse_equality(mj, i_e, morph.scale, ordered_links_idx)
-            if e_info["type"] == gs.EQUALITY_TYPE.CONNECT:  # only this type is supported right now
+            if e_info["type"] in (gs.EQUALITY_TYPE.CONNECT, gs.EQUALITY_TYPE.JOINT, gs.EQUALITY_TYPE.WELD):
                 self._add_equality(
                     name=e_info["name"],
                     type=e_info["type"],
@@ -396,7 +396,7 @@ class RigidEntity(Entity):
                     sol_params=e_info["sol_params"],
                 )
             else:
-                gs.logger.warning(f"(MJCF) Equality type '{e_info['type']}' not supported for now.")
+                gs.logger.warning(f"Equality type {e_info['type']} not supported")
 
     def _load_URDF(self, morph, surface):
         l_infos, j_infos, equalities = uu.parse_urdf(morph, surface)
@@ -416,8 +416,7 @@ class RigidEntity(Entity):
             self._add_by_info(l_info, (j_info,), l_info["g_infos"], morph, surface)
 
         for e_info in equalities:
-            # only those two types of equality are supported
-            if e_info["type"] == gs.EQUALITY_TYPE.CONNECT or e_info["type"] == gs.EQUALITY_TYPE.JOINT:
+            if e_info["type"] in (gs.EQUALITY_TYPE.CONNECT, gs.EQUALITY_TYPE.JOINT, gs.EQUALITY_TYPE.WELD):
                 self._add_equality(
                     name=e_info["name"],
                     type=e_info["type"],
@@ -617,9 +616,18 @@ class RigidEntity(Entity):
 
         return link, joints
 
-    def _add_equality(
-        self, name, type, link1_idx, link2_idx, anchor1_pos, anchor2_pos, rel_pose, torque_scale, sol_params
-    ):
+    def _add_equality(self, name, type, eq_obj1id, eq_obj2id, eq_data, sol_params):
+        if type == gs.EQUALITY_TYPE.CONNECT:
+            eq_obj1id += self._link_start
+            eq_obj2id += self._link_start
+        elif type == gs.EQUALITY_TYPE.JOINT:
+            eq_obj1id += self._joint_start
+            eq_obj2id += self._joint_start
+        elif type == gs.EQUALITY_TYPE.WELD:
+            eq_obj1id += self._link_start
+            eq_obj2id += self._link_start
+        else:
+            gs.logger.warning(f"Equality type {type} not supported. Only CONNECT, JOINT, and WELD are supported.")
         equality = RigidEquality(
             entity=self,
             name=name,
