@@ -2497,7 +2497,7 @@ class RigidEntity(Entity):
             The net force applied on each links due to direct external contacts.
         """
         tensor = ti_mat_field_to_torch(
-            self._solver.links_state.contact_force, envs_idx, slice(self.link_start, self.link_end), transpose=True
+            self._solver.links_state.contact_force, envs_idx, slice(self.link_start, self.link_end), transpose=True, unsafe=unsafe
         )
         return tensor.squeeze(0) if self._solver.n_envs == 0 else tensor
 
