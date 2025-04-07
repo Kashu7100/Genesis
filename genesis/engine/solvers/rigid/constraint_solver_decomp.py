@@ -342,30 +342,6 @@ class ConstraintSolver:
         self.aref[n_con, i_b] = aref
         self.efc_D[n_con, i_b] = 1 / ti.max(diag, gs.EPS)
 
-    @ti.kernel
-    def add_equality_constraints(self):
-        ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
-        for i_b in range(self._B):
-            for i_e in range(self._solver.n_equalities):
-                if self._solver.equality_info[i_e].eq_type == gs.EQUALITY_TYPE.CONNECT:
-                    self._func_equality_connect(i_b, i_e)
-                elif self._solver.equality_info[i_e].eq_type == gs.EQUALITY_TYPE.WELD:
-                    pass
-                elif self._solver.equality_info[i_e].eq_type == gs.EQUALITY_TYPE.JOINT:
-                    self._func_equality_joint(i_b, i_e)
-
-    @ti.kernel
-    def add_equality_constraints(self):
-        ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
-        for i_b in range(self._B):
-            for i_e in range(self._solver.n_equalities):
-                if self._solver.equality_info[i_e].eq_type == gs.EQUALITY_TYPE.CONNECT:
-                    self._func_equality_connect(i_b, i_e)
-                elif self._solver.equality_info[i_e].eq_type == gs.EQUALITY_TYPE.WELD:
-                    self._func_equality_weld(i_b, i_e)
-                elif self._solver.equality_info[i_e].eq_type == gs.EQUALITY_TYPE.JOINT:
-                    self._func_equality_joint(i_b, i_e)
-
     @ti.func
     def _func_equality_weld(self, i_b, i_e):
         # TODO: sparse mode
@@ -527,6 +503,18 @@ class ConstraintSolver:
             self.diag[i_con, i_b] = diag
             self.aref[i_con, i_b] = aref
             self.efc_D[i_con, i_b] = 1.0 / ti.max(diag, gs.EPS)
+
+    @ti.kernel
+    def add_equality_constraints(self):
+        ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
+        for i_b in range(self._B):
+            for i_e in range(self._solver.n_equalities):
+                if self._solver.equality_info[i_e].eq_type == gs.EQUALITY_TYPE.CONNECT:
+                    self._func_equality_connect(i_b, i_e)
+                elif self._solver.equality_info[i_e].eq_type == gs.EQUALITY_TYPE.WELD:
+                    self._func_equality_weld(i_b, i_e)
+                elif self._solver.equality_info[i_e].eq_type == gs.EQUALITY_TYPE.JOINT:
+                    self._func_equality_joint(i_b, i_e)
 
     @ti.kernel
     def add_joint_limit_constraints(self):
