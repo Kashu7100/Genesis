@@ -13,7 +13,7 @@ def main():
     args = parser.parse_args()
 
     ########################## init ##########################
-    gs.init(backend=gs.cpu if args.cpu else gs.gpu)
+    gs.init(backend=gs.cpu if args.cpu else gs.gpu, precision="64" if args.cpu else "32", seed=0)
 
     ########################## create a scene ##########################
     scene = gs.Scene(
@@ -29,7 +29,9 @@ def main():
             file="meshes/tank.obj",
             scale=5.0,
             fixed=True,
-            euler=(90, 0, 90),
+            # euler=(90, 0, 90),
+            euler=(80, 10, 90),
+            pos=(0.05, -0.1, 0.0),
         ),
         # vis_mode="collision",
     )

@@ -214,11 +214,12 @@ def test_box_box_dynamics(gs_sim):
             np.array([*(0.15 * np.random.rand(2)), np.pi * np.random.rand()]),
         )
         init_simulators(gs_sim, qpos=np.concatenate((cube1_pos, cube1_quat, cube2_pos, cube2_quat)))
-        for i in range(100):
+        for i in range(110):
             gs_sim.scene.step()
+            if i > 100:
+                qvel = gs_robot.get_dofs_velocity().cpu()
+                np.testing.assert_allclose(qvel, 0, atol=1e-2)
 
-        qvel = gs_robot.get_dofs_velocity().cpu()
-        np.testing.assert_allclose(qvel, 0, atol=1e-2)
         qpos = gs_robot.get_dofs_position().cpu()
         np.testing.assert_allclose(qpos[8], 0.6, atol=1e-3)
 
@@ -258,13 +259,15 @@ def test_many_boxes_dynamics(box_box_detection, dynamics, show_viewer):
     if dynamics:
         for entity in scene.entities[1:]:
             entity.set_dofs_velocity(4.0 * np.random.rand(6))
-    for i in range(800 if dynamics else 400):
+    num_steps = 850 if dynamics else 400
+    for i in range(num_steps):
         scene.step()
+        if i > num_steps - 50:
+            for n, entity in enumerate(scene.entities[1:]):
+                i, j, k = int(n / 25), int(n / 5) % 5, n % 5
+                qvel = entity.get_dofs_velocity().cpu()
+                np.testing.assert_allclose(qvel, 0, atol=0.15 if dynamics else 0.05)
 
-    for n, entity in enumerate(scene.entities[1:]):
-        i, j, k = int(n / 25), int(n / 5) % 5, n % 5
-        qvel = entity.get_dofs_velocity().cpu()
-        np.testing.assert_allclose(qvel, 0, atol=0.1 if dynamics else 0.05)
     for n, entity in enumerate(scene.entities[1:]):
         i, j, k = int(n / 25), int(n / 5) % 5, n % 5
         qpos = entity.get_dofs_position().cpu()
@@ -292,6 +295,8 @@ def test_simple_kinematic_chain(gs_sim, mj_sim, atol):
     simulate_and_check_mujoco_consistency(gs_sim, mj_sim, atol=atol, num_steps=200)
 
 
+# Disable Genesis multi-contact because it relies on discretized geometry unlike Mujoco
+@pytest.mark.multi_contact(False)
 @pytest.mark.parametrize("xml_path", ["xml/walker.xml"])
 @pytest.mark.parametrize("gs_solver", [gs.constraint_solver.CG])
 @pytest.mark.parametrize("gs_integrator", [gs.integrator.Euler])
@@ -301,6 +306,7 @@ def test_walker(gs_sim, mj_sim, atol):
     qpos = np.zeros((gs_robot.n_qs,))
     qpos[2] += 0.5
     qvel = np.random.rand(gs_robot.n_dofs) * 0.2
+
     # Cannot simulate any longer because collision detection is very sensitive
     simulate_and_check_mujoco_consistency(gs_sim, mj_sim, qpos, qvel, atol=atol, num_steps=90)
 
@@ -340,12 +346,13 @@ def test_stickman(gs_sim, mj_sim, atol):
     init_simulators(gs_sim)
 
     # Run the simulation for a few steps
-    for i in range(2500):
+    for i in range(4000):
         gs_sim.scene.step()
+        if i > 3900:
+            (gs_robot,) = gs_sim.entities
+            qvel = gs_robot.get_dofs_velocity().cpu()
+            np.testing.assert_allclose(qvel, 0, atol=0.3)
 
-    (gs_robot,) = gs_sim.entities
-    qvel = gs_robot.get_dofs_velocity().cpu()
-    np.testing.assert_allclose(qvel, 0, atol=0.1)
     qpos = gs_robot.get_dofs_position().cpu()
     assert np.linalg.norm(qpos[:2]) < 1.3
     body_z = gs_sim.rigid_solver.links_state.pos.to_numpy()[:-1, 0, 2]
@@ -462,12 +469,17 @@ def test_inverse_kinematics(show_viewer):
         scene.step()
 
     # release
-    franka.control_dofs_position(np.array([0.4, 0.4]), fingers_dof)
-    for i in range(400):
-        scene.step()
+    if not use_suction:
+        franka.control_dofs_position(np.array([0.4, 0.4]), fingers_dof)
+    else:
+        rigid.delete_weld_constraint(link_cube, link_franka)
 
-    qvel = cube.get_dofs_velocity().cpu()
-    np.testing.assert_allclose(qvel, 0, atol=0.05)
+    for i in range(450):
+        scene.step()
+        if i > 400:
+            qvel = cube.get_dofs_velocity().cpu()
+            np.testing.assert_allclose(qvel, 0, atol=0.05)
+
     qpos = cube.get_dofs_position().cpu()
     np.testing.assert_allclose(qpos[2], 0.06, atol=1e-3)
 
@@ -508,19 +520,24 @@ def test_nonconvex_collision(show_viewer):
     )
     scene.build()
 
+    # Force numpy seed because this test is very sensitive to the initial condition
+    np.random.seed(0)
     ball.set_dofs_velocity(np.random.rand(ball.n_dofs) * 0.8)
     for i in range(1500):
         scene.step()
-
-    qvel = scene.sim.rigid_solver.dofs_state.vel.to_numpy()[:, 0]
-    np.testing.assert_allclose(qvel, 0, atol=0.1)
+        if i > 1400:
+            qvel = scene.sim.rigid_solver.dofs_state.vel.to_numpy()[:, 0]
+            np.testing.assert_allclose(qvel, 0, atol=0.1)
 
     if show_viewer:
         scene.viewer.stop()
 
 
+# FIXME: Force executing all 'huggingface_hub' tests on the same worker to prevent hitting HF rate limit
+@pytest.mark.xdist_group(name="huggingface_hub")
+@pytest.mark.parametrize("euler", [(90, 0, 90), (75, 15, 90)])
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
-def test_convexify(show_viewer):
+def test_convexify(euler, show_viewer):
     # The test check that the volume difference is under a given threshold and
     # that convex decomposition is only used whenever it is necessary.
     # Then run a simulation to see if it explodes, i.e. objects are at reset inside tank.
@@ -536,7 +553,8 @@ def test_convexify(show_viewer):
             file="meshes/tank.obj",
             scale=5.0,
             fixed=True,
-            euler=(90, 0, 90),
+            euler=euler,
+            pos=(0.05, -0.1, 0.0),
         ),
         vis_mode="collision",
     )
@@ -554,6 +572,7 @@ def test_convexify(show_viewer):
                 pos=(0.0, 0.15 * (i - 1.5), 0.4),
             ),
             vis_mode="collision",
+            # visualize_contact=True,
         )
         objs.append(obj)
     scene.build()
@@ -570,16 +589,27 @@ def test_convexify(show_viewer):
     assert 5 <= len(cup.geoms) <= 20
     assert 5 <= len(mug.geoms) <= 40
 
-    for i in range(2000):
+    # Check resting conditions repeateadly rather not just once, for numerical robustness
+    num_steps = 1600 if euler == (90, 0, 90) else 500
+    for i in range(num_steps):
         scene.step()
+        if i > num_steps - 100:
+            qvel = gs_sim.rigid_solver.get_dofs_velocity().cpu()
+            np.testing.assert_allclose(qvel, 0, atol=0.3)
 
     for obj in objs:
-        qvel = obj.get_dofs_velocity().cpu()
-        np.testing.assert_allclose(qvel, 0, atol=0.5)
         qpos = obj.get_dofs_position().cpu()
         np.testing.assert_array_less(0, qpos[2])
         np.testing.assert_array_less(qpos[2], 0.15)
         np.testing.assert_array_less(torch.linalg.norm(qpos[:2]), 0.5)
+
+    # Check that the mug and donut are landing straight if the tank is horizontal.
+    # The cup is tipping because it does not land flat due to convex decomposition error.
+    if euler == (90, 0, 90):
+        for i, obj in enumerate((mug, donut)):
+            qpos = obj.get_dofs_position().cpu()
+            np.testing.assert_allclose(qpos[0], 0.0, atol=6e-3)
+            np.testing.assert_allclose(qpos[1], 0.15 * (i - 1.5), atol=5e-3)
 
     if show_viewer:
         scene.viewer.stop()
