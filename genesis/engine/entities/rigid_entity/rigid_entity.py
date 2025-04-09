@@ -1704,7 +1704,9 @@ class RigidEntity(Entity):
         return self._solver.get_links_quat(self._base_links_idx, envs_idx, unsafe=unsafe).squeeze(-2)
 
     @gs.assert_built
-    def get_vel(self, envs_idx=None, *, ref: Literal["world_origin", "link_origin", "link_com"] = "link_origin", unsafe=False):
+    def get_vel(
+        self, envs_idx=None, *, ref: Literal["world_origin", "link_origin", "link_com"] = "link_origin", unsafe=False
+    ):
         """
         Returns linear velocity of the entity's base link.
 
@@ -1779,7 +1781,12 @@ class RigidEntity(Entity):
 
     @gs.assert_built
     def get_links_vel(
-        self, ls_idx_local=None, envs_idx=None, *, ref: Literal["world_origin", "link_origin", "link_com"] = "link_origin", unsafe=False
+        self,
+        ls_idx_local=None,
+        envs_idx=None,
+        *,
+        ref: Literal["world_origin", "link_origin", "link_com"] = "link_origin",
+        unsafe=False,
     ):
         """
         Returns linear velocity of all the entity's links expressed at a given reference position in world coordinates.
@@ -2521,7 +2528,11 @@ class RigidEntity(Entity):
             The net force applied on each links due to direct external contacts.
         """
         tensor = ti_field_to_torch(
-            self._solver.links_state.contact_force, envs_idx, slice(self.link_start, self.link_end), transpose=True, unsafe=unsafe
+            self._solver.links_state.contact_force,
+            envs_idx,
+            slice(self.link_start, self.link_end),
+            transpose=True,
+            unsafe=unsafe,
         )
         return tensor.squeeze(0) if self._solver.n_envs == 0 else tensor
 
