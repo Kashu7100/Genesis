@@ -4364,7 +4364,7 @@ class RigidSolver(Solver):
         )
         REF_MAP = {"world_origin": 2, "link_origin": 1, "link_com": 0}
         assert ref in REF_MAP.keys()
-        if self.n_envs == 0 :
+        if self.n_envs == 0:
             _tensor = _tensor.unsqueeze(0)
         self._kernel_get_links_vel(_tensor, links_idx, envs_idx, ref=REF_MAP[ref])
         tensor = _tensor.squeeze(0) if self.n_envs == 0 else _tensor
@@ -4384,10 +4384,10 @@ class RigidSolver(Solver):
         ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
         for i_l_, i_b_ in ti.ndrange(links_idx.shape[0], envs_idx.shape[0]):
             l_state = self.links_state[links_idx[i_l_], envs_idx[i_b_]]
-            xvel = l_state.vel        # world origin
-            if ti.static(ref == 0):   # link's CoM
+            xvel = l_state.vel  # world origin
+            if ti.static(ref == 0):  # link's CoM
                 xvel += l_state.ang.cross(l_state.i_pos)
-            elif ti.static(ref == 1): # link's origin
+            elif ti.static(ref == 1):  # link's origin
                 xvel += l_state.ang.cross(l_state.pos - l_state.COM)
             for i in ti.static(range(3)):
                 tensor[i_b_, i_l_, i] = xvel[i]
@@ -4407,7 +4407,7 @@ class RigidSolver(Solver):
             None, links_idx, self.n_links, 3, envs_idx, idx_name="links_idx", unsafe=unsafe
         )
         self._kernel_inverse_dynamics_for_sensors()
-        if self.n_envs == 0 :
+        if self.n_envs == 0:
             _tensor = _tensor.unsqueeze(0)
         self._kernel_get_links_acc(_tensor, links_idx, envs_idx)
         tensor = _tensor.squeeze(0) if self.n_envs == 0 else _tensor

@@ -84,8 +84,8 @@ class Mesh(RBC):
         if self._mesh.vertices.shape[0] > 3 and self._mesh.faces.shape[0] > target_face_num:
             self._mesh = trimesh.Trimesh(
                 *fast_simplification.simplify(
-                    sdf_mesh.vertices,
-                    sdf_mesh.faces,
+                    self._mesh.vertices,
+                    self._mesh.faces,
                     target_count=target_face_num,
                     lossless=True,
                 )
