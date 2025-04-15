@@ -84,6 +84,19 @@ def initialize_genesis(request, backend):
 
 
 @pytest.fixture
+def mpr_vanilla(request):
+    mpr_vanilla = None
+    for mark in request.node.iter_markers("mpr_vanilla"):
+        if mark.args:
+            if mpr_vanilla is not None:
+                pytest.fail("'mpr_vanilla' can only be specified once.")
+            (mpr_vanilla,) = mark.args
+    if mpr_vanilla is None:
+        mpr_vanilla = True
+    return mpr_vanilla
+
+
+@pytest.fixture
 def adjacent_collision(request):
     adjacent_collision = None
     for mark in request.node.iter_markers("adjacent_collision"):
@@ -166,7 +179,9 @@ def mj_sim(xml_path, gs_solver, gs_integrator, multi_contact, adjacent_collision
 
 
 @pytest.fixture
-def gs_sim(xml_path, gs_solver, gs_integrator, multi_contact, adjacent_collision, dof_damping, show_viewer, mj_sim):
+def gs_sim(
+    xml_path, gs_solver, gs_integrator, multi_contact, mpr_vanilla, adjacent_collision, dof_damping, show_viewer, mj_sim
+):
     scene = gs.Scene(
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(3, -1, 1.5),
@@ -183,6 +198,7 @@ def gs_sim(xml_path, gs_solver, gs_integrator, multi_contact, adjacent_collision
         rigid_options=gs.options.RigidOptions(
             integrator=gs_integrator,
             constraint_solver=gs_solver,
+            enable_mpr_vanilla=mpr_vanilla,
             box_box_detection=True,
             enable_self_collision=True,
             enable_multi_contact=multi_contact,
