@@ -1682,7 +1682,9 @@ class RigidEntity(Entity):
         return self._solver.get_links_quat(self._base_links_idx, envs_idx, unsafe=unsafe).squeeze(-2)
 
     @gs.assert_built
-    def get_vel(self, envs_idx=None, *, unsafe=False):
+    def get_vel(
+        self, envs_idx=None, *, ref: Literal["link_origin", "link_com", "entity_com"] = "link_origin", unsafe=False
+    ):
         """
         Returns linear velocity of the entity's base link.
 
@@ -1696,7 +1698,7 @@ class RigidEntity(Entity):
         vel : torch.Tensor, shape (3,) or (n_envs, 3)
             The linear velocity of the entity's base link.
         """
-        return self._solver.get_links_vel(self._base_links_idx, envs_idx, unsafe=unsafe).squeeze(-2)
+        return self._solver.get_links_vel(self._base_links_idx, envs_idx, ref=ref, unsafe=unsafe).squeeze(-2)
 
     @gs.assert_built
     def get_ang(self, envs_idx=None, *, unsafe=False):
