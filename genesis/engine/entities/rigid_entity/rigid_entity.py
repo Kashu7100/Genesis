@@ -1710,7 +1710,7 @@ class RigidEntity(Entity):
 
     @gs.assert_built
     def get_vel(
-        self, envs_idx=None, *, ref: Literal["world_origin", "link_origin", "link_com"] = "link_origin", unsafe=False
+        self, envs_idx=None, *, ref: Literal["link_origin", "link_com", "entity_com"] = "link_origin", unsafe=False
     ):
         """
         Returns linear velocity of the entity's base link.

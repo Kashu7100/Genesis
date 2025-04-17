@@ -4361,13 +4361,13 @@ class RigidSolver(Solver):
         links_idx=None,
         envs_idx=None,
         *,
-        ref: Literal["world_origin", "link_origin", "link_com"] = "link_origin",
+        ref: Literal["link_origin", "link_com", "entity_com"] = "link_origin",
         unsafe: bool = False,
     ):
         _tensor, links_idx, envs_idx = self._sanitize_2D_io_variables(
             None, links_idx, self.n_links, 3, envs_idx, idx_name="links_idx", unsafe=unsafe
         )
-        REF_MAP = {"world_origin": 2, "link_origin": 1, "link_com": 0}
+        REF_MAP = {"entity_com": 2, "link_origin": 1, "link_com": 0}
         assert ref in REF_MAP.keys()
         if self.n_envs == 0:
             _tensor = _tensor.unsqueeze(0)
