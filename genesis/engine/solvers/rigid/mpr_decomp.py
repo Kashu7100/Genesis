@@ -22,6 +22,8 @@ class MPR:
             self.CCD_EPS = 1e-9
         else:
             self.CCD_EPS = 1e-10
+        self.CCD_TOLERANCE = 1e-6
+        self.CCD_ITERATIONS = 50
 
         self.support_field = SupportField(rigid_solver)
         self.init_support()
