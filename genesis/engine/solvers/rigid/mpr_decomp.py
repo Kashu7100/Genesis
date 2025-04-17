@@ -348,7 +348,7 @@ class MPR:
                 vec = self.simplex_support[i_ga, i_gb, i1, i_b].v.cross(self.simplex_support[i_ga, i_gb, i2, i_b].v)
                 b[i] = vec.dot(self.simplex_support[i_ga, i_gb, i3, i_b].v) * (1 - 2 * (((i + 1) // 2) % 2))
 
-            sum_ = sum_ + b[i]
+        sum_ = b.sum()
 
         if sum_ < self.CCD_EPS:
             direction = self.mpr_portal_dir(i_ga, i_gb, i_b)
