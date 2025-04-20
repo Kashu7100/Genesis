@@ -230,7 +230,7 @@ def convex_decompose(mesh, morph):
 
 
 def postprocess_collision_geoms(
-    g_infos, decimate, decimate_face_num, convexify, decompose_error_threshold, coacd_options
+    g_infos, morph  # decimate, decimate_face_num, convexify, decompose_error_threshold, coacd_options
 ):
     # Early return if there is no geometry to process
     if not g_infos:
@@ -238,7 +238,7 @@ def postprocess_collision_geoms(
 
     # Check if all the geometries can be convexify without decomposition
     must_decompose = False
-    if convexify:
+    if morph.convexify:
         for g_info in g_infos:
             mesh = g_info["mesh"]
             tmesh = mesh.trimesh
@@ -252,7 +252,7 @@ def postprocess_collision_geoms(
                 must_decompose = True
             elif tmesh.volume > gs.EPS:
                 volume_err = cmesh.volume / tmesh.volume - 1.0
-                if volume_err > decompose_error_threshold:
+                if volume_err > morph.decompose_error_threshold:
                     must_decompose = True
 
     # Check whether merging the geometries is possible, i.e.
@@ -292,7 +292,7 @@ def postprocess_collision_geoms(
         cmesh = trimesh.convex.convex_hull(tmesh)
         if tmesh.is_winding_consistent:
             volume_err = cmesh.volume / tmesh.volume - 1.0
-            must_decompose = volume_err > decompose_error_threshold
+            must_decompose = volume_err > morph.decompose_error_threshold
 
     if must_decompose:
         if math.isinf(volume_err):
@@ -318,8 +318,8 @@ def postprocess_collision_geoms(
             else:
                 cmesh = trimesh.convex.convex_hull(tmesh)
                 volume_err = cmesh.volume / tmesh.volume - 1.0
-            if volume_err > decompose_error_threshold:  # Note that 'inf' is not larger than 'inf'
-                tmeshes = convex_decompose(tmesh, coacd_options)
+            if volume_err > morph.decompose_error_threshold:  # Note that 'inf' is not larger than 'inf'
+                tmeshes = convex_decompose(tmesh, morph)
                 meshes = [
                     gs.Mesh.from_trimesh(
                         tmesh, surface=gs.surfaces.Collision(), metadata={**mesh.metadata, "decomposed": True}
@@ -337,7 +337,7 @@ def postprocess_collision_geoms(
         mesh = g_info["mesh"]
         tmesh = mesh.trimesh
         num_vertices = len(tmesh.vertices)
-        if not convexify and not decimate and num_vertices > 5000:
+        if not morph.convexify and not morph.decimate and num_vertices > 5000:
             gs.logger.warning(
                 f"At least one of the meshes contain many vertices ({num_vertices}). Consider setting "
                 "'morph.decimate=True' or 'morph.convexify=True' to speed up collision detection and improve numerical "
@@ -345,9 +345,9 @@ def postprocess_collision_geoms(
             )
         mesh = gs.Mesh.from_trimesh(
             mesh=tmesh,
-            convexify=convexify,
-            decimate=decimate,
-            decimate_face_num=decimate_face_num,
+            convexify=morph.convexify,
+            decimate=morph.decimate,
+            decimate_face_num=morph.decimate_face_num,
             surface=gs.surfaces.Collision(),
             metadata=mesh.metadata.copy(),
         )

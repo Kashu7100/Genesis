@@ -415,17 +415,17 @@ class RigidEntity(Entity):
 
             self._add_by_info(l_info, (j_info,), l_info["g_infos"], morph, surface)
 
-        for e_info in equalities:
-            # only those two types of equality are supported
-            if e_info["type"] == gs.EQUALITY_TYPE.CONNECT or e_info["type"] == gs.EQUALITY_TYPE.JOINT:
-                self._add_equality(
-                    name=e_info["name"],
-                    type=e_info["type"],
-                    eq_obj1id=e_info["eq_obj1id"],
-                    eq_obj2id=e_info["eq_obj2id"],
-                    eq_data=e_info["eq_data"],
-                    sol_params=e_info["sol_params"],
-                )
+        # for e_info in equalities:
+        #     # only those two types of equality are supported
+        #     if e_info["type"] == gs.EQUALITY_TYPE.CONNECT or e_info["type"] == gs.EQUALITY_TYPE.JOINT:
+        #         self._add_equality(
+        #             name=e_info["name"],
+        #             type=e_info["type"],
+        #             eq_obj1id=e_info["eq_obj1id"],
+        #             eq_obj2id=e_info["eq_obj2id"],
+        #             eq_data=e_info["eq_data"],
+        #             sol_params=e_info["sol_params"],
+        #         )
 
     def _build(self):
         assert self.n_links == len(self.joints)
@@ -606,14 +606,7 @@ class RigidEntity(Entity):
         # last chance to avoid it. Moreover, it tends to reduce the final number of collision geometries. In
         # both cases, this improves runtime performance, numerical stability and compilation time.
         if isinstance(morph, gs.options.morphs.FileMorph):
-            cg_infos = mu.postprocess_collision_geoms(
-                cg_infos,
-                morph.decimate,
-                morph.decimate_face_num,
-                morph.convexify,
-                morph.decompose_error_threshold,
-                morph.coacd_options,
-            )
+            cg_infos = mu.postprocess_collision_geoms(cg_infos, morph)
 
         # Randomize collision mesh colors. The is especially useful to check convex decomposition.
         for g_info in cg_infos:
