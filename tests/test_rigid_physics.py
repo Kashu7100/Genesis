@@ -420,6 +420,44 @@ def test_robot_kinematics(gs_sim, mj_sim, atol):
         check_mujoco_data_consistency(gs_sim, mj_sim, atol=atol)
 
 
+def test_robot_scaling(show_viewer, atol):
+    mass = None
+    links_pos = None
+    for scale in (0.5, 1.0, 2.0):
+        scene = gs.Scene(
+            sim_options=gs.options.SimOptions(
+                gravity=(0, 0, -10.0),
+            ),
+            show_viewer=show_viewer,
+            show_FPS=False,
+        )
+        robot = scene.add_entity(
+            gs.morphs.MJCF(
+                file="xml/franka_emika_panda/panda.xml",
+                scale=scale,
+            ),
+        )
+        scene.build()
+
+        mass_ = robot.get_mass() / scale**3
+        if mass is None:
+            mass = mass_
+        np.testing.assert_allclose(mass, mass_, atol=atol)
+
+        dofs_lower_bound, dofs_upper_bound = robot.get_dofs_limit()
+        qpos = 0.5 * dofs_lower_bound
+        robot.set_dofs_position(qpos)
+
+        links_pos_ = robot.get_links_pos() / scale
+        if links_pos is None:
+            links_pos = links_pos_
+        np.testing.assert_allclose(links_pos, links_pos_, atol=atol)
+
+        scene.step()
+        qf_passive = scene.rigid_solver.dofs_state.qf_passive.to_numpy()
+        np.testing.assert_allclose(qf_passive, 0, atol=atol)
+
+
 def test_set_root_pose(show_viewer, atol):
     scene = gs.Scene(
         show_viewer=show_viewer,
@@ -718,7 +756,7 @@ def test_convexify(euler, show_viewer):
                 pos=(0.0, 0.15 * (i - 1.5), 0.4),
             ),
             vis_mode="collision",
-            # visualize_contact=True,
+            visualize_contact=True,
         )
         objs.append(obj)
     scene.build()
@@ -738,7 +776,7 @@ def test_convexify(euler, show_viewer):
     assert all(geom.metadata["decomposed"] for geom in box.geoms) and 5 <= len(box.geoms) <= 20
 
     # Check resting conditions repeateadly rather not just once, for numerical robustness
-    num_steps = 1500 if euler == (90, 0, 90) else 600
+    num_steps = 1300 if euler == (90, 0, 90) else 600
     for i in range(num_steps):
         scene.step()
         if i > num_steps - 100:
