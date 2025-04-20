@@ -36,7 +36,7 @@ def _order_links(l_infos, j_infos, links_g_info=None):
 
     if not ordered_links_idx:
         # avoid case with worldbody without any body (geom directly assigned to worldbody)
-        return [], [], []
+        return [], [], [], []
 
     ordered_links_idx = np.concatenate(ordered_links_idx).tolist()
 
