@@ -12,7 +12,7 @@ from genesis.utils import mesh as mu
 from genesis.utils import mjcf as mju
 from genesis.utils import terrain as tu
 from genesis.utils import urdf as uu
-from genesis.utils.misc import tensor_to_array, ti_field_to_torch
+from genesis.utils.misc import tensor_to_array, ti_field_to_torch, ALLOCATE_TENSOR_WARNING
 
 from ..base_entity import Entity
 from .rigid_joint import RigidJoint
@@ -1045,7 +1045,7 @@ class RigidEntity(Entity):
             ]
         )
 
-        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs)
+        dofs_idx = self._get_idx(dofs_idx_local, self.n_dofs, unsafe=False)
         n_dofs = len(dofs_idx)
         if n_dofs == 0:
             gs.raise_exception("Target dofs not provided.")
@@ -1063,7 +1063,7 @@ class RigidEntity(Entity):
                     links_idx_by_dofs.append(v.idx_local)  # converted to global later
                     break
 
-        links_idx_by_dofs = self._get_idx(links_idx_by_dofs, self.n_links, self._link_start)
+        links_idx_by_dofs = self._get_idx(links_idx_by_dofs, self.n_links, self._link_start, unsafe=False)
         n_links_by_dofs = len(links_idx_by_dofs)
 
         if envs_idx is None:
@@ -1366,7 +1366,7 @@ class RigidEntity(Entity):
         else:
             envs_idx = self._solver._sanitize_envs_idx(envs_idx)
 
-        links_idx = self._get_idx(ls_idx_local, self.n_links, self._link_start)
+        links_idx = self._get_idx(links_idx_local, self.n_links, self._link_start, unsafe=False)
         links_pos = torch.empty((len(envs_idx), len(links_idx), 3), dtype=gs.tc_float, device=gs.device)
         links_quat = torch.empty((len(envs_idx), len(links_idx), 4), dtype=gs.tc_float, device=gs.device)
 
@@ -1374,7 +1374,7 @@ class RigidEntity(Entity):
             links_pos,
             links_quat,
             qpos,
-            self._get_idx(qs_idx_local, self.n_qs, self._q_start),
+            self._get_idx(qs_idx_local, self.n_qs, self._q_start, unsafe=False),
             links_idx,
             envs_idx,
         )
@@ -1868,7 +1868,11 @@ class RigidEntity(Entity):
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
-
+        if not unsafe:
+            _pos = torch.as_tensor(pos, dtype=gs.tc_float, device=gs.device).contiguous()
+            if _pos is not pos:
+                gs.logger.debug(ALLOCATE_TENSOR_WARNING)
+            pos = _pos
         self._solver.set_base_links_pos(
             pos.unsqueeze(-2), self._base_links_idx, envs_idx, unsafe=unsafe, skip_forward=zero_velocity
         )
@@ -1889,7 +1893,11 @@ class RigidEntity(Entity):
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
-
+        if not unsafe:
+            _quat = torch.as_tensor(quat, dtype=gs.tc_float, device=gs.device).contiguous()
+            if _quat is not quat:
+                gs.logger.debug(ALLOCATE_TENSOR_WARNING)
+            quat = _quat
         self._solver.set_base_links_quat(
             quat.unsqueeze(-2), self._base_links_idx, envs_idx, unsafe=unsafe, skip_forward=zero_velocity
         )
@@ -1988,7 +1996,10 @@ class RigidEntity(Entity):
             return idx_global
 
         # Perform a bunch of sanity checks
-        idx_global = torch.as_tensor(idx_global, dtype=gs.tc_int, device=gs.device).contiguous()
+        _idx_global = torch.as_tensor(idx_global, dtype=gs.tc_int, device=gs.device).contiguous()
+        if _idx_global is not idx_global:
+            gs.logger.debug(ALLOCATE_TENSOR_WARNING)
+        idx_global = torch.atleast_1d(_idx_global)
 
         if idx_global.ndim != 1:
             gs.raise_exception("Expecting a 1D tensor for `idx_local`.")
@@ -2398,7 +2409,8 @@ class RigidEntity(Entity):
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
-        self.set_dofs_velocity(None, envs_idx=envs_idx)
+        dofs_idx_local = torch.arange(self.n_dofs, dtype=gs.tc_int, device=gs.device)
+        self.set_dofs_velocity(None, dofs_idx_local, envs_idx, unsafe=unsafe)
 
     @gs.assert_built
     def detect_collision(self, env_idx=0):
@@ -2532,33 +2544,29 @@ class RigidEntity(Entity):
         )
         return tensor.squeeze(0) if self._solver.n_envs == 0 else tensor
 
-    def set_friction_ratio(self, friction_ratio, ls_idx_local, envs_idx=None):
+    def set_friction_ratio(self, friction_ratio, links_idx_local, envs_idx=None):
         """
         Set the friction ratio of the geoms of the specified links.
         Parameters
         ----------
         friction_ratio : torch.Tensor, shape (n_envs, n_links)
             The friction ratio
-        ls_idx_local : array_like
+        links_idx_local : array_like
             The indices of the links to set friction ratio.
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
-        geom_indices = [
-            self._links[il]._geom_start + g_idx for il in ls_idx_local for g_idx in range(self._links[il].n_geoms)
-        ]
-
-        self._solver.set_geoms_friction_ratio(
-            torch.cat(
-                [
-                    ratio.unsqueeze(-1).repeat(1, self._links[j].n_geoms)
-                    for j, ratio in zip(ls_idx_local, friction_ratio.unbind(-1))
-                ],
-                dim=-1,
-            ),
-            geom_indices,
-            envs_idx,
+        links_n_geoms = torch.tensor(
+            [self._links[i_l].n_geoms for i_l in links_idx_local], dtype=gs.tc_int, device=gs.device
         )
+        links_friction_ratio = torch.as_tensor(friction_ratio, dtype=gs.tc_float, device=gs.device)
+        geoms_friction_ratio = torch.repeat_interleave(links_friction_ratio, links_n_geoms, dim=-1)
+        geoms_idx = torch.tensor(
+            [i_g for i_l in links_idx_local for i_g in range(self._links[i_l].geom_start, self._links[i_l].geom_end)],
+            dtype=gs.tc_int,
+            device=gs.device,
+        )
+        self._solver.set_geoms_friction_ratio(geoms_friction_ratio, geoms_idx, envs_idx)
 
     def set_friction(self, friction):
         """

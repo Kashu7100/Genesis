@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import mujoco
+
 import genesis as gs
 
 
