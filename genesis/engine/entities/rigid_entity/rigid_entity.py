@@ -497,6 +497,8 @@ class RigidEntity(Entity):
         self._vgeoms = self.vgeoms
 
         self._init_jac_and_IK()
+        # TODO: add RRT initialization
+        self._init_rrt()
 
     def _init_jac_and_IK(self):
         if not self._requires_jac_and_IK:
@@ -553,6 +555,30 @@ class RigidEntity(Entity):
         self._IK_jacobian_T = ti.field(
             dtype=gs.ti_float, shape=self._solver._batch_shape((self.n_dofs, self._IK_error_dim))
         )
+
+    def _init_rrt(self):
+        self._rrt_max_nodes = 10_000
+        struct_node_info = ti.types.struct(
+            parent_idx=ti.i32,
+            configuration=ti.types.vector(self.n_qs, gs.ti_float),
+        )
+        self._rrt_node_info = struct_node_info.field(
+            shape=self._solver._batch_shape(self._rrt_max_nodes), needs_grad=False, layout=ti.Layout.SOA
+        )
+        self._rrt_tree_size = ti.field(dtype=ti.i32, shape=self._solver._batch_shape())
+        self._rrt_start_configuration = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self.n_qs))
+        self._rrt_goal_configuration = ti.field(dtype=gs.ti_float, shape=self._solver._batch_shape(self.n_qs))
+        self._rrt_is_active = ti.field(dtype=ti.i32, shape=self._solver._batch_shape())
+        self._rrt_goal_reached_node_idx = ti.field(dtype=ti.i32, shape=self._solver._batch_shape())
+
+    def _reset_rrt(self):
+        self._rrt_node_info.parent_idx.fill(-1)
+        self._rrt_node_info.configuration.fill(0.0)
+        self._rrt_tree_size.fill(0)
+        self._rrt_start_configuration.fill(0.0)
+        self._rrt_goal_configuration.fill(0.0)
+        self._rrt_is_active.fill(0)
+        self._rrt_goal_reached_node_idx.fill(-1)
 
     def _add_by_info(self, l_info, j_infos, g_infos, morph, surface):
         if len(j_infos) > 1 and any(j_info["type"] in (gs.JOINT_TYPE.FREE, gs.JOINT_TYPE.FIXED) for j_info in j_infos):
@@ -1513,6 +1539,196 @@ class RigidEntity(Entity):
     # ------------------------------------------------------------------------------------
     # --------------------------------- motion planing -----------------------------------
     # ------------------------------------------------------------------------------------
+
+    def plan_path_rrt(
+        self,
+        links,
+        poss=[],
+        quats=[],
+        init_qpos=None,
+        respect_joint_limit=True,
+        max_samples=50,
+        max_solver_iters=20,
+        damping=0.01,
+        pos_tol=5e-4,  # 0.5 mm
+        rot_tol=5e-3,  # 0.28 degree
+        pos_mask=[True, True, True],
+        rot_mask=[True, True, True],
+        max_step_size=0.5,
+        dofs_idx_local=None,
+        return_error=False,
+        envs_idx=None,
+    ):
+        self.inverse_kinematics_multilink(
+            links,
+            poss,
+            quats,
+            init_qpos,
+            respect_joint_limit,
+            max_samples,
+            max_solver_iters,
+            damping,
+            pos_tol,  # 0.5 mm
+            rot_tol,  # 0.28 degree
+            pos_mask,
+            rot_mask,
+            max_step_size,
+            dofs_idx_local,
+            return_error,
+            envs_idx,
+        )
+
+        # run RRT
+        self._reset_rrt()
+        self._kernel_rrt(
+            damping,
+            pos_tol,
+            rot_tol,
+            max_step_size,
+            envs_idx,
+        )
+
+    @ti.func
+    def _nearest_neighbor(
+        self,
+        configuration: ti.types.vector(),
+        tree_size: ti.i32,
+        env_idx: ti.i32,
+    ):
+        nearest_neighbor_idx = -1
+        nearest_neighbor_dist = 1e6
+        ti.loop_config(serialize=self._solver._para_level < gs.PARA_LEVEL.ALL)
+        for i_n in range(tree_size):
+            dist = (self._rrt_node_info.configuration[i_n, env_idx] - configuration).norm()
+            if dist < nearest_neighbor_dist:
+                nearest_neighbor_dist = dist
+                nearest_neighbor_idx = i_n
+        return nearest_neighbor_idx
+
+    @ti.func
+    def _steer_to_random_sample(
+        self,
+        nearest_neighbor_idx: ti.i32,
+        random_sample: ti.types.vector(),
+        env_idx: ti.i32,
+        max_step_size: ti.f32,
+    ):
+        # Calculate direction vector from nearest neighbor to random sample
+        nearest_config = self._rrt_node_info.configuration[nearest_neighbor_idx, env_idx]
+        direction = random_sample - nearest_config
+        direction_magnitude = direction.norm()
+
+        # If the step size exceeds max_step_size, clip it
+        if direction_magnitude > max_step_size:
+            # Normalize direction and scale by max_step_size
+            direction = direction.normalized() * max_step_size
+
+        steer_result = nearest_config + direction
+        return steer_result
+
+    @ti.func
+    def _is_goal_configuration(
+        self,
+        configuration: ti.types.vector(),
+        env_idx: ti.i32,
+    ):
+        for i_q in range(self.n_qs):
+            if (configuration[i_q] < self._rrt_goal_configuration[i_q, env_idx] - self.pos_tol) | (
+                configuration[i_q] > self._rrt_goal_configuration[i_q, env_idx] + self.pos_tol
+            ):
+                return False
+        return True
+
+    @ti.kernel
+    def _kernel_rrt(
+        self,
+        damping: ti.f32,
+        pos_tol: ti.f32,
+        rot_tol: ti.f32,
+        max_step_size: ti.f32,
+        envs_idx: ti.types.ndarray(),
+        q_limit_lower: ti.types.ndarray(),
+        q_limit_upper: ti.types.ndarray(),
+    ):
+        # set goal configuration by running IK
+
+        ti.loop_config(serialize=self._solver._para_level < gs.PARA_LEVEL.ALL)
+        for i_b in envs_idx:
+            for i_q in range(self.n_qs):
+                # self._solver.qpos[i_q + self._q_start, i_b] = self._IK_qpos_orig[i_q, i_b] # NOTE: done in IK
+                self._rrt_start_configuration[i_q, i_b] = self._IK_qpos_orig[i_q, i_b]
+                self._rrt_goal_configuration[i_q, i_b] = self._IK_qpos_best[i_q, i_b]
+                self._rrt_node_info.configuration[i_q, 0, i_b] = self._IK_qpos_orig[i_q, i_b]
+
+            self._rrt_tree_size[i_b] = 1
+            self._rrt_is_active[i_b] = 1
+
+            for i in ti.static(range(self._rrt_max_nodes)):
+                # goal bias
+                if ti.random() < self.goal_bias:
+                    # TODO: run IK to get goal configuration
+                    pass
+                else:
+                    # sample random configuration
+                    random_sample = ti.Vector(
+                        [
+                            q_limit_lower[i_q] + ti.random() * (q_limit_upper[i_q] - q_limit_lower[i_q])
+                            for i_q in range(self.n_qs)
+                        ]
+                    )
+
+                # find nearest neighbor
+                nearest_neighbor_idx = self._nearest_neighbor(
+                    random_sample,
+                    self._rrt_tree_size[i_b],
+                    i_b,
+                )
+
+                # steer from nearest neighbor to random sample
+                steer_result = self._steer_to_random_sample(
+                    nearest_neighbor_idx,
+                    random_sample,
+                    i_b,
+                    max_step_size,
+                )
+
+                # set the steer result and collision check for i_b
+                for i_q in range(self.n_qs):
+                    self._solver.qpos[i_q + self._q_start, i_b] = steer_result[i_q]
+                # TODO: is this needed? - run FK to update link states using current q
+                self._solver._func_forward_kinematics_entity(self._idx_in_solver, i_b)
+
+                self._solver.collider._func_clear_single_env(i_b)
+                # detect collision
+                self._solver._func_update_geom_aabbs_single_env(i_b)
+                self._solver.collider._func_broad_phase_single_env(i_b)
+                self._solver.collider._func_narrow_phase_single_env(i_b)
+                if self._solver.collider._has_terrain:
+                    self._solver.collider._func_narrow_phase_terrain_single_env(i_b)
+                if self._solver.collider._has_nonconvex_nonterrain:
+                    self._solver.collider._func_narrow_phase_nonconvex_nonterrain_single_env(i_b)
+
+                has_collision = False
+                for i_c in range(self._solver.collider.n_contacts[i_b]):
+                    i_la = self._solver.collider.contact_data[i_c, i_b].link_a
+                    i_lb = self._solver.collider.contact_data[i_c, i_b].link_b
+
+                    if (self.link_start <= i_la < self.link_end) | (self.link_start <= i_lb < self.link_end):
+                        has_collision = True
+                        break
+
+                if has_collision:
+                    continue
+
+                # add new node
+                self._rrt_tree_size[i_b] += 1
+                self._rrt_node_info.configuration[self._rrt_tree_size[i_b], i_b] = steer_result
+                self._rrt_node_info.parent[self._rrt_tree_size[i_b], i_b] = nearest_neighbor_idx
+
+                # check the obtained steer result is within goal configuration
+                if self._is_goal_configuration(steer_result, i_b):
+                    self._rrt_is_active[i_b] = 0
+                    break
 
     @gs.assert_built
     def plan_path(
