@@ -611,6 +611,21 @@ class RigidEntity(Entity):
             # Unified parser handles both articulations and rigid bodies
             l_infos, links_j_infos, links_g_infos, eqs_info = parse_usd_rigid_entity(morph, surface)
 
+        if hasattr(morph, "collision_group") and morph.collision_group is not None:
+            for i, (group_name, link_names) in enumerate(morph.collision_group.items()):
+                group_id = i + 1  # group 0 is reserved for no group
+                for link_name in link_names:
+                    # Find the link index
+                    link_idx = -1
+                    for idx, l_info in enumerate(l_infos):
+                        if l_info["name"] == link_name:
+                            link_idx = idx
+                            break
+
+                    if link_idx != -1:
+                        for g_info in links_g_infos[link_idx]:
+                            g_info["group"] = group_id
+
         # Make sure that the inertia matrix of all links is valid
         if not morph.recompute_inertia:
             for l_info in l_infos:

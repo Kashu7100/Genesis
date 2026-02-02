@@ -881,6 +881,7 @@ class MJCF(FileMorph):
     quat: Optional[tuple] = None
     requires_jac_and_IK: bool = True
     default_armature: Optional[float] = 0.1
+    collision_group: Optional[dict] = None
 
     def __init__(self, **data):
         super().__init__(**data)
@@ -1006,6 +1007,7 @@ class URDF(FileMorph):
     merge_fixed_links: bool = True
     links_to_keep: List[str] = []
     default_armature: Optional[float] = 0.1
+    collision_group: Optional[dict] = None
 
     def __init__(self, **data):
         super().__init__(**data)
