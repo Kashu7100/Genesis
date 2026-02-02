@@ -177,6 +177,9 @@ class Primitive(Morph):
     conaffinity : int, optional
         The 32-bit integer bitmasks used for contact filtering of contact pairs. When the conaffinity of one geom and
         the contype of the other geom share a common bit set to 1, two geoms can collide. Defaults to 0xFFFF.
+    group : int, optional
+        The collision group of the geometry. Geometries with the same non-zero group do not collide with each other.
+        Defaults to 0.
     """
 
     # Rigid specific
@@ -184,6 +187,7 @@ class Primitive(Morph):
     batch_fixed_verts: bool = True
     contype: int = 0xFFFF
     conaffinity: int = 0xFFFF
+    group: int = 0
 
 
 class Box(Primitive, TetGenMixin):
@@ -702,6 +706,9 @@ class Mesh(FileMorph, TetGenMixin):
     conaffinity : int, optional
         The 32-bit integer bitmasks used for contact filtering of contact pairs. When the conaffinity of one geom and
         the contype of the other geom share a common bit set to 1, two geoms can collide. Defaults to 0xFFFF.
+    group : int, optional
+        The collision group of the geometry. Geometries with the same non-zero group do not collide with each other.
+        Defaults to 0.
     group_by_material : bool, optional
         Whether to group submeshes by their visual material type defined in the asset file. Defaults to True.
         **This is only used for RigidEntity.**
@@ -735,6 +742,7 @@ class Mesh(FileMorph, TetGenMixin):
     fixed: bool = False
     contype: int = 0xFFFF
     conaffinity: int = 0xFFFF
+    group: int = 0
     group_by_material: bool = True
     merge_submeshes_for_collision: bool = True
 

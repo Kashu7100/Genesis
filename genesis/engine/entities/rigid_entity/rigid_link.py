@@ -286,6 +286,7 @@ class RigidLink(RBC):
         needs_coup=False,
         contype=1,
         conaffinity=1,
+        group=0,
         data=None,
     ):
         geom = RigidGeom(
@@ -306,6 +307,7 @@ class RigidLink(RBC):
             needs_coup=needs_coup,
             contype=contype,
             conaffinity=conaffinity,
+            group=group,
             data=data,
         )
         self._geoms.append(geom)

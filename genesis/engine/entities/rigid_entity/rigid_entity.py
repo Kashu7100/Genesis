@@ -306,6 +306,7 @@ class RigidEntity(Entity):
                     needs_coup=self.material.needs_coup,
                     contype=g_info["contype"],
                     conaffinity=g_info["conaffinity"],
+                    group=g_info.get("group", 0),
                 )
 
             # Record ranges for this variant
@@ -1067,6 +1068,7 @@ class RigidEntity(Entity):
                 needs_coup=self.material.needs_coup,
                 contype=g_info["contype"],
                 conaffinity=g_info["conaffinity"],
+                group=g_info.get("group", 0),
             )
 
         return link, joints

@@ -51,6 +51,7 @@ class RigidGeom(RBC):
         needs_coup: bool,
         contype,
         conaffinity,
+        group,
         center_init=None,
         data=None,
     ):
@@ -68,6 +69,7 @@ class RigidGeom(RBC):
         self._needs_coup: bool = needs_coup
         self._contype = int(contype)
         self._conaffinity = int(conaffinity)
+        self._group = int(group)
         self._is_convex: bool = mesh.is_convex
         self._cell_start: int = cell_start
         self._vert_start: int = vert_start
@@ -523,6 +525,13 @@ class RigidGeom(RBC):
         See `contype` documentation for details.
         """
         return self._conaffinity
+
+    @property
+    def group(self) -> int:
+        """
+        Get the collision group of the geometry.
+        """
+        return self._group
 
     @property
     def coup_softness(self) -> float:

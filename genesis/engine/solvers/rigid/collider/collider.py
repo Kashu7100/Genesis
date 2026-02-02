@@ -252,6 +252,10 @@ class Collider:
                 if link_a is link_b:
                     continue
 
+                # geoms in the same collision group
+                if geom_a.group != 0 and geom_a.group == geom_b.group:
+                    continue
+
                 # Filter out right away weld constraint that have been declared statically and cannot be removed
                 is_valid = True
                 for eq in self._solver.equalities:
