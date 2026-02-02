@@ -2014,6 +2014,117 @@ def test_frictionloss_advanced(show_viewer, tol):
     assert_allclose(box.get_dofs_velocity(), 0.0, tol=50 * tol)
 
 
+@pytest.mark.required
+def test_collision_group(show_viewer):
+    # Test with collision groups
+    scene = gs.Scene(show_viewer=show_viewer)
+    plane = scene.add_entity(gs.morphs.Plane())
+
+    all_links = [
+        "base",
+        "Head_upper",
+        "Head_lower",
+        "FL_hip",
+        "FL_thigh",
+        "FL_calf",
+        "FL_calflower",
+        "FL_calflower1",
+        "FL_foot",
+        "FR_hip",
+        "FR_thigh",
+        "FR_calf",
+        "FR_calflower",
+        "FR_calflower1",
+        "FR_foot",
+        "RL_hip",
+        "RL_thigh",
+        "RL_calf",
+        "RL_calflower",
+        "RL_calflower1",
+        "RL_foot",
+        "RR_hip",
+        "RR_thigh",
+        "RR_calf",
+        "RR_calflower",
+        "RR_calflower1",
+        "RR_foot",
+        "imu",
+        "radar",
+    ]
+
+    collision_group = {"robot": all_links}
+    robot = scene.add_entity(
+        gs.morphs.URDF(
+            file="urdf/go2/urdf/go2.urdf",
+            pos=(0.0, 0.0, 0.4),
+            collision_group=collision_group,
+        )
+    )
+    scene.build()
+
+    for _ in range(100):
+        scene.step()
+
+    contacts = scene.rigid_solver.collider.get_contacts(as_tensor=False, to_torch=False)
+    robot_links = set(range(robot.link_start, robot.link_end))
+
+    # In a batched scene, contacts is a tuple of arrays
+    if scene.n_envs > 0:
+        link_a_list = contacts["link_a"][0]
+        link_b_list = contacts["link_b"][0]
+    else:
+        link_a_list = contacts["link_a"]
+        link_b_list = contacts["link_b"]
+
+    for i in range(len(link_a_list)):
+        link_a = link_a_list[i]
+        link_b = link_b_list[i]
+        if link_a in robot_links and link_b in robot_links:
+            raise AssertionError("Self-collision detected when collision groups should prevent it.")
+
+    scene.destroy()
+
+    # Test without collision groups
+    scene = gs.Scene(show_viewer=show_viewer)
+    plane = scene.add_entity(gs.morphs.Plane())
+    robot_no_group = scene.add_entity(
+        gs.morphs.URDF(
+            file="urdf/go2/urdf/go2.urdf",
+            pos=(0.0, 0.0, 0.4),
+        )
+    )
+    scene.build()
+
+    # Let the robot fall and settle
+    for _ in range(200):
+        scene.step()
+
+    contacts = scene.rigid_solver.collider.get_contacts(as_tensor=False, to_torch=False)
+
+    self_collision_found = False
+    if scene.n_envs > 0:
+        link_a_list = contacts["link_a"][0]
+        link_b_list = contacts["link_b"][0]
+    else:
+        link_a_list = contacts["link_a"]
+        link_b_list = contacts["link_b"]
+
+    robot_links = set(range(robot_no_group.link_start, robot_no_group.link_end))
+    for i in range(len(link_a_list)):
+        link_a = link_a_list[i]
+        link_b = link_b_list[i]
+        if link_a in robot_links and link_b in robot_links:
+            self_collision_found = True
+            break
+
+    if not self_collision_found:
+        pytest.skip("No self-collision detected without collision groups, so test is inconclusive.")
+
+    scene.reset()
+    for _ in range(230):
+        scene.step()
+
+
 @pytest.mark.parametrize("backend", [gs.cpu])
 def test_nonconvex_collision(show_viewer):
     scene = gs.Scene(
