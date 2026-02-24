@@ -341,6 +341,10 @@ class RigidSolver(KinematicSolver):
         self._func_vel_at_point = func_vel_at_point
         self._func_apply_coupling_force = func_apply_coupling_force
 
+    def _post_build_entities(self):
+        """No-op: RigidSolver entities keep their collision parameters."""
+        pass
+
     def _cache_counters(self):
         super()._cache_counters()
         self._n_equalities = self.n_equalities

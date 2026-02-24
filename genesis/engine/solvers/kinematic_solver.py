@@ -5,7 +5,7 @@ import torch
 
 import genesis as gs
 import genesis.utils.array_class as array_class
-from genesis.engine.entities.avatar_entity import AvatarEntity
+from genesis.engine.entities.rigid_entity import KinematicEntity
 from genesis.engine.states import QueriedStates
 from genesis.engine.states.solvers import AvatarSolverState
 from genesis.options.solvers import RigidOptions
@@ -98,7 +98,7 @@ class KinematicSolver(Solver):
 
         morph._enable_mujoco_compatibility = self._enable_mujoco_compatibility
 
-        entity = AvatarEntity(
+        entity = KinematicEntity(
             scene=self._scene,
             solver=self,
             material=material,
@@ -157,6 +157,15 @@ class KinematicSolver(Solver):
     def _build_entities(self):
         for entity in self._entities:
             entity._build()
+        self._post_build_entities()
+
+    def _post_build_entities(self):
+        """Disable collision on all entity geoms (avatar/kinematic entities have no physics)."""
+        for entity in self._entities:
+            for geom in entity.geoms:
+                geom._contype = 0
+                geom._conaffinity = 0
+                geom._needs_coup = False
 
     def _cache_counters(self):
         self._n_qs = self.n_qs

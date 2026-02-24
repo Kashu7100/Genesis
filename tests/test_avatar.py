@@ -1,4 +1,4 @@
-"""Tests for AvatarEntity (visualization-only ghost entities)."""
+"""Tests for avatar (kinematic-only) ghost entities."""
 
 import numpy as np
 import pytest
@@ -91,16 +91,13 @@ class TestAvatarOptions:
 
 @pytest.mark.required
 def test_avatar_entity_type():
-    """Avatar entities should be instances of AvatarEntity and KinematicEntity."""
-    from genesis.engine.entities.avatar_entity import AvatarEntity
+    """Avatar entities should be KinematicEntity but not RigidEntity."""
     from genesis.engine.entities.rigid_entity import KinematicEntity
 
     scene, robot, ghost = _build_scene_with_avatar()
     try:
-        assert isinstance(ghost, AvatarEntity)
         assert isinstance(ghost, KinematicEntity)
         assert not isinstance(ghost, gs.engine.entities.RigidEntity)
-        assert not isinstance(robot, AvatarEntity)
         assert isinstance(robot, gs.engine.entities.RigidEntity)
         assert isinstance(robot, KinematicEntity)
     finally:
@@ -125,19 +122,21 @@ def test_avatar_solver_type():
 
 
 def test_avatar_entity_components():
-    """Avatar entity should use Avatar-specific link, joint, and geom classes."""
-    from genesis.engine.entities.avatar_entity.avatar_geom import AvatarGeom
-    from genesis.engine.entities.avatar_entity.avatar_joint import AvatarJoint
-    from genesis.engine.entities.avatar_entity.avatar_link import AvatarLink
+    """Avatar entity should use RigidLink, RigidJoint, RigidGeom with collision disabled."""
+    from genesis.engine.entities.rigid_entity.rigid_geom import RigidGeom
+    from genesis.engine.entities.rigid_entity.rigid_joint import RigidJoint
+    from genesis.engine.entities.rigid_entity.rigid_link import RigidLink
 
     scene, _, ghost = _build_scene_with_avatar()
     try:
         for link in ghost.links:
-            assert isinstance(link, AvatarLink)
+            assert isinstance(link, RigidLink)
         for joint in ghost.joints:
-            assert isinstance(joint, AvatarJoint)
+            assert isinstance(joint, RigidJoint)
         for geom in ghost.geoms:
-            assert isinstance(geom, AvatarGeom)
+            assert isinstance(geom, RigidGeom)
+            assert geom.contype == 0
+            assert geom.conaffinity == 0
     finally:
         scene.destroy()
 
@@ -503,11 +502,8 @@ def test_avatar_material_not_rigid():
 
 
 def test_entity_hierarchy():
-    """KinematicEntity is the base; RigidEntity and AvatarEntity inherit from it."""
-    from genesis.engine.entities.avatar_entity import AvatarEntity
+    """KinematicEntity is the base; RigidEntity inherits from it; no AvatarEntity class."""
     from genesis.engine.entities.rigid_entity import KinematicEntity, RigidEntity
 
     assert issubclass(RigidEntity, KinematicEntity)
-    assert issubclass(AvatarEntity, KinematicEntity)
-    assert not issubclass(AvatarEntity, RigidEntity)
-    assert not issubclass(RigidEntity, AvatarEntity)
+    assert not issubclass(KinematicEntity, RigidEntity)

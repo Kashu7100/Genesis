@@ -1577,7 +1577,7 @@ class Scene(RBC):
 
     @property
     def avatar_solver(self):
-        """The scene's `avatar_solver`, managing all the `AvatarEntity` in the scene."""
+        """The scene's `avatar_solver`, managing all the avatar (kinematic-only) entities in the scene."""
         return self._sim.avatar_solver
 
     @property
