@@ -91,29 +91,34 @@ class TestAvatarOptions:
 
 @pytest.mark.required
 def test_avatar_entity_type():
-    """Avatar entities should be instances of AvatarEntity and RigidEntity."""
+    """Avatar entities should be instances of AvatarEntity and KinematicEntity."""
     from genesis.engine.entities.avatar_entity import AvatarEntity
+    from genesis.engine.entities.rigid_entity import KinematicEntity
 
     scene, robot, ghost = _build_scene_with_avatar()
     try:
         assert isinstance(ghost, AvatarEntity)
-        assert isinstance(ghost, gs.engine.entities.RigidEntity)
+        assert isinstance(ghost, KinematicEntity)
+        assert not isinstance(ghost, gs.engine.entities.RigidEntity)
         assert not isinstance(robot, AvatarEntity)
+        assert isinstance(robot, gs.engine.entities.RigidEntity)
+        assert isinstance(robot, KinematicEntity)
     finally:
         scene.destroy()
 
 
 @pytest.mark.required
 def test_avatar_solver_type():
-    """The avatar solver should be an AvatarSolver (standalone, not inheriting from RigidSolver)."""
-    from genesis.engine.solvers.avatar_solver import AvatarSolver
+    """The avatar solver should be a KinematicSolver (base class, not RigidSolver)."""
+    from genesis.engine.solvers.kinematic_solver import KinematicSolver, AvatarSolver
     from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
 
     scene, _, _ = _build_scene_with_avatar()
     try:
         solver = scene.avatar_solver
-        assert isinstance(solver, AvatarSolver)
-        assert not isinstance(solver, RigidSolver), "AvatarSolver must NOT inherit from RigidSolver"
+        assert isinstance(solver, KinematicSolver)
+        assert isinstance(solver, AvatarSolver)  # AvatarSolver is alias for KinematicSolver
+        assert not isinstance(solver, RigidSolver), "Avatar solver must NOT be a RigidSolver"
         assert solver.is_active
     finally:
         scene.destroy()
@@ -477,14 +482,16 @@ def test_multiple_avatar_entities():
 # ---------------------------------------------------------------------------
 
 
-def test_avatar_solver_not_rigid_solver():
-    """AvatarSolver must not inherit from RigidSolver -- the classes are completely unrelated."""
-    from genesis.engine.solvers.avatar_solver import AvatarSolver
+def test_solver_hierarchy():
+    """KinematicSolver is the base; RigidSolver inherits from it; AvatarSolver is an alias."""
+    from genesis.engine.solvers.kinematic_solver import KinematicSolver, AvatarSolver
     from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
     from genesis.engine.solvers.base_solver import Solver
 
-    assert not issubclass(AvatarSolver, RigidSolver)
-    assert issubclass(AvatarSolver, Solver)
+    assert AvatarSolver is KinematicSolver
+    assert issubclass(KinematicSolver, Solver)
+    assert issubclass(RigidSolver, KinematicSolver)
+    assert not issubclass(KinematicSolver, RigidSolver)
 
 
 def test_avatar_material_not_rigid():
@@ -493,3 +500,14 @@ def test_avatar_material_not_rigid():
 
     assert not issubclass(gs.materials.Avatar, gs.materials.Rigid)
     assert issubclass(gs.materials.Avatar, Material)
+
+
+def test_entity_hierarchy():
+    """KinematicEntity is the base; RigidEntity and AvatarEntity inherit from it."""
+    from genesis.engine.entities.avatar_entity import AvatarEntity
+    from genesis.engine.entities.rigid_entity import KinematicEntity, RigidEntity
+
+    assert issubclass(RigidEntity, KinematicEntity)
+    assert issubclass(AvatarEntity, KinematicEntity)
+    assert not issubclass(AvatarEntity, RigidEntity)
+    assert not issubclass(RigidEntity, AvatarEntity)

@@ -42,14 +42,14 @@ if TYPE_CHECKING:
     from genesis.options.solvers import AvatarOptions
 
 
-class AvatarSolver(Solver):
+class KinematicSolver(Solver):
     """
-    A visualization-only solver for ghost/reference articulated entities.
+    Base solver for articulated kinematic entities (FK, rendering, state get/set).
 
-    Inherits from Solver (the base class) directly. Uses the same ABD kernel functions
-    as RigidSolver for FK and rendering, but has no dependency on RigidSolver.
-    All physics-related operations (collision, constraint solving, integration) are disabled.
-    The solver only computes forward kinematics for visualization purposes.
+    Provides the full build pipeline, field init methods, counter properties,
+    render methods, and IO sanitization shared by both AvatarSolver and RigidSolver.
+
+    RigidSolver extends this with physics (collision, constraints, dynamics).
     """
 
     def __init__(self, scene: "Scene", sim: "Simulator", options: "AvatarOptions") -> None:
@@ -133,14 +133,32 @@ class AvatarSolver(Solver):
 
     def build(self):
         super().build()
+        self._setup_build_environment()
+        self._build_entities()
+        self._cache_counters()
+        self._setup_dummy_sizes()
+        self._build_static_config()
+        self._create_data_manager()
+        self._init_dof_fields()
+        self._init_vert_fields()
+        self._init_vvert_fields()
+        self._init_geom_fields()
+        self._init_vgeom_fields()
+        self._init_link_fields()
+        self._init_entity_fields()
+        self._init_envs_offset()
+        self._func_update_geoms(self._scene._envs_idx, force_update_fixed_geoms=True)
+
+    def _setup_build_environment(self):
         self.n_envs = self.sim.n_envs
         self._B = self.sim._B
         self._para_level = self.sim._para_level
 
+    def _build_entities(self):
         for entity in self._entities:
             entity._build()
 
-        # Cache counter values
+    def _cache_counters(self):
         self._n_qs = self.n_qs
         self._n_dofs = self.n_dofs
         self._n_links = self.n_links
@@ -163,7 +181,7 @@ class AvatarSolver(Solver):
         self._links = self.links
         self._joints = self.joints
 
-        # Dummy fields for kernel compilation (at least size 1)
+    def _setup_dummy_sizes(self):
         self.n_qs_ = max(1, self.n_qs)
         self.n_dofs_ = max(1, self.n_dofs)
         self.n_links_ = max(1, self.n_links)
@@ -181,7 +199,8 @@ class AvatarSolver(Solver):
         self.n_fixed_verts_ = max(1, self.n_fixed_verts)
         self.n_candidate_equalities_ = 1
 
-        # Avatar-specific: hibernation parameters (zeroed out, required by DataManager)
+    def _build_static_config(self):
+        # Hibernation parameters (zeroed out, required by DataManager)
         self._hibernation_thresh_vel = 0.0
         self._hibernation_thresh_acc = 0.0
 
@@ -205,22 +224,27 @@ class AvatarSolver(Solver):
             solver_type=0,
         )
 
-        # Create DataManager (reads self.n_xxx_, self._B, self._options, etc.)
+    def _create_data_manager(self):
         self.data_manager = array_class.DataManager(self)
         self._errno = self.data_manager.errno
         self._rigid_global_info = self.data_manager.rigid_global_info
         self._rigid_adjoint_cache = self.data_manager.rigid_adjoint_cache
 
-        # Initialize fields (kinematic init only, no physics)
-        self._init_dof_fields()
-        self._init_vert_fields()
-        self._init_vvert_fields()
-        self._init_geom_fields()
-        self._init_vgeom_fields()
-        self._init_link_fields()
-        self._init_entity_fields()
-        self._init_envs_offset()
-        self._func_update_geoms(self._scene._envs_idx, force_update_fixed_geoms=True)
+    # ------------------------------------------------------------------------------------
+    # --------------------------------- hook methods -------------------------------------
+    # ------------------------------------------------------------------------------------
+
+    def _sanitize_joint_sol_params(self, sol_params):
+        """Hook: sanitize joint constraint solver params. No-op in base (no constraints)."""
+        return sol_params
+
+    def _sanitize_geom_sol_params(self, sol_params):
+        """Hook: sanitize geom constraint solver params. No-op in base (no constraints)."""
+        return sol_params
+
+    def _check_init_qpos_bounds(self, joints, init_qpos):
+        """Hook: check if initial qpos is within joint limits. No-op in base."""
+        pass
 
     # ------------------------------------------------------------------------------------
     # --------------------------------- init methods -------------------------------------
@@ -296,8 +320,8 @@ class AvatarSolver(Solver):
 
         if self.joints:
             joints = self.joints
-            # Skip _sanitize_sol_params -- avatar has no constraints
             joints_sol_params = np.array([joint.sol_params for joint in joints], dtype=gs.np_float)
+            joints_sol_params = self._sanitize_joint_sol_params(joints_sol_params)
 
             kernel_init_joint_fields(
                 joints_type=np.array([joint.type for joint in joints], dtype=gs.np_int),
@@ -317,6 +341,7 @@ class AvatarSolver(Solver):
         if self.n_qs > 0:
             init_qpos = np.tile(np.expand_dims(self.init_qpos, -1), (1, self._B))
             self.qpos0.from_numpy(init_qpos)
+            self._check_init_qpos_bounds(self.joints, init_qpos)
             self.qpos.from_numpy(init_qpos)
 
         self.links_T = self._rigid_global_info.links_T
@@ -376,8 +401,8 @@ class AvatarSolver(Solver):
 
         if self.n_geoms > 0:
             geoms = self.geoms
-            # Skip _sanitize_sol_params -- avatar has no constraints
             geoms_sol_params = np.array([geom.sol_params for geom in geoms], dtype=gs.np_float)
+            geoms_sol_params = self._sanitize_geom_sol_params(geoms_sol_params)
 
             geoms_center = []
             for geom in geoms:
@@ -578,7 +603,7 @@ class AvatarSolver(Solver):
         self._fk_dirty = True
 
     def set_dofs_velocity(self, velocity=None, dofs_idx=None, envs_idx=None, *, skip_forward=False):
-        """No-op: avatar entities have no dynamics, so velocity is always zero."""
+        """No-op: kinematic entities have no dynamics, so velocity is always zero."""
         pass
 
     def get_dofs_position(self, dofs_idx=None, envs_idx=None):
@@ -648,35 +673,63 @@ class AvatarSolver(Solver):
     # ------------------------------------------------------------------------------------
 
     def substep(self, f):
-        """No-op: avatar entities are not simulated."""
+        """No-op: kinematic entities are not simulated."""
         pass
 
     def substep_pre_coupling(self, f):
-        """No-op: avatar entities do not participate in coupling."""
+        """No-op: kinematic entities do not participate in coupling."""
         pass
 
     def substep_post_coupling(self, f):
-        """No-op: avatar entities do not participate in coupling."""
+        """No-op: kinematic entities do not participate in coupling."""
         pass
 
     def check_errno(self):
-        """No-op: avatar solver has no error conditions to check."""
+        """No-op: kinematic solver has no error conditions to check."""
         pass
 
     def clear_external_force(self):
-        """No-op: avatar entities have no external forces."""
+        """No-op: kinematic entities have no external forces."""
         pass
 
     def reset_grad(self):
-        """No-op: avatar solver does not support gradients."""
+        """No-op: kinematic solver does not support gradients."""
         self._queried_states.clear()
+
+    def process_input_grad(self):
+        """No-op: kinematic solver does not support gradients."""
+        pass
+
+    def substep_pre_coupling_grad(self, f):
+        """No-op: kinematic solver does not support gradients."""
+        pass
+
+    def substep_post_coupling_grad(self, f):
+        """No-op: kinematic solver does not support gradients."""
+        pass
+
+    def add_grad_from_state(self, state):
+        """No-op: kinematic solver does not support gradients."""
+        pass
+
+    def collect_output_grads(self):
+        """No-op: kinematic solver does not support gradients."""
+        pass
+
+    def save_ckpt(self, ckpt_name):
+        """No-op: kinematic solver does not save checkpoints."""
+        pass
+
+    def load_ckpt(self, ckpt_name):
+        """No-op: kinematic solver does not load checkpoints."""
+        pass
 
     # ------------------------------------------------------------------------------------
     # -------------------------------- process_input -------------------------------------
     # ------------------------------------------------------------------------------------
 
     def process_input(self, in_backward=False):
-        """Process input for avatar entities (set qpos from user commands)."""
+        """Process input for entities (set qpos from user commands)."""
         for entity in self._entities:
             entity.process_input(in_backward=in_backward)
 
@@ -687,8 +740,8 @@ class AvatarSolver(Solver):
     def _make_scratch_physics_tensors(self):
         """Create temporary zero tensors for kernel_get_state/kernel_set_state compatibility.
 
-        The kernels require velocity/acceleration/mass/friction fields, but avatars
-        have no dynamics so these are always zero. Allocated per-call since
+        The kernels require velocity/acceleration/mass/friction fields, but kinematic
+        entities have no dynamics so these are always zero. Allocated per-call since
         get_state/set_state are infrequent.
         """
         _B = self._B
@@ -894,3 +947,7 @@ class AvatarSolver(Solver):
         if self._entities:
             return np.concatenate([entity.init_qpos for entity in self._entities], dtype=gs.np_float)
         return np.array([], dtype=gs.np_float)
+
+
+# Backward compatibility alias
+AvatarSolver = KinematicSolver

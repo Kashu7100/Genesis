@@ -23,6 +23,7 @@ from genesis.repr_base import RBC
 
 from .entities import HybridEntity
 from .solvers import (
+    KinematicSolver,
     AvatarSolver,
     FEMSolver,
     MPMSolver,
@@ -203,7 +204,7 @@ class Simulator(RBC):
             solver.build()
             if solver.is_active:
                 self._active_solvers.append(solver)
-                if not isinstance(solver, (RigidSolver, AvatarSolver)):
+                if not isinstance(solver, KinematicSolver):
                     self._rigid_only = False
         self._coupler.build()
 

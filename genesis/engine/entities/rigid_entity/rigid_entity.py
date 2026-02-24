@@ -112,9 +112,13 @@ def compute_inertial_from_geom_infos(cg_infos, vg_infos, rho):
 
 
 @qd.data_oriented
-class RigidEntity(Entity):
+class KinematicEntity(Entity):
     """
-    Entity class in rigid body systems. One rigid entity can be a robot, a terrain, a floating rigid body, etc.
+    Base entity class for articulated rigid-body systems (kinematic pipeline, morphology loading, FK).
+
+    Subclasses:
+    - RigidEntity: adds Jacobian and IK support for physics simulation.
+    - AvatarEntity: visualization-only ghost entities with no-collision geoms.
     """
 
     # override typing
@@ -852,48 +856,8 @@ class RigidEntity(Entity):
         self._init_jac_and_IK()
 
     def _init_jac_and_IK(self):
-        if not self._requires_jac_and_IK:
-            return
-
-        if self.n_dofs == 0:
-            return
-
-        self._jacobian = qd.field(dtype=gs.qd_float, shape=(6, self.n_dofs, self._solver._B))
-
-        # compute joint limit in q space
-        q_limit_lower = []
-        q_limit_upper = []
-        for joint in self.joints:
-            if joint.type == gs.JOINT_TYPE.FREE:
-                q_limit_lower.append(joint.dofs_limit[:3, 0])
-                q_limit_lower.append(-np.ones(4))  # quaternion lower bound
-                q_limit_upper.append(joint.dofs_limit[:3, 1])
-                q_limit_upper.append(np.ones(4))  # quaternion upper bound
-            elif joint.type == gs.JOINT_TYPE.FIXED:
-                pass
-            else:
-                q_limit_lower.append(joint.dofs_limit[:, 0])
-                q_limit_upper.append(joint.dofs_limit[:, 1])
-        self.q_limit = np.stack(
-            (np.concatenate(q_limit_lower), np.concatenate(q_limit_upper)), axis=0, dtype=gs.np_float
-        )
-
-        # for storing intermediate results
-        self._IK_n_tgts = self._solver._options.IK_max_targets
-        self._IK_error_dim = self._IK_n_tgts * 6
-        self._IK_mat = qd.field(dtype=gs.qd_float, shape=(self._IK_error_dim, self._IK_error_dim, self._solver._B))
-        self._IK_inv = qd.field(dtype=gs.qd_float, shape=(self._IK_error_dim, self._IK_error_dim, self._solver._B))
-        self._IK_L = qd.field(dtype=gs.qd_float, shape=(self._IK_error_dim, self._IK_error_dim, self._solver._B))
-        self._IK_U = qd.field(dtype=gs.qd_float, shape=(self._IK_error_dim, self._IK_error_dim, self._solver._B))
-        self._IK_y = qd.field(dtype=gs.qd_float, shape=(self._IK_error_dim, self._IK_error_dim, self._solver._B))
-        self._IK_qpos_orig = qd.field(dtype=gs.qd_float, shape=(self.n_qs, self._solver._B))
-        self._IK_qpos_best = qd.field(dtype=gs.qd_float, shape=(self.n_qs, self._solver._B))
-        self._IK_delta_qpos = qd.field(dtype=gs.qd_float, shape=(self.n_dofs, self._solver._B))
-        self._IK_vec = qd.field(dtype=gs.qd_float, shape=(self._IK_error_dim, self._solver._B))
-        self._IK_err_pose = qd.field(dtype=gs.qd_float, shape=(self._IK_error_dim, self._solver._B))
-        self._IK_err_pose_best = qd.field(dtype=gs.qd_float, shape=(self._IK_error_dim, self._solver._B))
-        self._IK_jacobian = qd.field(dtype=gs.qd_float, shape=(self._IK_error_dim, self.n_dofs, self._solver._B))
-        self._IK_jacobian_T = qd.field(dtype=gs.qd_float, shape=(self.n_dofs, self._IK_error_dim, self._solver._B))
+        """No-op in base kinematic entity. Overridden by RigidEntity for Jacobian/IK support."""
+        pass
 
     def _add_by_info(self, l_info, j_infos, g_infos, morph, surface):
         if len(j_infos) > 1 and any(j_info["type"] in (gs.JOINT_TYPE.FREE, gs.JOINT_TYPE.FIXED) for j_info in j_infos):
@@ -1169,8 +1133,8 @@ class RigidEntity(Entity):
         if self._is_attached:
             gs.raise_exception("Entity already attached.")
 
-        if not isinstance(parent_entity, RigidEntity):
-            gs.raise_exception("Parent entity must derive from 'RigidEntity'.")
+        if not isinstance(parent_entity, KinematicEntity):
+            gs.raise_exception("Parent entity must derive from 'KinematicEntity'.")
 
         if parent_entity is self:
             gs.raise_exception("Cannot attach entity to itself.")
@@ -3667,6 +3631,54 @@ class RigidEntity(Entity):
     def is_local_collision_mask(self):
         """Whether the contype and conaffinity bitmasks of this entity only applies to self-collision."""
         return self._is_local_collision_mask
+
+
+class RigidEntity(KinematicEntity):
+    """Physics-enabled entity with Jacobian and IK support."""
+
+    def _init_jac_and_IK(self):
+        if not self._requires_jac_and_IK:
+            return
+
+        if self.n_dofs == 0:
+            return
+
+        self._jacobian = qd.field(dtype=gs.qd_float, shape=(6, self.n_dofs, self._solver._B))
+
+        # compute joint limit in q space
+        q_limit_lower = []
+        q_limit_upper = []
+        for joint in self.joints:
+            if joint.type == gs.JOINT_TYPE.FREE:
+                q_limit_lower.append(joint.dofs_limit[:3, 0])
+                q_limit_lower.append(-np.ones(4))  # quaternion lower bound
+                q_limit_upper.append(joint.dofs_limit[:3, 1])
+                q_limit_upper.append(np.ones(4))  # quaternion upper bound
+            elif joint.type == gs.JOINT_TYPE.FIXED:
+                pass
+            else:
+                q_limit_lower.append(joint.dofs_limit[:, 0])
+                q_limit_upper.append(joint.dofs_limit[:, 1])
+        self.q_limit = np.stack(
+            (np.concatenate(q_limit_lower), np.concatenate(q_limit_upper)), axis=0, dtype=gs.np_float
+        )
+
+        # for storing intermediate results
+        self._IK_n_tgts = self._solver._options.IK_max_targets
+        self._IK_error_dim = self._IK_n_tgts * 6
+        self._IK_mat = qd.field(dtype=gs.qd_float, shape=(self._IK_error_dim, self._IK_error_dim, self._solver._B))
+        self._IK_inv = qd.field(dtype=gs.qd_float, shape=(self._IK_error_dim, self._IK_error_dim, self._solver._B))
+        self._IK_L = qd.field(dtype=gs.qd_float, shape=(self._IK_error_dim, self._IK_error_dim, self._solver._B))
+        self._IK_U = qd.field(dtype=gs.qd_float, shape=(self._IK_error_dim, self._IK_error_dim, self._solver._B))
+        self._IK_y = qd.field(dtype=gs.qd_float, shape=(self._IK_error_dim, self._IK_error_dim, self._solver._B))
+        self._IK_qpos_orig = qd.field(dtype=gs.qd_float, shape=(self.n_qs, self._solver._B))
+        self._IK_qpos_best = qd.field(dtype=gs.qd_float, shape=(self.n_qs, self._solver._B))
+        self._IK_delta_qpos = qd.field(dtype=gs.qd_float, shape=(self.n_dofs, self._solver._B))
+        self._IK_vec = qd.field(dtype=gs.qd_float, shape=(self._IK_error_dim, self._solver._B))
+        self._IK_err_pose = qd.field(dtype=gs.qd_float, shape=(self._IK_error_dim, self._solver._B))
+        self._IK_err_pose_best = qd.field(dtype=gs.qd_float, shape=(self._IK_error_dim, self._solver._B))
+        self._IK_jacobian = qd.field(dtype=gs.qd_float, shape=(self._IK_error_dim, self.n_dofs, self._solver._B))
+        self._IK_jacobian_T = qd.field(dtype=gs.qd_float, shape=(self.n_dofs, self._IK_error_dim, self._solver._B))
 
 
 @qd.kernel(fastcache=gs.use_fastcache)

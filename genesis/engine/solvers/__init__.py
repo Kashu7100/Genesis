@@ -1,4 +1,4 @@
-from .avatar_solver import AvatarSolver
+from .kinematic_solver import KinematicSolver, AvatarSolver
 from .tool_solver import ToolSolver
 from .rigid.rigid_solver import RigidSolver
 from .mpm_solver import MPMSolver

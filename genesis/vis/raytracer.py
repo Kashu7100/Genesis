@@ -246,7 +246,7 @@ class Raytracer:
             light.add_to_render(self)
 
         for entity in self.sim.entities:
-            if isinstance(entity, entities.RigidEntity):
+            if isinstance(entity, entities.KinematicEntity):
                 for geom in entity.vgeoms + entity.geoms:
                     self.add_surface(str(geom.uid), geom.surface)
             else:
