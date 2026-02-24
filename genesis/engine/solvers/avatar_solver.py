@@ -1,10 +1,12 @@
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import genesis as gs
 from genesis.engine.entities import RigidEntity
 from genesis.engine.entities.avatar_entity import AvatarEntity
-from genesis.engine.states.solvers import AvatarSolverState
+from genesis.engine.states.solvers import AvatarSolverState, QueriedStates
 
+from .base_solver import Solver
 from .rigid.rigid_solver import RigidSolver
 
 if TYPE_CHECKING:
@@ -23,8 +25,49 @@ class AvatarSolver(RigidSolver):
     """
 
     def __init__(self, scene: "Scene", sim: "Simulator", options: "AvatarOptions") -> None:
-        super().__init__(scene, sim, options)
+        # Skip RigidSolver.__init__ — it reads many physics options that don't apply here.
+        Solver.__init__(self, scene, sim, options)
+
+        # Hardcode all physics-related attributes that RigidSolver.__init__ would read from options.
         self._enable_collision = False
+        self._enable_multi_contact = False
+        self._enable_mujoco_compatibility = False
+        self._enable_joint_limit = False
+        self._enable_self_collision = False
+        self._enable_neutral_collision = False
+        self._enable_adjacent_collision = False
+        self._disable_constraint = True
+        self._max_collision_pairs = 0
+        self._integrator = gs.integrator.approximate_implicitfast
+        self._box_box_detection = False
+        self._requires_grad = False
+        self._enable_heterogeneous = False
+        self._use_contact_island = False
+        self._use_hibernation = False
+        self._hibernation_thresh_vel = 0.0
+        self._hibernation_thresh_acc = 0.0
+        self._sol_min_timeconst = 0.0
+        self._sol_default_timeconst = 0.0
+
+        # Lightweight namespace for fields that build() reads from self._options.
+        self._options = SimpleNamespace(
+            max_dynamic_constraints=0,
+            batch_links_info=False,
+            batch_dofs_info=False,
+            batch_joints_info=False,
+            sparse_solve=False,
+            constraint_solver=gs.constraint_solver.Newton,
+            use_hibernation=False,
+        )
+
+        self.collider = None
+        self.constraint_solver = None
+        self.qpos = None
+        self._is_backward = False
+        self._is_forward_pos_updated = False
+        self._is_forward_vel_updated = False
+        self._queried_states = QueriedStates()
+        self._ckpt = dict()
 
     def add_entity(self, idx, material, morph, surface, visualize_contact=False, name=None):
         morph_heterogeneous = []
@@ -62,6 +105,10 @@ class AvatarSolver(RigidSolver):
         assert isinstance(entity, RigidEntity)
         self._entities.append(entity)
         return entity
+
+    def _init_mass_mat(self):
+        """No-op: avatar entities have no physics so no mass matrix or gravity needed."""
+        pass
 
     def _init_invweight_and_meaninertia(self, envs_idx=None, *, force_update=True):
         """No-op: avatar entities do not need inverse weight computation."""
