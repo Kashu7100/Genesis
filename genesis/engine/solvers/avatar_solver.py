@@ -1,7 +1,6 @@
 from typing import TYPE_CHECKING
 
 import genesis as gs
-from genesis.engine.entities import RigidEntity
 from genesis.engine.entities.avatar_entity import AvatarEntity
 from genesis.engine.states.solvers import AvatarSolverState
 from genesis.options.solvers import RigidOptions
@@ -78,7 +77,6 @@ class AvatarSolver(RigidSolver):
             morph_heterogeneous=morph_heterogeneous,
             name=name,
         )
-        assert isinstance(entity, RigidEntity)
         self._entities.append(entity)
         return entity
 
@@ -105,22 +103,30 @@ class AvatarSolver(RigidSolver):
 
         if gs.use_zerocopy and self.n_envs == 0:
             # Fast path: direct tensor writes, no kernel launch or sanitization.
-            cache = getattr(self, "_zerocopy_cache", None)
-            if cache is None:
+
+            # Cache stable tensor views (created once, never change).
+            if not hasattr(self, "_zerocopy_views"):
                 from genesis.utils.misc import qd_to_torch
 
-                pos_view = qd_to_torch(self.dofs_state.pos, transpose=True, copy=False)
-                qpos_view = qd_to_torch(self._rigid_global_info.qpos, transpose=True, copy=False)
+                self._zerocopy_views = (
+                    qd_to_torch(self.dofs_state.pos, transpose=True, copy=False),
+                    qd_to_torch(self._rigid_global_info.qpos, transpose=True, copy=False),
+                )
+            pos_view, qpos_view = self._zerocopy_views
+
+            # Cache dof index mapping, keyed on dofs_idx so it invalidates when dofs_idx changes.
+            cache_key = tuple(int(x) for x in dofs_idx) if dofs_idx is not None else None
+            dof_cache = getattr(self, "_zerocopy_dof_cache", None)
+            if dof_cache is None or dof_cache[0] != cache_key:
                 dofs_idx_t = (
                     torch.as_tensor(dofs_idx, dtype=torch.long, device=gs.device)
                     if dofs_idx is not None
                     else torch.arange(self.n_dofs, dtype=torch.long, device=gs.device)
                 )
                 qs_idx_t = self._build_dof_to_q_map(dofs_idx_t)
-                cache = (pos_view, qpos_view, dofs_idx_t, qs_idx_t)
-                self._zerocopy_cache = cache
+                self._zerocopy_dof_cache = (cache_key, dofs_idx_t, qs_idx_t)
+            _, dofs_idx_t, qs_idx_t = self._zerocopy_dof_cache
 
-            pos_view, qpos_view, dofs_idx_t, qs_idx_t = cache
             if not isinstance(position, torch.Tensor):
                 position = torch.as_tensor(position, dtype=gs.tc_float, device=gs.device)
             pos_view[0, dofs_idx_t] = position
@@ -205,6 +211,22 @@ class AvatarSolver(RigidSolver):
         for entity in self._entities:
             entity.process_input(in_backward=in_backward)
 
+    def _make_scratch_physics_tensors(self):
+        """Create temporary zero tensors for kernel_get_state/kernel_set_state compatibility.
+
+        The kernels require velocity/acceleration/mass/friction fields, but avatars
+        have no dynamics so these are always zero. Allocated per-call since
+        get_state/set_state are infrequent.
+        """
+        _B = self._B
+        args = {"dtype": gs.tc_float, "requires_grad": False, "scene": self._scene}
+        return (
+            gs.zeros((_B, self.n_dofs), **args),  # dofs_vel
+            gs.zeros((_B, self.n_dofs), **args),  # dofs_acc
+            gs.zeros((_B, self.n_links), **args),  # mass_shift
+            gs.ones((_B, self.n_geoms), **args),  # friction_ratio
+        )
+
     def get_state(self, f=None):
         if self.is_active:
             s_global = self.sim.cur_step_global
@@ -215,15 +237,16 @@ class AvatarSolver(RigidSolver):
 
             from genesis.engine.solvers.rigid.rigid_solver import kernel_get_state
 
+            _vel, _acc, _mass, _friction = self._make_scratch_physics_tensors()
             kernel_get_state(
                 qpos=state.qpos,
-                vel=state.dofs_vel,
-                acc=state.dofs_acc,
+                vel=_vel,
+                acc=_acc,
                 links_pos=state.links_pos,
                 links_quat=state.links_quat,
                 i_pos_shift=state.i_pos_shift,
-                mass_shift=state.mass_shift,
-                friction_ratio=state.friction_ratio,
+                mass_shift=_mass,
+                friction_ratio=_friction,
                 links_state=self.links_state,
                 dofs_state=self.dofs_state,
                 geoms_state=self.geoms_state,
@@ -252,15 +275,16 @@ class AvatarSolver(RigidSolver):
             else:
                 kernel_set_zero(envs_idx, self._errno)
 
+            _vel, _acc, _mass, _friction = self._make_scratch_physics_tensors()
             kernel_set_state(
                 qpos=state.qpos,
-                dofs_vel=state.dofs_vel,
-                dofs_acc=state.dofs_acc,
+                dofs_vel=_vel,
+                dofs_acc=_acc,
                 links_pos=state.links_pos,
                 links_quat=state.links_quat,
                 i_pos_shift=state.i_pos_shift,
-                mass_shift=state.mass_shift,
-                friction_ratio=state.friction_ratio,
+                mass_shift=_mass,
+                friction_ratio=_friction,
                 envs_idx=envs_idx,
                 links_state=self.links_state,
                 dofs_state=self.dofs_state,
