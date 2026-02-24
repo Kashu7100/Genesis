@@ -496,7 +496,7 @@ class IPCCoupler(RBC):
         self._rigid_abd_transforms = {}
 
         # Debug: print all registered entity coupling types
-        gs.logger.info(f"Registered entity coupling types: {self._entity_coupling_types}")
+        gs.logger.debug(f"Registered entity coupling types: {self._entity_coupling_types}")
 
         # Pre-fetch info arrays once (avoid repeated qd_to_numpy in loops).
         # Not batched: batch_*_info is rejected in build().
@@ -606,7 +606,7 @@ class IPCCoupler(RBC):
                             R_link_to_target,
                             t_link_to_target,
                         )
-                        gs.logger.info(
+                        gs.logger.debug(
                             f"Merging link {link_idx} ({self.rigid_solver.links[link_idx].name}) "
                             f"into target link {target_link_idx} ({self.rigid_solver.links[target_link_idx].name}) "
                             f"via fixed joint"
@@ -846,7 +846,7 @@ class IPCCoupler(RBC):
                             for original_link_idx in link_data["original_to_target"].keys():
                                 self._link_to_abd_geo[(i_b, original_link_idx)] = merged_mesh
                                 self._link_to_abd_slot[(i_b, original_link_idx)] = abd_slot
-                                gs.logger.info(
+                                gs.logger.debug(
                                     f"Created ABD slot mapping: link {original_link_idx} -> target link {link_idx} (merged via fixed joint)"
                                 )
 
@@ -877,7 +877,7 @@ class IPCCoupler(RBC):
         """
         self._abd_state_feature = self._ipc_world.features().find(AffineBodyStateAccessorFeature)
         body_count = self._abd_state_feature.body_count()
-        gs.logger.info(f"AffineBodyStateAccessorFeature initialized with {body_count} ABD bodies")
+        gs.logger.debug(f"AffineBodyStateAccessorFeature initialized with {body_count} ABD bodies")
 
         if body_count == 0:
             # No ABD bodies, feature not needed
@@ -909,7 +909,7 @@ class IPCCoupler(RBC):
                 f"This may cause indexing errors in AffineBodyStateAccessorFeature."
             )
         else:
-            gs.logger.info(
+            gs.logger.debug(
                 f"ABD body index mapping created: {len(self._abd_body_idx_to_link)} entries. "
                 f"Optimized state retrieval enabled (O(N) instead of O(M), N={body_count})."
             )
@@ -936,7 +936,7 @@ class IPCCoupler(RBC):
             entity_idx = entity._idx_in_solver
 
             self._entity_coupling_types[entity_idx] = coupling_mode
-            gs.logger.info(f"Rigid entity (solver idx={entity_idx}): coupling mode '{coupling_mode}'")
+            gs.logger.debug(f"Rigid entity (solver idx={entity_idx}): coupling mode '{coupling_mode}'")
 
             # Resolve link filter from material
             link_filter_names = entity.material.coupling_link_filter
@@ -946,7 +946,7 @@ class IPCCoupler(RBC):
                     link = entity.get_link(name=name)
                     target_links.add(link.idx)
                 self._ipc_link_filters[entity_idx] = target_links
-                gs.logger.info(f"Entity {entity_idx}: IPC link filter set to {len(target_links)} link(s)")
+                gs.logger.debug(f"Entity {entity_idx}: IPC link filter set to {len(target_links)} link(s)")
 
             # Resolve collision settings from material
             if not entity.material.enable_coupling_collision:
@@ -961,7 +961,7 @@ class IPCCoupler(RBC):
                     for local_idx in range(entity.n_links):
                         solver_link_idx = local_idx + entity._link_start
                         self._link_collision_settings.setdefault(entity_idx, {})[solver_link_idx] = False
-                gs.logger.info(
+                gs.logger.debug(
                     f"Entity {entity_idx}: IPC collision disabled for "
                     f"{len(self._link_collision_settings.get(entity_idx, {}))} link(s)"
                 )
@@ -1261,9 +1261,9 @@ class IPCCoupler(RBC):
                 # Update ref_dof_prev on all ABD instances
                 for joint_idx, joint in enumerate(art_data.revolute_joints + art_data.prismatic_joints):
                     child_link_idx = joint.link.idx
-                    abd_geo_slot = self._find_abd_geometry_slot_by_link(child_link_idx, env_idx)
 
                     # Check if abd_geo_slot is None before accessing it
+                    abd_geo_slot = self._link_to_abd_slot.get((env_idx, child_link_idx), None)
                     if abd_geo_slot is None:
                         continue
 
@@ -1771,7 +1771,7 @@ class IPCCoupler(RBC):
 
     def reset(self, envs_idx=None):
         """Reset coupling state"""
-        gs.logger.info("Resetting IPC coupler state")
+        gs.logger.debug("Resetting IPC coupler state")
         self._ipc_world.recover(0)
         self._ipc_world.retrieve()
 
@@ -2055,33 +2055,34 @@ class IPCCoupler(RBC):
         parent_link_idx_original = joint.link.parent_idx if joint.link.parent_idx >= 0 else 0
         parent_link_idx = find_target_link_for_fixed_merge(self.rigid_solver, parent_link_idx_original)
 
-        parent_abd_slot = self._find_abd_geometry_slot_by_link(parent_link_idx, env_idx=i_b)
-        child_abd_slot = self._find_abd_geometry_slot_by_link(child_link_idx, env_idx=i_b)
-
-        if parent_abd_slot is None or child_abd_slot is None:
-            raise RuntimeError(
+        try:
+            parent_abd_slot = self._link_to_abd_slot[(i_b, parent_link_idx)]
+            child_abd_slot = self._link_to_abd_slot[(i_b, child_link_idx)]
+        except KeyError as e:
+            gs.raise_exception_from(
                 f"Failed to build external_articulation in multi-env mode: "
                 f"entity {entity_idx}, env {i_b}, joint '{joint.name}', "
-                f"missing ABD slot(s) for parent={parent_link_idx}, child={child_link_idx}."
+                f"missing ABD slot(s) for parent={parent_link_idx}, child={child_link_idx}.",
+                e,
             )
 
         joint_axis_local = joint.dofs_motion_ang[0] if jtype == "revolute" else joint.dofs_motion_vel[0]
         child_link = self.rigid_solver.links[child_link_idx]
         parent_link = self.rigid_solver.links[parent_link_idx]
 
-        gs.logger.info(f"\n--- Processing {jtype} joint: {joint.name} (env {i_b}) ---")
-        gs.logger.info(f"  Parent link: {parent_link_idx} ({parent_link.name})")
-        gs.logger.info(f"  Child link: {child_link_idx} ({child_link.name})")
-        gs.logger.info(f"  Joint axis (joint frame): {joint_axis_local}")
+        gs.logger.debug(f"\n--- Processing {jtype} joint: {joint.name} (env {i_b}) ---")
+        gs.logger.debug(f"  Parent link: {parent_link_idx} ({parent_link.name})")
+        gs.logger.debug(f"  Child link: {child_link_idx} ({child_link.name})")
+        gs.logger.debug(f"  Joint axis (joint frame): {joint_axis_local}")
 
         child_rot_matrix = compute_link_init_world_rotation(self.rigid_solver, child_link_idx)
         joint_axis = child_rot_matrix @ joint_axis_local
 
-        gs.logger.info(f"  Child link rotation matrix:\n{child_rot_matrix}")
-        gs.logger.info(f"  Joint axis (world): {joint_axis}")
+        gs.logger.debug(f"  Child link rotation matrix:\n{child_rot_matrix}")
+        gs.logger.debug(f"  Joint axis (world): {joint_axis}")
 
         joint_pos = joints_xanchor[joint.idx, i_b]
-        gs.logger.info(f"  Joint position (world): {joint_pos}")
+        gs.logger.debug(f"  Joint position (world): {joint_pos}")
 
         v1 = joint_pos - 0.5 * joint_axis
         v2 = joint_pos + 0.5 * joint_axis
@@ -2132,7 +2133,7 @@ class IPCCoupler(RBC):
             has_non_fixed_base = not base_link.is_fixed
             base_link_idx = entity.base_link_idx
 
-            gs.logger.info(
+            gs.logger.debug(
                 f"Adding articulated entity {entity_idx} with {joint_info['n_joints']} joints "
                 f"({len(joint_info['revolute_joints'])} revolute, {len(joint_info['prismatic_joints'])} prismatic)"
             )
@@ -2225,23 +2226,4 @@ class IPCCoupler(RBC):
             if has_non_fixed_base:
                 self._articulation_with_non_fixed_base.append(entity_idx)
 
-            gs.logger.info(f"Successfully added articulated entity {entity_idx} to IPC")
-
-    def _find_abd_geometry_slot_by_link(self, link_idx, env_idx=0):
-        """
-        Find the ABD geometry slot corresponding to a link_idx in the IPC scene.
-
-        Parameters
-        ----------
-        link_idx : int
-            Genesis link index
-        env_idx : int
-            Environment index (default: 0)
-
-        Returns
-        -------
-        GeometrySlot or None
-            The ABD geometry slot if found, None otherwise
-        """
-        # Look up in the mapping created during _add_rigid_geoms_to_ipc
-        return self._link_to_abd_slot.get((env_idx, link_idx), None)
+            gs.logger.debug(f"Successfully added articulated entity {entity_idx} to IPC")
