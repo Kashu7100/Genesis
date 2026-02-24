@@ -385,7 +385,7 @@ class Scene(RBC):
         else:
             morph_for_checks = morph
 
-        if isinstance(material, gs.materials.Rigid):
+        if isinstance(material, (gs.materials.Rigid, gs.materials.Avatar)):
             # small sdf res is sufficient for primitives regardless of size
             if isinstance(morph_for_checks, gs.morphs.Primitive):
                 material._sdf_max_res = 32
@@ -395,7 +395,7 @@ class Scene(RBC):
             surface.smooth = False
 
         if isinstance(morph_for_checks, (gs.morphs.URDF, gs.morphs.MJCF, gs.morphs.USD, gs.morphs.Terrain)):
-            if not isinstance(material, (gs.materials.Rigid, gs.materials.Hybrid)):
+            if not isinstance(material, (gs.materials.Rigid, gs.materials.Avatar, gs.materials.Hybrid)):
                 gs.raise_exception(f"Unsupported material for morph: {material} and {morph_for_checks}.")
 
         if surface.double_sided is None:
@@ -404,7 +404,7 @@ class Scene(RBC):
         if vis_mode is not None:
             surface.vis_mode = vis_mode
         # validate and populate default surface.vis_mode considering morph type
-        if isinstance(material, (gs.materials.Rigid, gs.materials.Tool)):
+        if isinstance(material, (gs.materials.Rigid, gs.materials.Avatar, gs.materials.Tool)):
             if surface.vis_mode is None:
                 surface.vis_mode = "visual"
 
