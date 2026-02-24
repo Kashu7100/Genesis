@@ -1,12 +1,11 @@
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import genesis as gs
 from genesis.engine.entities import RigidEntity
 from genesis.engine.entities.avatar_entity import AvatarEntity
-from genesis.engine.states.solvers import AvatarSolverState, QueriedStates
+from genesis.engine.states.solvers import AvatarSolverState
+from genesis.options.solvers import RigidOptions
 
-from .base_solver import Solver
 from .rigid.rigid_solver import RigidSolver
 
 if TYPE_CHECKING:
@@ -25,49 +24,25 @@ class AvatarSolver(RigidSolver):
     """
 
     def __init__(self, scene: "Scene", sim: "Simulator", options: "AvatarOptions") -> None:
-        # Skip RigidSolver.__init__ — it reads many physics options that don't apply here.
-        Solver.__init__(self, scene, sim, options)
-
-        # Hardcode all physics-related attributes that RigidSolver.__init__ would read from options.
-        self._enable_collision = False
-        self._enable_multi_contact = False
-        self._enable_mujoco_compatibility = False
-        self._enable_joint_limit = False
-        self._enable_self_collision = False
-        self._enable_neutral_collision = False
-        self._enable_adjacent_collision = False
-        self._disable_constraint = True
-        self._max_collision_pairs = 0
-        self._integrator = gs.integrator.approximate_implicitfast
-        self._box_box_detection = False
-        self._requires_grad = False
-        self._enable_heterogeneous = False
-        self._use_contact_island = False
-        self._use_hibernation = False
-        self._hibernation_thresh_vel = 0.0
-        self._hibernation_thresh_acc = 0.0
-        self._sol_min_timeconst = 0.0
-        self._sol_default_timeconst = 0.0
-
-        # Lightweight namespace for fields that build() reads from self._options.
-        self._options = SimpleNamespace(
-            max_dynamic_constraints=0,
-            batch_links_info=False,
-            batch_dofs_info=False,
-            batch_joints_info=False,
-            sparse_solve=False,
-            constraint_solver=gs.constraint_solver.Newton,
+        # Build a full RigidOptions with physics disabled so all RigidSolver infrastructure works.
+        internal_options = RigidOptions(
+            dt=options.dt,
+            enable_collision=False,
+            enable_joint_limit=False,
+            enable_self_collision=False,
+            enable_neutral_collision=False,
+            enable_adjacent_collision=False,
+            disable_constraint=True,
+            max_collision_pairs=0,
+            enable_multi_contact=False,
+            enable_mujoco_compatibility=False,
+            use_contact_island=False,
             use_hibernation=False,
+            max_dynamic_constraints=0,
+            iterations=0,
         )
-
-        self.collider = None
-        self.constraint_solver = None
-        self.qpos = None
-        self._is_backward = False
-        self._is_forward_pos_updated = False
-        self._is_forward_vel_updated = False
-        self._queried_states = QueriedStates()
-        self._ckpt = dict()
+        super().__init__(scene, sim, internal_options)
+        self._enable_collision = False
 
     def add_entity(self, idx, material, morph, surface, visualize_contact=False, name=None):
         morph_heterogeneous = []
@@ -121,6 +96,56 @@ class AvatarSolver(RigidSolver):
     def _init_constraint_solver(self):
         """No-op: avatar entities do not need constraint solving."""
         self.constraint_solver = None
+
+    def set_dofs_position(self, position, dofs_idx=None, envs_idx=None):
+        from genesis.utils.misc import qd_to_torch
+        from genesis.engine.solvers.rigid.rigid_solver import (
+            kernel_set_dofs_position,
+            kernel_set_zero,
+            kernel_forward_kinematics_links_geoms,
+        )
+
+        position, dofs_idx, envs_idx = self._sanitize_io_variables(
+            position, dofs_idx, self.n_dofs, "dofs_idx", envs_idx, skip_allocation=True
+        )
+        if self.n_envs == 0:
+            position = position[None]
+        kernel_set_dofs_position(
+            position,
+            dofs_idx,
+            envs_idx,
+            self.dofs_state,
+            self.links_info,
+            self.joints_info,
+            self.entities_info,
+            self._rigid_global_info,
+            self._static_rigid_sim_config,
+        )
+
+        if gs.use_zerocopy:
+            errno = qd_to_torch(self._errno, copy=False)
+            errno[envs_idx] = 0
+        else:
+            kernel_set_zero(envs_idx, self._errno)
+
+        # Skip collider.reset() and constraint_solver.reset() — avatar has neither.
+
+        kernel_forward_kinematics_links_geoms(
+            envs_idx,
+            links_state=self.links_state,
+            links_info=self.links_info,
+            joints_state=self.joints_state,
+            joints_info=self.joints_info,
+            dofs_state=self.dofs_state,
+            dofs_info=self.dofs_info,
+            geoms_state=self.geoms_state,
+            geoms_info=self.geoms_info,
+            entities_info=self.entities_info,
+            rigid_global_info=self._rigid_global_info,
+            static_rigid_sim_config=self._static_rigid_sim_config,
+        )
+        self._is_forward_pos_updated = True
+        self._is_forward_vel_updated = True
 
     def substep(self, f):
         """No-op: avatar entities are not simulated."""
