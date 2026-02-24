@@ -84,6 +84,46 @@ class RigidSolverState:
         return self._s_global
 
 
+class AvatarSolverState:
+    """
+    Dynamic state queried from an AvatarSolver.
+    """
+
+    def __init__(self, scene, s_global):
+        self.scene = scene
+        self._s_global = s_global
+
+        _B = scene.sim.avatar_solver._B
+        args = {
+            "dtype": gs.tc_float,
+            "requires_grad": scene.requires_grad,
+            "scene": self.scene,
+        }
+        self.qpos = gs.zeros((_B, scene.sim.avatar_solver.n_qs), **args)
+        self.dofs_vel = gs.zeros((_B, scene.sim.avatar_solver.n_dofs), **args)
+        self.dofs_acc = gs.zeros((_B, scene.sim.avatar_solver.n_dofs), **args)
+        self.links_pos = gs.zeros((_B, scene.sim.avatar_solver.n_links, 3), **args)
+        self.links_quat = gs.zeros((_B, scene.sim.avatar_solver.n_links, 4), **args)
+        self.i_pos_shift = gs.zeros((_B, scene.sim.avatar_solver.n_links, 3), **args)
+        self.mass_shift = gs.zeros((_B, scene.sim.avatar_solver.n_links), **args)
+        self.friction_ratio = gs.ones((_B, scene.sim.avatar_solver.n_geoms), **args)
+
+    def serializable(self):
+        self.scene = None
+        self.qpos = self.qpos.detach()
+        self.dofs_vel = self.dofs_vel.detach()
+        self.dofs_acc = self.dofs_acc.detach()
+        self.links_pos = self.links_pos.detach()
+        self.links_quat = self.links_quat.detach()
+        self.i_pos_shift = self.i_pos_shift.detach()
+        self.mass_shift = self.mass_shift.detach()
+        self.friction_ratio = self.friction_ratio.detach()
+
+    @property
+    def s_global(self):
+        return self._s_global
+
+
 class ToolSolverState:
     """
     Dynamic state queried from a RigidSolver.

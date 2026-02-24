@@ -120,6 +120,10 @@ class RigidEntity(Entity):
     # override typing
     _solver: "RigidSolver"
 
+    # Subclasses can override these to use custom Joint/Link classes
+    _JointClass = RigidJoint
+    _LinkClass = RigidLink
+
     def __init__(
         self,
         scene: "Scene",
@@ -935,7 +939,7 @@ class RigidEntity(Entity):
                 else:
                     assert False
 
-            joint = RigidJoint(
+            joint = self._JointClass(
                 entity=self,
                 name=j_info["name"],
                 idx=joint_start + i_j_,
@@ -964,7 +968,7 @@ class RigidEntity(Entity):
             joints.append(joint)
 
         # Add child link
-        link = RigidLink(
+        link = self._LinkClass(
             entity=self,
             name=l_info["name"],
             idx=link_idx,
