@@ -162,7 +162,6 @@ class RasterizerContext:
 
         self.on_tool()
         self.on_rigid()
-        self.on_avatar()
         self.on_mpm()
         self.on_sph()
         self.on_pbd()
@@ -381,16 +380,23 @@ class RasterizerContext:
             dtype=np.float32,
         )
 
-    def on_rigid(self):
+    def _rigid_solvers(self):
+        """Yield active solvers that manage KinematicEntity-based entities (rigid + avatar)."""
         if self.sim.rigid_solver.is_active:
+            yield self.sim.rigid_solver
+        if self.sim.avatar_solver.is_active:
+            yield self.sim.avatar_solver
+
+    def on_rigid(self):
+        for solver in self._rigid_solvers():
             # TODO: support dynamic switching in GUI later
-            for rigid_entity in self.sim.rigid_solver.entities:
-                if rigid_entity.surface.vis_mode == "visual":
-                    geoms = rigid_entity.vgeoms
-                    geoms_T = self.sim.rigid_solver._vgeoms_render_T
+            for entity in solver.entities:
+                if entity.surface.vis_mode == "visual":
+                    geoms = entity.vgeoms
+                    geoms_T = solver._vgeoms_render_T
                 else:
-                    geoms = rigid_entity.geoms
-                    geoms_T = self.sim.rigid_solver._geoms_render_T
+                    geoms = entity.geoms
+                    geoms_T = solver._geoms_render_T
 
                 for geom in geoms:
                     # For heterogeneous simulation, filter envs based on geom's assigned environments
@@ -398,7 +404,7 @@ class RasterizerContext:
                     if len(geom_envs_idx) == 0:
                         continue
 
-                    if "sdf" in rigid_entity.surface.vis_mode:
+                    if "sdf" in entity.surface.vis_mode:
                         mesh = geom.get_sdf_trimesh()
                     else:
                         mesh = geom.get_trimesh()
@@ -408,26 +414,26 @@ class RasterizerContext:
                         pyrender.Mesh.from_trimesh(
                             mesh=mesh,
                             poses=geom_T,
-                            smooth=geom.surface.smooth if "collision" not in rigid_entity.surface.vis_mode else False,
+                            smooth=geom.surface.smooth if "collision" not in entity.surface.vis_mode else False,
                             double_sided=(
-                                geom.surface.double_sided if "collision" not in rigid_entity.surface.vis_mode else False
+                                geom.surface.double_sided if "collision" not in entity.surface.vis_mode else False
                             ),
-                            is_floor=isinstance(rigid_entity._morph, gs.morphs.Plane),
+                            is_floor=isinstance(entity._morph, gs.morphs.Plane),
                             env_shared=not self.env_separate_rigid,
                         ),
                     )
-                    if isinstance(rigid_entity._morph, gs.morphs.Plane):
+                    if isinstance(entity._morph, gs.morphs.Plane):
                         self.set_reflection_mat(geom_T)
 
     def update_rigid(self, buffer_updates):
-        if self.sim.rigid_solver.is_active:
-            for rigid_entity in self.sim.rigid_solver.entities:
-                if rigid_entity.surface.vis_mode == "visual":
-                    geoms = rigid_entity.vgeoms
-                    geoms_T = self.sim.rigid_solver._vgeoms_render_T
+        for solver in self._rigid_solvers():
+            for entity in solver.entities:
+                if entity.surface.vis_mode == "visual":
+                    geoms = entity.vgeoms
+                    geoms_T = solver._vgeoms_render_T
                 else:
-                    geoms = rigid_entity.geoms
-                    geoms_T = self.sim.rigid_solver._geoms_render_T
+                    geoms = entity.geoms
+                    geoms_T = solver._geoms_render_T
 
                 for geom in geoms:
                     # Skip geoms that weren't added - in heterogeneous simulation, some geoms
@@ -445,68 +451,8 @@ class RasterizerContext:
                     node.mesh._bounds = None
                     node.mesh.primitives[0].poses = geom_T
                     buffer_updates[self._scene.get_buffer_id(node, "model")] = geom_T.transpose((0, 2, 1))
-                    if isinstance(rigid_entity._morph, gs.morphs.Plane):
+                    if isinstance(entity._morph, gs.morphs.Plane):
                         self.set_reflection_mat(geom_T)
-
-    def on_avatar(self):
-        if self.sim.avatar_solver.is_active:
-            for avatar_entity in self.sim.avatar_solver.entities:
-                if avatar_entity.surface.vis_mode == "visual":
-                    geoms = avatar_entity.vgeoms
-                    geoms_T = self.sim.avatar_solver._vgeoms_render_T
-                else:
-                    geoms = avatar_entity.geoms
-                    geoms_T = self.sim.avatar_solver._geoms_render_T
-
-                for geom in geoms:
-                    geom_envs_idx = self._get_geom_active_envs_idx(geom, self.rendered_envs_idx)
-                    if len(geom_envs_idx) == 0:
-                        continue
-
-                    if "sdf" in avatar_entity.surface.vis_mode:
-                        mesh = geom.get_sdf_trimesh()
-                    else:
-                        mesh = geom.get_trimesh()
-                    geom_T = geoms_T[geom.idx][geom_envs_idx]
-                    self.add_rigid_node(
-                        geom,
-                        pyrender.Mesh.from_trimesh(
-                            mesh=mesh,
-                            poses=geom_T,
-                            smooth=geom.surface.smooth if "collision" not in avatar_entity.surface.vis_mode else False,
-                            double_sided=(
-                                geom.surface.double_sided
-                                if "collision" not in avatar_entity.surface.vis_mode
-                                else False
-                            ),
-                            is_floor=False,
-                            env_shared=not self.env_separate_rigid,
-                        ),
-                    )
-
-    def update_avatar(self, buffer_updates):
-        if self.sim.avatar_solver.is_active:
-            for avatar_entity in self.sim.avatar_solver.entities:
-                if avatar_entity.surface.vis_mode == "visual":
-                    geoms = avatar_entity.vgeoms
-                    geoms_T = self.sim.avatar_solver._vgeoms_render_T
-                else:
-                    geoms = avatar_entity.geoms
-                    geoms_T = self.sim.avatar_solver._geoms_render_T
-
-                for geom in geoms:
-                    if geom.uid not in self.rigid_nodes:
-                        continue
-
-                    geom_envs_idx = self._get_geom_active_envs_idx(geom, self.rendered_envs_idx)
-                    if len(geom_envs_idx) == 0:
-                        continue
-
-                    geom_T = geoms_T[geom.idx][geom_envs_idx]
-                    node = self.rigid_nodes[geom.uid]
-                    node.mesh._bounds = None
-                    node.mesh.primitives[0].poses = geom_T
-                    buffer_updates[self._scene.get_buffer_id(node, "model")] = geom_T.transpose((0, 2, 1))
 
     def update_contact(self, buffer_updates):
         if self.sim.rigid_solver.is_active and any(link.visualize_contact for link in self.sim.rigid_solver.links):
@@ -1058,7 +1004,6 @@ class RasterizerContext:
         self.update_link_frame(self.buffer)
         self.update_tool(self.buffer)
         self.update_rigid(self.buffer)
-        self.update_avatar(self.buffer)
         self.update_contact(self.buffer)
         self.update_mpm(self.buffer)
         self.update_sph(self.buffer)
