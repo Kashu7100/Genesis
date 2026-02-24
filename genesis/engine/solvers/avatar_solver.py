@@ -43,6 +43,7 @@ class AvatarSolver(RigidSolver):
         )
         super().__init__(scene, sim, internal_options)
         self._enable_collision = False
+        self._fk_dirty = False
 
     def add_entity(self, idx, material, morph, surface, visualize_contact=False, name=None):
         morph_heterogeneous = []
@@ -98,38 +99,71 @@ class AvatarSolver(RigidSolver):
         self.constraint_solver = None
 
     def set_dofs_position(self, position, dofs_idx=None, envs_idx=None):
-        from genesis.utils.misc import qd_to_torch
-        from genesis.engine.solvers.rigid.rigid_solver import (
-            kernel_set_dofs_position,
-            kernel_set_zero,
-            kernel_forward_kinematics_links_geoms,
-        )
+        """Write joint positions. FK is deferred to update_visual_states."""
+        import torch
+        from genesis.engine.solvers.rigid.rigid_solver import kernel_set_dofs_position
 
-        position, dofs_idx, envs_idx = self._sanitize_io_variables(
-            position, dofs_idx, self.n_dofs, "dofs_idx", envs_idx, skip_allocation=True
-        )
-        if self.n_envs == 0:
-            position = position[None]
-        kernel_set_dofs_position(
-            position,
-            dofs_idx,
-            envs_idx,
-            self.dofs_state,
-            self.links_info,
-            self.joints_info,
-            self.entities_info,
-            self._rigid_global_info,
-            self._static_rigid_sim_config,
-        )
+        if gs.use_zerocopy and self.n_envs == 0:
+            # Fast path: direct tensor writes, no kernel launch or sanitization.
+            cache = getattr(self, "_zerocopy_cache", None)
+            if cache is None:
+                from genesis.utils.misc import qd_to_torch
 
-        if gs.use_zerocopy:
-            errno = qd_to_torch(self._errno, copy=False)
-            errno[envs_idx] = 0
+                pos_view = qd_to_torch(self.dofs_state.pos, transpose=True, copy=False)
+                qpos_view = qd_to_torch(self._rigid_global_info.qpos, transpose=True, copy=False)
+                dofs_idx_t = (
+                    torch.as_tensor(dofs_idx, dtype=torch.long, device=gs.device)
+                    if dofs_idx is not None
+                    else torch.arange(self.n_dofs, dtype=torch.long, device=gs.device)
+                )
+                qs_idx_t = self._build_dof_to_q_map(dofs_idx_t)
+                cache = (pos_view, qpos_view, dofs_idx_t, qs_idx_t)
+                self._zerocopy_cache = cache
+
+            pos_view, qpos_view, dofs_idx_t, qs_idx_t = cache
+            if not isinstance(position, torch.Tensor):
+                position = torch.as_tensor(position, dtype=gs.tc_float, device=gs.device)
+            pos_view[0, dofs_idx_t] = position
+            qpos_view[0, qs_idx_t] = position
         else:
-            kernel_set_zero(envs_idx, self._errno)
+            position, dofs_idx, envs_idx = self._sanitize_io_variables(
+                position, dofs_idx, self.n_dofs, "dofs_idx", envs_idx, skip_allocation=True
+            )
+            if self.n_envs == 0:
+                position = position[None]
+            kernel_set_dofs_position(
+                position,
+                dofs_idx,
+                envs_idx,
+                self.dofs_state,
+                self.links_info,
+                self.joints_info,
+                self.entities_info,
+                self._rigid_global_info,
+                self._static_rigid_sim_config,
+            )
+        self._fk_dirty = True
 
-        # Skip collider.reset() and constraint_solver.reset() — avatar has neither.
+    def _build_dof_to_q_map(self, dofs_idx_t):
+        """Build a mapping from DOF indices to qpos indices for revolute/prismatic joints."""
+        import torch
 
+        dof_to_q = torch.zeros(self.n_dofs, dtype=torch.long, device=gs.device)
+        for entity in self._entities:
+            for joint in entity.joints:
+                if joint.n_dofs == 0:
+                    continue
+                for i in range(joint.n_dofs):
+                    dof_to_q[joint.dof_start - entity.dof_start + i] = joint.q_start - entity.q_start + i
+        return dof_to_q[dofs_idx_t]
+
+    def forward_kinematics(self):
+        """Run FK to update link/geom poses from current qpos. Called by the visualizer."""
+        if not self._fk_dirty:
+            return
+        from genesis.engine.solvers.rigid.rigid_solver import kernel_forward_kinematics_links_geoms
+
+        envs_idx = self._scene._sanitize_envs_idx(None)
         kernel_forward_kinematics_links_geoms(
             envs_idx,
             links_state=self.links_state,
@@ -144,8 +178,7 @@ class AvatarSolver(RigidSolver):
             rigid_global_info=self._rigid_global_info,
             static_rigid_sim_config=self._static_rigid_sim_config,
         )
-        self._is_forward_pos_updated = True
-        self._is_forward_vel_updated = True
+        self._fk_dirty = False
 
     def substep(self, f):
         """No-op: avatar entities are not simulated."""
