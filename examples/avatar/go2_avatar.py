@@ -12,6 +12,7 @@ import argparse
 import math
 
 import numpy as np
+import torch
 
 import genesis as gs
 
@@ -53,7 +54,7 @@ def main():
     scene.build()
 
     # ── Default standing pose (joint angles only, 12 DOFs) ───────────
-    joint_angles = np.array(
+    joint_angles = torch.tensor(
         [
             0.0,
             0.8,
@@ -68,7 +69,8 @@ def main():
             1.0,
             -1.5,  # RL
         ],
-        dtype=np.float32,
+        dtype=torch.float32,
+        device=gs.device,
     )
 
     # Get joint DOF indices (skip the 6 base DOFs of the free joint)
@@ -101,7 +103,7 @@ def main():
         phase = 2.0 * math.pi * freq * t
         offset = amplitude * math.sin(phase)
 
-        ref_angles = joint_angles.copy()
+        ref_angles = joint_angles.clone()
         # Oscillate thigh joints (indices 1, 4, 7, 10)
         ref_angles[1] += offset
         ref_angles[4] += offset
