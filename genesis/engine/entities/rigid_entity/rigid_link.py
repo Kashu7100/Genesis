@@ -31,6 +31,9 @@ class RigidLink(RBC):
     multiple RigidGeoms (`link.geoms`, for collision) and RigidVisGeoms (`link.vgeoms` for visualization).
     """
 
+    # Subclasses can override to use a custom Geom class
+    _GeomClass = RigidGeom
+
     def __init__(
         self,
         entity: "RigidEntity",
@@ -313,7 +316,7 @@ class RigidLink(RBC):
         conaffinity=1,
         data=None,
     ):
-        geom = RigidGeom(
+        geom = self._GeomClass(
             link=self,
             idx=self.n_geoms + self._geom_start,
             cell_start=self.n_cells + self._cell_start,

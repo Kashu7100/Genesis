@@ -1,4 +1,4 @@
-from genesis.engine.entities.rigid_entity.rigid_geom import RigidGeom, RigidVisGeom
+from genesis.engine.entities.rigid_entity.rigid_geom import RigidGeom
 
 
 class AvatarGeom(RigidGeom):
@@ -14,9 +14,3 @@ class AvatarGeom(RigidGeom):
         kwargs["conaffinity"] = 0
         kwargs["needs_coup"] = False
         super().__init__(**kwargs)
-
-
-class AvatarVisGeom(RigidVisGeom):
-    """Visual geometry for avatar entities. Pass-through subclass of RigidVisGeom."""
-
-    pass

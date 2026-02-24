@@ -87,6 +87,9 @@ class RigidSolverState:
 class AvatarSolverState:
     """
     Dynamic state queried from an AvatarSolver.
+
+    Only stores position-related fields (qpos, link poses). Physics fields
+    (velocity, acceleration, mass, friction) are omitted since avatars have no dynamics.
     """
 
     def __init__(self, scene, s_global):
@@ -100,24 +103,16 @@ class AvatarSolverState:
             "scene": self.scene,
         }
         self.qpos = gs.zeros((_B, scene.sim.avatar_solver.n_qs), **args)
-        self.dofs_vel = gs.zeros((_B, scene.sim.avatar_solver.n_dofs), **args)
-        self.dofs_acc = gs.zeros((_B, scene.sim.avatar_solver.n_dofs), **args)
         self.links_pos = gs.zeros((_B, scene.sim.avatar_solver.n_links, 3), **args)
         self.links_quat = gs.zeros((_B, scene.sim.avatar_solver.n_links, 4), **args)
         self.i_pos_shift = gs.zeros((_B, scene.sim.avatar_solver.n_links, 3), **args)
-        self.mass_shift = gs.zeros((_B, scene.sim.avatar_solver.n_links), **args)
-        self.friction_ratio = gs.ones((_B, scene.sim.avatar_solver.n_geoms), **args)
 
     def serializable(self):
         self.scene = None
         self.qpos = self.qpos.detach()
-        self.dofs_vel = self.dofs_vel.detach()
-        self.dofs_acc = self.dofs_acc.detach()
         self.links_pos = self.links_pos.detach()
         self.links_quat = self.links_quat.detach()
         self.i_pos_shift = self.i_pos_shift.detach()
-        self.mass_shift = self.mass_shift.detach()
-        self.friction_ratio = self.friction_ratio.detach()
 
     @property
     def s_global(self):
