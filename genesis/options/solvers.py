@@ -343,6 +343,69 @@ Parameters in these solver-specific options will override SimOptions if availabl
 """
 
 
+class AvatarOptions(Options):
+    """
+    Options configuring the AvatarSolver (visualization-only solver).
+
+    AvatarSolver is a lightweight solver for ghost/reference entities that only computes
+    forward kinematics for visualization. No collision, physics integration, or constraint
+    solving is performed.
+
+    Parameters
+    ----------
+    dt : float, optional
+        Time duration for each simulation step in seconds. If none, it will inherit from `SimOptions`. Defaults to None.
+    gravity : tuple, optional
+        Gravity force in N/kg. If none, it will inherit from `SimOptions`. Defaults to None.
+    IK_max_targets : int, optional
+        Maximum number of IK targets. Defaults to 6.
+    max_dynamic_constraints : int, optional
+        Maximum number of dynamic constraints. Defaults to 0.
+    """
+
+    dt: Optional[float] = None
+    gravity: Optional[tuple] = None
+    IK_max_targets: int = 6
+    max_dynamic_constraints: int = 0
+
+    # Avatar solver always disables these features
+    enable_collision: bool = False
+    enable_joint_limit: bool = False
+    enable_self_collision: bool = False
+    enable_neutral_collision: bool = False
+    enable_adjacent_collision: bool = False
+    disable_constraint: bool = True
+    max_collision_pairs: int = 0
+    multiplier_collision_broad_phase: int = 1
+    integrator: gs.integrator = gs.integrator.approximate_implicitfast
+    constraint_solver: gs.constraint_solver = gs.constraint_solver.Newton
+    iterations: int = 0
+    tolerance: float = 1e-6
+    ls_iterations: int = 0
+    ls_tolerance: float = 1e-2
+    noslip_iterations: int = 0
+    noslip_tolerance: float = 1e-6
+    sparse_solve: bool = False
+    contact_resolve_time: Optional[float] = None
+    constraint_timeconst: float = 0.01
+    use_contact_island: bool = False
+    box_box_detection: bool = False
+    use_hibernation: bool = False
+    hibernation_thresh_vel: float = 1e-3
+    hibernation_thresh_acc: float = 1e-2
+    enable_multi_contact: bool = False
+    enable_mujoco_compatibility: bool = False
+    use_gjk_collision: Optional[bool] = False
+
+    # batching info
+    batch_links_info: Optional[bool] = False
+    batch_joints_info: Optional[bool] = False
+    batch_dofs_info: Optional[bool] = False
+
+    def __init__(self, **data):
+        super().__init__(**data)
+
+
 class ToolOptions(Options):
     """
     Options configuring the ToolSolver.

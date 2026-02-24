@@ -284,6 +284,27 @@ class Raytracer:
                         uvs=np.array([]) if geom.uvs is None else geom.uvs,
                     )
 
+        # avatar entities
+        if self.sim.avatar_solver.is_active:
+            for avatar_entity in self.sim.avatar_solver.entities:
+                if avatar_entity.surface.vis_mode == "visual":
+                    geoms = avatar_entity.vgeoms
+                else:
+                    geoms = avatar_entity.geoms
+
+                for geom in geoms:
+                    if "sdf" in avatar_entity.surface.vis_mode:
+                        mesh = geom.get_sdf_trimesh()
+                    else:
+                        mesh = geom.get_trimesh()
+                    self.add_rigid_batch(
+                        name=str(geom.uid),
+                        vertices=mesh.vertices,
+                        triangles=mesh.faces,
+                        normals=mesh.vertex_normals,
+                        uvs=np.array([]) if geom.uvs is None else geom.uvs,
+                    )
+
         # MPM particles
         if self.sim.mpm_solver.is_active:
             for mpm_entity in self.sim.mpm_solver.entities:
@@ -665,6 +686,20 @@ class Raytracer:
 
                 for geom in geoms:
                     geom_T = geoms_T[geom.idx]  # TODO: support batching
+                    self.update_rigid_batch(str(geom.uid), geom_T)
+
+        # avatar entities
+        if self.sim.avatar_solver.is_active:
+            for avatar_entity in self.sim.avatar_solver.entities:
+                if avatar_entity.surface.vis_mode == "visual":
+                    geoms = avatar_entity.vgeoms
+                    geoms_T = self.sim.avatar_solver._vgeoms_render_T
+                else:
+                    geoms = avatar_entity.geoms
+                    geoms_T = self.sim.avatar_solver._geoms_render_T
+
+                for geom in geoms:
+                    geom_T = geoms_T[geom.idx]
                     self.update_rigid_batch(str(geom.uid), geom_T)
 
         # MPM particles

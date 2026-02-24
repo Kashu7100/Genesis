@@ -5,6 +5,7 @@ import numpy as np
 import genesis as gs
 from genesis.options.morphs import Morph
 from genesis.options.solvers import (
+    AvatarOptions,
     BaseCouplerOptions,
     IPCCouplerOptions,
     LegacyCouplerOptions,
@@ -22,6 +23,7 @@ from genesis.repr_base import RBC
 
 from .entities import HybridEntity
 from .solvers import (
+    AvatarSolver,
     FEMSolver,
     MPMSolver,
     PBDSolver,
@@ -80,6 +82,7 @@ class Simulator(RBC):
         coupler_options: BaseCouplerOptions,
         tool_options: ToolOptions,
         rigid_options: RigidOptions,
+        avatar_options: AvatarOptions,
         mpm_options: MPMOptions,
         sph_options: SPHOptions,
         fem_options: FEMOptions,
@@ -93,6 +96,7 @@ class Simulator(RBC):
         self.coupler_options = coupler_options
         self.tool_options = tool_options
         self.rigid_options = rigid_options
+        self.avatar_options = avatar_options
         self.mpm_options = mpm_options
         self.sph_options = sph_options
         self.fem_options = fem_options
@@ -112,6 +116,7 @@ class Simulator(RBC):
         # solvers
         self.tool_solver = ToolSolver(self.scene, self, self.tool_options)
         self.rigid_solver = RigidSolver(self.scene, self, self.rigid_options)
+        self.avatar_solver = AvatarSolver(self.scene, self, self.avatar_options)
         self.mpm_solver = MPMSolver(self.scene, self, self.mpm_options)
         self.sph_solver = SPHSolver(self.scene, self, self.sph_options)
         self.pbd_solver = PBDSolver(self.scene, self, self.pbd_options)
@@ -122,6 +127,7 @@ class Simulator(RBC):
             [
                 self.tool_solver,
                 self.rigid_solver,
+                self.avatar_solver,
                 self.mpm_solver,
                 self.sph_solver,
                 self.pbd_solver,
@@ -156,6 +162,10 @@ class Simulator(RBC):
     def _add_entity(self, morph: Morph, material, surface, visualize_contact=False, name: str | None = None):
         if isinstance(material, gs.materials.Tool):
             entity = self.tool_solver.add_entity(self.n_entities, material, morph, surface, name=name)
+        elif isinstance(material, gs.materials.Avatar):
+            entity = self.avatar_solver.add_entity(
+                self.n_entities, material, morph, surface, visualize_contact=False, name=name
+            )
         elif isinstance(material, gs.materials.Rigid):
             entity = self.rigid_solver.add_entity(
                 self.n_entities, material, morph, surface, visualize_contact, name=name
@@ -193,7 +203,7 @@ class Simulator(RBC):
             solver.build()
             if solver.is_active:
                 self._active_solvers.append(solver)
-                if not isinstance(solver, RigidSolver):
+                if not isinstance(solver, (RigidSolver, AvatarSolver)):
                     self._rigid_only = False
         self._coupler.build()
 
