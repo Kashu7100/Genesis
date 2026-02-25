@@ -193,8 +193,7 @@ def test_joints(n_envs, coupling_type, joint_type, fixed, show_viewer):
     assert moving_link_idx in ipc_links_idx
     assert (0, moving_link_idx) in scene.sim.coupler._link_to_abd_slot
     if coupling_type == "two_way_soft_constraint":
-        assert moving_link_idx in scene.sim.coupler.abd_data_by_link
-        assert not any(env_data is None for env_data in scene.sim.coupler.abd_data_by_link[moving_link_idx])
+        assert (moving_link_idx, 0) in scene.sim.coupler.abd_data_by_link
     elif coupling_type == "external_articulation":
         entity_idx = scene.sim.rigid_solver.entities.index(robot)
         art_data = scene.sim.coupler._articulated_entities[entity_idx]
@@ -228,7 +227,7 @@ def test_joints(n_envs, coupling_type, joint_type, fixed, show_viewer):
 
         if coupling_type == "two_way_soft_constraint" or not fixed:
             for env_idx in envs_idx:
-                abd_data = scene.sim.coupler.abd_data_by_link[moving_link_idx][env_idx]
+                abd_data = scene.sim.coupler.abd_data_by_link[(moving_link_idx, env_idx)]
                 gs_transform, ipc_transform = abd_data.aim_transform, abd_data.transform
                 # FIXME: Why the tolerance is must so large if no fixed ?!
                 assert_allclose(gs_transform[:3, 3], ipc_transform[:3, 3], atol=TOL_SINGLE if fixed else 0.2)
@@ -674,7 +673,8 @@ def test_robot_grasp_fem(coupling_type, show_viewer):
 
 @pytest.mark.required
 @pytest.mark.parametrize("n_envs", [0, 2])
-def test_momentum_conversation(n_envs, show_viewer):
+@pytest.mark.parametrize("enable_contact_proxy", [False, True])
+def test_momentum_conversation(n_envs, enable_contact_proxy, show_viewer):
     DT = 0.001
     DURATION = 0.30
     CONTACT_MARGIN = 0.01
@@ -689,6 +689,7 @@ def test_momentum_conversation(n_envs, show_viewer):
             contact_d_hat=CONTACT_MARGIN,
             constraint_strength_translation=1,
             constraint_strength_rotation=1,
+            enable_contact_proxy=enable_contact_proxy,
         ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(0.5, 1.3, 0.6),

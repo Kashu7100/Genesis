@@ -282,50 +282,28 @@ def read_ipc_geometry_metadata(geo):
     """
     Read solver_type, env_idx, and entity/link index from IPC geometry metadata.
 
-    Parameters
-    ----------
-    geo : Geometry
-        An IPC geometry with meta attributes
-
-    Returns
-    -------
-    tuple or None
-        (solver_type, env_idx, idx) where idx is entity_idx for fem/cloth
-        or link_idx for rigid. Returns None if metadata is missing/invalid.
+    Returns (solver_type, env_idx, idx) where idx is entity_idx for fem/cloth
+    or link_idx for rigid. Returns None if the geometry has no solver_type
+    metadata (i.e. not a Genesis-created geometry).
     """
-    try:
-        meta_attrs = geo.meta()
-        solver_type_attr = meta_attrs.find("solver_type")
-
-        if not solver_type_attr or solver_type_attr.name() != "solver_type":
-            return None
-
-        solver_type_view = solver_type_attr.view()
-        if len(solver_type_view) == 0:
-            return None
-        solver_type = str(solver_type_view[0])
-
-        env_idx_attr = meta_attrs.find("env_idx")
-        if not env_idx_attr:
-            return None
-        env_idx = int(str(env_idx_attr.view()[0]))
-
-        if solver_type == "rigid":
-            link_idx_attr = meta_attrs.find("link_idx")
-            if not link_idx_attr:
-                return None
-            idx = int(str(link_idx_attr.view()[0]))
-        elif solver_type in ("fem", "cloth"):
-            entity_idx_attr = meta_attrs.find("entity_idx")
-            if not entity_idx_attr:
-                return None
-            idx = int(str(entity_idx_attr.view()[0]))
-        else:
-            return None
-
-        return (solver_type, env_idx, idx)
-    except Exception:
+    meta_attrs = geo.meta()
+    solver_type_attr = meta_attrs.find("solver_type")
+    if solver_type_attr is None:
         return None
+
+    (solver_type,) = solver_type_attr.view()
+    solver_type = str(solver_type)
+
+    (env_idx,) = map(int, meta_attrs.find("env_idx").view())
+
+    if solver_type == "rigid":
+        (idx,) = map(int, meta_attrs.find("link_idx").view())
+    elif solver_type in ("fem", "cloth"):
+        (idx,) = map(int, meta_attrs.find("entity_idx").view())
+    else:
+        gs.raise_exception(f"Unknown IPC geometry solver_type: {solver_type!r}")
+
+    return (solver_type, env_idx, idx)
 
 
 # ============================================================
@@ -458,42 +436,40 @@ def compute_coupling_forces(
     return out_forces, out_torques
 
 
-def compute_link_contact_forces(
-    force_gradients,
-    link_indices,
-    env_indices,
-    vert_positions,
-    link_centers,
-    max_links,
-    max_envs,
+def compute_links_contact_wrench(
+    forces_grad,
+    links_idx,
+    envs_idx,
+    verts_pos,
+    links_center,
 ):
     """
     Compute contact forces and torques for rigid links from vertex gradients.
-    Uses np.add.at for accumulation (equivalent to atomic add).
 
     Parameters
     ----------
-    force_gradients : np.ndarray, shape (n, 3)
-    link_indices : np.ndarray, shape (n,), int
-    env_indices : np.ndarray, shape (n,), int
-    vert_positions : np.ndarray, shape (n, 3)
-    link_centers : np.ndarray, shape (n, 3)
-    max_links : int
-    max_envs : int
+    forces_grad : np.ndarray, shape (n, 3)
+    links_idx : np.ndarray, shape (n,), int
+    envs_idx : np.ndarray, shape (n,), int
+    verts_pos : np.ndarray, shape (n, 3)
+    links_center : np.ndarray, shape (n, 3)
 
     Returns
     -------
     tuple of (out_forces, out_torques), each shape (max_links, max_envs, 3)
     """
-    out_forces = np.zeros((max_links, max_envs, 3), dtype=force_gradients.dtype)
-    out_torques = np.zeros((max_links, max_envs, 3), dtype=force_gradients.dtype)
+    max_links = int(links_idx.max()) + 1
+    max_envs = int(envs_idx.max()) + 1
 
-    forces = -force_gradients  # (n, 3)
-    r = vert_positions - link_centers  # (n, 3)
+    out_forces = np.zeros((max_links, max_envs, 3), dtype=forces_grad.dtype)
+    out_torques = np.zeros((max_links, max_envs, 3), dtype=forces_grad.dtype)
+
+    forces = -forces_grad  # (n, 3)
+    r = verts_pos - links_center  # (n, 3)
     torques = np.cross(r, forces)  # (n, 3)
 
-    # Accumulate using np.add.at (unbuffered, like atomic add)
-    np.add.at(out_forces, (link_indices, env_indices), forces)
-    np.add.at(out_torques, (link_indices, env_indices), torques)
+    # Accumulate using np.add.at (unbuffered)
+    np.add.at(out_forces, (links_idx, envs_idx), forces)
+    np.add.at(out_torques, (links_idx, envs_idx), torques)
 
     return out_forces, out_torques
