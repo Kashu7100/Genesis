@@ -31,19 +31,13 @@ class ContactForceEntry(NamedTuple):
 class ArticulatedEntityData:
     """Typed container for per-entity articulation coupling data."""
 
-    entity: object  # RigidEntity
-    env_idx: int  # Legacy env0 alias; runtime uses *_by_env containers
-    active_env_indices: list
+    entity: object
     revolute_joints: list
     prismatic_joints: list
     joint_geo_slots_by_env: dict
     articulation_geos_by_env: dict
     articulation_slots_by_env: dict
     articulation_objects_by_env: dict
-    joint_geo_slots: list  # env0 alias
-    articulation_geo: object  # env0 alias
-    articulation_slot: object  # env0 alias
-    articulation_object: object  # env0 alias
     n_joints: int
     ref_dof_prev: np.ndarray
     delta_theta_tilde: np.ndarray
@@ -51,7 +45,7 @@ class ArticulatedEntityData:
     joint_qpos_indices: list
     joint_dof_indices: list
     mass_matrix: np.ndarray
-    has_non_fixed_base: bool
+    has_free_base: bool
     base_link_idx: int
     n_dofs_actual: int = 0
 
