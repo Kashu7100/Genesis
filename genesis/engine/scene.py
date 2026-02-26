@@ -472,10 +472,12 @@ class Scene(RBC):
             gs.raise_exception()
 
         # Set material-dependent default options
-        if isinstance(morph, gs.morphs.FileMorph):
-            # Rigid entities will convexify geom by default
-            if morph.convexify is None:
-                morph.convexify = isinstance(material, gs.materials.Rigid)
+        morphs_to_configure = morph if is_heterogeneous else (morph,)
+        for m in morphs_to_configure:
+            if isinstance(m, gs.morphs.FileMorph):
+                # Rigid entities will convexify geom by default
+                if m.convexify is None:
+                    m.convexify = isinstance(material, gs.materials.Rigid)
 
         entity = self._sim._add_entity(morph, material, surface, visualize_contact, name)
 

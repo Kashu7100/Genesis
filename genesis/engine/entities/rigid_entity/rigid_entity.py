@@ -231,22 +231,18 @@ class RigidEntity(Entity):
         is_scene_morph = isinstance(self._morph, (gs.morphs.URDF, gs.morphs.MJCF))
         n_links = len(self._links)
 
-        # Initialize per-variant-per-link tracking lists.
-        # Each entry is a list of length n_links (one value per link).
-        self.variants_link_geom_start = gs.List()
-        self.variants_link_geom_end = gs.List()
-        self.variants_link_vgeom_start = gs.List()
-        self.variants_link_vgeom_end = gs.List()
+        # Initialize per-variant-per-link tracking lists for geom counts and inertial properties.
+        # Geom ranges (start/end) are computed after index reassignment.
+        self._variants_n_geoms = gs.List()  # per-variant per-link collision geom counts
+        self._variants_n_vgeoms = gs.List()  # per-variant per-link visual geom counts
         self.variants_link_inertial_mass = gs.List()
         self.variants_link_inertial_pos = gs.List()
         self.variants_link_inertial_quat = gs.List()
         self.variants_link_inertial_i = gs.List()
 
         # --- Record the first variant (the primary morph) per-link ---
-        first_geom_starts = [link.geom_start for link in self._links]
-        first_geom_ends = [link.geom_end for link in self._links]
-        first_vgeom_starts = [link.vgeom_start for link in self._links]
-        first_vgeom_ends = [link.vgeom_end for link in self._links]
+        first_n_geoms = [link.n_geoms for link in self._links]
+        first_n_vgeoms = [link.n_vgeoms for link in self._links]
 
         if is_scene_morph:
             # For URDF/MJCF: use each link's parsed inertial properties
@@ -273,10 +269,8 @@ class RigidEntity(Entity):
             first_quats = [np.asarray(gu.identity_quat(), dtype=gs.np_float)]
             first_inertias = [i_tensor]
 
-        self.variants_link_geom_start.append(first_geom_starts)
-        self.variants_link_geom_end.append(first_geom_ends)
-        self.variants_link_vgeom_start.append(first_vgeom_starts)
-        self.variants_link_vgeom_end.append(first_vgeom_ends)
+        self._variants_n_geoms.append(first_n_geoms)
+        self._variants_n_vgeoms.append(first_n_vgeoms)
         self.variants_link_inertial_mass.append(first_masses)
         self.variants_link_inertial_pos.append(first_positions)
         self.variants_link_inertial_quat.append(first_quats)
@@ -297,6 +291,12 @@ class RigidEntity(Entity):
                     f"morph_heterogeneous only supports URDF, MJCF, Primitive, and Mesh, got: {type(morph).__name__}."
                 )
 
+        # Reassign geom/vgeom indices to be sequential in the flat list order, then compute
+        # variant ranges. This is necessary because link._add_geom auto-computes indices from
+        # link-local offsets set during primary loading, which become stale when variant geoms
+        # are added to earlier links in multi-link entities.
+        self._reassign_heterogeneous_indices()
+
     def _load_heterogeneous_single_link_variant(self, morph, g_infos):
         """Load a single-link heterogeneous variant (Primitive or Mesh)."""
         if len(self._links) != 1:
@@ -307,10 +307,6 @@ class RigidEntity(Entity):
 
         # Compute inertial properties for this variant from geometry
         het_mass, het_pos, het_i = compute_inertial_from_geom_infos(cg_infos, vg_infos, self.material.rho)
-
-        # Record per-link geom range start (before adding geoms)
-        var_geom_starts = [link.geom_start + link.n_geoms]
-        var_vgeom_starts = [link.vgeom_start + link.n_vgeoms]
 
         # Add visual geometries
         for g_info in vg_infos:
@@ -338,18 +334,107 @@ class RigidEntity(Entity):
                 conaffinity=g_info["conaffinity"],
             )
 
-        # Record per-link geom range end (after adding geoms)
-        var_geom_ends = [var_geom_starts[0] + len(cg_infos)]
-        var_vgeom_ends = [var_vgeom_starts[0] + len(vg_infos)]
-
-        self.variants_link_geom_start.append(var_geom_starts)
-        self.variants_link_geom_end.append(var_geom_ends)
-        self.variants_link_vgeom_start.append(var_vgeom_starts)
-        self.variants_link_vgeom_end.append(var_vgeom_ends)
+        self._variants_n_geoms.append([len(cg_infos)])
+        self._variants_n_vgeoms.append([len(vg_infos)])
         self.variants_link_inertial_mass.append([het_mass])
         self.variants_link_inertial_pos.append([het_pos])
         self.variants_link_inertial_quat.append([np.asarray(gu.identity_quat(), dtype=gs.np_float)])
         self.variants_link_inertial_i.append([het_i])
+
+    def _reassign_heterogeneous_indices(self):
+        """
+        Reassign all geom/vgeom indices to be sequential in flat list order, then compute
+        variant geom ranges from the per-variant per-link geom counts.
+
+        This is needed because link._add_geom auto-computes indices from link-local offsets
+        (e.g., link._geom_start) which were set during primary loading. When variant geoms
+        are added to earlier links, the auto-computed indices become stale — they overlap with
+        later links' primary geom indices. The solver arrays are indexed by position in the
+        flat geom list (entity.geoms iterates link.geoms per link), so geom.idx must match
+        the flat position for correct rendering, collision detection, and FK lookups.
+        """
+        n_links = len(self._links)
+        n_variants = len(self._variants_n_geoms)
+
+        # --- Reassign collision geom indices sequentially ---
+        running_idx = self._geom_start
+        running_cell = self._cell_start
+        running_vert = self._vert_start
+        running_face = self._face_start
+        running_edge = self._edge_start
+        running_free_vs = self._free_verts_state_start
+        running_fixed_vs = self._fixed_verts_state_start
+
+        for link in self._links:
+            for geom in link.geoms:
+                geom._idx = running_idx
+                geom._cell_start = running_cell
+                geom._vert_start = running_vert
+                geom._face_start = running_face
+                geom._edge_start = running_edge
+                if link.is_fixed and not self._batch_fixed_verts:
+                    geom._verts_state_start = running_fixed_vs
+                    running_fixed_vs += geom.n_verts
+                else:
+                    geom._verts_state_start = running_free_vs
+                    running_free_vs += geom.n_verts
+                running_idx += 1
+                running_cell += geom.n_cells
+                running_vert += geom.n_verts
+                running_face += geom.n_faces
+                running_edge += geom.n_edges
+
+        # --- Reassign visual geom indices sequentially ---
+        running_vgeom_idx = self._vgeom_start
+        running_vvert = self._vvert_start
+        running_vface = self._vface_start
+
+        for link in self._links:
+            for vgeom in link.vgeoms:
+                vgeom._idx = running_vgeom_idx
+                vgeom._vvert_start = running_vvert
+                vgeom._vface_start = running_vface
+                running_vgeom_idx += 1
+                running_vvert += vgeom.n_vverts
+                running_vface += vgeom.n_vfaces
+
+        # --- Compute variant geom/vgeom ranges from per-variant per-link counts ---
+        # Within each link, geoms are ordered: [primary_geoms..., variant1_geoms..., variant2_geoms..., ...]
+        # The flat entity list iterates links in order, so we walk through computing absolute positions.
+        self.variants_link_geom_start = gs.List()
+        self.variants_link_geom_end = gs.List()
+        self.variants_link_vgeom_start = gs.List()
+        self.variants_link_vgeom_end = gs.List()
+
+        for v in range(n_variants):
+            var_geom_starts = []
+            var_geom_ends = []
+            var_vgeom_starts = []
+            var_vgeom_ends = []
+
+            for i_l, link in enumerate(self._links):
+                # Compute the offset of variant v's geoms within this link's geom list.
+                # Geoms are ordered: [variant0_geoms, variant1_geoms, variant2_geoms, ...]
+                offset_in_link = sum(self._variants_n_geoms[v2][i_l] for v2 in range(v))
+                # The link's first geom in the flat list has idx = link.geoms[0].idx (after reassignment)
+                link_flat_start = link.geoms[0].idx if link.geoms else self._geom_start
+                geom_start = link_flat_start + offset_in_link
+                n_geoms_v = self._variants_n_geoms[v][i_l]
+                var_geom_starts.append(geom_start)
+                var_geom_ends.append(geom_start + n_geoms_v)
+
+                # Same for visual geoms
+                voffset_in_link = sum(self._variants_n_vgeoms[v2][i_l] for v2 in range(v))
+                link_vflat_start = link.vgeoms[0].idx if link.vgeoms else self._vgeom_start
+                vgeom_start = link_vflat_start + voffset_in_link
+                n_vgeoms_v = self._variants_n_vgeoms[v][i_l]
+                var_vgeom_starts.append(vgeom_start)
+                var_vgeom_ends.append(vgeom_start + n_vgeoms_v)
+
+            self.variants_link_geom_start.append(var_geom_starts)
+            self.variants_link_geom_end.append(var_geom_ends)
+            self.variants_link_vgeom_start.append(var_vgeom_starts)
+            self.variants_link_vgeom_end.append(var_vgeom_ends)
 
     def _parse_scene_file_for_variant(self, morph):
         """
@@ -479,10 +564,8 @@ class RigidEntity(Entity):
         v_l_infos, v_links_j_infos, v_links_g_infos = self._parse_scene_file_for_variant(morph)
         self._validate_heterogeneous_scene_structure(v_l_infos, v_links_j_infos)
 
-        var_geom_starts = []
-        var_geom_ends = []
-        var_vgeom_starts = []
-        var_vgeom_ends = []
+        var_n_geoms = []  # per-link collision geom counts for this variant
+        var_n_vgeoms = []  # per-link visual geom counts for this variant
         var_masses = []
         var_positions = []
         var_quats = []
@@ -491,10 +574,6 @@ class RigidEntity(Entity):
         for link, v_l_info, v_g_infos in zip(self._links, v_l_infos, v_links_g_infos):
             is_robot = v_l_info.get("is_robot", np.array(False, dtype=np.bool_))
             cg_infos, vg_infos = self._convert_g_infos_to_cg_infos_and_vg_infos(morph, v_g_infos, is_robot)
-
-            # Record geom range start (before adding)
-            geom_start = link.geom_start + link.n_geoms
-            vgeom_start = link.vgeom_start + link.n_vgeoms
 
             # Add visual geometries
             for g_info in vg_infos:
@@ -522,10 +601,8 @@ class RigidEntity(Entity):
                     conaffinity=g_info["conaffinity"],
                 )
 
-            var_geom_starts.append(geom_start)
-            var_geom_ends.append(geom_start + len(cg_infos))
-            var_vgeom_starts.append(vgeom_start)
-            var_vgeom_ends.append(vgeom_start + len(vg_infos))
+            var_n_geoms.append(len(cg_infos))
+            var_n_vgeoms.append(len(vg_infos))
 
             # Inertial properties: use variant's parsed values, fall back to geometry computation
             v_mass = v_l_info.get("inertial_mass")
@@ -547,10 +624,9 @@ class RigidEntity(Entity):
             var_quats.append(v_quat)
             var_inertias.append(v_i)
 
-        self.variants_link_geom_start.append(var_geom_starts)
-        self.variants_link_geom_end.append(var_geom_ends)
-        self.variants_link_vgeom_start.append(var_vgeom_starts)
-        self.variants_link_vgeom_end.append(var_vgeom_ends)
+        # Store per-variant per-link geom counts (ranges will be computed after reassignment)
+        self._variants_n_geoms.append(var_n_geoms)
+        self._variants_n_vgeoms.append(var_n_vgeoms)
         self.variants_link_inertial_mass.append(var_masses)
         self.variants_link_inertial_pos.append(var_positions)
         self.variants_link_inertial_quat.append(var_quats)
