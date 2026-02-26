@@ -221,69 +221,280 @@ class RigidEntity(Entity):
     def _load_heterogeneous_morphs(self):
         """
         Load heterogeneous morphs (additional geometry variants for parallel environments).
-        Each variant is loaded as additional geoms/vgeoms attached to the single link.
+        Each variant's geoms/vgeoms are appended to the corresponding links, and per-link
+        per-variant geom ranges and inertial properties are tracked for per-environment dispatch.
+        Supports both single-link (Primitive/Mesh) and multi-link (URDF/MJCF) entities.
         """
         if not self._enable_heterogeneous:
             return
 
-        # Initialize tracking lists for geom/vgeom ranges per variant.
-        # These store the start/end indices for each variant's geoms and vgeoms,
-        # enabling per-environment dispatch during simulation.
-        self.variants_link_start = gs.List()
-        self.variants_link_end = gs.List()
-        self.variants_n_links = gs.List()
-        self.variants_geom_start = gs.List()
-        self.variants_geom_end = gs.List()
-        self.variants_vgeom_start = gs.List()
-        self.variants_vgeom_end = gs.List()
-        self.variants_inertial_mass = gs.List()
-        self.variants_inertial_pos = gs.List()
-        self.variants_inertial_i = gs.List()
+        is_scene_morph = isinstance(self._morph, (gs.morphs.URDF, gs.morphs.MJCF))
+        n_links = len(self._links)
 
-        # Record the first variant (the main morph)
-        self.variants_link_start.append(self._link_start)
-        self.variants_n_links.append(len(self._links))
-        self.variants_link_end.append(self._link_start + len(self._links))
-        self.variants_geom_start.append(self._geom_start)
-        first_variant_geom_end = self._geom_start + len(self.geoms)
-        self.variants_geom_end.append(first_variant_geom_end)
-        self.variants_vgeom_start.append(self._vgeom_start)
-        self.variants_vgeom_end.append(self._vgeom_start + len(self.vgeoms))
-        # Store number of geoms in first variant for balanced block distribution across environments
-        self._first_variant_n_geoms = len(self.geoms)
-        self._first_variant_n_vgeoms = len(self.vgeoms)
+        # Initialize per-variant-per-link tracking lists.
+        # Each entry is a list of length n_links (one value per link).
+        self.variants_link_geom_start = gs.List()
+        self.variants_link_geom_end = gs.List()
+        self.variants_link_vgeom_start = gs.List()
+        self.variants_link_vgeom_end = gs.List()
+        self.variants_link_inertial_mass = gs.List()
+        self.variants_link_inertial_pos = gs.List()
+        self.variants_link_inertial_quat = gs.List()
+        self.variants_link_inertial_i = gs.List()
 
-        # Heterogeneous simulation only supports single-link entities.
-        if len(self._links) != 1:
-            gs.raise_exception("morph_heterogeneous only supports single-link entities.")
+        # --- Record the first variant (the primary morph) per-link ---
+        first_geom_starts = [link.geom_start for link in self._links]
+        first_geom_ends = [link.geom_end for link in self._links]
+        first_vgeom_starts = [link.vgeom_start for link in self._links]
+        first_vgeom_ends = [link.vgeom_end for link in self._links]
 
-        link = self._links[0]
+        if is_scene_morph:
+            # For URDF/MJCF: use each link's parsed inertial properties
+            first_masses = [link.inertial_mass for link in self._links]
+            first_positions = [
+                link.inertial_pos if link.inertial_pos is not None else gu.zero_pos() for link in self._links
+            ]
+            first_quats = [
+                np.asarray(link.inertial_quat, dtype=gs.np_float)
+                if link.inertial_quat is not None
+                else np.asarray(gu.identity_quat(), dtype=gs.np_float)
+                for link in self._links
+            ]
+            first_inertias = [
+                link.inertial_i if link.inertial_i is not None else np.zeros((3, 3), dtype=gs.np_float)
+                for link in self._links
+            ]
+        else:
+            # For single-link Primitive/Mesh: compute from geometry
+            cg_infos, vg_infos = self._convert_g_infos_to_cg_infos_and_vg_infos(self._morph, self._first_g_infos, False)
+            mass, pos, i_tensor = compute_inertial_from_geom_infos(cg_infos, vg_infos, self.material.rho)
+            first_masses = [mass]
+            first_positions = [pos]
+            first_quats = [np.asarray(gu.identity_quat(), dtype=gs.np_float)]
+            first_inertias = [i_tensor]
 
-        # Compute first variant's inertial properties using stored g_infos
-        cg_infos, vg_infos = self._convert_g_infos_to_cg_infos_and_vg_infos(self._morph, self._first_g_infos, False)
-        het_mass, het_pos, het_i = compute_inertial_from_geom_infos(cg_infos, vg_infos, self.material.rho)
-        self.variants_inertial_mass.append(het_mass)
-        self.variants_inertial_pos.append(het_pos)
-        self.variants_inertial_i.append(het_i)
+        self.variants_link_geom_start.append(first_geom_starts)
+        self.variants_link_geom_end.append(first_geom_ends)
+        self.variants_link_vgeom_start.append(first_vgeom_starts)
+        self.variants_link_vgeom_end.append(first_vgeom_ends)
+        self.variants_link_inertial_mass.append(first_masses)
+        self.variants_link_inertial_pos.append(first_positions)
+        self.variants_link_inertial_quat.append(first_quats)
+        self.variants_link_inertial_i.append(first_inertias)
 
-        # Load additional heterogeneous variants
+        # --- Load additional heterogeneous variants ---
         for morph in self._morph_heterogeneous:
-            if isinstance(morph, gs.morphs.Mesh):
+            if isinstance(morph, (gs.morphs.URDF, gs.morphs.MJCF)):
+                self._load_heterogeneous_scene_variant(morph)
+            elif isinstance(morph, gs.morphs.Mesh):
                 g_infos = self._load_mesh(morph, self._surface, load_geom_only_for_heterogeneous=True)
+                self._load_heterogeneous_single_link_variant(morph, g_infos)
             elif isinstance(morph, gs.morphs.Primitive):
                 g_infos = self._load_primitive(morph, self._surface, load_geom_only_for_heterogeneous=True)
+                self._load_heterogeneous_single_link_variant(morph, g_infos)
             else:
                 gs.raise_exception(
-                    f"morph_heterogeneous only supports Primitive and Mesh, got: {type(morph).__name__}."
+                    f"morph_heterogeneous only supports URDF, MJCF, Primitive, and Mesh, got: {type(morph).__name__}."
                 )
 
-            cg_infos, vg_infos = self._convert_g_infos_to_cg_infos_and_vg_infos(morph, g_infos, False)
+    def _load_heterogeneous_single_link_variant(self, morph, g_infos):
+        """Load a single-link heterogeneous variant (Primitive or Mesh)."""
+        if len(self._links) != 1:
+            gs.raise_exception("Primitive/Mesh heterogeneous morphs only support single-link entities.")
 
-            # Compute inertial properties for this variant from collision or visual geometries
-            het_mass, het_pos, het_i = compute_inertial_from_geom_infos(cg_infos, vg_infos, self.material.rho)
-            self.variants_inertial_mass.append(het_mass)
-            self.variants_inertial_pos.append(het_pos)
-            self.variants_inertial_i.append(het_i)
+        link = self._links[0]
+        cg_infos, vg_infos = self._convert_g_infos_to_cg_infos_and_vg_infos(morph, g_infos, False)
+
+        # Compute inertial properties for this variant from geometry
+        het_mass, het_pos, het_i = compute_inertial_from_geom_infos(cg_infos, vg_infos, self.material.rho)
+
+        # Record per-link geom range start (before adding geoms)
+        var_geom_starts = [link.geom_start + link.n_geoms]
+        var_vgeom_starts = [link.vgeom_start + link.n_vgeoms]
+
+        # Add visual geometries
+        for g_info in vg_infos:
+            link._add_vgeom(
+                vmesh=g_info["vmesh"],
+                init_pos=g_info.get("pos", gu.zero_pos()),
+                init_quat=g_info.get("quat", gu.identity_quat()),
+            )
+
+        # Add collision geometries
+        for g_info in cg_infos:
+            friction = self.material.friction
+            if friction is None:
+                friction = g_info.get("friction", gu.default_friction())
+            link._add_geom(
+                mesh=g_info["mesh"],
+                init_pos=g_info.get("pos", gu.zero_pos()),
+                init_quat=g_info.get("quat", gu.identity_quat()),
+                type=g_info["type"],
+                friction=friction,
+                sol_params=g_info["sol_params"],
+                data=g_info.get("data"),
+                needs_coup=self.material.needs_coup,
+                contype=g_info["contype"],
+                conaffinity=g_info["conaffinity"],
+            )
+
+        # Record per-link geom range end (after adding geoms)
+        var_geom_ends = [var_geom_starts[0] + len(cg_infos)]
+        var_vgeom_ends = [var_vgeom_starts[0] + len(vg_infos)]
+
+        self.variants_link_geom_start.append(var_geom_starts)
+        self.variants_link_geom_end.append(var_geom_ends)
+        self.variants_link_vgeom_start.append(var_vgeom_starts)
+        self.variants_link_vgeom_end.append(var_vgeom_ends)
+        self.variants_link_inertial_mass.append([het_mass])
+        self.variants_link_inertial_pos.append([het_pos])
+        self.variants_link_inertial_quat.append([np.asarray(gu.identity_quat(), dtype=gs.np_float)])
+        self.variants_link_inertial_i.append([het_i])
+
+    def _parse_scene_file_for_variant(self, morph):
+        """
+        Parse a URDF/MJCF file and apply the same cleanup as _load_scene (virtual root removal),
+        returning the raw info dicts without creating links/joints.
+        """
+        if isinstance(morph, gs.morphs.MJCF):
+            l_infos, links_j_infos, links_g_infos, _ = mju.parse_xml(morph, self._surface)
+        elif isinstance(morph, gs.morphs.URDF):
+            l_infos, links_j_infos, links_g_infos, _ = uu.parse_urdf(morph, self._surface)
+
+            # Apply the same Mujoco fallback for collision geometry as _load_scene
+            morph_ = copy(morph)
+            morph_.visualization = False
+            try:
+                l_infos, links_j_infos_mj, links_g_infos_mj, _ = mju.parse_xml(morph_, self._surface)
+
+                for j_info_gs in chain.from_iterable(links_j_infos):
+                    for j_info_mj in chain.from_iterable(links_j_infos_mj):
+                        if j_info_mj["name"] == j_info_gs["name"]:
+                            for name in ("dofs_force_range", "dofs_armature", "dofs_kp", "dofs_kv"):
+                                j_info_mj[name] = j_info_gs[name]
+                links_j_infos = links_j_infos_mj
+
+                if len(links_g_infos_mj) == len(links_g_infos) + 1:
+                    assert not links_g_infos_mj[0]
+                    links_g_infos.insert(0, [])
+                assert len(links_g_infos_mj) == len(links_g_infos)
+
+                for link_g_infos, link_g_infos_mj in zip(links_g_infos, links_g_infos_mj):
+                    for i_g, g_info in tuple(enumerate(link_g_infos))[::-1]:
+                        is_col = g_info["contype"] or g_info["conaffinity"]
+                        if is_col:
+                            del link_g_infos[i_g]
+                    for g_info in link_g_infos_mj:
+                        is_col = g_info["contype"] or g_info["conaffinity"]
+                        if is_col:
+                            link_g_infos.append(g_info)
+            except (ValueError, AssertionError):
+                pass  # Fall back to legacy parser results
+        else:
+            gs.raise_exception(f"Unsupported morph type for heterogeneous scene variant: {type(morph).__name__}.")
+
+        # Remove virtual root link (same logic as _load_scene)
+        if len(l_infos) > 1:
+            base_l_info, base_j_info, base_g_info = l_infos[0], links_j_infos[0], links_g_infos[0]
+            if (
+                (np.abs(l_infos[1]["pos"]) < gs.EPS).all()
+                and (np.abs(l_infos[1]["quat"] - (1, 0, 0, 0)) < gs.EPS).all()
+                and (base_l_info["name"] == "world" and base_j_info and base_j_info[0]["name"] == "world")
+                and sum(j_info["n_dofs"] for j_info in base_j_info) == 0
+                and not base_g_info
+            ):
+                del l_infos[0], links_j_infos[0], links_g_infos[0]
+                for l_info in l_infos:
+                    l_info["parent_idx"] = max(l_info["parent_idx"] - 1, -1)
+                    if "root_idx" in l_info:
+                        l_info["root_idx"] = max(l_info["root_idx"] - 1, -1)
+
+        # Add free floating joint at root if necessary (same logic as _load_scene lines 895-924)
+        if (
+            (isinstance(morph, gs.morphs.URDF) and not morph.fixed)
+            and links_j_infos
+            and sum(j_info["n_dofs"] for j_info in links_j_infos[0]) == 0
+        ):
+            j_info = dict()
+            j_info["name"] = "root_joint"
+            j_info["type"] = gs.JOINT_TYPE.FREE
+            j_info["n_qs"] = 7
+            j_info["n_dofs"] = 6
+            j_info["init_qpos"] = np.concatenate([gu.zero_pos(), gu.identity_quat()])
+            j_info["pos"] = gu.zero_pos()
+            j_info["quat"] = gu.identity_quat()
+            j_info["dofs_motion_ang"] = np.eye(6, 3, -3)
+            j_info["dofs_motion_vel"] = np.eye(6, 3)
+            j_info["dofs_limit"] = np.tile([-np.inf, np.inf], (6, 1))
+            j_info["dofs_stiffness"] = np.zeros(6)
+            j_info["dofs_invweight"] = np.zeros(6)
+            j_info["dofs_frictionloss"] = np.zeros(6)
+            j_info["dofs_damping"] = np.zeros(6)
+            j_info["dofs_armature"] = np.zeros(6)
+            j_info["dofs_kp"] = np.zeros((6,), dtype=gs.np_float)
+            j_info["dofs_kv"] = np.zeros((6,), dtype=gs.np_float)
+            j_info["dofs_force_range"] = np.tile([-np.inf, np.inf], (6, 1))
+            links_j_infos[0] = [j_info]
+
+        # Exclude joints with 0 dofs (same as _load_scene does before _add_by_info)
+        links_j_infos = [[j_info for j_info in link_j_infos if j_info["n_dofs"] > 0] for link_j_infos in links_j_infos]
+
+        return l_infos, links_j_infos, links_g_infos
+
+    def _validate_heterogeneous_scene_structure(self, variant_l_infos, variant_links_j_infos):
+        """Validate that a variant URDF/MJCF has the same joint structure as the primary."""
+        n_links = len(self._links)
+        if len(variant_l_infos) != n_links:
+            gs.raise_exception(
+                f"Heterogeneous variant has {len(variant_l_infos)} links, "
+                f"but primary has {n_links}. All variants must have the same link count."
+            )
+
+        for i_l, (link, v_j_infos) in enumerate(zip(self._links, variant_links_j_infos)):
+            primary_joints = link.joints
+            if len(v_j_infos) != len(primary_joints):
+                gs.raise_exception(
+                    f"Heterogeneous variant link {i_l} has {len(v_j_infos)} joints, "
+                    f"but primary has {len(primary_joints)}."
+                )
+            for p_joint, v_j_info in zip(primary_joints, v_j_infos):
+                if p_joint.name != v_j_info["name"]:
+                    gs.raise_exception(
+                        f"Joint name mismatch at link {i_l}: primary has '{p_joint.name}', "
+                        f"variant has '{v_j_info['name']}'. All variants must have the same joint names."
+                    )
+                if p_joint.type != v_j_info["type"]:
+                    gs.raise_exception(
+                        f"Joint type mismatch for '{p_joint.name}': primary has {p_joint.type}, "
+                        f"variant has {v_j_info['type']}."
+                    )
+                if p_joint.n_dofs != v_j_info["n_dofs"]:
+                    gs.raise_exception(
+                        f"DoF count mismatch for joint '{p_joint.name}': primary has {p_joint.n_dofs}, "
+                        f"variant has {v_j_info['n_dofs']}."
+                    )
+
+    def _load_heterogeneous_scene_variant(self, morph):
+        """Load a URDF/MJCF heterogeneous variant: parse, validate, and add geoms per link."""
+        v_l_infos, v_links_j_infos, v_links_g_infos = self._parse_scene_file_for_variant(morph)
+        self._validate_heterogeneous_scene_structure(v_l_infos, v_links_j_infos)
+
+        var_geom_starts = []
+        var_geom_ends = []
+        var_vgeom_starts = []
+        var_vgeom_ends = []
+        var_masses = []
+        var_positions = []
+        var_quats = []
+        var_inertias = []
+
+        for link, v_l_info, v_g_infos in zip(self._links, v_l_infos, v_links_g_infos):
+            is_robot = v_l_info.get("is_robot", np.array(False, dtype=np.bool_))
+            cg_infos, vg_infos = self._convert_g_infos_to_cg_infos_and_vg_infos(morph, v_g_infos, is_robot)
+
+            # Record geom range start (before adding)
+            geom_start = link.geom_start + link.n_geoms
+            vgeom_start = link.vgeom_start + link.n_vgeoms
 
             # Add visual geometries
             for g_info in vg_infos:
@@ -311,14 +522,39 @@ class RigidEntity(Entity):
                     conaffinity=g_info["conaffinity"],
                 )
 
-            # Record ranges for this variant
-            self.variants_link_start.append(self.variants_link_end[-1])
-            self.variants_link_end.append(self._link_start + len(self._links))
-            self.variants_n_links.append(self.variants_link_end[-1] - self.variants_link_start[-1])
-            self.variants_geom_start.append(self.variants_geom_end[-1])
-            self.variants_geom_end.append(self.variants_geom_end[-1] + len(cg_infos))
-            self.variants_vgeom_start.append(self.variants_vgeom_end[-1])
-            self.variants_vgeom_end.append(self.variants_vgeom_end[-1] + len(vg_infos))
+            var_geom_starts.append(geom_start)
+            var_geom_ends.append(geom_start + len(cg_infos))
+            var_vgeom_starts.append(vgeom_start)
+            var_vgeom_ends.append(vgeom_start + len(vg_infos))
+
+            # Inertial properties: use variant's parsed values, fall back to geometry computation
+            v_mass = v_l_info.get("inertial_mass")
+            v_pos = v_l_info.get("inertial_pos")
+            v_quat = v_l_info.get("inertial_quat")
+            v_i = v_l_info.get("inertial_i")
+            if v_mass is None or v_pos is None or v_i is None:
+                het_mass, het_pos, het_i = compute_inertial_from_geom_infos(cg_infos, vg_infos, self.material.rho)
+                v_mass = v_mass if v_mass is not None else het_mass
+                v_pos = v_pos if v_pos is not None else het_pos
+                v_i = v_i if v_i is not None else het_i
+            v_mass = max(float(v_mass), gs.EPS)
+            v_pos = np.asarray(v_pos, dtype=gs.np_float)
+            v_quat = np.asarray(v_quat if v_quat is not None else gu.identity_quat(), dtype=gs.np_float)
+            v_i = np.asarray(v_i, dtype=gs.np_float)
+
+            var_masses.append(v_mass)
+            var_positions.append(v_pos)
+            var_quats.append(v_quat)
+            var_inertias.append(v_i)
+
+        self.variants_link_geom_start.append(var_geom_starts)
+        self.variants_link_geom_end.append(var_geom_ends)
+        self.variants_link_vgeom_start.append(var_vgeom_starts)
+        self.variants_link_vgeom_end.append(var_vgeom_ends)
+        self.variants_link_inertial_mass.append(var_masses)
+        self.variants_link_inertial_pos.append(var_positions)
+        self.variants_link_inertial_quat.append(var_quats)
+        self.variants_link_inertial_i.append(var_inertias)
 
     def _load_model(self):
         self._links = gs.List()
