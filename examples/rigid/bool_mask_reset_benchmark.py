@@ -1,7 +1,7 @@
 """
 Benchmark: bool mask reset vs nonzero() + int index reset.
 
-Compares the two scene.reset() approaches at scale (10,000 envs):
+Compares the two scene.reset() approaches:
 
   OLD (blocking):
       idx = reset_buf.nonzero(as_tuple=False).squeeze(-1)
@@ -10,7 +10,7 @@ Compares the two scene.reset() approaches at scale (10,000 envs):
   NEW (non-blocking):
       scene.reset(state=init_state, envs_idx=reset_buf)
 
-The nonzero() call forces a GPU→CPU sync. At high env counts this
+On GPU the nonzero() call forces a GPU→CPU sync. At high env counts this
 becomes a significant bottleneck in RL training loops.
 """
 
@@ -55,9 +55,13 @@ def bench_reset(scene, init_state, reset_buf, method, n_warmup=10, n_iters=100):
 
 
 def main():
+    if not torch.cuda.is_available():
+        print("CUDA not available — this benchmark requires a GPU. Skipping.")
+        return
+
     gs.init(backend=gs.gpu)
 
-    n_envs = 10_000
+    n_envs = 4
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=0.01),
         show_viewer=False,
@@ -73,8 +77,8 @@ def main():
     print(f"Device       : {gs.device}")
     print()
 
-    # Test different reset fractions: 10%, 50%, 90%, 100%
-    reset_fractions = [0.1, 0.5, 0.9, 1.0]
+    # Test different reset fractions: 25%, 50%, 75%, 100%
+    reset_fractions = [0.25, 0.5, 0.75, 1.0]
 
     header = f"{'Reset %':>8}  {'# resets':>8}  {'nonzero (ms)':>14}  {'bool mask (ms)':>15}  {'speedup':>8}"
     print(header)
@@ -94,10 +98,10 @@ def main():
 
     print()
 
-    # Also benchmark with a random mask (more realistic RL scenario)
-    print("--- Random mask (20% reset probability per env) ---")
+    # Also benchmark with a random mask
+    print("--- Random mask (50% reset probability per env) ---")
     torch.manual_seed(42)
-    reset_buf = torch.rand(n_envs, device=gs.device) < 0.2
+    reset_buf = torch.rand(n_envs, device=gs.device) < 0.5
     n_reset = reset_buf.sum().item()
 
     ms_nonzero = bench_reset(scene, init_state, reset_buf, "nonzero")
@@ -105,7 +109,7 @@ def main():
     speedup = ms_nonzero / ms_bool
 
     print(
-        f"  Random 20%  ({int(n_reset)} resets):  nonzero={ms_nonzero:.2f} ms  bool_mask={ms_bool:.2f} ms  speedup={speedup:.2f}x"
+        f"  Random 50%  ({int(n_reset)} resets):  nonzero={ms_nonzero:.2f} ms  bool_mask={ms_bool:.2f} ms  speedup={speedup:.2f}x"
     )
 
 
