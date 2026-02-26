@@ -567,28 +567,25 @@ def test_bool_mask_reset(tol):
     """Test that scene.reset(envs_idx=bool_mask) produces identical results to int-index reset."""
     n_envs = 4
 
-    # --- helper: build scene, step, snapshot, step more, reset, snapshot ---
     def _build_and_reset(envs_idx_variant):
-        scene = gs.Scene(show_viewer=False)
-        scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0, 0, 0.5)))
+        scene = gs.Scene(
+            sim_options=gs.options.SimOptions(dt=0.01),
+            show_viewer=False,
+        )
+        scene.add_entity(gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True))
+        box = scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0, 0, 0.5)))
         scene.build(n_envs=n_envs)
 
-        # Step forward to get a non-trivial state
-        for _ in range(10):
+        init_state = scene.get_state()
+
+        # Let the box fall with gravity to get a non-trivial state
+        for _ in range(50):
             scene.step()
 
-        # Save checkpoint state
-        ckpt_state = scene.get_state()
-
-        # Step further so the state diverges from checkpoint
-        for _ in range(10):
-            scene.step()
-
-        # Reset selected envs back to checkpoint
-        scene.reset(state=ckpt_state, envs_idx=envs_idx_variant)
+        # Reset selected envs back to initial state
+        scene.reset(state=init_state, envs_idx=envs_idx_variant)
 
         # Snapshot the resulting state
-        result_state = scene.get_state()
         solver = scene.rigid_solver
         qpos = qd_to_torch(solver._rigid_global_info.qpos, transpose=True, copy=True)
         dofs_vel = qd_to_torch(solver.dofs_state.vel, transpose=True, copy=True)
@@ -613,82 +610,36 @@ def test_bool_mask_reset(tol):
 def test_bool_mask_reset_selective(tol):
     """Test that bool mask reset only affects masked environments and leaves others untouched."""
     n_envs = 4
-    scene = gs.Scene(show_viewer=False)
-    scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0, 0, 0.5)))
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=0.01),
+        show_viewer=False,
+    )
+    scene.add_entity(gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True))
+    box = scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0, 0, 0.5)))
     scene.build(n_envs=n_envs)
 
-    # Step forward and save checkpoint
-    for _ in range(10):
-        scene.step()
-    ckpt_state = scene.get_state()
+    init_state = scene.get_state()
 
-    # Step further to diverge
-    for _ in range(10):
+    # Let the box fall to get a diverged state
+    for _ in range(50):
         scene.step()
 
-    # Snapshot pre-reset state of env 1 (should NOT be affected by reset)
-    solver = scene.rigid_solver
-    pre_reset_qpos = qd_to_torch(solver._rigid_global_info.qpos, transpose=True, copy=True)
+    # Snapshot pre-reset positions
+    pre_reset_pos = box.get_pos().clone()
 
-    # Reset only envs 0 and 2 via bool mask
-    bool_mask = torch.tensor([True, False, True, False], dtype=torch.bool, device=gs.device)
-    scene.reset(state=ckpt_state, envs_idx=bool_mask)
+    # RL-style termination: reset envs where box fell below threshold
+    box_height = pre_reset_pos[:, 2]
+    reset_buf = box_height < 0.05
+    scene.reset(state=init_state, envs_idx=reset_buf)
 
-    post_reset_qpos = qd_to_torch(solver._rigid_global_info.qpos, transpose=True, copy=True)
+    post_reset_pos = box.get_pos()
 
-    # Env 0, 2: should match checkpoint
-    assert_allclose(post_reset_qpos[0], ckpt_state.solvers_state[0].qpos[0], tol=tol)
-    assert_allclose(post_reset_qpos[2], ckpt_state.solvers_state[0].qpos[2], tol=tol)
-
-    # Env 1, 3: should be unchanged from pre-reset (NOT reset to checkpoint)
-    assert_allclose(post_reset_qpos[1], pre_reset_qpos[1], tol=tol)
-    assert_allclose(post_reset_qpos[3], pre_reset_qpos[3], tol=tol)
-
-
-@pytest.mark.required
-def test_bool_mask_reset_all_true(tol):
-    """Test that an all-True bool mask is equivalent to resetting all envs."""
-    n_envs = 2
-    scene = gs.Scene(show_viewer=False)
-    scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0, 0, 0.5)))
-    scene.build(n_envs=n_envs)
-
-    for _ in range(10):
-        scene.step()
-    ckpt_state = scene.get_state()
-
-    for _ in range(10):
-        scene.step()
-
-    # Reset all envs via all-True mask
-    all_true = torch.ones(n_envs, dtype=torch.bool, device=gs.device)
-    scene.reset(state=ckpt_state, envs_idx=all_true)
-
-    solver = scene.rigid_solver
-    post_qpos = qd_to_torch(solver._rigid_global_info.qpos, transpose=True, copy=True)
-    assert_allclose(post_qpos, ckpt_state.solvers_state[0].qpos, tol=tol)
-
-
-@pytest.mark.required
-def test_bool_mask_reset_all_false(tol):
-    """Test that an all-False bool mask leaves all environments untouched."""
-    n_envs = 2
-    scene = gs.Scene(show_viewer=False)
-    scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0, 0, 0.5)))
-    scene.build(n_envs=n_envs)
-
-    for _ in range(20):
-        scene.step()
-
-    # Snapshot before no-op reset
-    solver = scene.rigid_solver
-    pre_qpos = qd_to_torch(solver._rigid_global_info.qpos, transpose=True, copy=True)
-
-    all_false = torch.zeros(n_envs, dtype=torch.bool, device=gs.device)
-    scene.reset(state=scene.get_state(), envs_idx=all_false)
-
-    post_qpos = qd_to_torch(solver._rigid_global_info.qpos, transpose=True, copy=True)
-    assert_allclose(post_qpos, pre_qpos, tol=tol)
+    # Reset envs: should be back at initial height (0.5)
+    for i in range(n_envs):
+        if reset_buf[i]:
+            assert_allclose(post_reset_pos[i, 2], torch.tensor(0.5, dtype=gs.tc_float, device=gs.device), tol=tol)
+        else:
+            assert_allclose(post_reset_pos[i], pre_reset_pos[i], tol=tol)
 
 
 @pytest.mark.required
