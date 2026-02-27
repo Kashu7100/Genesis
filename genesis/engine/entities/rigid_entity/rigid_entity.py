@@ -436,22 +436,37 @@ class RigidEntity(Entity):
             self.variants_link_vgeom_start.append(var_vgeom_starts)
             self.variants_link_vgeom_end.append(var_vgeom_ends)
 
-    def _parse_scene_file_for_variant(self, morph):
+    def _parse_and_prepare_scene_infos(self, morph, surface):
         """
-        Parse a URDF/MJCF file and apply the same cleanup as _load_scene (virtual root removal),
-        returning the raw info dicts without creating links/joints.
-        """
-        if isinstance(morph, gs.morphs.MJCF):
-            l_infos, links_j_infos, links_g_infos, _ = mju.parse_xml(morph, self._surface)
-        elif isinstance(morph, gs.morphs.URDF):
-            l_infos, links_j_infos, links_g_infos, _ = uu.parse_urdf(morph, self._surface)
+        Parse a scene file (URDF, MJCF, or USD) and apply standard cleanup:
+        - Mujoco fallback for URDF collision geometry
+        - Virtual root link removal
 
-            # Apply the same Mujoco fallback for collision geometry as _load_scene
+        Used by both the normal loading path (_load_scene) and heterogeneous variant loading.
+
+        Returns (l_infos, links_j_infos, links_g_infos, eqs_info).
+        """
+        # Mujoco's unified MJCF+URDF parser is not good enough for now to be used for loading both MJCF and URDF files.
+        # First, it would happen when loading visual meshes having supported format (i.e. Collada files '.dae').
+        # Second, it does not take into account URDF 'mimic' joint constraints. However, it does a better job at
+        # initialized undetermined physics parameters.
+        if isinstance(morph, gs.morphs.MJCF):
+            # Mujoco's unified MJCF+URDF parser systematically for MJCF files
+            l_infos, links_j_infos, links_g_infos, eqs_info = mju.parse_xml(morph, surface)
+        elif isinstance(morph, (gs.morphs.URDF, gs.morphs.Drone)):
+            # Custom "legacy" URDF parser for loading geometries (visual and collision) and equality constraints.
+            # This is necessary because Mujoco cannot parse visual geometries (meshes) reliably for URDF.
+            l_infos, links_j_infos, links_g_infos, eqs_info = uu.parse_urdf(morph, surface)
+
+            # Mujoco's unified MJCF+URDF parser for only link, joints, and collision geometries properties
             morph_ = copy(morph)
             morph_.visualization = False
             try:
-                l_infos, links_j_infos_mj, links_g_infos_mj, _ = mju.parse_xml(morph_, self._surface)
+                # Mujoco's unified MJCF+URDF parser for URDF files.
+                # Note that Mujoco URDF parser completely ignores equality constraints.
+                l_infos, links_j_infos_mj, links_g_infos_mj, _ = mju.parse_xml(morph_, surface)
 
+                # Mujoco is not parsing actuators properties
                 for j_info_gs in chain.from_iterable(links_j_infos):
                     for j_info_mj in chain.from_iterable(links_j_infos_mj):
                         if j_info_mj["name"] == j_info_gs["name"]:
@@ -459,42 +474,69 @@ class RigidEntity(Entity):
                                 j_info_mj[name] = j_info_gs[name]
                 links_j_infos = links_j_infos_mj
 
+                # Take into account 'world' body if it was added automatically for our legacy URDF parser
                 if len(links_g_infos_mj) == len(links_g_infos) + 1:
                     assert not links_g_infos_mj[0]
                     links_g_infos.insert(0, [])
                 assert len(links_g_infos_mj) == len(links_g_infos)
 
+                # Replace collision geometries with Mujoco's, keeping visual geometries from legacy parser.
+                # Mujoco uses collision meshes as "fake" visuals to avoid loading mesh files.
                 for link_g_infos, link_g_infos_mj in zip(links_g_infos, links_g_infos_mj):
+                    # Remove collision geometries from our legacy URDF parser
                     for i_g, g_info in tuple(enumerate(link_g_infos))[::-1]:
                         is_col = g_info["contype"] or g_info["conaffinity"]
                         if is_col:
                             del link_g_infos[i_g]
+
+                    # Add collision geometries from Mujoco's unified MJCF+URDF parser
                     for g_info in link_g_infos_mj:
                         is_col = g_info["contype"] or g_info["conaffinity"]
                         if is_col:
                             link_g_infos.append(g_info)
-            except (ValueError, AssertionError):
-                pass  # Fall back to legacy parser results
-        else:
-            gs.raise_exception(f"Unsupported morph type for heterogeneous scene variant: {type(morph).__name__}.")
+            except (ValueError, AssertionError) as e:
+                gs.logger.warning(
+                    "Falling back to legacy URDF parser. Default values of physics properties may be off:\n"
+                    + str(e).replace("\n", " - ")
+                )
+        elif isinstance(morph, gs.morphs.USD):
+            from genesis.utils.usd import parse_usd_rigid_entity
 
-        # Remove virtual root link (same logic as _load_scene)
-        if len(l_infos) > 1:
-            base_l_info, base_j_info, base_g_info = l_infos[0], links_j_infos[0], links_g_infos[0]
-            if (
-                (np.abs(l_infos[1]["pos"]) < gs.EPS).all()
-                and (np.abs(l_infos[1]["quat"] - (1, 0, 0, 0)) < gs.EPS).all()
-                and (base_l_info["name"] == "world" and base_j_info and base_j_info[0]["name"] == "world")
-                and sum(j_info["n_dofs"] for j_info in base_j_info) == 0
-                and not base_g_info
-            ):
+            # Unified parser handles both articulations and rigid bodies
+            l_infos, links_j_infos, links_g_infos, eqs_info = parse_usd_rigid_entity(morph, surface)
+        else:
+            gs.raise_exception(f"Unsupported morph type: {type(morph).__name__}.")
+
+        # Remove any "virtual" root link that was not present in the original file morph.
+        # Mujoco unified parser and our legacy parser have different behaviors.
+        # * Mujoco unified parser always adds a root 'world' link if it does not exist, and fuse all fixed links from
+        #   root to first articulated body.
+        # * Our legacy parser adds a root 'world' link if the root joint is not a fixed joint in file morph.
+        # Remove this virtual world link if the child has a free joint (the free joint absorbs the full pose into
+        # 'init_qpos' regardless of pos/quat), or if the child has an identity transform.
+        base_j_info, base_g_info = links_j_infos[0], links_g_infos[0]
+        if len(l_infos) > 1 and (sum(j_info["n_dofs"] for j_info in base_j_info) == 0) and not base_g_info:
+            child_has_freejoint = any(j_info["type"] == gs.JOINT_TYPE.FREE for j_info in links_j_infos[1])
+            child_is_identity = (np.abs(l_infos[1]["pos"]) < gs.EPS).all() and (
+                np.abs(l_infos[1]["quat"] - (1, 0, 0, 0)) < gs.EPS
+            ).all()
+            if child_has_freejoint or child_is_identity:
                 del l_infos[0], links_j_infos[0], links_g_infos[0]
                 for l_info in l_infos:
                     l_info["parent_idx"] = max(l_info["parent_idx"] - 1, -1)
                     if "root_idx" in l_info:
                         l_info["root_idx"] = max(l_info["root_idx"] - 1, -1)
 
-        # Add free floating joint at root if necessary (same logic as _load_scene lines 895-924)
+        return l_infos, links_j_infos, links_g_infos, eqs_info
+
+    def _parse_scene_file_for_variant(self, morph):
+        """
+        Parse a URDF/MJCF variant file and prepare for heterogeneous loading.
+        Adds free joint at root if necessary and filters 0-dof joints.
+        """
+        l_infos, links_j_infos, links_g_infos, _ = self._parse_and_prepare_scene_infos(morph, self._surface)
+
+        # Add free floating joint at root if necessary
         if (
             (isinstance(morph, gs.morphs.URDF) and not morph.fixed)
             and links_j_infos
@@ -521,7 +563,7 @@ class RigidEntity(Entity):
             j_info["dofs_force_range"] = np.tile([-np.inf, np.inf], (6, 1))
             links_j_infos[0] = [j_info]
 
-        # Exclude joints with 0 dofs (same as _load_scene does before _add_by_info)
+        # Exclude joints with 0 dofs
         links_j_infos = [[j_info for j_info in link_j_infos if j_info["n_dofs"] > 0] for link_j_infos in links_j_infos]
 
         return l_infos, links_j_infos, links_g_infos
@@ -867,66 +909,8 @@ class RigidEntity(Entity):
     def _load_scene(self, morph, surface):
         from genesis.engine.couplers import IPCCoupler
 
-        # Mujoco's unified MJCF+URDF parser is not good enough for now to be used for loading both MJCF and URDF files.
-        # First, it would happen when loading visual meshes having supported format (i.e. Collada files '.dae').
-        # Second, it does not take into account URDF 'mimic' joint constraints. However, it does a better job at
-        # initialized undetermined physics parameters.
-        if isinstance(morph, gs.morphs.MJCF):
-            # Mujoco's unified MJCF+URDF parser systematically for MJCF files
-            l_infos, links_j_infos, links_g_infos, eqs_info = mju.parse_xml(morph, surface)
-        elif isinstance(morph, (gs.morphs.URDF, gs.morphs.Drone)):
-            # Custom "legacy" URDF parser for loading geometries (visual and collision) and equality constraints.
-            # This is necessary because Mujoco cannot parse visual geometries (meshes) reliably for URDF.
-            l_infos, links_j_infos, links_g_infos, eqs_info = uu.parse_urdf(morph, surface)
-
-            # Mujoco's unified MJCF+URDF parser for only link, joints, and collision geometries properties
-            morph_ = copy(morph)
-            morph_.visualization = False
-            try:
-                # Mujoco's unified MJCF+URDF parser for URDF files.
-                # Note that Mujoco URDF parser completely ignores equality constraints.
-                l_infos, links_j_infos_mj, links_g_infos_mj, _ = mju.parse_xml(morph_, surface)
-
-                # Mujoco is not parsing actuators properties
-                for j_info_gs in chain.from_iterable(links_j_infos):
-                    for j_info_mj in chain.from_iterable(links_j_infos_mj):
-                        if j_info_mj["name"] == j_info_gs["name"]:
-                            for name in ("dofs_force_range", "dofs_armature", "dofs_kp", "dofs_kv"):
-                                j_info_mj[name] = j_info_gs[name]
-                links_j_infos = links_j_infos_mj
-
-                # Take into account 'world' body if it was added automatically for our legacy URDF parser
-                if len(links_g_infos_mj) == len(links_g_infos) + 1:
-                    assert not links_g_infos_mj[0]
-                    links_g_infos.insert(0, [])
-                assert len(links_g_infos_mj) == len(links_g_infos)
-
-                # Update collision geometries, ignoring fake" visual geometries returned by Mujoco, (which is using
-                # collision as visual to avoid loading mesh files), and keeping the true visual geometries provided
-                # by our custom legacy URDF parser.
-                # Note that the Kinematic tree ordering is stable between Mujoco and Genesis (Hopefully!).
-                for link_g_infos, link_g_infos_mj in zip(links_g_infos, links_g_infos_mj):
-                    # Remove collision geometries from our legacy URDF parser
-                    for i_g, g_info in tuple(enumerate(link_g_infos))[::-1]:
-                        is_col = g_info["contype"] or g_info["conaffinity"]
-                        if is_col:
-                            del link_g_infos[i_g]
-
-                    # Add visual geometries from Mujoco's unified MJCF+URDF parser
-                    for g_info in link_g_infos_mj:
-                        is_col = g_info["contype"] or g_info["conaffinity"]
-                        if is_col:
-                            link_g_infos.append(g_info)
-            except (ValueError, AssertionError) as e:
-                gs.logger.warning(
-                    "Falling back to legacy URDF parser. Default values of physics properties may be off:\n"
-                    + str(e).replace("\n", " - ")
-                )
-        elif isinstance(morph, gs.morphs.USD):
-            from genesis.utils.usd import parse_usd_rigid_entity
-
-            # Unified parser handles both articulations and rigid bodies
-            l_infos, links_j_infos, links_g_infos, eqs_info = parse_usd_rigid_entity(morph, surface)
+        # Parse file and apply standard cleanup (Mujoco fallback + virtual root removal)
+        l_infos, links_j_infos, links_g_infos, eqs_info = self._parse_and_prepare_scene_infos(morph, surface)
 
         # Make sure that the inertia matrix of all links is valid
         if not morph.recompute_inertia:
@@ -957,26 +941,6 @@ class RigidEntity(Entity):
 
                 # Make sure that the inertia matrix is symmetric with positive eigenvalues
                 l_info["inertial_i"] = Q @ np.diag(np.maximum(inertia_diag, 0.0)) @ Q.T
-
-        # Remove any "virtual" root link that was not present in the original file morph.
-        # Mujoco unified parser and our legacy parser have different behaviors.
-        # * Mujoco unified parser always adds a root 'world' link if it does not exist, and fuse all fixed links from
-        #   root to first articulated body.
-        # * Our legacy parser adds a root 'world' link if the root joint is not a fixed joint in file morph.
-        # Remove this virtual world link if the child has a free joint (the free joint absorbs the full pose into
-        # 'init_qpos' regardless of pos/quat), or if the child has an identity transform.
-        base_j_info, base_g_info = links_j_infos[0], links_g_infos[0]
-        if len(l_infos) > 1 and (sum(j_info["n_dofs"] for j_info in base_j_info) == 0) and not base_g_info:
-            child_has_freejoint = any(j_info["type"] == gs.JOINT_TYPE.FREE for j_info in links_j_infos[1])
-            child_is_identity = (np.abs(l_infos[1]["pos"]) < gs.EPS).all() and (
-                np.abs(l_infos[1]["quat"] - (1, 0, 0, 0)) < gs.EPS
-            ).all()
-            if child_has_freejoint or child_is_identity:
-                del l_infos[0], links_j_infos[0], links_g_infos[0]
-                for l_info in l_infos:
-                    l_info["parent_idx"] = max(l_info["parent_idx"] - 1, -1)
-                    if "root_idx" in l_info:
-                        l_info["root_idx"] = max(l_info["root_idx"] - 1, -1)
 
         # URDF is a robot description file so all links have same root_idx
         if isinstance(morph, gs.morphs.URDF) and not morph._enable_mujoco_compatibility:
