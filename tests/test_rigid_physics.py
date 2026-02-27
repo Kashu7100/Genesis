@@ -4617,10 +4617,8 @@ def test_heterogeneous_articulated_simulation(show_viewer, tol):
     assert_allclose(het_qpos[2], het_qpos[3], tol=tol)
 
     # Different-variant envs produce different results (different mass/geometry -> different dynamics)
-    with pytest.raises(AssertionError):
-        assert_allclose(het_pos[0], het_pos[2], tol=tol)
-    with pytest.raises(AssertionError):
-        assert_allclose(het_qpos[0], het_qpos[2], tol=tol)
+    assert not np.allclose(het_pos[0], het_pos[2], atol=tol, rtol=tol), "Variant A and B positions should differ"
+    assert not np.allclose(het_qpos[0], het_qpos[2], atol=tol, rtol=tol), "Variant A and B qpos should differ"
 
 
 @pytest.mark.required
@@ -4641,12 +4639,11 @@ def test_heterogeneous_articulated_mass_and_joints(tol):
     scene.build(n_envs=4)
 
     # Mass: shape (n_envs,), balanced block [A, A, B, B]
-    mass = het_obj.get_mass()
+    mass = tensor_to_array(het_obj.get_mass())
     assert mass.shape == (4,)
     assert_allclose(mass[0], mass[1], tol=tol)  # Same variant A
     assert_allclose(mass[2], mass[3], tol=tol)  # Same variant B
-    with pytest.raises(AssertionError):
-        assert_allclose(mass[0], mass[2], tol=tol)  # Different variants
+    assert not np.allclose(mass[0], mass[2], atol=tol, rtol=tol), "Variant A and B masses should differ"
 
     # Joint structure: both variants share the same joints (root_joint + joint1)
     assert len(het_obj.joints) == 2
@@ -4724,8 +4721,8 @@ def test_heterogeneous_articulated_same_variant(tol):
     for _ in range(30):
         scene.step()
 
-    pos = het_obj.get_pos()
-    qpos = het_obj.get_qpos()
+    pos = tensor_to_array(het_obj.get_pos())
+    qpos = tensor_to_array(het_obj.get_qpos())
 
     # All 4 envs should produce identical results
     assert_allclose(pos[0], pos[1], tol=tol)
@@ -4734,6 +4731,79 @@ def test_heterogeneous_articulated_same_variant(tol):
     assert_allclose(qpos[0], qpos[1], tol=tol)
     assert_allclose(qpos[0], qpos[2], tol=tol)
     assert_allclose(qpos[0], qpos[3], tol=tol)
+
+
+@pytest.mark.required
+def test_heterogeneous_articulated_uneven_envs(tol):
+    """Test variant assignment with n_envs not evenly divisible by n_variants.
+
+    3 envs / 2 variants -> balanced block [A, A, B] (extra env goes to first variant).
+    """
+    urdf_a = "urdf/simple/two_cube_revolute.urdf"
+    urdf_b = "urdf/simple/two_cube_revolute_small.urdf"
+
+    scene = gs.Scene(show_viewer=False)
+    scene.add_entity(gs.morphs.Plane())
+    het_obj = scene.add_entity(
+        morph=[
+            gs.morphs.URDF(file=urdf_a, pos=(0, 0, 0.15)),
+            gs.morphs.URDF(file=urdf_b, pos=(0, 0, 0.15)),
+        ]
+    )
+    scene.build(n_envs=3)
+
+    for _ in range(30):
+        scene.step()
+
+    mass = tensor_to_array(het_obj.get_mass())
+    pos = tensor_to_array(het_obj.get_pos())
+
+    # Envs 0-1 -> variant A, env 2 -> variant B
+    assert_allclose(mass[0], mass[1], tol=tol)
+    assert not np.allclose(mass[0], mass[2], atol=tol, rtol=tol), "Variant A and B masses should differ"
+    assert_allclose(pos[0], pos[1], tol=tol)
+    assert not np.allclose(pos[0], pos[2], atol=tol, rtol=tol), "Variant A and B positions should differ"
+
+
+@pytest.mark.required
+def test_heterogeneous_articulated_reset_and_control(tol):
+    """Test reset preserves variant assignment and control works per-variant."""
+    urdf_a = "urdf/simple/two_cube_revolute.urdf"
+    urdf_b = "urdf/simple/two_cube_revolute_small.urdf"
+
+    scene = gs.Scene(show_viewer=False)
+    scene.add_entity(gs.morphs.Plane())
+    het_obj = scene.add_entity(
+        morph=[
+            gs.morphs.URDF(file=urdf_a, pos=(0, 0, 0.15)),
+            gs.morphs.URDF(file=urdf_b, pos=(0, 0, 0.15)),
+        ]
+    )
+    scene.build(n_envs=4)
+
+    # Run, then reset, then run again — should reproduce initial trajectory
+    for _ in range(20):
+        scene.step()
+    pos_before_reset = tensor_to_array(het_obj.get_pos())
+
+    scene.reset()
+    for _ in range(20):
+        scene.step()
+    pos_after_reset = tensor_to_array(het_obj.get_pos())
+
+    assert_allclose(pos_before_reset, pos_after_reset, tol=tol)
+
+    # Control: apply position target on the revolute joint (last dof)
+    scene.reset()
+    revolute_dof_idx = het_obj.joints[-1].dofs_idx_local[0]
+    target = 0.5
+    for _ in range(100):
+        het_obj.control_dofs_position(np.array([target]), dofs_idx_local=[revolute_dof_idx])
+        scene.step()
+
+    dofs_pos = tensor_to_array(het_obj.get_dofs_position())
+    # All envs should reach near the target on the revolute dof
+    assert_allclose(dofs_pos[:, revolute_dof_idx], target, tol=0.1)
 
 
 @pytest.mark.required
