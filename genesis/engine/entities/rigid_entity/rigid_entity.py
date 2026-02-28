@@ -123,10 +123,6 @@ class KinematicEntity(Entity):
     # override typing
     _solver: "RigidSolver"
 
-    # Subclasses can override these to use custom Joint/Link classes
-    _JointClass = RigidJoint
-    _LinkClass = RigidLink
-
     def __init__(
         self,
         scene: "Scene",
@@ -205,30 +201,6 @@ class KinematicEntity(Entity):
         self._tgt[key] = value
 
     def init_ckpt(self):
-        pass
-
-    def process_input(self, in_backward=False):
-        """No-op for kinematic entities; overridden in RigidEntity."""
-        self._tgt = dict()
-
-    def process_input_grad(self):
-        """No-op for kinematic entities; overridden in RigidEntity."""
-        pass
-
-    def save_ckpt(self, ckpt_name):
-        """No-op for kinematic entities; overridden in RigidEntity."""
-        pass
-
-    def load_ckpt(self, ckpt_name):
-        """No-op for kinematic entities; overridden in RigidEntity."""
-        pass
-
-    def reset_grad(self):
-        """No-op for kinematic entities; overridden in RigidEntity."""
-        pass
-
-    def zero_all_dofs_velocity(self, envs_idx=None, *, skip_forward=False):
-        """No-op for kinematic entities; overridden in RigidEntity."""
         pass
 
     def _load_morph(self, morph: Morph):
@@ -878,7 +850,6 @@ class KinematicEntity(Entity):
         self._init_jac_and_IK()
 
     def _init_jac_and_IK(self):
-        """Initialize Jacobian and IK data structures for this entity."""
         if not self._requires_jac_and_IK:
             return
 
@@ -978,7 +949,7 @@ class KinematicEntity(Entity):
                 else:
                     assert False
 
-            joint = self._JointClass(
+            joint = RigidJoint(
                 entity=self,
                 name=j_info["name"],
                 idx=joint_start + i_j_,
@@ -1007,7 +978,7 @@ class KinematicEntity(Entity):
             joints.append(joint)
 
         # Add child link
-        link = self._LinkClass(
+        link = RigidLink(
             entity=self,
             name=l_info["name"],
             idx=link_idx,
@@ -1197,7 +1168,7 @@ class KinematicEntity(Entity):
             gs.raise_exception("Entity already attached.")
 
         if not isinstance(parent_entity, KinematicEntity):
-            gs.raise_exception("Parent entity must derive from 'KinematicEntity'.")
+            gs.raise_exception("Parent entity must derive from 'KinematicEntity' or 'RigidEntity'.")
 
         if parent_entity is self:
             gs.raise_exception("Cannot attach entity to itself.")
