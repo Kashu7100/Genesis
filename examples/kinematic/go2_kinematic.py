@@ -76,7 +76,7 @@ def main():
     robot.set_dofs_position(joint_angles, robot_dof_idx)
     ghost.set_dofs_position(joint_angles, ghost_dof_idx)
 
-    for step in range(10000):
+    for step in range(250):
         t = step * scene.sim_options.dt
 
         # Sinusoidal reference trajectory for the ghost
