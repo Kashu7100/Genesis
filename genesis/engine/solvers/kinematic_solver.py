@@ -8,7 +8,7 @@ import genesis.utils.array_class as array_class
 from genesis.engine.entities.rigid_entity import KinematicEntity
 from genesis.engine.states import QueriedStates
 from genesis.engine.states.solvers import KinematicSolverState
-from genesis.options.solvers import RigidOptions
+from genesis.options.solvers import RigidOptions, KinematicOptions
 from genesis.utils.misc import qd_to_torch, sanitize_indexed_tensor
 
 from .base_solver import Solver
@@ -39,7 +39,6 @@ from .rigid.abd.accessor import (
 if TYPE_CHECKING:
     from genesis.engine.scene import Scene
     from genesis.engine.simulator import Simulator
-    from genesis.options.solvers import KinematicOptions
 
 
 class KinematicSolver(Solver):
@@ -55,23 +54,27 @@ class KinematicSolver(Solver):
     def __init__(self, scene: "Scene", sim: "Simulator", options: "KinematicOptions") -> None:
         super().__init__(scene, sim, options)
 
-        # Internal RigidOptions for DataManager compatibility (provides iterations, tolerance, etc.)
-        self._options = RigidOptions(
-            dt=options.dt,
-            enable_collision=False,
-            enable_joint_limit=False,
-            enable_self_collision=False,
-            enable_neutral_collision=False,
-            enable_adjacent_collision=False,
-            disable_constraint=True,
-            max_collision_pairs=0,
-            enable_multi_contact=False,
-            enable_mujoco_compatibility=False,
-            use_contact_island=False,
-            use_hibernation=False,
-            max_dynamic_constraints=0,
-            iterations=0,
-        )
+        if isinstance(options, RigidOptions):
+            self._options = options
+        elif isinstance(options, KinematicOptions):
+            self._options = RigidOptions(
+                dt=options.dt,
+                enable_collision=False,
+                enable_joint_limit=False,
+                enable_self_collision=False,
+                enable_neutral_collision=False,
+                enable_adjacent_collision=False,
+                disable_constraint=True,
+                max_collision_pairs=0,
+                enable_multi_contact=False,
+                enable_mujoco_compatibility=False,
+                use_contact_island=False,
+                use_hibernation=False,
+                max_dynamic_constraints=0,
+                iterations=0,
+            )
+        else:
+            gs.raise_exception(f"Invalid options type: {type(options)}")
 
         self._enable_collision = False
         self._enable_mujoco_compatibility = False

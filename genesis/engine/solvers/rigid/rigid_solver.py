@@ -227,7 +227,6 @@ class RigidSolver(KinematicSolver):
     def __init__(self, scene: "Scene", sim: "Simulator", options: RigidOptions) -> None:
         super().__init__(scene, sim, options)
 
-        # Override kinematic defaults with physics options
         self._enable_collision = options.enable_collision
         self._enable_multi_contact = options.enable_multi_contact
         self._enable_mujoco_compatibility = options.enable_mujoco_compatibility
@@ -271,9 +270,6 @@ class RigidSolver(KinematicSolver):
                 "Using a simulation timestep smaller than 2ms is not recommended for 'use_gjk_collision=False' as "
                 "it could lead to numerically unstable collision detection."
             )
-
-        # Override the dummy RigidOptions from KinematicSolver with the real one
-        self._options = options
 
         self._is_backward: bool = False
         self._ckpt = dict()
