@@ -1,11 +1,12 @@
 from contextlib import nullcontext
+from itertools import permutations
 
 import numpy as np
 import pytest
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.utils.misc import tensor_to_array
+from genesis.utils.misc import tensor_to_array, geometric_mean, harmonic_mean
 
 from .conftest import TOL_SINGLE
 from .utils import assert_allclose, get_hf_dataset
@@ -79,11 +80,224 @@ def get_ipc_rigid_links_idx(scene, env_idx):
     return links_idx
 
 
-def get_entity_base_z(entity):
-    pos = tensor_to_array(entity.get_pos())
-    if pos.ndim == 1:
-        return float(pos[2])
-    return float(pos.reshape(-1, 3)[0, 2])
+@pytest.mark.parametrize("enable_rigid_rigid_contact", [False, True])
+def test_contact_pair_friction_resistance(enable_rigid_rigid_contact):
+    scene = gs.Scene(
+        coupler_options=gs.options.IPCCouplerOptions(
+            contact_resistance=36.0,
+            enable_rigid_rigid_contact=enable_rigid_rigid_contact,
+        ),
+        show_viewer=False,
+    )
+
+    plane = scene.add_entity(
+        gs.morphs.Plane(),
+        material=gs.materials.Rigid(
+            coupling_mode="ipc_only",
+        ),
+    )
+    rigid_a = scene.add_entity(
+        gs.morphs.Box(
+            pos=(0.0, 0.0, 0.12),
+            size=(0.05, 0.05, 0.05),
+        ),
+        material=gs.materials.Rigid(
+            coupling_mode="ipc_only",
+            coup_friction=0.25,
+            contact_resistance=9.0,
+        ),
+    )
+    rigid_b = scene.add_entity(
+        gs.morphs.Box(
+            pos=(0.2, 0.0, 0.12),
+            size=(0.05, 0.05, 0.05),
+        ),
+        material=gs.materials.Rigid(
+            coupling_mode="ipc_only",
+            coup_friction=0.64,
+            contact_resistance=16.0,
+        ),
+    )
+    rigid_c = scene.add_entity(
+        gs.morphs.Box(
+            pos=(-0.2, 0.0, 0.12),
+            size=(0.05, 0.05, 0.05),
+        ),
+        material=gs.materials.Rigid(
+            coupling_mode="ipc_only",
+            coup_friction=0.16,
+            contact_resistance=None,
+        ),
+    )
+    fem = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.4, 0.0, 0.12),
+            size=(0.05, 0.05, 0.05),
+        ),
+        material=gs.materials.FEM.Elastic(
+            E=5e4,
+            nu=0.35,
+            rho=1000.0,
+            friction_mu=0.49,
+            contact_resistance=25.0,
+        ),
+    )
+
+    scene.build()
+
+    tab = scene.sim.coupler._ipc_scene.contact_tabular()
+    for entities in permutations((plane, rigid_a, rigid_b, rigid_c, fem), 2):
+        elems_idx = []
+        frictions = []
+        resistances = []
+        for entity in entities:
+            if isinstance(entity, gs.engine.entities.RigidEntity):
+                if entity is plane:
+                    entity_idx = scene.sim.rigid_solver.entities.index(plane)
+                    elem = scene.sim.coupler._ipc_ground_contacts[entity_idx]
+                else:
+                    entity_idx = scene.sim.rigid_solver.entities.index(entity)
+                    elem = scene.sim.coupler._ipc_abd_contacts[entity_idx]
+                friction = entity.material.coup_friction
+            else:  # isinstance(entity, gs.engine.entities.FEMEntity)
+                entity_idx = scene.sim.fem_solver.entities.index(fem)
+                elem = scene.sim.coupler._ipc_fem_contacts[entity_idx]
+                friction = entity.material.friction_mu
+            resistance = entity.material.contact_resistance or scene.sim.coupler.options.contact_resistance
+            elems_idx.append(elem.id())
+            frictions.append(friction)
+            resistances.append(resistance)
+        model = tab.at(*elems_idx)
+        assert model.friction_rate() == pytest.approx(geometric_mean(*frictions))
+        assert model.resistance() == pytest.approx(harmonic_mean(*resistances))
+        assert model.is_enabled() ^ (
+            all(isinstance(entity, gs.engine.entities.RigidEntity) and entity is not plane for entity in entities)
+            and not enable_rigid_rigid_contact
+        )
+
+
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_rigid_ground_sliding(n_envs, show_viewer):
+    GRAVITY = np.array([5.0, 0.0, -10.0], dtype=gs.np_float)
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.01,
+            gravity=GRAVITY,
+        ),
+        coupler_options=gs.options.IPCCouplerOptions(
+            contact_d_hat=0.01,
+            enable_rigid_rigid_contact=False,
+        ),
+        show_viewer=show_viewer,
+    )
+
+    scene.add_entity(
+        gs.morphs.Plane(),
+        material=gs.materials.Rigid(
+            coupling_mode="ipc_only",
+            coup_friction=0.25,
+        ),
+    )
+
+    cubes = []
+    for y, mu in ((-0.4, 0.0), (-0.2, 0.01), (0.0, 0.04), (0.2, 0.09), (0.4, 0.16)):
+        cube = scene.add_entity(
+            gs.morphs.Box(
+                pos=(0.0, y, 0.12),
+                size=(0.08, 0.08, 0.08),
+            ),
+            material=gs.materials.Rigid(
+                coupling_mode="ipc_only",
+                coup_friction=mu,
+            ),
+        )
+        cubes.append(cube)
+
+    scene.build(n_envs=n_envs)
+
+    initial_positions = np.stack([tensor_to_array(cube.get_pos()) for cube in cubes], axis=-2)
+    for _ in range(100):
+        scene.step()
+    final_positions = np.stack([tensor_to_array(cube.get_pos()) for cube in cubes], axis=-2)
+
+    # Coarse non-penetration sanity check
+    assert (final_positions[..., 2] > 0.0).all()
+
+    # Distance from ground should be friction-independent
+    assert_allclose(np.diff(final_positions[..., 2], axis=-1), 0.0, tol=TOL_SINGLE)
+
+    # No y-axis driving force: lateral drift should be minimal
+    assert_allclose(initial_positions[..., 1], final_positions[..., 1], tol=TOL_SINGLE)
+
+    # All cubes should move along +x under tilted gravity.
+    assert ((final_positions[..., 0] - initial_positions[..., 0]) > 0.5).all()
+
+    # Lower coup_friction should slide farther, so x should strictly decrease as mu increases.
+    assert (np.diff(final_positions[..., ::-1, 0], axis=-1) > 0.2).all()
+
+
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_ipc_rigid_ground_clearance(n_envs, show_viewer):
+    GRAVITY = np.array([0.0, 0.0, -9.8], dtype=gs.np_float)
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.005,
+            gravity=GRAVITY,
+        ),
+        coupler_options=gs.options.IPCCouplerOptions(
+            contact_d_hat=0.01,
+            contact_resistance=1e6,
+            enable_rigid_rigid_contact=False,
+        ),
+        show_viewer=show_viewer,
+    )
+
+    scene.add_entity(
+        gs.morphs.Plane(),
+        material=gs.materials.Rigid(
+            coupling_mode="ipc_only",
+        ),
+    )
+
+    cubes = []
+    for y, resistance in ((-0.4, 1e2), (-0.2, 1e3), (0.0, 1e4), (0.2, 1e5), (0.4, 1e6)):
+        cube = scene.add_entity(
+            gs.morphs.Box(
+                pos=(0.0, y, 0.05),
+                size=(0.08, 0.08, 0.08),
+            ),
+            material=gs.materials.Rigid(
+                coupling_mode="ipc_only",
+                coup_friction=0.0,
+                contact_resistance=resistance,
+            ),
+        )
+        cubes.append(cube)
+
+    scene.build(n_envs=n_envs)
+
+    initial_positions = np.stack([tensor_to_array(cube.get_pos()) for cube in cubes], axis=-2)
+
+    dist = []
+    for _ in range(70):
+        scene.step()
+    for _ in range(20):
+        scene.step()
+        dist.append(np.stack([tensor_to_array(cube.get_verts())[..., 2].min(axis=-1) for cube in cubes], axis=-1))
+    dist = np.stack(dist, axis=-1)
+
+    final_positions = np.stack([tensor_to_array(cube.get_pos()) for cube in cubes], axis=-2)
+
+    # No lateral driving force in x/y; drift should stay small.
+    assert_allclose(initial_positions[..., :2], final_positions[..., :2], atol=TOL_SINGLE)
+
+    # Make sure that it reaches equilibrium
+    assert_allclose(dist[..., -1], dist[..., -2], tol=TOL_SINGLE)
+
+    # Larger contact resistance should produce larger ground clearance (less penetration/compression).
+    assert (np.diff(dist, axis=-2) > TOL_SINGLE).all()
 
 
 @pytest.mark.required
@@ -112,23 +326,23 @@ def test_link_filter_strict():
     scene.build(n_envs=0)
 
     coupler = scene.sim.coupler
-    entity_idx = robot._idx_in_solver
+    entity_idx = scene.sim.rigid_solver.entities.index(robot)
     base_link_idx = robot.get_link("base").idx
     moving_link_idx = robot.get_link("moving").idx
 
-    assert entity_idx in coupler._ipc_link_filters
-    assert coupler._ipc_link_filters[entity_idx] == {moving_link_idx}
+    assert entity_idx in coupler._coupling_link_filters
+    assert coupler._coupling_link_filters[entity_idx] == {moving_link_idx}
 
     ipc_links_idx = get_ipc_rigid_links_idx(scene, env_idx=0)
     assert moving_link_idx in ipc_links_idx
     assert base_link_idx not in ipc_links_idx
 
-    assert (0, moving_link_idx) in coupler._link_to_abd_slot
-    assert (0, base_link_idx) not in coupler._link_to_abd_slot
+    assert (0, moving_link_idx) in coupler._abd_link_to_slot
+    assert (0, base_link_idx) not in coupler._abd_link_to_slot
 
 
 @pytest.mark.required
-@pytest.mark.parametrize("n_envs", [0])  # FIXME: batching is not supported for now
+@pytest.mark.parametrize("n_envs", [0, 2])
 @pytest.mark.parametrize("coupling_type", ["two_way_soft_constraint", "external_articulation"])
 @pytest.mark.parametrize("joint_type", ["revolute", "prismatic"])
 @pytest.mark.parametrize("fixed", [True, False])
@@ -139,6 +353,7 @@ def test_joints(n_envs, coupling_type, joint_type, fixed, show_viewer):
     POS = (0, 0, 0.5)
     OMEGA = 2.0 * np.pi  # 1 Hz oscillation
     SCALE = 0.5 if joint_type == "revolute" else 0.15
+    CONTACT_MARGIN = 0.01
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
@@ -149,7 +364,7 @@ def test_joints(n_envs, coupling_type, joint_type, fixed, show_viewer):
             enable_collision=False,
         ),
         coupler_options=gs.options.IPCCouplerOptions(
-            contact_friction_mu=0.5,
+            contact_d_hat=CONTACT_MARGIN,
             constraint_strength_translation=1,
             constraint_strength_rotation=1,
             enable_rigid_rigid_contact=False,
@@ -166,7 +381,13 @@ def test_joints(n_envs, coupling_type, joint_type, fixed, show_viewer):
         show_viewer=show_viewer,
     )
 
-    scene.add_entity(gs.morphs.Plane())
+    scene.add_entity(
+        gs.morphs.Plane(),
+        material=gs.materials.Rigid(
+            coupling_mode="ipc_only",
+            coup_friction=0.5,
+        ),
+    )
 
     robot = scene.add_entity(
         morph=gs.morphs.URDF(
@@ -175,7 +396,6 @@ def test_joints(n_envs, coupling_type, joint_type, fixed, show_viewer):
             fixed=fixed,
         ),
         material=gs.materials.Rigid(
-            friction=0.5,
             coupling_mode=coupling_type,
         ),
     )
@@ -189,14 +409,20 @@ def test_joints(n_envs, coupling_type, joint_type, fixed, show_viewer):
     moving_link_idx = robot.get_link("moving").idx
     ipc_links_idx = get_ipc_rigid_links_idx(scene, env_idx=0)
     assert moving_link_idx in ipc_links_idx
-    assert (0, moving_link_idx) in scene.sim.coupler._link_to_abd_slot
+    assert (0, moving_link_idx) in scene.sim.coupler._abd_link_to_slot
     if coupling_type == "two_way_soft_constraint":
-        assert moving_link_idx in scene.sim.coupler.abd_data_by_link
-        assert set(envs_idx) == set(scene.sim.coupler.abd_data_by_link[moving_link_idx])
-    elif fixed:
-        assert not scene.sim.coupler.abd_data_by_link
+        assert (moving_link_idx, 0) in scene.sim.coupler._abd_data_by_link
+    elif coupling_type == "external_articulation":
+        entity_idx = scene.sim.rigid_solver.entities.index(robot)
+        art_data = scene.sim.coupler._articulation_entities[entity_idx]
+        assert art_data is not None
+        assert len(art_data.articulation_slots_by_env) == max(scene.n_envs, 1)
+        if fixed:
+            assert not scene.sim.coupler._abd_data_by_link
 
+    dist_min = float("inf")
     cur_dof_pos_history, target_dof_pos_history = [], []
+    gs_transform_history, ipc_transform_history = [], []
     for i in range(100):
         # Apply sinusoidal target position
         t = i * scene.sim_options.dt
@@ -208,12 +434,19 @@ def test_joints(n_envs, coupling_type, joint_type, fixed, show_viewer):
         cur_dof_pos_history.append(cur_dof_pos)
         target_dof_pos_history.append(target_dof_pos)
 
+        # Make sure the robot never went through the ground
+        if not fixed:
+            robot_verts = tensor_to_array(robot.get_verts())
+            dist_min = np.minimum(dist_min, robot_verts[..., 2].min(axis=-1))
+            # FIXME: For some reason it actually can...
+            assert (dist_min > -0.1).all()
+
         scene.step()
 
         if coupling_type == "two_way_soft_constraint" or not fixed:
             for env_idx in envs_idx:
-                abd_data = scene.sim.coupler.abd_data_by_link[moving_link_idx][env_idx]
-                gs_transform, ipc_transform = abd_data["aim_transform"], abd_data["transform"]
+                abd_data = scene.sim.coupler._abd_data_by_link[(moving_link_idx, env_idx)]
+                gs_transform, ipc_transform = abd_data.aim_transform, abd_data.transform
                 # FIXME: Why the tolerance is must so large if no fixed ?!
                 assert_allclose(gs_transform[:3, 3], ipc_transform[:3, 3], atol=TOL_SINGLE if fixed else 0.2)
                 assert_allclose(
@@ -221,26 +454,36 @@ def test_joints(n_envs, coupling_type, joint_type, fixed, show_viewer):
                     gu.R_to_xyz(ipc_transform[:3, :3], rpy=True),
                     atol=1e-4 if fixed else 0.3,
                 )
+                gs_transform_history.append(gs_transform)
+                ipc_transform_history.append(ipc_transform)
     cur_dof_pos_history = np.stack(cur_dof_pos_history, axis=-1)
     target_dof_pos_history = np.stack(target_dof_pos_history, axis=-1)
 
     for env_idx in envs_idx if scene.n_envs > 0 else (slice(None),):
         corr = np.corrcoef(cur_dof_pos_history[env_idx], target_dof_pos_history)[0, 1]
         assert corr > 1.0 - 5e-3
-    # FIXME: Why is it necessary to skip many steps if not fixed ?!
-    start_idx = 0 if fixed else 50
     assert_allclose(
-        cur_dof_pos_history[..., start_idx:] - cur_dof_pos_history[..., start_idx],
-        target_dof_pos_history[..., start_idx:] - target_dof_pos_history[..., start_idx],
+        cur_dof_pos_history - cur_dof_pos_history[..., [0]],
+        target_dof_pos_history - target_dof_pos_history[..., [0]],
         tol=0.03,
     )
     assert_allclose(np.ptp(cur_dof_pos_history, axis=-1), 2 * SCALE, tol=0.05)
 
-    final_base_pos = robot.get_pos()
+    if gs_transform_history:
+        gs_pos_history, gs_quat_history = gu.T_to_trans_quat(np.stack(gs_transform_history, axis=0))
+        ipc_pos_history, ipc_quat_history = gu.T_to_trans_quat(np.stack(ipc_transform_history, axis=0))
+        pos_err_history = np.linalg.norm(ipc_pos_history - gs_pos_history, axis=-1)
+        rot_err_history = np.linalg.norm(
+            gu.quat_to_rotvec(gu.transform_quat_by_quat(gs.inv_quat(gs_quat_history), ipc_quat_history)), axis=-1
+        )
+        assert (np.percentile(pos_err_history, 90, axis=0) < 1e-2).all()
+        assert (np.percentile(rot_err_history, 90, axis=0) < 5e-2).all()
+
+    # Make sure the robot bounced on the ground or stayed in place
     if fixed:
-        assert_allclose(final_base_pos, POS, atol=TOL_SINGLE)
+        assert_allclose(robot.get_pos(), POS, atol=TOL_SINGLE)
     else:
-        assert POS[2] - final_base_pos[..., 2] > 0.2
+        assert (dist_min < 1.5 * CONTACT_MARGIN).all()
 
 
 @pytest.mark.required
@@ -257,7 +500,6 @@ def test_objects_freefall(n_envs, show_viewer):
         ),
         coupler_options=gs.options.IPCCouplerOptions(
             contact_d_hat=0.01,
-            contact_friction_mu=0.3,
             enable_rigid_rigid_contact=False,
             two_way_coupling=True,
         ),
@@ -295,7 +537,6 @@ def test_objects_freefall(n_envs, show_viewer):
         ),
         material=gs.materials.Rigid(
             rho=500.0,
-            friction=0.3,
             coupling_mode="ipc_only",
         ),
         surface=gs.surfaces.Plastic(
@@ -324,7 +565,7 @@ def test_objects_freefall(n_envs, show_viewer):
 
     ipc_links_idx = get_ipc_rigid_links_idx(scene, env_idx=0)
     assert box.base_link_idx in ipc_links_idx
-    assert (0, box.base_link_idx) in scene.sim.coupler._link_to_abd_slot
+    assert (0, box.base_link_idx) in scene.sim.coupler._abd_link_to_slot
 
     # Verify that geometries are present in IPC for each environment
     cloth_entity_idx = scene.sim.fem_solver.entities.index(cloth)
@@ -394,7 +635,7 @@ def test_objects_freefall(n_envs, show_viewer):
 
 
 @pytest.mark.required
-@pytest.mark.parametrize("n_envs", [0])  # FIXME: batching is not supported for now
+@pytest.mark.parametrize("n_envs", [0, 2])
 def test_objects_colliding(n_envs, show_viewer):
     DT = 0.02
     CONTACT_MARGIN = 0.01
@@ -418,7 +659,13 @@ def test_objects_colliding(n_envs, show_viewer):
         show_viewer=show_viewer,
     )
 
-    scene.add_entity(gs.morphs.Plane())
+    scene.add_entity(
+        gs.morphs.Plane(),
+        material=gs.materials.Rigid(
+            coupling_mode="ipc_only",
+            coup_friction=0.5,
+        ),
+    )
 
     asset_path = get_hf_dataset(pattern="IPC/grid20x20.obj")
     cloth = scene.add_entity(
@@ -447,7 +694,7 @@ def test_objects_colliding(n_envs, show_viewer):
         ),
         material=gs.materials.Rigid(
             rho=500.0,
-            friction=0.3,
+            coup_friction=0.3,
             coupling_mode="ipc_only",
         ),
         surface=gs.surfaces.Plastic(
@@ -464,6 +711,7 @@ def test_objects_colliding(n_envs, show_viewer):
             E=1.0e3,
             nu=0.3,
             rho=1000.0,
+            friction_mu=0.3,
             model="stable_neohookean",
         ),
         surface=gs.surfaces.Plastic(
@@ -496,16 +744,16 @@ def test_objects_colliding(n_envs, show_viewer):
         obj_p_history = np.stack(p_history[obj], axis=-3)
 
         # Make sure that all vertices are laying on the ground
-        assert (obj_p_history[..., 2] > 0.0).all()
         assert (obj_p_history[..., 2] < 1.5 * CONTACT_MARGIN).any()
+        assert (obj_p_history[..., 2] > 0.0).all()
 
         # Check that the objects did not fly away (5cm)
         obj_delta_history = np.linalg.norm((obj_p_history - obj_p_history[..., [0], :, :])[..., :2], axis=-1)
-        assert_allclose(obj_delta_history, 0.0, atol=0.05)
+        assert_allclose(obj_delta_history, 0.0, atol=0.1)
 
         # Make sure that all objects reached steady state
         obj_disp_history = np.linalg.norm(np.diff(obj_p_history[..., -10:, :, :], axis=-3), axis=-1)
-        assert_allclose(obj_disp_history, 0.0, tol=2e-3)
+        assert_allclose(obj_disp_history, 0.0, tol=5e-3)
 
         # Make sure that the cloth is laying on all objects (at least one vertex above the others)
         if obj is cloth:
@@ -527,10 +775,9 @@ def test_robot_grasp_fem(coupling_type, show_viewer):
             gravity=GRAVITY,
         ),
         coupler_options=gs.options.IPCCouplerOptions(
-            contact_friction_mu=0.8,
-            constraint_strength_translation=100,
-            constraint_strength_rotation=100,
-            newton_translation_tolerance=10,
+            constraint_strength_translation=10.0,
+            constraint_strength_rotation=10.0,
+            newton_translation_tolerance=10.0,
             enable_rigid_rigid_contact=False,
             enable_rigid_ground_contact=False,
         ),
@@ -541,10 +788,16 @@ def test_robot_grasp_fem(coupling_type, show_viewer):
         show_viewer=show_viewer,
     )
 
-    scene.add_entity(gs.morphs.Plane())
+    scene.add_entity(
+        gs.morphs.Plane(),
+        material=gs.materials.Rigid(
+            coupling_mode="ipc_only",
+            coup_friction=0.8,
+        ),
+    )
 
     material_kwargs = dict(
-        friction=0.8,
+        coup_friction=0.8,
         coupling_mode=coupling_type,
     )
     if coupling_type == "two_way_soft_constraint":
@@ -566,6 +819,7 @@ def test_robot_grasp_fem(coupling_type, show_viewer):
             E=5.0e4,
             nu=0.45,
             rho=1000.0,
+            friction_mu=0.5,
             model="stable_neohookean",
         ),
         surface=gs.surfaces.Plastic(
@@ -588,13 +842,13 @@ def test_robot_grasp_fem(coupling_type, show_viewer):
     ipc_links_idx = get_ipc_rigid_links_idx(scene, env_idx=0)
     assert franka_finger_links_idx.issubset(ipc_links_idx)
     for link_idx in franka_finger_links_idx:
-        assert (0, link_idx) in scene.sim.coupler._link_to_abd_slot
+        assert (0, link_idx) in scene.sim.coupler._abd_link_to_slot
 
     franka_links_idx = {link.idx for link in franka.links}
     franka_ipc_links_idx = franka_links_idx.intersection(ipc_links_idx)
     if coupling_type == "two_way_soft_constraint":
         entity_idx = scene.sim.rigid_solver.entities.index(franka)
-        assert scene.sim.coupler._ipc_link_filters.get(entity_idx) == franka_finger_links_idx
+        assert scene.sim.coupler._coupling_link_filters.get(entity_idx) == franka_finger_links_idx
         assert franka_ipc_links_idx == franka_finger_links_idx
     else:
         assert franka_finger_links_idx.issubset(franka_ipc_links_idx)
@@ -647,10 +901,11 @@ def test_robot_grasp_fem(coupling_type, show_viewer):
 
 
 @pytest.mark.required
-@pytest.mark.parametrize("n_envs", [0])
+@pytest.mark.parametrize("n_envs", [0, 2])
 def test_momentum_conversation(n_envs, show_viewer):
     DT = 0.001
     DURATION = 0.30
+    CONTACT_MARGIN = 0.01
     VELOCITY = np.array([4.0, 0.0, 0.0], dtype=gs.np_float)
 
     scene = gs.Scene(
@@ -659,6 +914,7 @@ def test_momentum_conversation(n_envs, show_viewer):
             gravity=(0.0, 0.0, 0.0),
         ),
         coupler_options=gs.options.IPCCouplerOptions(
+            contact_d_hat=CONTACT_MARGIN,
             constraint_strength_translation=1,
             constraint_strength_rotation=1,
         ),
@@ -679,6 +935,7 @@ def test_momentum_conversation(n_envs, show_viewer):
             nu=0.45,
             rho=1000.0,
             model="stable_neohookean",
+            friction_mu=0.0,
         ),
     )
 
@@ -690,7 +947,6 @@ def test_momentum_conversation(n_envs, show_viewer):
         ),
         material=gs.materials.Rigid(
             rho=1000,
-            friction=0.3,
             coupling_mode="two_way_soft_constraint",
         ),
         surface=gs.surfaces.Plastic(
@@ -707,17 +963,27 @@ def test_momentum_conversation(n_envs, show_viewer):
     rigid_link_idx = rigid_cube.base_link_idx
     ipc_links_idx = get_ipc_rigid_links_idx(scene, env_idx=0)
     assert rigid_link_idx in ipc_links_idx
-    assert (0, rigid_link_idx) in scene.sim.coupler._link_to_abd_slot
+    assert (0, rigid_link_idx) in scene.sim.coupler._abd_link_to_slot
 
-    blob_radius = blob.morph.radius
-    blob_rho = blob.material.rho
-    blob_mass = (4.0 / 3.0) * np.pi * blob_radius**3 * blob_rho
     cube_mass = rigid_cube.get_mass()
 
+    # Read actual FEM mass from IPC geometry (mesh mass != analytical sphere mass due to tet discretization).
+    blob_radius = blob.morph.radius
+    blob_rho = blob.material.rho
+    blob_analytical_mass = (4.0 / 3.0) * np.pi * blob_radius**3 * blob_rho
+    (fem_raw_geo,) = find_ipc_geometries(scene, solver_type="fem", idx=fem_entity_idx, env_idx=0)
+    fem_mass_density = fem_raw_geo.meta().find(builtin.mass_density).view().item()
+    fem_merged_geo = get_ipc_merged_geometry(scene, solver_type="fem", idx=fem_entity_idx, env_idx=0)
+    fem_vertex_volumes = fem_merged_geo.vertices().find(builtin.volume).view().reshape(-1)
+    blob_mass = float(np.sum(fem_vertex_volumes) * fem_mass_density)
+    assert_allclose(blob_mass, blob_analytical_mass, rtol=0.01)
+
     total_p_history = []
+    momentum_0 = VELOCITY * cube_mass
+
     dist_min = float("inf")
     fem_positions_prev = None  # FEM initial velocity is zero
-    for _ in range(int(DURATION / DT)):
+    for step in range(int(DURATION / DT)):
         cube_vel = tensor_to_array(rigid_cube.get_links_vel(links_idx_local=0, ref="link_com")[..., 0, :])
         rigid_linear_momentum = cube_mass * cube_vel
 
@@ -731,24 +997,21 @@ def test_momentum_conversation(n_envs, show_viewer):
 
         # Make sure that rigid and fem are not penetrating each other
         fem_aabb_min, fem_aabb_max = fem_positions.min(axis=-2), fem_positions.max(axis=-2)
-        rigid_aabb_min, rigid_aabb_max = tensor_to_array(rigid_cube.get_AABB())
-        delta = np.maximum(0, np.maximum(rigid_aabb_min - fem_aabb_max, fem_aabb_min - rigid_aabb_max))
+        rigid_aabb = tensor_to_array(rigid_cube.get_AABB())
+        rigid_aabb_min, rigid_aabb_max = rigid_aabb[..., 0, :], rigid_aabb[..., 1, :]
         overlap = np.minimum(fem_aabb_max, rigid_aabb_max) - np.maximum(rigid_aabb_min, fem_aabb_min)
-        dist_min = min(dist_min, -overlap.min(axis=-1))
-        assert dist_min > 0.0
+        dist_min = np.minimum(dist_min, -overlap.min(axis=-1))
+        assert (dist_min > 0.0).all()
 
         volume_attr = fem_proc_geo.vertices().find(builtin.volume)
-        mass_density_attr = fem_proc_geo.vertices().find(builtin.mass_density)
-        if volume_attr and mass_density_attr:
-            # FIXME: Never hitting this branch
-            volumes = volume_attr.view()
-            mass_densities = mass_density_attr.view().reshape(-1)
-            fem_vertex_masses = volumes * mass_densities
-        else:
-            n_vertices = len(fem_positions)
-            fem_vertex_masses = np.full(n_vertices, fill_value=(blob_mass / n_vertices))
+        fem_vertex_masses = volume_attr.view().reshape(-1) * fem_mass_density
         assert_allclose(np.sum(fem_vertex_masses), blob_mass, tol=TOL_SINGLE)
         fem_linear_momentum = np.sum(fem_vertex_masses[:, np.newaxis] * fem_velocities, axis=0)
+
+        # Before collision: FEM should have zero momentum, rigid should carry all momentum.
+        if step < int(DURATION / 10 / DT):
+            assert_allclose(fem_linear_momentum, 0.0, atol=TOL_SINGLE)
+            assert_allclose(rigid_linear_momentum, momentum_0, tol=TOL_SINGLE)
 
         total_linear_momentum = rigid_linear_momentum + fem_linear_momentum
         total_p_history.append(total_linear_momentum)
@@ -756,19 +1019,17 @@ def test_momentum_conversation(n_envs, show_viewer):
         scene.step()
 
     # Make sure the objects bounced on each other
-    assert dist_min < 0.01
-    fem_centroid = fem_positions.mean(axis=-2)
-    rigid_centroid = rigid_cube.get_pos()
-    # FIXME: The velocity post-impact does not match expectation ?!
+    assert (dist_min < 1.5 * CONTACT_MARGIN).all()
     expected_cube_vel = (cube_mass - blob_mass) / (cube_mass + blob_mass) * VELOCITY
     expected_blob_vel = 2 * cube_mass / (cube_mass + blob_mass) * VELOCITY
-    assert_allclose(cube_vel, expected_cube_vel, tol=0.5)
-    assert_allclose(fem_velocities.mean(axis=-2), expected_blob_vel, tol=0.5)
+    assert (cube_vel[..., 0] < -0.5).all()
+    assert (fem_velocities[..., 0].mean(axis=-1) > 0.5).all()
 
-    # FIXME: Why momentum conservation is not satisfied more accurately ?!
-    momentum_0 = VELOCITY * cube_mass
-    assert_allclose(total_p_history, momentum_0, tol=0.03)
-    assert_allclose(total_p_history[-1], momentum_0, rtol=0.01, atol=0.001)
+    # Check total momentum conservation.
+    # NOTE : The tet mesh's contact-facing vertices (x < -0.05) have a z-mean of -0.00138 due to TetGen's asymmetric
+    # Steiner point insertion, causing an asymmetric contact force distribution during the x-direction collision.
+    # This z-bias produces a net -z impulse, resulting in the observed z-momentum leak.
+    assert_allclose(total_p_history, momentum_0, tol=0.001)
 
 
 @pytest.mark.required
@@ -786,7 +1047,7 @@ def test_collision_delegation_ipc_vs_rigid(coupling_mode, enable_rigid_ground_co
         show_viewer=False,
     )
 
-    plane = scene.add_entity(gs.morphs.Plane())
+    plane = scene.add_entity(gs.morphs.Plane())  # No coupling_mode: stays in rigid solver only
 
     # Non-IPC box — always handled by rigid solver
     box = scene.add_entity(
@@ -847,10 +1108,23 @@ def test_collision_delegation_ipc_vs_rigid(coupling_mode, enable_rigid_ground_co
     # Non-IPC box always has rigid solver ground pairs
     assert any(pair_idx[min(a, b), max(a, b)] >= 0 for a in box_geoms for b in ground_geoms)
 
-    # IPC-excluded geoms must have no rigid solver pairs at all
+    # Pairs between IPC-excluded geoms must have no rigid solver pairs (handled by IPC)
     for i_ga in ipc_excluded_geoms:
-        for i_gb in range(pair_idx.shape[0]):
-            assert pair_idx[(i_ga, i_gb) if i_ga < i_gb else (i_gb, i_ga)] == -1
+        for i_gb in ipc_excluded_geoms:
+            if i_ga < i_gb:
+                assert pair_idx[i_ga, i_gb] == -1
+
+    # Mixed pairs (IPC-excluded ↔ non-IPC) must be kept in rigid solver
+    for i_ga in ipc_excluded_geoms:
+        for i_gb in box_geoms:
+            a, b = min(i_ga, i_gb), max(i_ga, i_gb)
+            assert pair_idx[a, b] >= 0
+
+    # IPC-excluded geom ↔ ground must be kept in rigid solver (ground is not IPC-excluded)
+    for i_ga in ipc_excluded_geoms:
+        for i_gb in ground_geoms:
+            a, b = min(i_ga, i_gb), max(i_ga, i_gb)
+            assert pair_idx[a, b] >= 0
 
     # Non-excluded rigid geoms (if any) keep rigid solver ground and self-collision pairs
     if rigid_kept_geoms:

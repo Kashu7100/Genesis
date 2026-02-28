@@ -46,6 +46,16 @@ class Rigid(Material):
         coupling_link_filter : tuple of str or None, optional
             Tuple of link names to include in IPC coupling. Only supported with coupling_mode='two_way_soft_constraint'.
             If None, all links participate. Use this to filter to specific links. Default is None.
+        enable_coupling_collision : bool, optional
+            Whether IPC collision is enabled for this entity's links. Only used by the IPC coupler.
+            Unlike ``coupling_mode=None`` (which removes the entity from IPC entirely), setting this to
+            False keeps the entity in IPC for coupling forces but disables contact response. Default is True.
+        coupling_collision_links : tuple of str or None, optional
+            If set, only these links are affected by ``enable_coupling_collision``. Only used by the IPC coupler.
+            If None, the setting applies to ALL coupled links of this entity. Default is None.
+        contact_resistance : float or None, optional
+            IPC coupling contact resistance/stiffness override for this entity. ``None`` means use
+            ``IPCCouplerOptions.contact_resistance``. Default is None.
     """
 
     def __init__(
@@ -59,9 +69,12 @@ class Rigid(Material):
         sdf_cell_size=0.005,
         sdf_min_res=32,
         sdf_max_res=128,
-        gravity_compensation=0,
+        gravity_compensation=0.0,
         coupling_mode=None,
         coupling_link_filter=None,
+        enable_coupling_collision=True,
+        coupling_collision_links=None,
+        contact_resistance=None,
     ):
         super().__init__()
 
@@ -83,6 +96,9 @@ class Rigid(Material):
 
         if coup_softness < 0:
             gs.raise_exception("`coup_softness` must be non-negative.")
+
+        if contact_resistance is not None and contact_resistance < 0:
+            gs.raise_exception("`contact_resistance` must be non-negative.")
 
         if coup_restitution < 0 or coup_restitution > 1:
             gs.raise_exception("`coup_restitution` must be in the range [0, 1].")
@@ -108,6 +124,11 @@ class Rigid(Material):
         self._gravity_compensation = float(gravity_compensation)
         self._coupling_mode = coupling_mode
         self._coupling_link_filter = tuple(coupling_link_filter) if coupling_link_filter is not None else None
+        self._enable_coupling_collision = bool(enable_coupling_collision)
+        self._coupling_collision_links = (
+            tuple(coupling_collision_links) if coupling_collision_links is not None else None
+        )
+        self._contact_resistance = float(contact_resistance) if contact_resistance is not None else None
 
     @property
     def gravity_compensation(self) -> float:
@@ -140,6 +161,11 @@ class Rigid(Material):
         return self._coup_restitution
 
     @property
+    def contact_resistance(self) -> float | None:
+        """IPC coupling contact resistance/stiffness override, or None for coupler default."""
+        return self._contact_resistance
+
+    @property
     def sdf_cell_size(self) -> float:
         """Size of each SDF grid cell in meters."""
         return self._sdf_cell_size
@@ -168,3 +194,13 @@ class Rigid(Material):
     def coupling_link_filter(self) -> tuple[str, ...] | None:
         """Tuple of link names to include in IPC coupling."""
         return self._coupling_link_filter
+
+    @property
+    def enable_coupling_collision(self) -> bool:
+        """Whether IPC collision is enabled for this entity's links."""
+        return self._enable_coupling_collision
+
+    @property
+    def coupling_collision_links(self) -> tuple[str, ...] | None:
+        """Tuple of link names affected by enable_coupling_collision."""
+        return self._coupling_collision_links

@@ -14,7 +14,7 @@ import genesis as gs
 
 
 def main():
-    gs.init(backend=gs.gpu, logging_level="info")
+    gs.init(backend=gs.cpu, logging_level="info")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", "--vis", action="store_true", default=False)
@@ -26,7 +26,6 @@ def main():
         ),
         coupler_options=gs.options.IPCCouplerOptions(
             contact_d_hat=0.01,  # Contact barrier distance (10mm) - must be appropriate for mesh resolution
-            contact_friction_mu=0.3,  # Friction coefficient
             two_way_coupling=True,  # Enable two-way coupling (forces from IPC to Genesis rigid bodies)
         ),
         viewer_options=gs.options.ViewerOptions(

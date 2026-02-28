@@ -4,11 +4,18 @@ Utility functions for IPC coupler.
 Stateless helper functions extracted from IPCCoupler for clarity.
 """
 
+import numba as nb
 import numpy as np
-from scipy.spatial.transform import Rotation as R
 
 import genesis as gs
 import genesis.utils.geom as gu
+
+try:
+    from uipc.core import Scene as _UIPCScene
+
+    _UIPC_AVAILABLE = True
+except ImportError:
+    _UIPC_AVAILABLE = False
 
 
 def find_target_link_for_fixed_merge(rigid_solver, link_idx):
@@ -101,11 +108,8 @@ def compute_link_to_link_transform(rigid_solver, from_link_idx, to_link_idx):
 
 
 def is_robot_entity(entity):
-    """Heuristic: treat URDF/MJCF/Drone morphs as robots."""
-    try:
-        return isinstance(entity.morph, (gs.morphs.URDF, gs.morphs.MJCF, gs.morphs.Drone))
-    except Exception:
-        return False
+    """Check if entity is a robot (has non-fixed, non-free joints)."""
+    return any(j.type not in (gs.JOINT_TYPE.FIXED, gs.JOINT_TYPE.FREE) for j in entity.joints)
 
 
 def compute_link_init_world_rotation(rigid_solver, link_idx):
@@ -209,9 +213,7 @@ def build_ipc_scene_config(options, sim_options):
     dict
         Scene config dict ready to pass to Scene(config)
     """
-    from uipc import Scene
-
-    config = Scene.default_config()
+    config = _UIPCScene.default_config()
 
     # Basic simulation parameters (derived from SimOptions)
     config["dt"] = sim_options.dt
@@ -280,94 +282,108 @@ def read_ipc_geometry_metadata(geo):
     """
     Read solver_type, env_idx, and entity/link index from IPC geometry metadata.
 
-    Parameters
-    ----------
-    geo : Geometry
-        An IPC geometry with meta attributes
-
-    Returns
-    -------
-    tuple or None
-        (solver_type, env_idx, idx) where idx is entity_idx for fem/cloth
-        or link_idx for rigid. Returns None if metadata is missing/invalid.
+    Returns (solver_type, env_idx, idx) where idx is entity_idx for fem/cloth
+    or link_idx for rigid. Returns None if the geometry has no solver_type
+    metadata (i.e. not a Genesis-created geometry).
     """
-    try:
-        meta_attrs = geo.meta()
-        solver_type_attr = meta_attrs.find("solver_type")
-
-        if not solver_type_attr or solver_type_attr.name() != "solver_type":
-            return None
-
-        solver_type_view = solver_type_attr.view()
-        if len(solver_type_view) == 0:
-            return None
-        solver_type = str(solver_type_view[0])
-
-        env_idx_attr = meta_attrs.find("env_idx")
-        if not env_idx_attr:
-            return None
-        env_idx = int(str(env_idx_attr.view()[0]))
-
-        if solver_type == "rigid":
-            link_idx_attr = meta_attrs.find("link_idx")
-            if not link_idx_attr:
-                return None
-            idx = int(str(link_idx_attr.view()[0]))
-        elif solver_type in ("fem", "cloth"):
-            entity_idx_attr = meta_attrs.find("entity_idx")
-            if not entity_idx_attr:
-                return None
-            idx = int(str(entity_idx_attr.view()[0]))
-        else:
-            return None
-
-        return (solver_type, env_idx, idx)
-    except Exception:
+    meta_attrs = geo.meta()
+    solver_type_attr = meta_attrs.find("solver_type")
+    if solver_type_attr is None:
         return None
 
+    (solver_type,) = solver_type_attr.view()
+    solver_type = str(solver_type)
 
-def decompose_transform_matrix(transform_4x4):
+    (env_idx,) = map(int, meta_attrs.find("env_idx").view())
+
+    if solver_type == "rigid":
+        (idx,) = map(int, meta_attrs.find("link_idx").view())
+    elif solver_type in ("fem", "cloth"):
+        (idx,) = map(int, meta_attrs.find("entity_idx").view())
+    else:
+        gs.raise_exception(f"Unknown IPC geometry solver_type: {solver_type!r}")
+
+    return (solver_type, env_idx, idx)
+
+
+# ============================================================
+# Numpy computation functions (replacing Quadrants kernels)
+# ============================================================
+
+
+@nb.jit(nopython=True, cache=True)
+def compute_coupling_forces(
+    ipc_transforms,
+    aim_transforms,
+    link_masses,
+    inertia_tensors,
+    translation_strength,
+    rotation_strength,
+    dt2,
+):
     """
-    Decompose a 4x4 transformation matrix into position and quaternion (wxyz).
+    Compute coupling forces and torques for all links.
 
     Parameters
     ----------
-    transform_4x4 : np.ndarray
-        4x4 homogeneous transformation matrix
+    ipc_transforms : np.ndarray, shape (n, 4, 4)
+    aim_transforms : np.ndarray, shape (n, 4, 4)
+    link_masses : np.ndarray, shape (n,)
+    inertia_tensors : np.ndarray, shape (n, 3, 3)
+    translation_strength : float
+    rotation_strength : float
+    dt2 : float
 
     Returns
     -------
-    tuple
-        (pos, quat_wxyz) where pos is (3,) and quat_wxyz is (4,)
+    tuple of (forces, torques), each shape (n, 3)
     """
-    pos = transform_4x4[:3, 3]
-    rot_mat = transform_4x4[:3, :3]
-    quat_xyzw = R.from_matrix(rot_mat).as_quat()
-    quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
-    return pos, quat_wxyz
+    n = ipc_transforms.shape[0]
+    out_forces = np.zeros((n, 3), dtype=ipc_transforms.dtype)
+    out_torques = np.zeros((n, 3), dtype=ipc_transforms.dtype)
 
+    for i in range(n):
+        pos_current = ipc_transforms[i, :3, 3]
+        pos_aim = aim_transforms[i, :3, 3]
 
-def build_link_transform_matrix(pos_3, quat_4):
-    """
-    Build a 4x4 transformation matrix from position and quaternion.
-    Uses uipc Transform for consistency with IPC.
+        R_current = ipc_transforms[i, :3, :3]
+        R_aim = aim_transforms[i, :3, :3]
 
-    Parameters
-    ----------
-    pos_3 : array-like
-        Position (3,)
-    quat_4 : array-like
-        Quaternion in wxyz order (4,)
+        # Linear force: F = strength * mass * delta_pos / dt^2
+        mass = link_masses[i]
+        for k in range(3):
+            out_forces[i, k] = translation_strength * mass * (pos_current[k] - pos_aim[k]) / dt2
 
-    Returns
-    -------
-    np.ndarray
-        4x4 transformation matrix
-    """
-    from uipc import Transform, Vector3, Quaternion
+        # Relative rotation: R_rel = R_current @ R_aim^T
+        R_rel = R_current @ R_aim.T
 
-    t = Transform.Identity()
-    t.translate(Vector3.Values((float(pos_3[0]), float(pos_3[1]), float(pos_3[2]))))
-    uipc_quat = Quaternion(quat_4)
-    t.rotate(uipc_quat)
-    return t.matrix().copy()
+        # Rodrigues: extract rotation vector
+        trace = R_rel[0, 0] + R_rel[1, 1] + R_rel[2, 2]
+        cos_val = (trace - 1.0) / 2.0
+        cos_val = max(-1.0, min(1.0, cos_val))
+        theta = np.arccos(cos_val)
+
+        rotvec = np.zeros(3, dtype=ipc_transforms.dtype)
+        if theta > 1e-6:
+            ax0 = R_rel[2, 1] - R_rel[1, 2]
+            ax1 = R_rel[0, 2] - R_rel[2, 0]
+            ax2 = R_rel[1, 0] - R_rel[0, 1]
+            norm = np.sqrt(ax0 * ax0 + ax1 * ax1 + ax2 * ax2)
+            if norm > 1e-8:
+                s = theta / norm
+                rotvec[0] = s * ax0
+                rotvec[1] = s * ax1
+                rotvec[2] = s * ax2
+
+        # Transform inertia to world frame: I_world = R @ I @ R^T
+        I_world = R_current @ inertia_tensors[i] @ R_current.T
+
+        # Torque = (rotation_strength / dt^2) * I_world @ rotvec
+        scale = rotation_strength / dt2
+        for k in range(3):
+            val = 0.0
+            for m in range(3):
+                val += I_world[k, m] * rotvec[m]
+            out_torques[i, k] = scale * val
+
+    return out_forces, out_torques

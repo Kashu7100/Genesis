@@ -7,7 +7,7 @@ import genesis as gs
 
 
 def main():
-    gs.init(backend=gs.gpu, logging_level="info")
+    gs.init(backend=gs.cpu, logging_level="info")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-ipc", action="store_true", default=False)
@@ -23,17 +23,20 @@ def main():
     coupler_options = None
     if not args.no_ipc:
         coupler_options = gs.options.IPCCouplerOptions(
-            contact_friction_mu=0.8,
-            constraint_strength_translation=100,
-            constraint_strength_rotation=100,
+            constraint_strength_translation=10.0,
+            constraint_strength_rotation=10.0,
             enable_rigid_rigid_contact=False,
             enable_rigid_ground_contact=False,
-            newton_translation_tolerance=10,
+            newton_translation_tolerance=10.0,
         )
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=0.01,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(2.0, 1.0, 1.0),
+            camera_lookat=(0.3, 0.0, 0.5),
         ),
         coupler_options=coupler_options,
         show_viewer=args.vis,
@@ -42,7 +45,7 @@ def main():
     scene.add_entity(gs.morphs.Plane())
 
     franka_material_kwargs = dict(
-        friction=0.8,
+        coup_friction=0.8,
         coupling_mode=args.coupling_type,
     )
     if args.coupling_type == "two_way_soft_constraint":
@@ -60,11 +63,12 @@ def main():
             E=5.0e4,
             nu=0.45,
             rho=1000.0,
+            friction_mu=0.5,
             model="stable_neohookean",
         )
     else:
         cube_material = gs.materials.Rigid()
-    cube = scene.add_entity(
+    scene.add_entity(
         morph=gs.morphs.Box(
             pos=(0.65, 0.0, 0.03),
             size=(0.05, 0.05, 0.05),

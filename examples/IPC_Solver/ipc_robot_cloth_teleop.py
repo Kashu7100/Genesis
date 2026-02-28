@@ -30,7 +30,7 @@ DELTA_ROT = 0.02
 
 
 def main():
-    gs.init(backend=gs.gpu, logging_level="info")
+    gs.init(backend=gs.cpu, logging_level="info")
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -55,10 +55,8 @@ def main():
             newton_semi_implicit_enable=False,  # Must be false to avoid time stealing artifact
             linear_system_tolerance=1e-3,
             contact_enable=True,
-            enable_rigid_rigid_contact=False,
+            enable_rigid_rigid_contact=True,
             contact_d_hat=0.001,
-            contact_friction_mu=0.5,
-            fem_fem_friction_mu=0.0,
             contact_resistance=1e7,
         ),
         viewer_options=gs.options.ViewerOptions(
@@ -108,6 +106,7 @@ def main():
             rho=200,
             thickness=0.001,
             bending_stiffness=10.0,
+            friction_mu=0.5,
         ),
         surface=gs.surfaces.Plastic(
             color=(0.3, 0.1, 0.8, 1.0),
@@ -126,6 +125,7 @@ def main():
             rho=200,
             thickness=0.001,
             bending_stiffness=40.0,
+            friction_mu=0.5,
         ),
         surface=gs.surfaces.Plastic(
             color=(0.3, 0.5, 0.8, 1.0),
@@ -148,7 +148,7 @@ def main():
                 ),
                 material=gs.materials.Rigid(
                     rho=500,
-                    friction=0.5,
+                    coup_friction=0.5,
                     coupling_mode="ipc_only",
                 ),
                 surface=gs.surfaces.Plastic(
@@ -166,6 +166,9 @@ def main():
     target_pos, target_quat = target_init_pos.copy(), target_init_quat.copy()
 
     scene.build()
+
+    franka.set_dofs_kp(500.0, dofs_idx_local=finger_dofs_idx)
+    franka.set_dofs_kv(50.0, dofs_idx_local=finger_dofs_idx)
 
     # Setting initial configuration is not supported by coupling mode "external_articulation"
     if args.coupling_type != "external_articulation":
@@ -242,9 +245,11 @@ def main():
             franka.control_dofs_position(qpos[motor_dofs_idx], motor_dofs_idx)
 
             if gripper_close[()]:
-                franka.control_dofs_velocity([-0.1, -0.1], dofs_idx_local=finger_dofs_idx)
+                # FIXME: Force control is acting weird...
+                # franka.control_dofs_force(-0.1, dofs_idx_local=finger_dofs_idx)
+                franka.control_dofs_position(-0.03, dofs_idx_local=finger_dofs_idx)
             else:
-                franka.control_dofs_velocity([0.1, 0.1], dofs_idx_local=finger_dofs_idx)
+                franka.control_dofs_position(0.04, dofs_idx_local=finger_dofs_idx)
 
             scene.step()
 
