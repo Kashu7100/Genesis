@@ -715,7 +715,7 @@ def test_segmentation_map(segmentation_level, particle_mode, renderer_type, rend
             (gs.materials.MPM.Elastic(), particle_mode),
             (gs.materials.PBD.Cloth(), particle_mode),
             (gs.materials.SPH.Liquid(), "particle" if particle_mode == "visual" else particle_mode),
-            # TODO: Add avatar. Currently avatar solver is buggy.
+            # TODO: Add kinematic. Currently kinematic solver is buggy.
         )
 
     ducks = []

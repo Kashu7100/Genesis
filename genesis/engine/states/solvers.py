@@ -84,28 +84,28 @@ class RigidSolverState:
         return self._s_global
 
 
-class AvatarSolverState:
+class KinematicSolverState:
     """
-    Dynamic state queried from an AvatarSolver.
+    Dynamic state queried from a KinematicSolver.
 
     Only stores position-related fields (qpos, link poses). Physics fields
-    (velocity, acceleration, mass, friction) are omitted since avatars have no dynamics.
+    (velocity, acceleration, mass, friction) are omitted since kinematic entities have no dynamics.
     """
 
     def __init__(self, scene, s_global):
         self.scene = scene
         self._s_global = s_global
 
-        _B = scene.sim.avatar_solver._B
+        _B = scene.sim.kinematic_solver._B
         args = {
             "dtype": gs.tc_float,
             "requires_grad": scene.requires_grad,
             "scene": self.scene,
         }
-        self.qpos = gs.zeros((_B, scene.sim.avatar_solver.n_qs), **args)
-        self.links_pos = gs.zeros((_B, scene.sim.avatar_solver.n_links, 3), **args)
-        self.links_quat = gs.zeros((_B, scene.sim.avatar_solver.n_links, 4), **args)
-        self.i_pos_shift = gs.zeros((_B, scene.sim.avatar_solver.n_links, 3), **args)
+        self.qpos = gs.zeros((_B, scene.sim.kinematic_solver.n_qs), **args)
+        self.links_pos = gs.zeros((_B, scene.sim.kinematic_solver.n_links, 3), **args)
+        self.links_quat = gs.zeros((_B, scene.sim.kinematic_solver.n_links, 4), **args)
+        self.i_pos_shift = gs.zeros((_B, scene.sim.kinematic_solver.n_links, 3), **args)
 
     def serializable(self):
         self.scene = None

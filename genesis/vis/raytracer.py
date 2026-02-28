@@ -284,16 +284,16 @@ class Raytracer:
                         uvs=np.array([]) if geom.uvs is None else geom.uvs,
                     )
 
-        # avatar entities
-        if self.sim.avatar_solver.is_active:
-            for avatar_entity in self.sim.avatar_solver.entities:
-                if avatar_entity.surface.vis_mode == "visual":
-                    geoms = avatar_entity.vgeoms
+        # kinematic entities
+        if self.sim.kinematic_solver.is_active:
+            for kinematic_entity in self.sim.kinematic_solver.entities:
+                if kinematic_entity.surface.vis_mode == "visual":
+                    geoms = kinematic_entity.vgeoms
                 else:
-                    geoms = avatar_entity.geoms
+                    geoms = kinematic_entity.geoms
 
                 for geom in geoms:
-                    if "sdf" in avatar_entity.surface.vis_mode:
+                    if "sdf" in kinematic_entity.surface.vis_mode:
                         mesh = geom.get_sdf_trimesh()
                     else:
                         mesh = geom.get_trimesh()
@@ -688,15 +688,15 @@ class Raytracer:
                     geom_T = geoms_T[geom.idx]  # TODO: support batching
                     self.update_rigid_batch(str(geom.uid), geom_T)
 
-        # avatar entities
-        if self.sim.avatar_solver.is_active:
-            for avatar_entity in self.sim.avatar_solver.entities:
-                if avatar_entity.surface.vis_mode == "visual":
-                    geoms = avatar_entity.vgeoms
-                    geoms_T = self.sim.avatar_solver._vgeoms_render_T
+        # kinematic entities
+        if self.sim.kinematic_solver.is_active:
+            for kinematic_entity in self.sim.kinematic_solver.entities:
+                if kinematic_entity.surface.vis_mode == "visual":
+                    geoms = kinematic_entity.vgeoms
+                    geoms_T = self.sim.kinematic_solver._vgeoms_render_T
                 else:
-                    geoms = avatar_entity.geoms
-                    geoms_T = self.sim.avatar_solver._geoms_render_T
+                    geoms = kinematic_entity.geoms
+                    geoms_T = self.sim.kinematic_solver._geoms_render_T
 
                 for geom in geoms:
                     geom_T = geoms_T[geom.idx]

@@ -339,11 +339,11 @@ Parameters in these solver-specific options will override SimOptions if availabl
 """
 
 
-class AvatarOptions(Options):
+class KinematicOptions(Options):
     """
-    Options configuring the AvatarSolver (visualization-only solver).
+    Options configuring the KinematicSolver (visualization-only solver).
 
-    AvatarSolver is a lightweight solver for ghost/reference entities that only computes
+    KinematicSolver is a lightweight solver for ghost/reference entities that only computes
     forward kinematics for visualization. No collision, physics integration, or constraint
     solving is performed.
 

@@ -1,11 +1,11 @@
 from .base import Material
 
 
-class Avatar(Material):
+class Kinematic(Material):
     """
     Visualization-only material for ghost/reference entities.
 
-    Avatar entities are rendered but do not participate in physics simulation, collision detection,
+    Kinematic entities are rendered but do not participate in physics simulation, collision detection,
     or constraint solving. Only density is accepted since it is used for inertia computation
     during forward kinematics.
 

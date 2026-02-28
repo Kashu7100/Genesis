@@ -381,11 +381,11 @@ class RasterizerContext:
         )
 
     def _rigid_solvers(self):
-        """Yield active solvers that manage KinematicEntity-based entities (rigid + avatar)."""
+        """Yield active solvers that manage KinematicEntity-based entities (rigid + kinematic)."""
         if self.sim.rigid_solver.is_active:
             yield self.sim.rigid_solver
-        if self.sim.avatar_solver.is_active:
-            yield self.sim.avatar_solver
+        if self.sim.kinematic_solver.is_active:
+            yield self.sim.kinematic_solver
 
     def on_rigid(self):
         for solver in self._rigid_solvers():

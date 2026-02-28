@@ -1,5 +1,5 @@
 """
-Benchmark: measure simulation step time with and without AvatarEntity.
+Benchmark: measure simulation step time with and without KinematicEntity.
 
 Runs headless (no viewer, no rendering) to isolate simulation overhead.
 """
@@ -16,7 +16,7 @@ N_WARMUP = 200
 N_STEPS = 2000
 
 
-def bench_without_avatar():
+def bench_without_kinematic():
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=0.01),
         show_viewer=False,
@@ -39,7 +39,7 @@ def bench_without_avatar():
     return elapsed
 
 
-def bench_with_avatar():
+def bench_with_kinematic():
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=0.01),
         show_viewer=False,
@@ -50,7 +50,7 @@ def bench_with_avatar():
     )
     ghost = scene.add_entity(
         gs.morphs.URDF(file="urdf/go2/urdf/go2.urdf", pos=(0, -0.5, 0.42)),
-        material=gs.materials.Avatar(),
+        material=gs.materials.Kinematic(),
     )
     scene.build()
 
@@ -99,8 +99,8 @@ def bench_with_avatar():
     return t_set + t_step, t_set, t_step
 
 
-def bench_with_avatar_no_update():
-    """With avatar entity present but NOT updating its pose each step."""
+def bench_with_kinematic_no_update():
+    """With kinematic entity present but NOT updating its pose each step."""
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=0.01),
         show_viewer=False,
@@ -111,7 +111,7 @@ def bench_with_avatar_no_update():
     )
     scene.add_entity(
         gs.morphs.URDF(file="urdf/go2/urdf/go2.urdf", pos=(0, -0.5, 0.42)),
-        material=gs.materials.Avatar(),
+        material=gs.materials.Kinematic(),
     )
     scene.build()
 
@@ -132,9 +132,9 @@ def main():
 
     print(f"Warming up {N_WARMUP} steps, then timing {N_STEPS} steps (headless).\n")
 
-    t_without = bench_without_avatar()
-    t_no_update = bench_with_avatar_no_update()
-    t_total, t_set, t_step = bench_with_avatar()
+    t_without = bench_without_kinematic()
+    t_no_update = bench_with_kinematic_no_update()
+    t_total, t_set, t_step = bench_with_kinematic()
 
     fps_without = N_STEPS / t_without
     fps_no_update = N_STEPS / t_no_update
@@ -142,11 +142,11 @@ def main():
     overhead_no_update = (t_no_update - t_without) / t_without * 100
     overhead_total = (t_total - t_without) / t_without * 100
 
-    print(f"{'Without avatar:':<30} {t_without:.3f}s  ({fps_without:.0f} steps/s)")
+    print(f"{'Without kinematic:':<30} {t_without:.3f}s  ({fps_without:.0f} steps/s)")
     print(
-        f"{'With avatar (static):':<30} {t_no_update:.3f}s  ({fps_no_update:.0f} steps/s)  {overhead_no_update:+.1f}%"
+        f"{'With kinematic (static):':<30} {t_no_update:.3f}s  ({fps_no_update:.0f} steps/s)  {overhead_no_update:+.1f}%"
     )
-    print(f"{'With avatar (updating):':<30} {t_total:.3f}s  ({fps_total:.0f} steps/s)  {overhead_total:+.1f}%")
+    print(f"{'With kinematic (updating):':<30} {t_total:.3f}s  ({fps_total:.0f} steps/s)  {overhead_total:+.1f}%")
     print(f"  ├─ set_dofs_position:         {t_set:.3f}s  ({t_set / t_total * 100:.0f}%)")
     print(f"  └─ scene.step():              {t_step:.3f}s  ({t_step / t_total * 100:.0f}%)")
 

@@ -7,7 +7,7 @@ import genesis as gs
 import genesis.utils.array_class as array_class
 from genesis.engine.entities.rigid_entity import KinematicEntity
 from genesis.engine.states import QueriedStates
-from genesis.engine.states.solvers import AvatarSolverState
+from genesis.engine.states.solvers import KinematicSolverState
 from genesis.options.solvers import RigidOptions
 from genesis.utils.misc import qd_to_torch, sanitize_indexed_tensor
 
@@ -39,7 +39,7 @@ from .rigid.abd.accessor import (
 if TYPE_CHECKING:
     from genesis.engine.scene import Scene
     from genesis.engine.simulator import Simulator
-    from genesis.options.solvers import AvatarOptions
+    from genesis.options.solvers import KinematicOptions
 
 
 class KinematicSolver(Solver):
@@ -47,12 +47,12 @@ class KinematicSolver(Solver):
     Base solver for articulated kinematic entities (FK, rendering, state get/set).
 
     Provides the full build pipeline, field init methods, counter properties,
-    render methods, and IO sanitization shared by both AvatarSolver and RigidSolver.
+    render methods, and IO sanitization shared by both KinematicSolver and RigidSolver.
 
     RigidSolver extends this with physics (collision, constraints, dynamics).
     """
 
-    def __init__(self, scene: "Scene", sim: "Simulator", options: "AvatarOptions") -> None:
+    def __init__(self, scene: "Scene", sim: "Simulator", options: "KinematicOptions") -> None:
         super().__init__(scene, sim, options)
 
         # Internal RigidOptions for DataManager compatibility (provides iterations, tolerance, etc.)
@@ -160,7 +160,7 @@ class KinematicSolver(Solver):
         self._post_build_entities()
 
     def _post_build_entities(self):
-        """Disable collision on all entity geoms (avatar/kinematic entities have no physics)."""
+        """Disable collision on all entity geoms (kinematic entities have no physics)."""
         for entity in self._entities:
             for geom in entity.geoms:
                 geom._contype = 0
@@ -768,7 +768,7 @@ class KinematicSolver(Solver):
             if s_global in self._queried_states:
                 return self._queried_states[s_global][0]
 
-            state = AvatarSolverState(self._scene, s_global)
+            state = KinematicSolverState(self._scene, s_global)
 
             _vel, _acc, _mass, _friction = self._make_scratch_physics_tensors()
             kernel_get_state(
@@ -956,7 +956,3 @@ class KinematicSolver(Solver):
         if self._entities:
             return np.concatenate([entity.init_qpos for entity in self._entities], dtype=gs.np_float)
         return np.array([], dtype=gs.np_float)
-
-
-# Backward compatibility alias
-AvatarSolver = KinematicSolver

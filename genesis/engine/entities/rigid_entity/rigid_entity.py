@@ -116,7 +116,7 @@ class KinematicEntity(Entity):
     """
     Base entity class for articulated rigid-body systems (morphology, FK, Jacobian, IK).
 
-    Used directly by KinematicSolver for visualization-only avatar entities,
+    Used directly by KinematicSolver for visualization-only kinematic entities,
     and subclassed by RigidEntity as a type marker for physics-enabled entities.
     """
 

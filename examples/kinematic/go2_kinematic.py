@@ -1,10 +1,10 @@
 """
-Example: AvatarEntity as a ghost reference motion.
+Example: KinematicEntity as a ghost reference motion.
 
 Creates a Go2 quadruped as a physics-simulated entity alongside a second Go2
-loaded as an AvatarEntity (visualization-only ghost).  The avatar follows a
+loaded as a KinematicEntity (visualization-only ghost).  The kinematic entity follows a
 simple sinusoidal joint trajectory while the physics robot is free to fall and
-interact with the ground.  This demonstrates how AvatarEntity can display a
+interact with the ground.  This demonstrates how KinematicEntity can display a
 reference motion without affecting simulation speed or physics.
 """
 
@@ -41,13 +41,13 @@ def main():
         ),
     )
 
-    # ── Ghost Go2 (avatar entity — visualization only) ───────────────
+    # ── Ghost Go2 (kinematic entity — visualization only) ─────────────
     ghost = scene.add_entity(
         gs.morphs.URDF(
             file="urdf/go2/urdf/go2.urdf",
             pos=(0.0, -0.5, 0.42),
         ),
-        material=gs.materials.Avatar(),
+        material=gs.materials.Kinematic(),
         surface=gs.surfaces.Default(color=(0.4, 0.7, 1.0), opacity=0.5),
     )
 
