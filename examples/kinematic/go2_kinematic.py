@@ -10,6 +10,7 @@ reference motion without affecting simulation speed or physics.
 
 import argparse
 import math
+import os
 
 import numpy as np
 
@@ -76,7 +77,7 @@ def main():
     robot.set_dofs_position(joint_angles, robot_dof_idx)
     ghost.set_dofs_position(joint_angles, ghost_dof_idx)
 
-    for step in range(250):
+    for step in range(500 if "PYTEST_VERSION" not in os.environ else 5):
         t = step * scene.sim_options.dt
 
         # Sinusoidal reference trajectory for the ghost
