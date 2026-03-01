@@ -1989,7 +1989,7 @@ class KinematicEntity(Entity):
             gs.raise_exception("Neither `name` nor `uid` is provided.")
 
     @gs.assert_built
-    def set_dofs_position(self, position, dofs_idx_local=None, envs_idx=None, *, zero_velocity=True):
+    def set_dofs_position(self, position, dofs_idx_local=None, envs_idx=None):
         """
         Set the entity's dofs' position.
 
@@ -2012,8 +2012,6 @@ class KinematicEntity(Entity):
             gs.raise_exception("This method is not supported by `RigidMaterial.coupling_mode='external_articulation'`.")
 
         dofs_idx = self._get_global_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
-        if zero_velocity:
-            self.zero_all_dofs_velocity(envs_idx=envs_idx, skip_forward=True)
         self._solver.set_dofs_position(position, dofs_idx, envs_idx)
 
     @gs.assert_built
@@ -2927,6 +2925,34 @@ class RigidEntity(KinematicEntity):
     # ------------------------------------------------------------------------------------
     # ----------------------------- DOF property setters ---------------------------------
     # ------------------------------------------------------------------------------------
+
+    @gs.assert_built
+    def set_dofs_position(self, position, dofs_idx_local=None, envs_idx=None, *, zero_velocity=True):
+        """
+        Set the entity's dofs' position.
+
+        Parameters
+        ----------
+        position : array_like
+            The position to set.
+        dofs_idx_local : None | array_like, optional
+            The indices of the dofs to set. If None, all dofs will be set. Note that here this uses the local `q_idx`,
+            not the scene-level one. Defaults to None.
+        envs_idx : None | array_like, optional
+            The indices of the environments. If None, all environments will be considered. Defaults to None.
+        zero_velocity : bool, optional
+            Whether to zero the velocity of all the entity's dofs. Defaults to True. This is a safety measure after a
+            sudden change in entity pose.
+        """
+        from genesis.engine.couplers import IPCCoupler
+
+        if isinstance(self.sim.coupler, IPCCoupler) and self.material.coupling_mode == "external_articulation":
+            gs.raise_exception("This method is not supported by `RigidMaterial.coupling_mode='external_articulation'`.")
+
+        dofs_idx = self._get_global_idx(dofs_idx_local, self.n_dofs, self._dof_start, unsafe=True)
+        if zero_velocity:
+            self.zero_all_dofs_velocity(envs_idx=envs_idx, skip_forward=True)
+        self._solver.set_dofs_position(position, dofs_idx, envs_idx)
 
     @gs.assert_built
     def set_dofs_kp(self, kp, dofs_idx_local=None, envs_idx=None):

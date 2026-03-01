@@ -30,15 +30,19 @@ from .abd.misc import (
     kernel_init_equality_fields,
     kernel_apply_links_external_force,
     kernel_apply_links_external_torque,
+    kernel_adjust_link_inertia,
     kernel_bit_reduction,
     kernel_set_zero,
     kernel_clear_external_force,
 )
 from .abd.forward_kinematics import (
     func_aggregate_awake_entities,
+    func_update_all_verts,
     func_forward_velocity,
     func_hibernate__for_all_awake_islands_either_hiberanate_or_update_aabb_sort_buffer,
     func_update_cartesian_space,
+    kernel_update_all_verts,
+    kernel_update_geom_aabbs,
     kernel_forward_kinematics_links_geoms,
     kernel_masked_forward_kinematics_links_geoms,
     kernel_forward_velocity,
@@ -47,6 +51,7 @@ from .abd.forward_kinematics import (
     kernel_update_verts_for_geoms,
     kernel_update_cartesian_space,
 )
+
 from .abd.forward_dynamics import (
     func_forward_dynamics,
     func_update_acc,
