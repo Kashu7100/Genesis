@@ -9,7 +9,7 @@ import genesis as gs
 import genesis.utils.array_class as array_class
 from genesis.engine.entities import DroneEntity, RigidEntity
 from genesis.engine.entities.base_entity import Entity
-from genesis.engine.states import QueriedStates, RigidSolverState
+from genesis.engine.states import RigidSolverState
 from genesis.options.solvers import RigidOptions
 from genesis.utils.misc import (
     DeprecationError,
@@ -17,93 +17,39 @@ from genesis.utils.misc import (
     qd_to_numpy,
     indices_to_mask,
     broadcast_tensor,
-    sanitize_indexed_tensor,
     assign_indexed_tensor,
 )
-from genesis.utils.sdf import SDF
 
-from ..base_solver import Solver
 from ..kinematic_solver import KinematicSolver
 from .collider import Collider
 from .constraint import ConstraintSolver, ConstraintSolverIsland
 from .abd.misc import (
-    func_add_safe_backward,
     func_apply_coupling_force,
-    func_apply_link_external_force,
-    func_apply_external_torque,
-    func_apply_link_external_torque,
-    func_atomic_add_if,
-    func_check_index_range,
-    func_clear_external_force,
-    func_read_field_if,
-    func_wakeup_entity_and_its_temp_island,
-    func_write_field_if,
-    func_write_and_read_field_if,
     kernel_init_invweight,
     kernel_init_meaninertia,
-    kernel_init_dof_fields,
-    kernel_init_link_fields,
-    kernel_update_heterogeneous_link_info,
-    kernel_init_joint_fields,
-    kernel_init_vert_fields,
-    kernel_init_vvert_fields,
-    kernel_init_geom_fields,
-    kernel_adjust_link_inertia,
-    kernel_init_vgeom_fields,
-    kernel_init_entity_fields,
     kernel_init_equality_fields,
     kernel_apply_links_external_force,
     kernel_apply_links_external_torque,
-    kernel_update_geoms_render_T,
-    kernel_update_vgeoms_render_T,
     kernel_bit_reduction,
     kernel_set_zero,
     kernel_clear_external_force,
 )
 from .abd.forward_kinematics import (
     func_aggregate_awake_entities,
-    func_COM_links,
-    func_COM_links_entity,
-    func_forward_kinematics_entity,
-    func_forward_kinematics_batch,
-    func_forward_velocity_entity,
-    func_forward_velocity_batch,
     func_forward_velocity,
-    func_hibernate_entity_and_zero_dof_velocities,
     func_hibernate__for_all_awake_islands_either_hiberanate_or_update_aabb_sort_buffer,
-    func_update_geoms_entity,
-    func_update_geoms_batch,
-    func_update_all_verts,
     func_update_cartesian_space,
-    func_update_cartesian_space_entity,
-    func_update_cartesian_space_batch,
-    func_update_geoms,
-    func_update_verts_for_geom,
     kernel_forward_kinematics_links_geoms,
     kernel_masked_forward_kinematics_links_geoms,
     kernel_forward_velocity,
     kernel_masked_forward_velocity,
     kernel_forward_kinematics_entity,
-    kernel_update_geoms,
     kernel_update_verts_for_geoms,
-    kernel_update_all_verts,
-    kernel_update_geom_aabbs,
-    kernel_update_vgeoms,
     kernel_update_cartesian_space,
 )
 from .abd.forward_dynamics import (
-    func_actuation,
-    func_bias_force,
-    func_compute_mass_matrix,
-    func_compute_qacc,
-    func_factor_mass,
     func_forward_dynamics,
-    func_solve_mass_entity,
-    func_solve_mass_batch,
-    func_solve_mass,
-    func_torque_and_passive_force,
     func_update_acc,
-    func_update_force,
     func_integrate,
     func_implicit_damping,
     func_vel_at_point,
@@ -156,13 +102,8 @@ from .abd.accessor import (
     kernel_set_geoms_friction,
 )
 from .abd.diff import (
-    func_copy_cartesian_space,
     func_copy_next_to_curr,
-    func_copy_next_to_curr_grad,
     func_integrate_dq_entity,
-    func_is_grad_valid,
-    func_load_adjoint_cache,
-    func_save_adjoint_cache,
     kernel_save_adjoint_cache,
     kernel_prepare_backward_substep,
     kernel_begin_backward_substep,
@@ -172,7 +113,6 @@ from .abd.diff import (
 if TYPE_CHECKING:
     from genesis.engine.scene import Scene
     from genesis.engine.simulator import Simulator
-    from genesis.engine.entities.rigid_entity import RigidJoint, RigidLink, RigidGeom, RigidVisGeom
 
 
 IS_OLD_TORCH = tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
@@ -327,9 +267,9 @@ class RigidSolver(KinematicSolver):
 
         # Physics-specific post-build steps
         self._init_mass_mat()
-        self._process_heterogeneous_link_info()
         self._init_equality_fields()
         self._init_invweight_and_meaninertia(force_update=False)
+
         self._init_collider()
         self._init_constraint_solver()
 
@@ -341,9 +281,9 @@ class RigidSolver(KinematicSolver):
         """No-op: RigidSolver entities keep their collision parameters."""
         pass
 
-    def _cache_counters(self):
-        super()._cache_counters()
+    def _setup_equalities(self):
         self._n_equalities = self.n_equalities
+        self.n_candidate_equalities_ = max(1, self.n_equalities + self._options.max_dynamic_constraints)
         self._equalities = self.equalities
 
         base_links_idx = []
@@ -355,19 +295,7 @@ class RigidSolver(KinematicSolver):
                 base_links_idx.append(joint.link.idx)
         self._base_links_idx = torch.tensor(base_links_idx, dtype=gs.tc_int, device=gs.device)
 
-    def _setup_dummy_sizes(self):
-        super()._setup_dummy_sizes()
-        self.n_candidate_equalities_ = max(1, self.n_equalities + self._options.max_dynamic_constraints)
-
-        # batch_links_info is required when heterogeneous simulation is used.
-        # We must update options because get_links_info reads from solver._options.batch_links_info.
-        if self._enable_heterogeneous:
-            self._options.batch_links_info = True
-
     def _build_static_config(self):
-        self._hibernation_thresh_vel = self._options.hibernation_thresh_vel
-        self._hibernation_thresh_acc = self._options.hibernation_thresh_acc
-
         static_rigid_sim_config = dict(
             backend=gs.backend,
             para_level=self.sim._para_level,
@@ -664,80 +592,6 @@ class RigidSolver(KinematicSolver):
         self._rigid_global_info.mass_parent_mask.from_numpy(mass_parent_mask)
 
         self._rigid_global_info.gravity.from_numpy(self.gravity)
-
-    def _process_heterogeneous_link_info(self):
-        """
-        Process heterogeneous link info: dispatch geoms per environment and compute per-env inertial properties.
-        This method is called after _init_link_fields to update the per-environment inertial properties
-        for entities with heterogeneous morphs.
-        """
-        for entity in self._entities:
-            # Skip non-heterogeneous entities
-            if not entity._enable_heterogeneous:
-                continue
-
-            # Get the number of variants for this entity
-            n_variants = len(entity.variants_geom_start)
-
-            # Distribute variants across environments using balanced block assignment:
-            # - If B >= n_variants: first B/n_variants environments get variant 0, next get variant 1, etc.
-            # - If B < n_variants: each environment gets a different variant (some variants unused)
-            if self._B >= n_variants:
-                base = self._B // n_variants
-                extra = self._B % n_variants  # first `extra` chunks get one more
-                sizes = np.r_[np.full(extra, base + 1), np.full(n_variants - extra, base)]
-                variant_idx = np.repeat(np.arange(n_variants), sizes)
-            else:
-                # Each environment gets a unique variant; variants beyond B are unused
-                variant_idx = np.arange(self._B)
-
-            # Get arrays from entity
-            np_geom_start = np.array(entity.variants_geom_start, dtype=gs.np_int)
-            np_geom_end = np.array(entity.variants_geom_end, dtype=gs.np_int)
-            np_vgeom_start = np.array(entity.variants_vgeom_start, dtype=gs.np_int)
-            np_vgeom_end = np.array(entity.variants_vgeom_end, dtype=gs.np_int)
-
-            # Process each link in this heterogeneous entity (currently only single-link supported)
-            for link in entity.links:
-                i_l = link.idx
-
-                # Build per-env arrays for geom/vgeom ranges
-                links_geom_start = np_geom_start[variant_idx]
-                links_geom_end = np_geom_end[variant_idx]
-                links_vgeom_start = np_vgeom_start[variant_idx]
-                links_vgeom_end = np_vgeom_end[variant_idx]
-
-                # Build per-env arrays for inertial properties
-                links_inertial_mass = np.array(
-                    [entity.variants_inertial_mass[v] for v in variant_idx], dtype=gs.np_float
-                )
-                links_inertial_pos = np.array([entity.variants_inertial_pos[v] for v in variant_idx], dtype=gs.np_float)
-                links_inertial_i = np.array([entity.variants_inertial_i[v] for v in variant_idx], dtype=gs.np_float)
-
-                # Update links_info with per-environment values
-                # Note: when batch_links_info is True, the shape is (n_links, B)
-                kernel_update_heterogeneous_link_info(
-                    i_l,
-                    links_geom_start,
-                    links_geom_end,
-                    links_vgeom_start,
-                    links_vgeom_end,
-                    links_inertial_mass,
-                    links_inertial_pos,
-                    links_inertial_i,
-                    self.links_info,
-                )
-
-                # Update active_envs_idx for geoms and vgeoms - indicates which environments each geom is active in
-                for geom in link.geoms:
-                    active_envs_mask = (links_geom_start <= geom.idx) & (geom.idx < links_geom_end)
-                    geom.active_envs_mask = torch.tensor(active_envs_mask, device=gs.device)
-                    (geom.active_envs_idx,) = np.where(active_envs_mask)
-
-                for vgeom in link.vgeoms:
-                    active_envs_mask = (links_vgeom_start <= vgeom.idx) & (vgeom.idx < links_vgeom_end)
-                    vgeom.active_envs_mask = torch.tensor(active_envs_mask, device=gs.device)
-                    (vgeom.active_envs_idx,) = np.where(active_envs_mask)
 
     def _init_equality_fields(self):
         self.equalities_info = self.data_manager.equalities_info

@@ -22,6 +22,7 @@ from .rigid.abd.misc import (
     kernel_init_vgeom_fields,
     kernel_init_entity_fields,
     kernel_update_geoms_render_T,
+    kernel_update_heterogeneous_link_info,
     kernel_update_vgeoms_render_T,
     kernel_set_zero,
 )
@@ -79,6 +80,11 @@ class KinematicSolver(Solver):
         self._enable_collision = False
         self._enable_mujoco_compatibility = False
         self._requires_grad = False
+        self._enable_heterogeneous = False  # Set to True when any entity has heterogeneous morphs
+        # Hibernation parameters (zeroed out, required by DataManager)
+        self._hibernation_thresh_vel = 0.0
+        self._hibernation_thresh_acc = 0.0
+
         self.collider = None
         self.constraint_solver = None
 
@@ -98,6 +104,7 @@ class KinematicSolver(Solver):
         morph_heterogeneous = []
         if isinstance(morph, (tuple, list)):
             morph, *morph_heterogeneous = morph
+            self._enable_heterogeneous |= bool(morph_heterogeneous)
 
         morph._enable_mujoco_compatibility = self._enable_mujoco_compatibility
 
@@ -136,41 +143,14 @@ class KinematicSolver(Solver):
 
     def build(self):
         super().build()
-        self._setup_build_environment()
-        self._build_entities()
-        self._cache_counters()
-        self._setup_dummy_sizes()
-        self._build_static_config()
-        self._create_data_manager()
-        self._init_dof_fields()
-        self._init_vert_fields()
-        self._init_vvert_fields()
-        self._init_geom_fields()
-        self._init_vgeom_fields()
-        self._init_link_fields()
-        self._init_entity_fields()
-        self._init_envs_offset()
-        self._func_update_geoms(self._scene._envs_idx, force_update_fixed_geoms=True)
-
-    def _setup_build_environment(self):
         self.n_envs = self.sim.n_envs
         self._B = self.sim._B
         self._para_level = self.sim._para_level
 
-    def _build_entities(self):
         for entity in self._entities:
             entity._build()
         self._post_build_entities()
 
-    def _post_build_entities(self):
-        """Disable collision on all entity geoms (kinematic entities have no physics)."""
-        for entity in self._entities:
-            for geom in entity.geoms:
-                geom._contype = 0
-                geom._conaffinity = 0
-                geom._needs_coup = False
-
-    def _cache_counters(self):
         self._n_qs = self.n_qs
         self._n_dofs = self.n_dofs
         self._n_links = self.n_links
@@ -186,14 +166,14 @@ class KinematicSolver(Solver):
         self._n_vfaces = self.n_vfaces
         self._n_vverts = self.n_vverts
         self._n_entities = self.n_entities
-        self._n_equalities = 0
 
         self._geoms = self.geoms
         self._vgeoms = self.vgeoms
         self._links = self.links
         self._joints = self.joints
 
-    def _setup_dummy_sizes(self):
+        self._setup_equalities()
+
         self.n_qs_ = max(1, self.n_qs)
         self.n_dofs_ = max(1, self.n_dofs)
         self.n_links_ = max(1, self.n_links)
@@ -209,13 +189,41 @@ class KinematicSolver(Solver):
         self.n_entities_ = max(1, self.n_entities)
         self.n_free_verts_ = max(1, self.n_free_verts)
         self.n_fixed_verts_ = max(1, self.n_fixed_verts)
+
+        # batch_links_info is required when heterogeneous simulation is used.
+        # We must update options because get_links_info reads from solver._options.batch_links_info.
+        if self._enable_heterogeneous:
+            self._options.batch_links_info = True
+
+        self._build_static_config()
+        self._create_data_manager()
+
+        self._init_dof_fields()
+        self._init_vert_fields()
+        self._init_vvert_fields()
+        self._init_geom_fields()
+        self._init_vgeom_fields()
+        self._init_link_fields()
+        self._process_heterogeneous_link_info()
+        self._init_entity_fields()
+
+        self._init_envs_offset()
+
+        self._func_update_geoms(self._scene._envs_idx, force_update_fixed_geoms=True)
+
+    def _post_build_entities(self):
+        """Disable collision on all entity geoms (kinematic entities have no physics)."""
+        for entity in self._entities:
+            for geom in entity.geoms:
+                geom._contype = 0
+                geom._conaffinity = 0
+                geom._needs_coup = False
+
+    def _setup_equalities(self):
+        self._n_equalities = 0
         self.n_candidate_equalities_ = 1
 
     def _build_static_config(self):
-        # Hibernation parameters (zeroed out, required by DataManager)
-        self._hibernation_thresh_vel = 0.0
-        self._hibernation_thresh_acc = 0.0
-
         # Static config with all physics disabled
         self._static_rigid_sim_config = array_class.StructRigidSimStaticConfig(
             backend=gs.backend,
@@ -357,6 +365,80 @@ class KinematicSolver(Solver):
             self.qpos.from_numpy(init_qpos)
 
         self.links_T = self._rigid_global_info.links_T
+
+    def _process_heterogeneous_link_info(self):
+        """
+        Process heterogeneous link info: dispatch geoms per environment and compute per-env inertial properties.
+        This method is called after _init_link_fields to update the per-environment inertial properties
+        for entities with heterogeneous morphs.
+        """
+        for entity in self._entities:
+            # Skip non-heterogeneous entities
+            if not entity._enable_heterogeneous:
+                continue
+
+            # Get the number of variants for this entity
+            n_variants = len(entity.variants_geom_start)
+
+            # Distribute variants across environments using balanced block assignment:
+            # - If B >= n_variants: first B/n_variants environments get variant 0, next get variant 1, etc.
+            # - If B < n_variants: each environment gets a different variant (some variants unused)
+            if self._B >= n_variants:
+                base = self._B // n_variants
+                extra = self._B % n_variants  # first `extra` chunks get one more
+                sizes = np.r_[np.full(extra, base + 1), np.full(n_variants - extra, base)]
+                variant_idx = np.repeat(np.arange(n_variants), sizes)
+            else:
+                # Each environment gets a unique variant; variants beyond B are unused
+                variant_idx = np.arange(self._B)
+
+            # Get arrays from entity
+            np_geom_start = np.array(entity.variants_geom_start, dtype=gs.np_int)
+            np_geom_end = np.array(entity.variants_geom_end, dtype=gs.np_int)
+            np_vgeom_start = np.array(entity.variants_vgeom_start, dtype=gs.np_int)
+            np_vgeom_end = np.array(entity.variants_vgeom_end, dtype=gs.np_int)
+
+            # Process each link in this heterogeneous entity (currently only single-link supported)
+            for link in entity.links:
+                i_l = link.idx
+
+                # Build per-env arrays for geom/vgeom ranges
+                links_geom_start = np_geom_start[variant_idx]
+                links_geom_end = np_geom_end[variant_idx]
+                links_vgeom_start = np_vgeom_start[variant_idx]
+                links_vgeom_end = np_vgeom_end[variant_idx]
+
+                # Build per-env arrays for inertial properties
+                links_inertial_mass = np.array(
+                    [entity.variants_inertial_mass[v] for v in variant_idx], dtype=gs.np_float
+                )
+                links_inertial_pos = np.array([entity.variants_inertial_pos[v] for v in variant_idx], dtype=gs.np_float)
+                links_inertial_i = np.array([entity.variants_inertial_i[v] for v in variant_idx], dtype=gs.np_float)
+
+                # Update links_info with per-environment values
+                # Note: when batch_links_info is True, the shape is (n_links, B)
+                kernel_update_heterogeneous_link_info(
+                    i_l,
+                    links_geom_start,
+                    links_geom_end,
+                    links_vgeom_start,
+                    links_vgeom_end,
+                    links_inertial_mass,
+                    links_inertial_pos,
+                    links_inertial_i,
+                    self.links_info,
+                )
+
+                # Update active_envs_idx for geoms and vgeoms - indicates which environments each geom is active in
+                for geom in link.geoms:
+                    active_envs_mask = (links_geom_start <= geom.idx) & (geom.idx < links_geom_end)
+                    geom.active_envs_mask = torch.tensor(active_envs_mask, device=gs.device)
+                    (geom.active_envs_idx,) = np.where(active_envs_mask)
+
+                for vgeom in link.vgeoms:
+                    active_envs_mask = (links_vgeom_start <= vgeom.idx) & (vgeom.idx < links_vgeom_end)
+                    vgeom.active_envs_mask = torch.tensor(active_envs_mask, device=gs.device)
+                    (vgeom.active_envs_idx,) = np.where(active_envs_mask)
 
     def _init_vert_fields(self):
         self.verts_info = self.data_manager.verts_info
