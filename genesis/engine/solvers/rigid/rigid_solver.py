@@ -9,7 +9,7 @@ import genesis as gs
 import genesis.utils.array_class as array_class
 from genesis.engine.entities import DroneEntity, RigidEntity
 from genesis.engine.entities.base_entity import Entity
-from genesis.engine.states import RigidSolverState
+from genesis.engine.states import QueriedStates, RigidSolverState
 from genesis.options.solvers import RigidOptions
 from genesis.utils.misc import (
     DeprecationError,
@@ -17,44 +17,93 @@ from genesis.utils.misc import (
     qd_to_numpy,
     indices_to_mask,
     broadcast_tensor,
+    sanitize_indexed_tensor,
     assign_indexed_tensor,
 )
+from genesis.utils.sdf import SDF
 
+from ..base_solver import Solver
 from ..kinematic_solver import KinematicSolver
 from .collider import Collider
 from .constraint import ConstraintSolver, ConstraintSolverIsland
 from .abd.misc import (
+    func_add_safe_backward,
     func_apply_coupling_force,
+    func_apply_link_external_force,
+    func_apply_external_torque,
+    func_apply_link_external_torque,
+    func_atomic_add_if,
+    func_check_index_range,
+    func_clear_external_force,
+    func_read_field_if,
+    func_wakeup_entity_and_its_temp_island,
+    func_write_field_if,
+    func_write_and_read_field_if,
     kernel_init_invweight,
     kernel_init_meaninertia,
+    kernel_init_dof_fields,
+    kernel_init_link_fields,
+    kernel_update_heterogeneous_link_info,
+    kernel_init_joint_fields,
+    kernel_init_vert_fields,
+    kernel_init_vvert_fields,
+    kernel_init_geom_fields,
+    kernel_adjust_link_inertia,
+    kernel_init_vgeom_fields,
+    kernel_init_entity_fields,
     kernel_init_equality_fields,
     kernel_apply_links_external_force,
     kernel_apply_links_external_torque,
-    kernel_adjust_link_inertia,
+    kernel_update_geoms_render_T,
+    kernel_update_vgeoms_render_T,
     kernel_bit_reduction,
     kernel_set_zero,
     kernel_clear_external_force,
 )
 from .abd.forward_kinematics import (
     func_aggregate_awake_entities,
-    func_update_all_verts,
+    func_COM_links,
+    func_COM_links_entity,
+    func_forward_kinematics_entity,
+    func_forward_kinematics_batch,
+    func_forward_velocity_entity,
+    func_forward_velocity_batch,
     func_forward_velocity,
+    func_hibernate_entity_and_zero_dof_velocities,
     func_hibernate__for_all_awake_islands_either_hiberanate_or_update_aabb_sort_buffer,
+    func_update_geoms_entity,
+    func_update_geoms_batch,
+    func_update_all_verts,
     func_update_cartesian_space,
-    kernel_update_all_verts,
-    kernel_update_geom_aabbs,
+    func_update_cartesian_space_entity,
+    func_update_cartesian_space_batch,
+    func_update_geoms,
+    func_update_verts_for_geom,
     kernel_forward_kinematics_links_geoms,
     kernel_masked_forward_kinematics_links_geoms,
     kernel_forward_velocity,
     kernel_masked_forward_velocity,
     kernel_forward_kinematics_entity,
+    kernel_update_geoms,
     kernel_update_verts_for_geoms,
+    kernel_update_all_verts,
+    kernel_update_geom_aabbs,
+    kernel_update_vgeoms,
     kernel_update_cartesian_space,
 )
-
 from .abd.forward_dynamics import (
+    func_actuation,
+    func_bias_force,
+    func_compute_mass_matrix,
+    func_compute_qacc,
+    func_factor_mass,
     func_forward_dynamics,
+    func_solve_mass_entity,
+    func_solve_mass_batch,
+    func_solve_mass,
+    func_torque_and_passive_force,
     func_update_acc,
+    func_update_force,
     func_integrate,
     func_implicit_damping,
     func_vel_at_point,
@@ -107,8 +156,13 @@ from .abd.accessor import (
     kernel_set_geoms_friction,
 )
 from .abd.diff import (
+    func_copy_cartesian_space,
     func_copy_next_to_curr,
+    func_copy_next_to_curr_grad,
     func_integrate_dq_entity,
+    func_is_grad_valid,
+    func_load_adjoint_cache,
+    func_save_adjoint_cache,
     kernel_save_adjoint_cache,
     kernel_prepare_backward_substep,
     kernel_begin_backward_substep,
