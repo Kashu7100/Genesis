@@ -18,17 +18,6 @@ class Kinematic(Material):
     def __init__(self, rho=200.0):
         super().__init__()
         self._rho = float(rho)
-        self._needs_coup = False
-        self._friction = None
-        self._coup_friction = 0.0
-        self._coup_softness = 0.0
-        self._coup_restitution = 0.0
-        self._sdf_cell_size = 0.005
-        self._sdf_min_res = 32
-        self._sdf_max_res = 32
-        self._gravity_compensation = 0.0
-        self._coupling_mode = None
-        self._coupling_link_filter = None
 
     # Properties required by RigidEntity during morphology loading
 
@@ -38,44 +27,44 @@ class Kinematic(Material):
 
     @property
     def friction(self):
-        return self._friction
+        return None
 
     @property
     def needs_coup(self):
-        return self._needs_coup
+        return False
 
     @property
     def coup_friction(self):
-        return self._coup_friction
+        return 0.0
 
     @property
     def coup_softness(self):
-        return self._coup_softness
+        return 0.0
 
     @property
     def coup_restitution(self):
-        return self._coup_restitution
+        return 0.0
 
     @property
     def sdf_cell_size(self):
-        return self._sdf_cell_size
+        return 0.005
 
     @property
     def sdf_min_res(self):
-        return self._sdf_min_res
+        return 32
 
     @property
     def sdf_max_res(self):
-        return self._sdf_max_res
+        return 32
 
     @property
     def gravity_compensation(self):
-        return self._gravity_compensation
+        return 0.0
 
     @property
     def coupling_mode(self):
-        return self._coupling_mode
+        return None
 
     @property
     def coupling_link_filter(self):
-        return self._coupling_link_filter
+        return None
