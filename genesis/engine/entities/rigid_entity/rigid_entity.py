@@ -203,6 +203,10 @@ class KinematicEntity(Entity):
     def init_ckpt(self):
         pass
 
+    def process_input(self):
+        """No-op for kinematic entities; overridden in RigidEntity."""
+        self._tgt = dict()
+
     def _load_morph(self, morph: Morph):
         """Load a single morph into the entity."""
         # Store g_infos for heterogeneous inertial computation

@@ -825,7 +825,7 @@ class KinematicSolver(Solver):
     def process_input(self, in_backward=False):
         """Process input for entities (set qpos from user commands)."""
         for entity in self._entities:
-            entity.process_input(in_backward=in_backward)
+            entity.process_input()
 
     # ------------------------------------------------------------------------------------
     # -------------------------------- state get/set -------------------------------------
