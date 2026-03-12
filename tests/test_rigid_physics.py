@@ -1,7 +1,6 @@
 import math
 import os
 import sys
-import tempfile
 import xml.etree.ElementTree as ET
 from contextlib import nullcontext
 from copy import deepcopy
@@ -4581,134 +4580,122 @@ def test_pick_heterogenous_objects(show_viewer):
     assert np.all(lift_deltas > 0.05), f"All objects should be lifted (deltas={lift_deltas:.3f})"
 
 
+def _build_two_link_revolute_urdf(tmp_path, name, geom_tag, geom_attribs, mass, inertia):
+    """Build a 2-link revolute URDF file and return its path."""
+    robot = ET.Element("robot", name=name)
+
+    for link_name, origin_xyz in [("base", None), ("moving", "0.1 0 0")]:
+        link = ET.SubElement(robot, "link", name=link_name)
+        for group_tag in ("visual", "collision"):
+            group = ET.SubElement(link, group_tag)
+            geom = ET.SubElement(group, "geometry")
+            ET.SubElement(geom, geom_tag, **geom_attribs)
+            if origin_xyz:
+                ET.SubElement(group, "origin", xyz=origin_xyz)
+        inertial = ET.SubElement(link, "inertial")
+        ET.SubElement(inertial, "mass", value=str(mass))
+        ET.SubElement(
+            inertial,
+            "inertia",
+            ixx=str(inertia),
+            ixy="0",
+            ixz="0",
+            iyy=str(inertia),
+            iyz="0",
+            izz=str(inertia),
+        )
+
+    joint = ET.SubElement(robot, "joint", name="joint1", type="revolute")
+    ET.SubElement(joint, "parent", link="base")
+    ET.SubElement(joint, "child", link="moving")
+    ET.SubElement(joint, "origin", xyz="0.1 0 0")
+    ET.SubElement(joint, "axis", xyz="0 1 0")
+    ET.SubElement(joint, "limit", lower="-1.57", upper="1.57", effort="100", velocity="1.0")
+
+    path = str(tmp_path / f"{name}.urdf")
+    ET.ElementTree(robot).write(path, encoding="utf-8", xml_declaration=True)
+    return path
+
+
 @pytest.mark.required
-def test_heterogeneous_articulated_simulation(show_viewer, tol):
+def test_heterogeneous_articulated_simulation(show_viewer, tol, tmp_path):
     """Test heterogeneous articulated simulation with vertex-based and primitive collision geometries.
 
-    Uses inline URDFs: variant A with box primitives, variant B with sphere mesh collision,
-    matching bounding boxes but different vertex counts and mass. Verifies:
-    - Same-variant envs produce identical dynamics (balanced block [A, A, B, B])
-    - Different-variant envs produce different dynamics
-    - Mass differs between variants
-    - Joint structure is shared
-    - Objects settle on ground without penetration
+    Variant A uses box primitives, variant B uses sphere mesh collision geometry,
+    matching bounding boxes but different vertex counts and mass. Verifies dynamics,
+    mass, joint structure, and ground contact settling.
     """
     sphere_mesh_path = os.path.join(get_assets_dir(), "meshes", "sphere.obj")
 
-    urdf_a_content = """\
-<?xml version="1.0"?>
-<robot name="two_box_revolute">
-  <link name="base">
-    <visual><geometry><box size="0.1 0.1 0.1"/></geometry></visual>
-    <collision><geometry><box size="0.1 0.1 0.1"/></geometry></collision>
-    <inertial>
-      <mass value="1.0"/>
-      <inertia ixx="0.00667" ixy="0" ixz="0" iyy="0.00667" iyz="0" izz="0.00667"/>
-    </inertial>
-  </link>
-  <link name="moving">
-    <visual><geometry><box size="0.1 0.1 0.1"/></geometry><origin xyz="0.1 0 0"/></visual>
-    <collision><geometry><box size="0.1 0.1 0.1"/></geometry><origin xyz="0.1 0 0"/></collision>
-    <inertial>
-      <mass value="1.0"/>
-      <inertia ixx="0.00667" ixy="0" ixz="0" iyy="0.00667" iyz="0" izz="0.00667"/>
-    </inertial>
-  </link>
-  <joint name="joint1" type="revolute">
-    <parent link="base"/><child link="moving"/>
-    <origin xyz="0.1 0 0"/><axis xyz="0 1 0"/>
-    <limit lower="-1.57" upper="1.57" effort="100" velocity="1.0"/>
-  </joint>
-</robot>"""
+    # Variant A: box primitive collision
+    urdf_a_path = _build_two_link_revolute_urdf(
+        tmp_path,
+        "two_box_revolute",
+        "box",
+        {"size": "0.1 0.1 0.1"},
+        mass=1.0,
+        inertia=0.00667,
+    )
+    # Variant B: sphere mesh collision (642 vertices, matching 0.1 bounding box)
+    urdf_b_path = _build_two_link_revolute_urdf(
+        tmp_path,
+        "two_sphere_revolute",
+        "mesh",
+        {"filename": sphere_mesh_path, "scale": "0.05 0.05 0.05"},
+        mass=0.5,
+        inertia=0.0002,
+    )
 
-    # Variant B: sphere mesh collision (642 vertices vs box primitive, matching 0.1 bounding box)
-    urdf_b_content = f"""\
-<?xml version="1.0"?>
-<robot name="two_sphere_revolute">
-  <link name="base">
-    <visual><geometry><mesh filename="{sphere_mesh_path}" scale="0.05 0.05 0.05"/></geometry></visual>
-    <collision><geometry><mesh filename="{sphere_mesh_path}" scale="0.05 0.05 0.05"/></geometry></collision>
-    <inertial>
-      <mass value="0.5"/>
-      <inertia ixx="0.0002" ixy="0" ixz="0" iyy="0.0002" iyz="0" izz="0.0002"/>
-    </inertial>
-  </link>
-  <link name="moving">
-    <visual><geometry><mesh filename="{sphere_mesh_path}" scale="0.05 0.05 0.05"/></geometry><origin xyz="0.1 0 0"/></visual>
-    <collision><geometry><mesh filename="{sphere_mesh_path}" scale="0.05 0.05 0.05"/></geometry><origin xyz="0.1 0 0"/></collision>
-    <inertial>
-      <mass value="0.5"/>
-      <inertia ixx="0.0002" ixy="0" ixz="0" iyy="0.0002" iyz="0" izz="0.0002"/>
-    </inertial>
-  </link>
-  <joint name="joint1" type="revolute">
-    <parent link="base"/><child link="moving"/>
-    <origin xyz="0.1 0 0"/><axis xyz="0 1 0"/>
-    <limit lower="-1.57" upper="1.57" effort="100" velocity="1.0"/>
-  </joint>
-</robot>"""
+    scene = gs.Scene(show_viewer=show_viewer)
+    scene.add_entity(gs.morphs.Plane())
+    het_obj = scene.add_entity(
+        morph=[
+            gs.morphs.URDF(file=urdf_a_path, pos=(0, 0, 0.15)),
+            gs.morphs.URDF(file=urdf_b_path, pos=(0.5, 0, 0.2)),
+        ]
+    )
+    scene.build(n_envs=4)
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".urdf", delete=False) as f:
-        f.write(urdf_a_content)
-        urdf_a_path = f.name
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".urdf", delete=False) as f:
-        f.write(urdf_b_content)
-        urdf_b_path = f.name
+    for _ in range(30):
+        scene.step()
+    het_pos = tensor_to_array(het_obj.get_pos())
+    het_qpos = tensor_to_array(het_obj.get_qpos())
 
-    try:
-        scene = gs.Scene(show_viewer=show_viewer)
-        scene.add_entity(gs.morphs.Plane())
-        het_obj = scene.add_entity(
-            morph=[
-                gs.morphs.URDF(file=urdf_a_path, pos=(0, 0, 0.15)),
-                gs.morphs.URDF(file=urdf_b_path, pos=(0.5, 0, 0.2)),
-            ]
-        )
-        scene.build(n_envs=4)
+    # Same-variant envs produce identical results (balanced block [A, A, B, B])
+    assert_allclose(het_pos[0], het_pos[1], tol=tol)
+    assert_allclose(het_pos[2], het_pos[3], tol=tol)
+    assert_allclose(het_qpos[0], het_qpos[1], tol=tol)
+    assert_allclose(het_qpos[2], het_qpos[3], tol=tol)
 
-        for _ in range(30):
-            scene.step()
-        het_pos = tensor_to_array(het_obj.get_pos())
-        het_qpos = tensor_to_array(het_obj.get_qpos())
+    # Different-variant envs produce different results
+    assert not np.allclose(het_pos[0], het_pos[2], atol=tol, rtol=tol), "Variant A and B positions should differ"
+    assert not np.allclose(het_qpos[0], het_qpos[2], atol=tol, rtol=tol), "Variant A and B qpos should differ"
 
-        # Same-variant envs produce identical results (balanced block [A, A, B, B])
-        assert_allclose(het_pos[0], het_pos[1], tol=tol)
-        assert_allclose(het_pos[2], het_pos[3], tol=tol)
-        assert_allclose(het_qpos[0], het_qpos[1], tol=tol)
-        assert_allclose(het_qpos[2], het_qpos[3], tol=tol)
+    # Mass differs between variants
+    mass = tensor_to_array(het_obj.get_mass())
+    assert mass.shape == (4,)
+    assert_allclose(mass[0], mass[1], tol=tol)
+    assert_allclose(mass[2], mass[3], tol=tol)
+    assert not np.allclose(mass[0], mass[2], atol=tol, rtol=tol), "Variant A and B masses should differ"
 
-        # Different-variant envs produce different results
-        assert not np.allclose(het_pos[0], het_pos[2], atol=tol, rtol=tol), "Variant A and B positions should differ"
-        assert not np.allclose(het_qpos[0], het_qpos[2], atol=tol, rtol=tol), "Variant A and B qpos should differ"
+    # Joint structure: both variants share the same joints (root_joint + joint1)
+    assert len(het_obj.joints) == 2
+    assert {j.name for j in het_obj.joints} == {"root_joint", "joint1"}
+    assert len(het_obj.links) == 2
+    assert het_obj.get_qpos().shape == (4, 8)  # free joint (7) + revolute (1)
+    assert het_obj.get_dofs_velocity().shape == (4, 7)  # free joint (6) + revolute (1)
 
-        # Mass differs between variants
-        mass = tensor_to_array(het_obj.get_mass())
-        assert mass.shape == (4,)
-        assert_allclose(mass[0], mass[1], tol=tol)
-        assert_allclose(mass[2], mass[3], tol=tol)
-        assert not np.allclose(mass[0], mass[2], atol=tol, rtol=tol), "Variant A and B masses should differ"
+    # Simulate longer for ground contact settling (total 500 steps)
+    for _ in range(470):
+        scene.step()
 
-        # Joint structure: both variants share the same joints (root_joint + joint1)
-        assert len(het_obj.joints) == 2
-        assert {j.name for j in het_obj.joints} == {"root_joint", "joint1"}
-        assert len(het_obj.links) == 2
-        assert het_obj.get_qpos().shape == (4, 8)  # free joint (7) + revolute (1)
-        assert het_obj.get_dofs_velocity().shape == (4, 7)  # free joint (6) + revolute (1)
+    # All objects should be above ground
+    pos = tensor_to_array(het_obj.get_pos())
+    assert np.all(pos[:, 2] > 0.0), f"Objects penetrated ground: z={pos[:, 2]}"
 
-        # Simulate longer for ground contact settling (total 500 steps)
-        for _ in range(470):
-            scene.step()
-
-        # All objects should be above ground
-        pos = tensor_to_array(het_obj.get_pos())
-        assert np.all(pos[:, 2] > 0.0), f"Objects penetrated ground: z={pos[:, 2]}"
-
-        # Velocity should be near zero (settled)
-        vel = tensor_to_array(het_obj.get_vel())
-        assert_allclose(vel, 0.0, tol=0.05)
-    finally:
-        os.unlink(urdf_a_path)
-        os.unlink(urdf_b_path)
+    # Velocity should be near zero (settled)
+    vel = tensor_to_array(het_obj.get_vel())
+    assert_allclose(vel, 0.0, tol=0.05)
 
 
 @pytest.mark.required
