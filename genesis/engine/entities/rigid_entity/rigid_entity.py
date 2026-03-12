@@ -661,6 +661,25 @@ class RigidEntity(Entity):
             v_quat = np.asarray(v_quat if v_quat is not None else gu.identity_quat(), dtype=gs.np_float)
             v_i = np.asarray(v_i, dtype=gs.np_float)
 
+            # Validate inertia matrix (positive-definiteness, triangle inequality, symmetry enforcement)
+            if not morph.recompute_inertia and v_i is not None:
+                inertia_diag, Q = np.linalg.eigh(0.5 * (v_i + v_i.T))
+                if (inertia_diag < -gs.EPS).any():
+                    gs.raise_exception(
+                        f"Inertia matrix of variant link '{v_l_info['name']}' not positive definite "
+                        f"(eigenvalues: {inertia_diag})."
+                    )
+                if any(
+                    inertia_diag[i] + inertia_diag[(i + 1) % 3] < inertia_diag[(i + 2) % 3] * (1.0 - 1e-6) - 1e-9
+                    for i in range(3)
+                ):
+                    gs.raise_exception(
+                        f"Inertia matrix of variant link '{v_l_info['name']}' does not satisfy A+B>=C for all "
+                        f"permutations (eigenvalues: {inertia_diag}). Please fix your variant morph file "
+                        f"'{morph.file}' or specify `recompute_inertia=True`."
+                    )
+                v_i = Q @ np.diag(np.maximum(inertia_diag, 0.0)) @ Q.T
+
             var_masses.append(v_mass)
             var_positions.append(v_pos)
             var_quats.append(v_quat)
