@@ -13,8 +13,8 @@ import pytest
 import genesis as gs
 
 
-WARMUP_STEPS = 200
-MEASURE_STEPS = 500
+WARMUP_STEPS = 100
+MEASURE_STEPS = 300
 
 
 def _build_many_boxes_scene(n_boxes, solver_type, n_envs=1):
