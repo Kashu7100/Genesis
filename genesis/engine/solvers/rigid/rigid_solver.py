@@ -377,7 +377,11 @@ class RigidSolver(KinematicSolver):
             box_box_detection=self._box_box_detection,
             sparse_solve=self._options.sparse_solve,
             integrator=self._integrator,
-            solver_type=self._options.constraint_solver,
+            solver_type=(
+                gs.constraint_solver.Newton
+                if self._options.constraint_solver == gs.constraint_solver.ComFree
+                else self._options.constraint_solver
+            ),
         )
 
         if self.is_active:
@@ -1009,7 +1013,7 @@ class RigidSolver(KinematicSolver):
             if not self._disable_constraint:
                 self.constraint_solver.add_equality_constraints()
                 self.constraint_solver.add_non_contact_inequality_constraints()
-                self.constraint_solver.resolve()
+                self.constraint_solver.resolve(skip_contact_force_update=True)
                 self._comfree_solver.post_iterative_solve()
             else:
                 self._comfree_solver.finalize_no_iterative_solve()

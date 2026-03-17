@@ -189,7 +189,7 @@ class ConstraintSolver:
             self._solver._static_rigid_sim_config,
         )
 
-    def resolve(self):
+    def resolve(self, skip_contact_force_update=False):
         func_solve_init(
             self._solver.dofs_info,
             self._solver.dofs_state,
@@ -218,12 +218,13 @@ class ConstraintSolver:
         if self._solver._options.noslip_iterations > 0:
             self.noslip()
 
-        func_update_contact_force(
-            self._solver.links_state,
-            self._collider._collider_state,
-            self.constraint_state,
-            self._solver._static_rigid_sim_config,
-        )
+        if not skip_contact_force_update:
+            func_update_contact_force(
+                self._solver.links_state,
+                self._collider._collider_state,
+                self.constraint_state,
+                self._solver._static_rigid_sim_config,
+            )
 
     def noslip(self):
         if self._solver._para_level >= gs.PARA_LEVEL.PARTIAL:
