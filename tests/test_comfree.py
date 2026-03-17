@@ -6,11 +6,22 @@ path where ComFree handles contacts and the iterative solver
 handles joint limits and equality constraints.
 """
 
+import tempfile
+
 import numpy as np
 import pytest
 
 import genesis as gs
+from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
 from genesis.utils.misc import qd_to_numpy
+
+
+def _get_rigid_solver(scene):
+    """Find the RigidSolver among scene solvers."""
+    for s in scene.sim.solvers:
+        if isinstance(s, RigidSolver):
+            return s
+    raise RuntimeError("No RigidSolver found")
 
 
 def _run_comfree_vs_newton(build_scene_fn, n_steps, get_result_fn, *, n_envs=1):
@@ -62,8 +73,7 @@ def test_comfree_pendulum_with_joint_limits(show_viewer):
 
     Tests the hybrid path: ComFree for contacts, iterative solver for joint limits.
     """
-    mjcf = """
-    <mujoco>
+    mjcf = """<mujoco>
       <option gravity="0 0 -9.81" timestep="0.01"/>
       <worldbody>
         <geom type="plane" size="5 5 0.1"/>
@@ -76,8 +86,11 @@ def test_comfree_pendulum_with_joint_limits(show_viewer):
           </body>
         </body>
       </worldbody>
-    </mujoco>
-    """
+    </mujoco>"""
+
+    with tempfile.NamedTemporaryFile(suffix=".xml", mode="w", delete=False) as f:
+        f.write(mjcf)
+        mjcf_path = f.name
 
     def build(solver_type):
         scene = gs.Scene(
@@ -88,7 +101,7 @@ def test_comfree_pendulum_with_joint_limits(show_viewer):
             ),
             show_viewer=False,
         )
-        scene.add_entity(gs.morphs.MJCF(string=mjcf))
+        scene.add_entity(gs.morphs.MJCF(file=mjcf_path))
         return scene
 
     def get_result(scene):
@@ -104,8 +117,7 @@ def test_comfree_pendulum_with_joint_limits(show_viewer):
 def test_comfree_no_contacts_only_joint_limits(show_viewer):
     """Hinge joint with limits, no contacts. ComFree contact path is a no-op;
     the iterative solver handles joint limits alone."""
-    mjcf = """
-    <mujoco>
+    mjcf = """<mujoco>
       <option gravity="0 0 -9.81" timestep="0.01"/>
       <worldbody>
         <body pos="0 0 2">
@@ -114,8 +126,11 @@ def test_comfree_no_contacts_only_joint_limits(show_viewer):
                 contype="0" conaffinity="0"/>
         </body>
       </worldbody>
-    </mujoco>
-    """
+    </mujoco>"""
+
+    with tempfile.NamedTemporaryFile(suffix=".xml", mode="w", delete=False) as f:
+        f.write(mjcf)
+        mjcf_path = f.name
 
     def build(solver_type):
         scene = gs.Scene(
@@ -126,7 +141,7 @@ def test_comfree_no_contacts_only_joint_limits(show_viewer):
             ),
             show_viewer=False,
         )
-        scene.add_entity(gs.morphs.MJCF(string=mjcf))
+        scene.add_entity(gs.morphs.MJCF(file=mjcf_path))
         return scene
 
     def get_result(scene):
@@ -192,7 +207,8 @@ def test_comfree_contact_force_nonzero(show_viewer):
     for _ in range(50):
         scene.step()
 
-    contact_force = qd_to_numpy(scene.sim.solvers[0].links_state.contact_force)
+    rigid = _get_rigid_solver(scene)
+    contact_force = qd_to_numpy(rigid.links_state.contact_force)
     total_force_mag = np.linalg.norm(contact_force, axis=-1).sum()
     scene.destroy()
 
@@ -222,7 +238,8 @@ def test_comfree_contact_force_direction(show_viewer):
     for _ in range(100):
         scene.step()
 
-    contact_force = qd_to_numpy(scene.sim.solvers[0].links_state.contact_force)
+    rigid = _get_rigid_solver(scene)
+    contact_force = qd_to_numpy(rigid.links_state.contact_force)
     box_link_force = contact_force[1, 0]  # link 1 = box, env 0
     scene.destroy()
 
@@ -274,8 +291,7 @@ def test_comfree_stacked_boxes(show_viewer):
 def test_comfree_weld_constraint_with_contact(show_viewer):
     """Equality (weld) constraint + contact. Tests the hybrid path where
     ComFree handles contacts and the iterative solver handles the weld."""
-    mjcf = """
-    <mujoco>
+    mjcf = """<mujoco>
       <option gravity="0 0 -9.81" timestep="0.01"/>
       <worldbody>
         <geom type="plane" size="5 5 0.1"/>
@@ -290,8 +306,11 @@ def test_comfree_weld_constraint_with_contact(show_viewer):
       <equality>
         <weld body1="base" body2="welded"/>
       </equality>
-    </mujoco>
-    """
+    </mujoco>"""
+
+    with tempfile.NamedTemporaryFile(suffix=".xml", mode="w", delete=False) as f:
+        f.write(mjcf)
+        mjcf_path = f.name
 
     def build(solver_type):
         scene = gs.Scene(
@@ -302,7 +321,7 @@ def test_comfree_weld_constraint_with_contact(show_viewer):
             ),
             show_viewer=False,
         )
-        scene.add_entity(gs.morphs.MJCF(string=mjcf))
+        scene.add_entity(gs.morphs.MJCF(file=mjcf_path))
         return scene
 
     def get_result(scene):
