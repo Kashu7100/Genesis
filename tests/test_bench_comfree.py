@@ -1,10 +1,12 @@
 """Benchmark: ComFree vs Newton solver FPS on dense-contact scenes.
 
 Run standalone or via pytest:
-    python tests/bench_comfree.py
-    pytest tests/bench_comfree.py -v -s --backend gpu
+    python tests/test_bench_comfree.py
+    pytest tests/test_bench_comfree.py -v -s --backend gpu
 """
 
+import json
+import os
 import time
 
 import numpy as np
@@ -15,6 +17,7 @@ import genesis as gs
 
 WARMUP_STEPS = 100
 MEASURE_STEPS = 300
+RESULTS_FILE = os.environ.get("COMFREE_BENCH_RESULTS", "/tmp/comfree_bench_results.json")
 
 
 def _build_many_boxes_scene(n_boxes, solver_type, n_envs=1):
@@ -68,6 +71,16 @@ def _run_benchmark(n_boxes, n_envs=1):
 
     speedup = results["ComFree"] / results["Newton"]
     print(f"  Speedup: {speedup:.2f}x")
+
+    entry = {"n_boxes": n_boxes, "n_envs": n_envs, **results, "speedup": speedup}
+    try:
+        existing = json.loads(open(RESULTS_FILE).read()) if os.path.exists(RESULTS_FILE) else []
+    except (json.JSONDecodeError, OSError):
+        existing = []
+    existing.append(entry)
+    with open(RESULTS_FILE, "w") as f:
+        json.dump(existing, f, indent=2)
+
     return results, speedup
 
 
