@@ -12,12 +12,13 @@ import numpy as np
 import pytest
 
 import genesis as gs
-from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
 from genesis.utils.misc import qd_to_numpy
 
 
 def _get_rigid_solver(scene):
     """Find the RigidSolver among scene solvers."""
+    from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
+
     for s in scene.sim.solvers:
         if isinstance(s, RigidSolver):
             return s
