@@ -178,6 +178,17 @@ class ConstraintSolver:
             self._solver._static_rigid_sim_config,
         )
 
+    def add_non_contact_inequality_constraints(self):
+        add_non_contact_inequality_constraints(
+            self._solver.links_info,
+            self._solver.dofs_state,
+            self._solver.dofs_info,
+            self._solver.joints_info,
+            self.constraint_state,
+            self._solver._rigid_global_info,
+            self._solver._static_rigid_sim_config,
+        )
+
     def resolve(self):
         func_solve_init(
             self._solver.dofs_info,
@@ -899,6 +910,37 @@ def add_inequality_constraints(
             rigid_global_info=rigid_global_info,
             static_rigid_sim_config=static_rigid_sim_config,
         )
+    if qd.static(static_rigid_sim_config.enable_joint_limit):
+        add_joint_limit_constraints(
+            links_info=links_info,
+            joints_info=joints_info,
+            dofs_info=dofs_info,
+            dofs_state=dofs_state,
+            rigid_global_info=rigid_global_info,
+            constraint_state=constraint_state,
+            static_rigid_sim_config=static_rigid_sim_config,
+        )
+
+
+@qd.kernel(fastcache=gs.use_fastcache)
+def add_non_contact_inequality_constraints(
+    links_info: array_class.LinksInfo,
+    dofs_state: array_class.DofsState,
+    dofs_info: array_class.DofsInfo,
+    joints_info: array_class.JointsInfo,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    add_frictionloss_constraints(
+        links_info=links_info,
+        joints_info=joints_info,
+        dofs_info=dofs_info,
+        dofs_state=dofs_state,
+        rigid_global_info=rigid_global_info,
+        constraint_state=constraint_state,
+        static_rigid_sim_config=static_rigid_sim_config,
+    )
     if qd.static(static_rigid_sim_config.enable_joint_limit):
         add_joint_limit_constraints(
             links_info=links_info,

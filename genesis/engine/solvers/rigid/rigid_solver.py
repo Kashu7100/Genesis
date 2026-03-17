@@ -1003,7 +1003,18 @@ class RigidSolver(KinematicSolver):
         if self._options.constraint_solver == gs.constraint_solver.ComFree:
             if self._enable_collision:
                 self.collider.detection()
-            self._comfree_solver.resolve()
+
+            self._comfree_solver.resolve_contacts()
+
+            if not self._disable_constraint:
+                self.constraint_solver.add_equality_constraints()
+                self.constraint_solver.add_non_contact_inequality_constraints()
+                self.constraint_solver.resolve()
+                self._comfree_solver.post_iterative_solve()
+            else:
+                self._comfree_solver.finalize_no_iterative_solve()
+
+            self._comfree_solver.update_contact_force()
             return
 
         if not self._disable_constraint:

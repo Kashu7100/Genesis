@@ -6,6 +6,9 @@ solver for contact constraints.
 
 Contact forces decouple across pairs, making the computation embarrassingly
 parallel with O(n) scaling in contact count.
+
+In hybrid mode, ComFree handles contacts while the existing iterative solver
+handles equality constraints, joint limits, and frictionloss.
 """
 
 from typing import TYPE_CHECKING
@@ -17,8 +20,6 @@ import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.abd import func_solve_mass_batch
 
-from ..collider.contact_island import ContactIsland
-
 if TYPE_CHECKING:
     from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
 
@@ -29,13 +30,16 @@ class ComFreeSolver:
         self._collider = rigid_solver.collider
         self._B = rigid_solver._B
 
-        self.constraint_state = rigid_solver.constraint_solver.constraint_state
-        self.contact_island = ContactIsland(self._collider)
+        self._qfrc_contact = qd.ndarray(gs.qd_float, shape=(rigid_solver.n_dofs, self._B))
 
-        self._k_user = rigid_solver._options.comfree_stiffness
-        self._d_user = rigid_solver._options.comfree_damping
+    def resolve_contacts(self):
+        """Compute closed-form contact forces and fold into acc_smooth.
 
-    def resolve(self):
+        After this call, dofs_state.acc_smooth and dofs_state.force include
+        contact effects, so the iterative solver sees post-contact state.
+        The contact generalized forces are saved in self._qfrc_contact for
+        later accumulation.
+        """
         kernel_comfree_resolve(
             self._solver.links_info,
             self._solver.links_state,
@@ -43,18 +47,41 @@ class ComFreeSolver:
             self._solver.dofs_info,
             self._solver.entities_info,
             self._collider._collider_state,
-            self.constraint_state,
+            self._qfrc_contact,
+            self._solver.constraint_solver.constraint_state,
             self._solver._rigid_global_info,
             self._solver._static_rigid_sim_config,
         )
 
-        func_comfree_update_qacc(
+    def finalize_no_iterative_solve(self):
+        """Set dofs_state.acc when the iterative solver was skipped.
+
+        When disable_constraint is True, the iterative solver doesn't run,
+        so func_update_qacc never sets dofs_state.acc. We set it from the
+        updated acc_smooth (which includes contact effects).
+        """
+        kernel_comfree_set_acc_from_acc_smooth(
             self._solver.dofs_state,
-            self.constraint_state,
+            self._qfrc_contact,
             self._solver._static_rigid_sim_config,
             self._solver._errno,
         )
 
+    def post_iterative_solve(self):
+        """Add contact forces to the iterative solver's output.
+
+        The iterative solver's func_update_qacc wrote qfrc_constraint and
+        force for non-contact constraints only. This adds the contact
+        contribution so the totals are correct.
+        """
+        kernel_comfree_post_solve(
+            self._solver.dofs_state,
+            self._qfrc_contact,
+            self._solver._static_rigid_sim_config,
+        )
+
+    def update_contact_force(self):
+        """Write per-link 3D contact forces."""
         func_comfree_update_contact_force(
             self._solver.links_state,
             self._collider._collider_state,
@@ -75,29 +102,25 @@ def kernel_comfree_resolve(
     dofs_info: array_class.DofsInfo,
     entities_info: array_class.EntitiesInfo,
     collider_state: array_class.ColliderState,
+    qfrc_contact: array_class.V_ANNOTATION,
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
 ):
     """Closed-form contact force computation.
 
-    For each contact detected by narrowphase, computes contact forces using
-    MuJoCo-style impedance (imp/aref/diag) but in a single closed-form
-    evaluation instead of iterative optimization.
-
-    Uses the same Jacobian, impedance, and pyramid construction as the
-    existing solver (add_collision_constraints), but replaces the iterative
-    CG/Newton solve with: efc_force = max(0, -(J·acc_smooth - aref) / diag).
+    Computes per-contact forces and folds them into acc_smooth so that
+    the subsequent iterative solver for non-contact constraints sees
+    post-contact state.
     """
     EPS = rigid_global_info.EPS[None]
     n_dofs = dofs_state.vel.shape[0]
     _B = dofs_state.vel.shape[1]
-    dt = rigid_global_info.substep_dt[None]
 
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
         for i_d in range(n_dofs):
-            constraint_state.qfrc_constraint[i_d, i_b] = gs.qd_float(0.0)
+            qfrc_contact[i_d, i_b] = gs.qd_float(0.0)
 
         for i_col in range(collider_state.n_contacts[i_b]):
             contact_data_normal = collider_state.contact_data.normal[i_col, i_b]
@@ -127,7 +150,6 @@ def kernel_comfree_resolve(
                 d = (2 * (i_dir % 2) - 1) * (d1 if i_dir < 2 else d2)
                 n_tilde = d * contact_data_friction - contact_data_normal
 
-                # Walk kinematic chain: compute J·vel (for impedance) and J·acc_smooth
                 jac_qvel = gs.qd_float(0.0)
                 jac_qacc_smooth = gs.qd_float(0.0)
 
@@ -167,7 +189,6 @@ def kernel_comfree_resolve(
 
                         link = links_info.parent_idx[link_maybe_batch]
 
-                # MuJoCo-style impedance and reference acceleration
                 imp, aref = gu.imp_aref(
                     contact_data_sol_params,
                     -contact_data_penetration,
@@ -175,21 +196,15 @@ def kernel_comfree_resolve(
                     -contact_data_penetration,
                 )
 
-                # Constraint-space inverse mass for this facet.
-                # Scale by n_pyramid_facets (4) to account for all facets
-                # coupling through the same body DOFs.
                 mu2 = contact_data_friction * contact_data_friction
                 JMinvJT = invweight * (1.0 + mu2) * 16.0
                 JMinvJT = qd.max(JMinvJT, EPS)
 
-                # Exact one-step force: set J·qacc = aref
-                # f = (aref - J·acc_smooth) / (J M⁻¹ Jᵀ)
                 Jaref = jac_qacc_smooth - aref
                 efc_force = qd.max(gs.qd_float(0.0), -Jaref / JMinvJT)
 
                 contact_force_3d = contact_force_3d + n_tilde * efc_force
 
-                # Scatter Jᵀ · force into generalized constraint forces
                 if efc_force > 0.0:
                     for i_ab in range(2):
                         sign = gs.qd_float(-1.0)
@@ -220,19 +235,20 @@ def kernel_comfree_resolve(
                                 diff = sign * vel
                                 jac = diff @ n_tilde
 
-                                constraint_state.qfrc_constraint[i_d, i_b] = (
-                                    constraint_state.qfrc_constraint[i_d, i_b]
-                                    + jac * efc_force
+                                qfrc_contact[i_d, i_b] = (
+                                    qfrc_contact[i_d, i_b] + jac * efc_force
                                 )
 
                             link = links_info.parent_idx[link_maybe_batch]
 
             collider_state.contact_data.force[i_col, i_b] = contact_force_3d
 
-        # Compute qacc = acc_smooth + M⁻¹ · qfrc_constraint
+        # Fold contact forces into acc_smooth so the iterative solver
+        # for non-contact constraints sees post-contact state.
+        # acc_contact = M⁻¹ · qfrc_contact (stored temporarily in constraint_state.qacc)
         func_solve_mass_batch(
             i_b,
-            constraint_state.qfrc_constraint,
+            qfrc_contact,
             constraint_state.qacc,
             array_class.PLACEHOLDER,
             entities_info=entities_info,
@@ -241,31 +257,58 @@ def kernel_comfree_resolve(
             is_backward=False,
         )
         for i_d in range(n_dofs):
-            constraint_state.qacc[i_d, i_b] = (
+            dofs_state.acc_smooth[i_d, i_b] = (
                 dofs_state.acc_smooth[i_d, i_b] + constraint_state.qacc[i_d, i_b]
+            )
+            dofs_state.force[i_d, i_b] = (
+                dofs_state.force[i_d, i_b] + qfrc_contact[i_d, i_b]
             )
 
 
 @qd.kernel(fastcache=gs.use_fastcache)
-def func_comfree_update_qacc(
+def kernel_comfree_set_acc_from_acc_smooth(
     dofs_state: array_class.DofsState,
-    constraint_state: array_class.ConstraintState,
+    qfrc_contact: array_class.V_ANNOTATION,
     static_rigid_sim_config: qd.template(),
     errno: array_class.V_ANNOTATION,
 ):
-    """Copy ComFree results to dofs_state (same as func_update_qacc)."""
+    """Set acc and qf_constraint when the iterative solver was skipped."""
     n_dofs = dofs_state.acc.shape[0]
     _B = dofs_state.acc.shape[1]
 
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_d, i_b in qd.ndrange(n_dofs, _B):
-        dofs_state.acc[i_d, i_b] = constraint_state.qacc[i_d, i_b]
-        dofs_state.qf_constraint[i_d, i_b] = constraint_state.qfrc_constraint[i_d, i_b]
-        dofs_state.force[i_d, i_b] = (
-            dofs_state.qf_smooth[i_d, i_b] + constraint_state.qfrc_constraint[i_d, i_b]
-        )
-        if qd.math.isnan(constraint_state.qacc[i_d, i_b]):
+        dofs_state.acc[i_d, i_b] = dofs_state.acc_smooth[i_d, i_b]
+        dofs_state.qf_constraint[i_d, i_b] = qfrc_contact[i_d, i_b]
+        dofs_state.force[i_d, i_b] = dofs_state.qf_smooth[i_d, i_b] + qfrc_contact[i_d, i_b]
+        if qd.math.isnan(dofs_state.acc_smooth[i_d, i_b]):
             errno[i_b] = errno[i_b] | array_class.ErrorCode.INVALID_FORCE_NAN
+
+
+@qd.kernel(fastcache=gs.use_fastcache)
+def kernel_comfree_post_solve(
+    dofs_state: array_class.DofsState,
+    qfrc_contact: array_class.V_ANNOTATION,
+    static_rigid_sim_config: qd.template(),
+):
+    """Add ComFree contact forces to the iterative solver's output.
+
+    After the iterative solver's func_update_qacc, qf_constraint and force
+    only reflect non-contact constraints. This adds the contact contribution.
+    Note: dofs_state.acc is already correct because the iterative solver
+    started from the modified acc_smooth (which includes contact effects).
+    """
+    n_dofs = dofs_state.acc.shape[0]
+    _B = dofs_state.acc.shape[1]
+
+    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+    for i_d, i_b in qd.ndrange(n_dofs, _B):
+        dofs_state.qf_constraint[i_d, i_b] = (
+            dofs_state.qf_constraint[i_d, i_b] + qfrc_contact[i_d, i_b]
+        )
+        dofs_state.force[i_d, i_b] = (
+            dofs_state.force[i_d, i_b] + qfrc_contact[i_d, i_b]
+        )
 
 
 @qd.kernel(fastcache=gs.use_fastcache)
@@ -274,11 +317,11 @@ def func_comfree_update_contact_force(
     collider_state: array_class.ColliderState,
     static_rigid_sim_config: qd.template(),
 ):
-    """Extract per-link 3D contact forces from ComFree results.
+    """Write per-link 3D contact forces from ComFree results.
 
-    Unlike the existing solver which reconstructs forces from efc_force,
-    ComFree stores per-contact λ values directly during the resolve kernel.
-    Here we recompute the 3D force from the contact data for reporting.
+    The iterative solver's func_update_contact_force would have written zeros
+    (since no contact constraints were added). This overwrites with the actual
+    ComFree contact forces stored in contact_data.force during resolve.
     """
     n_links = links_state.contact_force.shape[0]
     _B = links_state.contact_force.shape[1]
@@ -287,7 +330,6 @@ def func_comfree_update_contact_force(
     for i_l, i_b in qd.ndrange(n_links, _B):
         links_state.contact_force[i_l, i_b] = qd.Vector.zero(gs.qd_float, 3)
 
-    # Recompute per-contact 3D forces (same pyramid reconstruction)
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
         for i_c in range(collider_state.n_contacts[i_b]):
