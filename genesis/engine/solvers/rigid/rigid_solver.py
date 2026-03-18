@@ -26,6 +26,7 @@ from ..base_solver import Solver
 from ..kinematic_solver import KinematicSolver
 from .collider import Collider
 from .constraint import ConstraintSolver, ConstraintSolverIsland
+from .constraint.solver_comfree import ComFreeSolver
 from .abd.misc import (
     func_add_safe_backward,
     func_apply_coupling_force,
@@ -376,7 +377,11 @@ class RigidSolver(KinematicSolver):
             box_box_detection=self._box_box_detection,
             sparse_solve=self._options.sparse_solve,
             integrator=self._integrator,
-            solver_type=self._options.constraint_solver,
+            solver_type=(
+                gs.constraint_solver.Newton
+                if self._options.constraint_solver == gs.constraint_solver.ComFree
+                else self._options.constraint_solver
+            ),
         )
 
         if self.is_active:
@@ -881,6 +886,9 @@ class RigidSolver(KinematicSolver):
         else:
             self.constraint_solver = ConstraintSolver(self)
 
+        if self._options.constraint_solver == gs.constraint_solver.ComFree:
+            self._comfree_solver = ComFreeSolver(self)
+
     def substep(self, f):
         # from genesis.utils.tools import create_timer
         from genesis.engine.couplers import SAPCoupler
@@ -996,6 +1004,23 @@ class RigidSolver(KinematicSolver):
         return collision_pairs
 
     def _func_constraint_force(self):
+        if self._options.constraint_solver == gs.constraint_solver.ComFree:
+            if self._enable_collision:
+                self.collider.detection()
+
+            self._comfree_solver.resolve_contacts()
+
+            if not self._disable_constraint:
+                self.constraint_solver.add_equality_constraints()
+                self.constraint_solver.add_non_contact_inequality_constraints()
+                self.constraint_solver.resolve(skip_contact_force_update=True)
+                self._comfree_solver.post_iterative_solve()
+            else:
+                self._comfree_solver.finalize_no_iterative_solve()
+
+            self._comfree_solver.update_contact_force()
+            return
+
         if not self._disable_constraint:
             if self._use_contact_island:
                 self.constraint_solver.clear()

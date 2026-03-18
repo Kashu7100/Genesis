@@ -494,7 +494,7 @@ class RigidOptions(Options):
     batch_dofs_info: StrictBool = False
 
     # constraint solver
-    constraint_solver: gs.constraint_solver = gs.constraint_solver.Newton
+    constraint_solver: gs.constraint_solver = gs.constraint_solver.ComFree
     iterations: PositiveInt = 50
     tolerance: PositiveFloat = 1e-6
     ls_iterations: PositiveInt = 50
@@ -505,6 +505,10 @@ class RigidOptions(Options):
     constraint_timeconst: PositiveFloat = 0.01
     use_contact_island: StrictBool = False
     box_box_detection: StrictBool = False
+
+    # ComFree analytical contact solver parameters
+    comfree_stiffness: PositiveFloat = 1.0
+    comfree_damping: PositiveFloat = 0.9
 
     # hibernation threshold
     use_hibernation: StrictBool = False
