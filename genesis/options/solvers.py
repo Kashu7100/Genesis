@@ -494,7 +494,7 @@ class RigidOptions(Options):
     batch_dofs_info: StrictBool = False
 
     # constraint solver
-    constraint_solver: gs.constraint_solver = gs.constraint_solver.Newton
+    constraint_solver: gs.constraint_solver = gs.constraint_solver.ComFree
     iterations: PositiveInt = 50
     tolerance: PositiveFloat = 1e-6
     ls_iterations: PositiveInt = 50
