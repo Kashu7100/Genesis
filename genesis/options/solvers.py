@@ -431,7 +431,7 @@ class RigidOptions(Options):
         Defaults to 6.
     constraint_solver : gs.constraint_solver, optional
         Constraint solver type. Current supported constraint solvers are 'gs.constraint_solver.CG' (conjugate gradient)
-        and 'gs.constraint_solver.Newton' (Newton's method). Defaults to 'ComFree'.
+        and 'gs.constraint_solver.Newton' (Newton's method). Defaults to 'Newton'.
     iterations : int, optional
         Number of iterations for the constraint solver. Defaults to 50.
     tolerance : float, optional
@@ -494,7 +494,7 @@ class RigidOptions(Options):
     batch_dofs_info: StrictBool = False
 
     # constraint solver
-    constraint_solver: gs.constraint_solver = gs.constraint_solver.ComFree
+    constraint_solver: gs.constraint_solver = gs.constraint_solver.Newton
     iterations: PositiveInt = 50
     tolerance: PositiveFloat = 1e-6
     ls_iterations: PositiveInt = 50
