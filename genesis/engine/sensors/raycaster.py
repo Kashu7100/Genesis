@@ -23,7 +23,14 @@ from genesis.utils.geom import (
     transform_by_trans_quat,
 )
 from genesis.utils.misc import concat_with_tensor, make_tensor_field
-from genesis.utils.raycast_qd import bvh_ray_cast, kernel_update_verts_and_aabbs
+from genesis.utils.raycast_qd import (
+    bvh_ray_cast,
+    bvh_ray_cast_visual,
+    kernel_copy_custom_vverts,
+    kernel_update_visual_aabbs,
+    kernel_update_verts_and_aabbs,
+)
+from genesis.engine.solvers.rigid.abd.forward_kinematics import kernel_update_all_vverts
 from genesis.vis.rasterizer_context import RasterizerContext
 
 from .base_sensor import (
@@ -137,10 +144,88 @@ def kernel_cast_rays(
             output_hits[i_p_dist, i_b] = no_hit_values[i_s]
 
 
+@qd.kernel
+def kernel_cast_rays_visual(
+    vverts_state: array_class.VVertsState,
+    vfaces_info: array_class.VFacesInfo,
+    bvh_nodes: qd.template(),
+    bvh_morton_codes: qd.template(),
+    links_pos: qd.types.ndarray(ndim=3),
+    links_quat: qd.types.ndarray(ndim=3),
+    ray_starts: qd.types.ndarray(ndim=2),
+    ray_directions: qd.types.ndarray(ndim=2),
+    max_ranges: qd.types.ndarray(ndim=1),
+    no_hit_values: qd.types.ndarray(ndim=1),
+    is_world_frame: qd.types.ndarray(ndim=1),
+    points_to_sensor_idx: qd.types.ndarray(ndim=1),
+    sensor_cache_offsets: qd.types.ndarray(ndim=1),
+    sensor_point_offsets: qd.types.ndarray(ndim=1),
+    sensor_point_counts: qd.types.ndarray(ndim=1),
+    output_hits: qd.types.ndarray(ndim=2),
+    eps: float,
+):
+    """Visual-mesh variant of kernel_cast_rays. Uses vfaces/vverts instead of collision geometry."""
+    n_points = ray_starts.shape[0]
+    for i_p, i_b in qd.ndrange(n_points, output_hits.shape[-1]):
+        i_s = points_to_sensor_idx[i_p]
+
+        link_pos = qd.math.vec3(links_pos[i_b, i_s, 0], links_pos[i_b, i_s, 1], links_pos[i_b, i_s, 2])
+        link_quat = qd.math.vec4(
+            links_quat[i_b, i_s, 0], links_quat[i_b, i_s, 1], links_quat[i_b, i_s, 2], links_quat[i_b, i_s, 3]
+        )
+
+        ray_start_local = qd.math.vec3(ray_starts[i_p, 0], ray_starts[i_p, 1], ray_starts[i_p, 2])
+        ray_start_world = qd_transform_by_trans_quat(ray_start_local, link_pos, link_quat)
+
+        ray_dir_local = qd.math.vec3(ray_directions[i_p, 0], ray_directions[i_p, 1], ray_directions[i_p, 2])
+        ray_direction_world = qd_normalize(qd_transform_by_quat(ray_dir_local, link_quat), eps)
+
+        max_range = max_ranges[i_s]
+        hit_face, hit_distance, _hit_normal = bvh_ray_cast_visual(
+            ray_start=ray_start_world,
+            ray_dir=ray_direction_world,
+            max_range=max_range,
+            i_b=i_b,
+            bvh_nodes=bvh_nodes,
+            bvh_morton_codes=bvh_morton_codes,
+            vfaces_info=vfaces_info,
+            vverts_state=vverts_state,
+            eps=eps,
+        )
+
+        i_p_sensor = i_p - sensor_point_offsets[i_s]
+        i_p_offset = sensor_cache_offsets[i_s]
+        n_points_in_sensor = sensor_point_counts[i_s]
+        i_p_dist = i_p_offset + n_points_in_sensor * 3 + i_p_sensor
+
+        if hit_face >= 0:
+            dist = hit_distance
+            output_hits[i_p_dist, i_b] = dist
+
+            if is_world_frame[i_s]:
+                hit_point = ray_start_world + dist * ray_direction_world
+                output_hits[i_p_offset + i_p_sensor * 3 + 0, i_b] = hit_point.x
+                output_hits[i_p_offset + i_p_sensor * 3 + 1, i_b] = hit_point.y
+                output_hits[i_p_offset + i_p_sensor * 3 + 2, i_b] = hit_point.z
+            else:
+                hit_point = dist * qd_normalize(
+                    qd.math.vec3(ray_directions[i_p, 0], ray_directions[i_p, 1], ray_directions[i_p, 2]), eps
+                )
+                output_hits[i_p_offset + i_p_sensor * 3 + 0, i_b] = hit_point.x
+                output_hits[i_p_offset + i_p_sensor * 3 + 1, i_b] = hit_point.y
+                output_hits[i_p_offset + i_p_sensor * 3 + 2, i_b] = hit_point.z
+        else:
+            output_hits[i_p_offset + i_p_sensor * 3 + 0, i_b] = 0.0
+            output_hits[i_p_offset + i_p_sensor * 3 + 1, i_b] = 0.0
+            output_hits[i_p_offset + i_p_sensor * 3 + 2, i_b] = 0.0
+            output_hits[i_p_dist, i_b] = no_hit_values[i_s]
+
+
 @dataclass
 class RaycasterSharedMetadata(RigidSensorMetadataMixin, SharedSensorMetadata):
     bvh: LBVH | None = None
     aabb: AABB | None = None
+    use_visual_bvh: bool = False
 
     sensors_ray_start_idx: list[int] = field(default_factory=list)
     total_n_rays: int = 0
@@ -176,16 +261,44 @@ class RaycasterSensor(RigidSensorMixin, Sensor[RaycasterOptions, RaycasterShared
     @classmethod
     def _update_bvh(cls, shared_metadata: RaycasterSharedMetadata):
         """Rebuild BVH from current geometry in the scene."""
-        kernel_update_verts_and_aabbs(
-            geoms_info=shared_metadata.solver.geoms_info,
-            geoms_state=shared_metadata.solver.geoms_state,
-            verts_info=shared_metadata.solver.verts_info,
-            faces_info=shared_metadata.solver.faces_info,
-            free_verts_state=shared_metadata.solver.free_verts_state,
-            fixed_verts_state=shared_metadata.solver.fixed_verts_state,
-            static_rigid_sim_config=shared_metadata.solver._static_rigid_sim_config,
-            aabb_state=shared_metadata.aabb,
-        )
+        solver = shared_metadata.solver
+
+        if shared_metadata.use_visual_bvh:
+            # Ensure vgeom transforms are up-to-date
+            solver.update_vgeoms()
+            # Compute vverts world positions from vgeom transforms
+            kernel_update_all_vverts(
+                vverts_info=solver.vverts_info,
+                vgeoms_info=solver.vgeoms_info,
+                vgeoms_state=solver.vgeoms_state,
+                vverts_state=solver.vverts_state,
+                static_rigid_sim_config=solver._static_rigid_sim_config,
+            )
+            # Overwrite with custom vverts for entities that have them
+            for entity in solver.entities:
+                if entity.has_custom_vmesh:
+                    kernel_copy_custom_vverts(
+                        np.ascontiguousarray(entity._custom_vverts, dtype=gs.np_float),
+                        solver.vverts_state,
+                        entity.vvert_start,
+                    )
+            # Compute visual face AABBs
+            kernel_update_visual_aabbs(
+                vverts_state=solver.vverts_state,
+                vfaces_info=solver.vfaces_info,
+                aabb_state=shared_metadata.aabb,
+            )
+        else:
+            kernel_update_verts_and_aabbs(
+                geoms_info=solver.geoms_info,
+                geoms_state=solver.geoms_state,
+                verts_info=solver.verts_info,
+                faces_info=solver.faces_info,
+                free_verts_state=solver.free_verts_state,
+                fixed_verts_state=solver.fixed_verts_state,
+                static_rigid_sim_config=solver._static_rigid_sim_config,
+                aabb_state=shared_metadata.aabb,
+            )
 
         shared_metadata.bvh.build()
 
@@ -197,8 +310,16 @@ class RaycasterSensor(RigidSensorMixin, Sensor[RaycasterOptions, RaycasterShared
             self._shared_metadata.sensor_cache_offsets = concat_with_tensor(
                 self._shared_metadata.sensor_cache_offsets, 0
             )
-            n_faces = self._shared_metadata.solver.faces_info.geom_idx.shape[0]
-            n_envs = self._shared_metadata.solver.free_verts_state.pos.shape[1]
+
+            # Determine whether to use visual mesh for raycasting
+            use_visual = any(e.use_visual_raycasting for e in self._shared_metadata.solver.entities)
+            self._shared_metadata.use_visual_bvh = use_visual
+
+            if use_visual:
+                n_faces = self._shared_metadata.solver.vfaces_info.vgeom_idx.shape[0]
+            else:
+                n_faces = self._shared_metadata.solver.faces_info.geom_idx.shape[0]
+            n_envs = self._shared_metadata.solver._B
             self._shared_metadata.aabb = AABB(n_batches=n_envs, n_aabbs=n_faces)
 
             # FIXME: Empirically, the values 0 and 64 seem to be sufficient and decrease memory usage.
@@ -271,27 +392,48 @@ class RaycasterSensor(RigidSensorMixin, Sensor[RaycasterOptions, RaycasterShared
             links_pos = links_pos[None]
             links_quat = links_quat[None]
 
-        kernel_cast_rays(
-            shared_metadata.solver.fixed_verts_state,
-            shared_metadata.solver.free_verts_state,
-            shared_metadata.solver.verts_info,
-            shared_metadata.solver.faces_info,
-            shared_metadata.bvh.nodes,
-            shared_metadata.bvh.morton_codes,
-            links_pos,
-            links_quat,
-            shared_metadata.ray_starts,
-            shared_metadata.ray_dirs,
-            shared_metadata.max_ranges,
-            shared_metadata.no_hit_values,
-            shared_metadata.return_world_frame,
-            shared_metadata.points_to_sensor_idx,
-            shared_metadata.sensor_cache_offsets,
-            shared_metadata.sensor_point_offsets,
-            shared_metadata.sensor_point_counts,
-            shared_ground_truth_cache,
-            gs.EPS,
-        )
+        if shared_metadata.use_visual_bvh:
+            kernel_cast_rays_visual(
+                shared_metadata.solver.vverts_state,
+                shared_metadata.solver.vfaces_info,
+                shared_metadata.bvh.nodes,
+                shared_metadata.bvh.morton_codes,
+                links_pos,
+                links_quat,
+                shared_metadata.ray_starts,
+                shared_metadata.ray_dirs,
+                shared_metadata.max_ranges,
+                shared_metadata.no_hit_values,
+                shared_metadata.return_world_frame,
+                shared_metadata.points_to_sensor_idx,
+                shared_metadata.sensor_cache_offsets,
+                shared_metadata.sensor_point_offsets,
+                shared_metadata.sensor_point_counts,
+                shared_ground_truth_cache,
+                gs.EPS,
+            )
+        else:
+            kernel_cast_rays(
+                shared_metadata.solver.fixed_verts_state,
+                shared_metadata.solver.free_verts_state,
+                shared_metadata.solver.verts_info,
+                shared_metadata.solver.faces_info,
+                shared_metadata.bvh.nodes,
+                shared_metadata.bvh.morton_codes,
+                links_pos,
+                links_quat,
+                shared_metadata.ray_starts,
+                shared_metadata.ray_dirs,
+                shared_metadata.max_ranges,
+                shared_metadata.no_hit_values,
+                shared_metadata.return_world_frame,
+                shared_metadata.points_to_sensor_idx,
+                shared_metadata.sensor_cache_offsets,
+                shared_metadata.sensor_point_offsets,
+                shared_metadata.sensor_point_counts,
+                shared_ground_truth_cache,
+                gs.EPS,
+            )
 
     @classmethod
     def _update_shared_cache(

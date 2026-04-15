@@ -273,6 +273,130 @@ def kernel_update_verts_and_aabbs(
     )
 
 
+# =========================================== Visual Mesh Raycasting ===========================================
+
+
+@qd.func
+def get_visual_triangle_vertices(
+    i_f: int,
+    i_b: int,
+    vfaces_info: array_class.VFacesInfo,
+    vverts_state: array_class.VVertsState,
+):
+    """
+    Get the three vertices of a visual-mesh triangle in world space.
+    Simpler than collision variant: no fixed/free split, just batched positions.
+    """
+    tri_vertices = qd.Matrix.zero(gs.qd_float, 3, 3)
+    for i in qd.static(range(3)):
+        i_vv = vfaces_info.vverts_idx[i_f][i]
+        tri_vertices[:, i] = vverts_state.pos[i_vv, i_b]
+    return tri_vertices
+
+
+@qd.func
+def bvh_ray_cast_visual(
+    ray_start,
+    ray_dir,
+    max_range,
+    i_b,
+    bvh_nodes: qd.template(),
+    bvh_morton_codes: qd.template(),
+    vfaces_info: array_class.VFacesInfo,
+    vverts_state: array_class.VVertsState,
+    eps,
+):
+    """
+    Cast a ray through a BVH built from visual-mesh faces.
+    Same traversal as bvh_ray_cast but uses visual vertex data.
+    """
+    n_triangles = vfaces_info.vverts_idx.shape[0]
+
+    hit_face = -1
+    closest_distance = gs.qd_float(max_range)
+    hit_normal = qd.math.vec3(0.0, 0.0, 0.0)
+
+    node_stack = qd.Vector.zero(gs.qd_int, qd.static(STACK_SIZE))
+    node_stack[0] = 0
+    stack_idx = 1
+
+    while stack_idx > 0:
+        stack_idx -= 1
+        node_idx = node_stack[stack_idx]
+        node = bvh_nodes[i_b, node_idx]
+
+        aabb_t = ray_aabb_intersection(ray_start, ray_dir, node.bound.min, node.bound.max, eps)
+
+        if aabb_t >= 0.0 and aabb_t < closest_distance:
+            if node.left == -1:  # Leaf node
+                sorted_leaf_idx = node_idx - (n_triangles - 1)
+                i_f = qd.cast(bvh_morton_codes[i_b, sorted_leaf_idx][1], gs.qd_int)
+
+                tri_vertices = get_visual_triangle_vertices(i_f, i_b, vfaces_info, vverts_state)
+                v0, v1, v2 = tri_vertices[:, 0], tri_vertices[:, 1], tri_vertices[:, 2]
+
+                hit_result = ray_triangle_intersection(ray_start, ray_dir, v0, v1, v2, eps)
+
+                if hit_result.w > 0.0 and hit_result.x < closest_distance and hit_result.x >= 0.0:
+                    closest_distance = hit_result.x
+                    hit_face = i_f
+                    edge1 = v1 - v0
+                    edge2 = v2 - v0
+                    hit_normal = edge1.cross(edge2).normalized()
+            else:  # Internal node
+                if stack_idx < qd.static(STACK_SIZE - 2):
+                    node_stack[stack_idx] = node.left
+                    node_stack[stack_idx + 1] = node.right
+                    stack_idx += 2
+
+    return hit_face, closest_distance, hit_normal
+
+
+@qd.func
+def update_visual_aabbs(
+    vverts_state: array_class.VVertsState,
+    vfaces_info: array_class.VFacesInfo,
+    aabb_state: qd.template(),
+):
+    _B = vverts_state.pos.shape[1]
+    n_vfaces = vfaces_info.vverts_idx.shape[0]
+    for i_b, i_f in qd.ndrange(_B, n_vfaces):
+        aabb_state.aabbs[i_b, i_f].min.fill(qd.math.inf)
+        aabb_state.aabbs[i_b, i_f].max.fill(-qd.math.inf)
+
+        for i in qd.static(range(3)):
+            i_vv = vfaces_info.vverts_idx[i_f][i]
+            pos_v = vverts_state.pos[i_vv, i_b]
+            aabb_state.aabbs[i_b, i_f].min = qd.min(aabb_state.aabbs[i_b, i_f].min, pos_v)
+            aabb_state.aabbs[i_b, i_f].max = qd.max(aabb_state.aabbs[i_b, i_f].max, pos_v)
+
+
+@qd.kernel
+def kernel_update_visual_aabbs(
+    vverts_state: array_class.VVertsState,
+    vfaces_info: array_class.VFacesInfo,
+    aabb_state: qd.template(),
+):
+    update_visual_aabbs(vverts_state, vfaces_info, aabb_state)
+
+
+@qd.kernel
+def kernel_copy_custom_vverts(
+    custom_vverts: qd.types.ndarray(ndim=3),  # (n_vverts_entity, B, 3)
+    vverts_state: array_class.VVertsState,
+    vvert_start: int,
+):
+    """Copy per-batch custom vertex positions into the solver's vverts_state."""
+    n_vv = custom_vverts.shape[0]
+    _B = custom_vverts.shape[1]
+    for i_vv, i_b in qd.ndrange(n_vv, _B):
+        vverts_state.pos[vvert_start + i_vv, i_b] = qd.math.vec3(
+            custom_vverts[i_vv, i_b, 0],
+            custom_vverts[i_vv, i_b, 1],
+            custom_vverts[i_vv, i_b, 2],
+        )
+
+
 # FIXME: Fastcache is not supported because of 'bvh_nodes', 'bvh_morton_codes'.
 @qd.kernel(fastcache=False)
 def kernel_cast_ray(

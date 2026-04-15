@@ -1844,6 +1844,20 @@ def get_vverts_info(solver):
     )
 
 
+# =========================================== VvertsState ===========================================
+
+
+@DATA_ORIENTED
+class StructVvertsState(metaclass=BASE_METACLASS):
+    pos: V_ANNOTATION
+
+
+def get_vverts_state(solver):
+    return StructVvertsState(
+        pos=V(dtype=gs.qd_vec3, shape=(solver.n_vverts_, solver._B)),
+    )
+
+
 # =========================================== VfacesInfo ===========================================
 
 
@@ -2071,6 +2085,7 @@ class DataManager:
         self.entities_state = get_entities_state(solver)
 
         self.vverts_info = get_vverts_info(solver)
+        self.vverts_state = get_vverts_state(solver)
         self.vfaces_info = get_vfaces_info(solver)
 
         self.vgeoms_info = get_vgeoms_info(solver)
@@ -2136,6 +2151,7 @@ VertsInfo = StructVertsInfo if gs.use_ndarray else qd.template()
 EdgesInfo = StructEdgesInfo if gs.use_ndarray else qd.template()
 FacesInfo = StructFacesInfo if gs.use_ndarray else qd.template()
 VVertsInfo = StructVvertsInfo if gs.use_ndarray else qd.template()
+VVertsState = StructVvertsState if gs.use_ndarray else qd.template()
 VFacesInfo = StructVfacesInfo if gs.use_ndarray else qd.template()
 VGeomsInfo = StructVgeomsInfo if gs.use_ndarray else qd.template()
 VGeomsState = StructVgeomsState if gs.use_ndarray else qd.template()

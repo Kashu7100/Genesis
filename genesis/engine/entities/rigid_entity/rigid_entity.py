@@ -102,6 +102,12 @@ class KinematicEntity(Entity):
         self._is_attached: bool = False
         self._variant_init_qpos: list[np.ndarray] | None = None
 
+        # Custom visual mesh state (set via set_vverts / set_vmesh)
+        self._custom_vverts: np.ndarray | None = None  # (n_vverts, B, 3)  vertex positions per env
+        self._custom_vfaces: np.ndarray | None = None  # (n_vfaces, 3)     face indices (shared across envs)
+        self._vmesh_version: int = 0  # incremented on topology (face) changes
+        self._use_visual_raycasting: bool = False
+
         self._load_model()
 
         # Initialize target variables and checkpoint
@@ -1915,6 +1921,173 @@ class KinematicEntity(Entity):
         if self.is_built:
             return self._vgeoms
         return gs.List(vgeom for link in self._links for vgeom in link.vgeoms)
+
+    # ------------------------------------------------------------------------------------
+    # ----------------------------- custom visual mesh API ------------------------------
+    # ------------------------------------------------------------------------------------
+
+    @property
+    def has_custom_vmesh(self) -> bool:
+        """Whether this entity has custom visual mesh data set via :meth:`set_vverts` or :meth:`set_vmesh`."""
+        return self._custom_vverts is not None
+
+    @property
+    def vmesh_version(self) -> int:
+        """Version counter incremented on topology (face) changes."""
+        return self._vmesh_version
+
+    @property
+    def use_visual_raycasting(self) -> bool:
+        """Whether raycasting (depth camera, lidar) uses visual mesh instead of collision mesh.
+
+        Must be set **before** ``scene.build()``, because the raycaster BVH is sized at
+        build time based on this flag.
+        """
+        return self._use_visual_raycasting
+
+    @use_visual_raycasting.setter
+    def use_visual_raycasting(self, value: bool):
+        if self._is_built:
+            gs.logger.warning(
+                "use_visual_raycasting is set after scene.build(). "
+                "The raycaster BVH has already been sized and this change will NOT take effect. "
+                "Set this flag before calling scene.build()."
+            )
+        self._use_visual_raycasting = value
+
+    @gs.assert_built
+    def set_vverts(self, vverts, envs_idx=None):
+        """
+        Set custom visual vertex positions for this entity (topology unchanged).
+
+        When set, the rasterizer will update vertex positions per-environment instead of
+        using per-vgeom transform matrices. This is intended for externally-skinned
+        meshes (e.g., SMPL) where vertex positions are computed outside the solver.
+
+        This only affects rendering (and raycasting when ``use_visual_raycasting`` is enabled)
+        and does not change physics simulation.
+
+        Parameters
+        ----------
+        vverts : np.ndarray | torch.Tensor
+            Vertex positions in world space.
+            Shape ``(n_vverts, 3)`` for unbatched scenes or single-env update, or
+            ``(B, n_vverts, 3)`` for batched scenes where ``B = len(envs_idx)``
+            (or ``n_envs`` if ``envs_idx`` is None).
+        envs_idx : None | int | list | np.ndarray, optional
+            Environment indices to update. If None, all environments are updated.
+            When a single int is given, ``vverts`` may be ``(n_vverts, 3)``.
+        """
+        if isinstance(vverts, torch.Tensor):
+            vverts = vverts.detach().cpu().numpy()
+        vverts = np.asarray(vverts, dtype=np.float32)
+        B = self._solver._B
+
+        if self._custom_vverts is None or self._custom_vverts.shape[0] != self.n_vverts:
+            self._custom_vverts = np.zeros((self.n_vverts, B, 3), dtype=np.float32)
+            # Reset faces to None since this is vertex-only mode
+            self._custom_vfaces = None
+
+        if self._solver.n_envs == 0:
+            if vverts.shape != (self.n_vverts, 3):
+                gs.raise_exception(f"Expected vverts shape ({self.n_vverts}, 3), got {vverts.shape}")
+            self._custom_vverts[:, 0, :] = vverts
+        else:
+            if envs_idx is not None:
+                envs_idx = np.atleast_1d(np.asarray(envs_idx, dtype=int))
+            else:
+                envs_idx = np.arange(B)
+            # Allow (n_vverts, 3) as shorthand when updating a single environment
+            if len(envs_idx) == 1 and vverts.ndim == 2 and vverts.shape == (self.n_vverts, 3):
+                vverts = vverts[np.newaxis]  # -> (1, n_vverts, 3)
+            if vverts.shape != (len(envs_idx), self.n_vverts, 3):
+                gs.raise_exception(f"Expected vverts shape ({len(envs_idx)}, {self.n_vverts}, 3), got {vverts.shape}")
+            # Transpose from (B_sel, n_vverts, 3) -> assign into (n_vverts, B, 3)
+            self._custom_vverts[:, envs_idx, :] = vverts.transpose(1, 0, 2)
+
+    @gs.assert_built
+    def set_vmesh(self, vverts, vfaces, envs_idx=None):
+        """
+        Set custom visual mesh (vertices + faces) for this entity.
+
+        This is more general than :meth:`set_vverts` and supports changing mesh topology
+        (different number of vertices/faces). When faces differ from the previous call,
+        the renderer must rebuild GPU mesh objects which is slower than vertex-only updates.
+
+        Faces are shared across all environments.
+
+        Parameters
+        ----------
+        vverts : np.ndarray | torch.Tensor
+            Vertex positions in world space.
+            Shape ``(n_vverts, 3)`` for unbatched scenes or single-env update, or
+            ``(B, n_vverts, 3)`` for batched scenes where ``B = len(envs_idx)``
+            (or ``n_envs`` if ``envs_idx`` is None).
+        vfaces : np.ndarray | torch.Tensor
+            Triangle face indices, 0-indexed into ``vverts``.
+            Shape ``(n_vfaces, 3)``, shared across all environments.
+        envs_idx : None | int | list | np.ndarray, optional
+            Environment indices to update. If None, all environments are updated.
+        """
+        if isinstance(vverts, torch.Tensor):
+            vverts = vverts.detach().cpu().numpy()
+        if isinstance(vfaces, torch.Tensor):
+            vfaces = vfaces.detach().cpu().numpy()
+        vverts = np.asarray(vverts, dtype=np.float32)
+        vfaces = np.asarray(vfaces, dtype=np.int32)
+
+        if vfaces.ndim != 2 or vfaces.shape[1] != 3:
+            gs.raise_exception(f"Expected vfaces shape (n_vfaces, 3), got {vfaces.shape}")
+
+        B = self._solver._B
+        n_vverts = vverts.shape[-2] if vverts.ndim == 3 else vverts.shape[0]
+
+        # Detect topology change
+        faces_changed = (
+            self._custom_vfaces is None
+            or self._custom_vfaces.shape != vfaces.shape
+            or not np.array_equal(self._custom_vfaces, vfaces)
+        )
+
+        # (Re)allocate vertex buffer if vertex count changed
+        if self._custom_vverts is None or self._custom_vverts.shape[0] != n_vverts:
+            self._custom_vverts = np.zeros((n_vverts, B, 3), dtype=np.float32)
+
+        if faces_changed:
+            self._custom_vfaces = vfaces.copy()
+            self._vmesh_version += 1
+
+        # Fill in vertex positions
+        if self._solver.n_envs == 0:
+            if vverts.ndim == 3:
+                vverts = vverts[0]
+            if vverts.shape != (n_vverts, 3):
+                gs.raise_exception(f"Expected vverts shape ({n_vverts}, 3), got {vverts.shape}")
+            self._custom_vverts[:, 0, :] = vverts
+        else:
+            if envs_idx is not None:
+                envs_idx = np.atleast_1d(np.asarray(envs_idx, dtype=int))
+            else:
+                envs_idx = np.arange(B)
+            if len(envs_idx) == 1 and vverts.ndim == 2 and vverts.shape == (n_vverts, 3):
+                vverts = vverts[np.newaxis]
+            if vverts.shape != (len(envs_idx), n_vverts, 3):
+                gs.raise_exception(f"Expected vverts shape ({len(envs_idx)}, {n_vverts}, 3), got {vverts.shape}")
+            self._custom_vverts[:, envs_idx, :] = vverts.transpose(1, 0, 2)
+
+    @gs.assert_built
+    def clear_custom_vmesh(self):
+        """
+        Clear custom visual mesh data and revert to default FK-driven rendering.
+        """
+        if self._custom_vverts is not None:
+            self._custom_vverts = None
+            self._custom_vfaces = None
+            self._vmesh_version += 1  # trigger renderer rebuild back to instanced mode
+
+    # ------------------------------------------------------------------------------------
+    # ------------------------------------ link / joint ----------------------------------
+    # ------------------------------------------------------------------------------------
 
     @property
     def links(self) -> list[RigidLink]:

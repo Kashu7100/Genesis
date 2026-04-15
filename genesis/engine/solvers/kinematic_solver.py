@@ -374,6 +374,7 @@ class KinematicSolver(Solver):
 
     def _init_vvert_fields(self):
         self.vverts_info = self.data_manager.vverts_info
+        self.vverts_state = self.data_manager.vverts_state
         self.vfaces_info = self.data_manager.vfaces_info
         if self.n_vverts > 0:
             vgeoms = self.vgeoms
