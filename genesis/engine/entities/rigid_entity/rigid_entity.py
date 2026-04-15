@@ -104,7 +104,7 @@ class KinematicEntity(Entity):
 
         # Custom visual vertex state (set via set_vverts)
         self._custom_vverts: np.ndarray | None = None  # (B, n_vverts, 3)
-        self._use_visual_raycasting: bool = False
+        self._use_visual_raycasting: bool = material.use_visual_raycasting
 
         self._load_model()
 

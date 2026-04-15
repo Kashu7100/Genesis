@@ -397,6 +397,32 @@ def kernel_copy_custom_vverts(
         )
 
 
+@qd.kernel
+def kernel_merge_ray_hits(
+    primary: qd.types.ndarray(ndim=2),
+    secondary: qd.types.ndarray(ndim=2),
+    points_to_sensor_idx: qd.types.ndarray(ndim=1),
+    sensor_cache_offsets: qd.types.ndarray(ndim=1),
+    sensor_point_offsets: qd.types.ndarray(ndim=1),
+    sensor_point_counts: qd.types.ndarray(ndim=1),
+):
+    """Merge secondary ray cast results into primary, keeping closer hits per ray."""
+    n_points = points_to_sensor_idx.shape[0]
+    _B = primary.shape[1]
+    for i_p, i_b in qd.ndrange(n_points, _B):
+        i_s = points_to_sensor_idx[i_p]
+        i_p_sensor = i_p - sensor_point_offsets[i_s]
+        offset = sensor_cache_offsets[i_s]
+        n_pts = sensor_point_counts[i_s]
+
+        dist_idx = offset + n_pts * 3 + i_p_sensor
+        if secondary[dist_idx, i_b] < primary[dist_idx, i_b]:
+            primary[offset + i_p_sensor * 3 + 0, i_b] = secondary[offset + i_p_sensor * 3 + 0, i_b]
+            primary[offset + i_p_sensor * 3 + 1, i_b] = secondary[offset + i_p_sensor * 3 + 1, i_b]
+            primary[offset + i_p_sensor * 3 + 2, i_b] = secondary[offset + i_p_sensor * 3 + 2, i_b]
+            primary[dist_idx, i_b] = secondary[dist_idx, i_b]
+
+
 # FIXME: Fastcache is not supported because of 'bvh_nodes', 'bvh_morton_codes'.
 @qd.kernel(fastcache=False)
 def kernel_cast_ray(
