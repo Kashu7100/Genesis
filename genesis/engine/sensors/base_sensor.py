@@ -379,17 +379,26 @@ class RigidSensorMixin(Generic[RigidSensorMetadataMixinT]):
     def build(self):
         super().build()
 
-        if self._shared_metadata.solver is None:
-            self._shared_metadata.solver = self._manager._sim.rigid_solver
+        sim = self._manager._sim
 
-        batch_size = self._manager._sim._B
+        if self._shared_metadata.solver is None:
+            # Determine solver: use the attached entity's solver, or fall back to
+            # whichever solver has entities with use_visual_raycasting, or rigid_solver.
+            if self._options.entity_idx is not None and self._options.entity_idx >= 0:
+                self._shared_metadata.solver = sim.entities[self._options.entity_idx].solver
+            elif sim.kinematic_solver.is_active and any(e.use_visual_raycasting for e in sim.kinematic_solver.entities):
+                self._shared_metadata.solver = sim.kinematic_solver
+            else:
+                self._shared_metadata.solver = sim.rigid_solver
+
+        batch_size = sim._B
 
         # If entity_idx is < 0, this is a static sensor (not attached to any link)
         if self._options.entity_idx is None or self._options.entity_idx < 0:
             self._link = None
             return
 
-        entity = self._shared_metadata.solver.entities[self._options.entity_idx]
+        entity = sim.entities[self._options.entity_idx]
         self._link = entity.links[self._options.link_idx_local]
         self._shared_metadata.links_idx = concat_with_tensor(
             self._shared_metadata.links_idx, self._options.link_idx_local + entity.link_start

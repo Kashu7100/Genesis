@@ -2,19 +2,12 @@
 Custom Visual Mesh in Genesis
 ==============================
 
-Demonstrates how to use ``set_vverts()`` and ``set_vmesh()`` on a
-``KinematicEntity`` to update visual mesh vertices (and optionally faces)
-at runtime.
+Demonstrates how to use ``set_vverts()`` on a ``KinematicEntity`` to update
+visual vertex positions at runtime.
 
-``set_vverts()``
-    Fast path — only vertex positions change (topology unchanged).
-    Ideal for SMPL-style body models where vertex count and faces stay
-    constant across frames.
-
-``set_vmesh()``
-    General path — both vertices *and* faces can change between frames.
-    The renderer rebuilds GPU mesh objects when topology changes, which
-    is slower but supports arbitrary mesh updates.
+``set_vverts()`` is a fast path where only vertex positions change while the
+mesh topology (faces) stays constant. This is ideal for SMPL-style body
+models and other externally-skinned meshes.
 
 When ``use_visual_raycasting`` is enabled, depth cameras and lidars see
 the custom mesh instead of the collision hull.
@@ -91,7 +84,7 @@ def main():
     scene.add_entity(gs.morphs.Plane())
 
     if args.smpl:
-        # -------- SMPL path (set_vverts) --------
+        # -------- SMPL path --------
         import smplx
         import torch
 
@@ -143,10 +136,9 @@ def main():
             cam.render()
 
     else:
-        # -------- Box path (set_vverts + set_vmesh demo) --------
+        # -------- Box wave-deformation path --------
         base_verts, base_faces = create_box_mesh(size=0.5, subdivisions=3)
-        # Lift the box above the ground
-        base_verts[:, 2] += 0.5
+        base_verts[:, 2] += 0.5  # lift above ground
 
         mesh = trimesh.Trimesh(vertices=base_verts, faces=base_faces, process=False)
         tmp = tempfile.NamedTemporaryFile(suffix=".obj", delete=False)
@@ -164,8 +156,7 @@ def main():
         os.unlink(tmp.name)
         B = max(1, args.num_envs)
 
-        print("\n--- Phase 1: set_vverts (vertex-only deformation) ---")
-        for step in range(200):
+        for step in range(500):
             t = step * 0.05
             if args.num_envs > 0:
                 all_verts = np.stack([wave_deform(base_verts, t + b * 0.5) for b in range(B)], axis=0)
@@ -173,29 +164,6 @@ def main():
             else:
                 entity.set_vverts(wave_deform(base_verts, t))
 
-            scene.step()
-            cam.render()
-
-        print("--- Phase 2: set_vmesh (topology change — switch to icosphere) ---")
-        ico = trimesh.creation.icosphere(subdivisions=3, radius=0.3)
-        ico_verts = ico.vertices.astype(np.float32)
-        ico_verts[:, 2] += 0.5
-        ico_faces = ico.faces.astype(np.int32)
-
-        for step in range(200):
-            t = step * 0.05
-            if args.num_envs > 0:
-                all_verts = np.stack([wave_deform(ico_verts, t + b * 0.5) for b in range(B)], axis=0)
-                entity.set_vmesh(all_verts, ico_faces)
-            else:
-                entity.set_vmesh(wave_deform(ico_verts, t), ico_faces)
-
-            scene.step()
-            cam.render()
-
-        print("--- Phase 3: clear_custom_vmesh (revert to original) ---")
-        entity.clear_custom_vmesh()
-        for step in range(100):
             scene.step()
             cam.render()
 

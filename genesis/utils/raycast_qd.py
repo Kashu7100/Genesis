@@ -382,18 +382,18 @@ def kernel_update_visual_aabbs(
 
 @qd.kernel
 def kernel_copy_custom_vverts(
-    custom_vverts: qd.types.ndarray(ndim=3),  # (n_vverts_entity, B, 3)
+    custom_vverts: qd.types.ndarray(ndim=3),  # (B, n_vverts_entity, 3)
     vverts_state: array_class.VVertsState,
     vvert_start: int,
 ):
     """Copy per-batch custom vertex positions into the solver's vverts_state."""
-    n_vv = custom_vverts.shape[0]
-    _B = custom_vverts.shape[1]
-    for i_vv, i_b in qd.ndrange(n_vv, _B):
+    _B = custom_vverts.shape[0]
+    n_vv = custom_vverts.shape[1]
+    for i_b, i_vv in qd.ndrange(_B, n_vv):
         vverts_state.pos[vvert_start + i_vv, i_b] = qd.math.vec3(
-            custom_vverts[i_vv, i_b, 0],
-            custom_vverts[i_vv, i_b, 1],
-            custom_vverts[i_vv, i_b, 2],
+            custom_vverts[i_b, i_vv, 0],
+            custom_vverts[i_b, i_vv, 1],
+            custom_vverts[i_b, i_vv, 2],
         )
 
 

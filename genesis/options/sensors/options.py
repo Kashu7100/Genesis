@@ -106,17 +106,17 @@ class RigidSensorOptionsMixin(SensorOptions[SensorT]):
     euler_offset: Vec3FType = (0.0, 0.0, 0.0)
 
     def validate_scene(self, scene: "Scene"):
-        from genesis.engine.entities import RigidEntity
+        from genesis.engine.entities.rigid_entity.rigid_entity import KinematicEntity
 
         super().validate_scene(scene)
         if self.entity_idx is not None and self.entity_idx >= 0:
             if self.entity_idx >= len(scene.entities):
-                gs.raise_exception(f"Invalid RigidEntity index {self.entity_idx}.")
+                gs.raise_exception(f"Invalid entity index {self.entity_idx}.")
             entity = scene.entities[self.entity_idx]
-            if not isinstance(entity, RigidEntity):
-                gs.raise_exception(f"Entity at index {self.entity_idx} is not a RigidEntity.")
+            if not isinstance(entity, KinematicEntity):
+                gs.raise_exception(f"Entity at index {self.entity_idx} is not a RigidEntity or KinematicEntity.")
             if self.link_idx_local >= entity.n_links:
-                gs.raise_exception(f"Invalid RigidLink index {self.link_idx_local} for entity {self.entity_idx}.")
+                gs.raise_exception(f"Invalid link index {self.link_idx_local} for entity {self.entity_idx}.")
 
 
 class NoisySensorOptionsMixin(SensorOptions[SensorT]):

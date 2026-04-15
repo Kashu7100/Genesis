@@ -276,7 +276,7 @@ class RaycasterSensor(RigidSensorMixin, Sensor[RaycasterOptions, RaycasterShared
             )
             # Overwrite with custom vverts for entities that have them
             for entity in solver.entities:
-                if entity.has_custom_vmesh:
+                if entity.has_custom_vverts:
                     kernel_copy_custom_vverts(
                         np.ascontiguousarray(entity._custom_vverts, dtype=gs.np_float),
                         solver.vverts_state,
@@ -311,14 +311,19 @@ class RaycasterSensor(RigidSensorMixin, Sensor[RaycasterOptions, RaycasterShared
                 self._shared_metadata.sensor_cache_offsets, 0
             )
 
-            # Determine whether to use visual mesh for raycasting
-            use_visual = any(e.use_visual_raycasting for e in self._shared_metadata.solver.entities)
+            # Determine whether to use visual mesh for raycasting.
+            # KinematicSolver has no collision geometry — always use visual BVH.
+            # For RigidSolver, use visual BVH when any entity opts in.
+            from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
+
+            solver = self._shared_metadata.solver
+            use_visual = not isinstance(solver, RigidSolver) or any(e.use_visual_raycasting for e in solver.entities)
             self._shared_metadata.use_visual_bvh = use_visual
 
             if use_visual:
-                n_faces = self._shared_metadata.solver.vfaces_info.vgeom_idx.shape[0]
+                n_faces = solver.vfaces_info.vgeom_idx.shape[0]
             else:
-                n_faces = self._shared_metadata.solver.faces_info.geom_idx.shape[0]
+                n_faces = solver.faces_info.geom_idx.shape[0]
             n_envs = self._shared_metadata.solver._B
             self._shared_metadata.aabb = AABB(n_batches=n_envs, n_aabbs=n_faces)
 
