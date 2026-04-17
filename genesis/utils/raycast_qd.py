@@ -398,6 +398,19 @@ def kernel_copy_custom_vverts(
 
 
 @qd.kernel
+def kernel_invalidate_vverts_range(
+    vverts_state: array_class.VVertsState,
+    vvert_start: int,
+    n_vverts: int,
+):
+    """Set a range of visual vertices to a far-away position so they produce
+    degenerate AABBs that no ray will ever intersect."""
+    _B = vverts_state.pos.shape[1]
+    for i_vv, i_b in qd.ndrange(n_vverts, _B):
+        vverts_state.pos[vvert_start + i_vv, i_b] = qd.math.vec3(1e10, 1e10, 1e10)
+
+
+@qd.kernel
 def kernel_merge_ray_hits(
     primary: qd.types.ndarray(ndim=2),
     secondary: qd.types.ndarray(ndim=2),

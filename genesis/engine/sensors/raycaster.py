@@ -27,6 +27,7 @@ from genesis.utils.raycast_qd import (
     bvh_ray_cast,
     bvh_ray_cast_visual,
     kernel_copy_custom_vverts,
+    kernel_invalidate_vverts_range,
     kernel_merge_ray_hits,
     kernel_update_visual_aabbs,
     kernel_update_verts_and_aabbs,
@@ -298,12 +299,17 @@ class RaycasterSensor(RigidSensorMixin, Sensor[RaycasterOptions, RaycasterShared
             static_rigid_sim_config=solver._static_rigid_sim_config,
         )
         for entity in solver.entities:
-            if entity.has_custom_vverts:
+            if entity.use_visual_raycasting and entity.has_custom_vverts:
+                # Opted-in entity with custom vertices: copy them in.
                 kernel_copy_custom_vverts(
                     np.ascontiguousarray(entity._custom_vverts, dtype=gs.np_float),
                     solver.vverts_state,
                     entity.vvert_start,
                 )
+            elif not entity.use_visual_raycasting:
+                # Entity did not opt in: move its vverts far away so its AABBs
+                # are outside any ray's max_range and the BVH skips them.
+                kernel_invalidate_vverts_range(solver.vverts_state, entity.vvert_start, entity.n_vverts)
         kernel_update_visual_aabbs(
             vverts_state=solver.vverts_state,
             vfaces_info=solver.vfaces_info,
