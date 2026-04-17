@@ -399,6 +399,16 @@ class RigidSensorMixin(Generic[RigidSensorMetadataMixinT]):
             return
 
         entity = sim.entities[self._options.entity_idx]
+
+        # All sensors of the same type share one solver for link lookups.
+        # Mixing entities from different solvers would silently corrupt link indices.
+        if entity.solver is not self._shared_metadata.solver:
+            gs.raise_exception(
+                f"Sensor at entity_idx={self._options.entity_idx} belongs to {type(entity.solver).__name__}, "
+                f"but the raycaster is already bound to {type(self._shared_metadata.solver).__name__}. "
+                f"All raycaster/depth-camera sensors must be attached to entities in the same solver."
+            )
+
         self._link = entity.links[self._options.link_idx_local]
         self._shared_metadata.links_idx = concat_with_tensor(
             self._shared_metadata.links_idx, self._options.link_idx_local + entity.link_start

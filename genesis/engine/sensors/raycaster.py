@@ -31,7 +31,7 @@ from genesis.utils.raycast_qd import (
     kernel_update_visual_aabbs,
     kernel_update_verts_and_aabbs,
 )
-from genesis.engine.solvers.rigid.abd.forward_kinematics import kernel_update_all_vverts
+from genesis.engine.solvers.rigid.abd.forward_kinematics import kernel_forward_kinematics, kernel_update_all_vverts
 from genesis.vis.rasterizer_context import RasterizerContext
 
 from .base_sensor import (
@@ -275,6 +275,20 @@ class RaycasterSensor(RigidSensorMixin, Sensor[RaycasterOptions, RaycasterShared
     @classmethod
     def _update_visual_bvh_for_solver(cls, solver, aabb, bvh):
         """Update a visual-mesh BVH for a single solver."""
+        # Ensure link poses are valid (FK may not have run yet at build time).
+        if not solver._is_forward_pos_updated:
+            kernel_forward_kinematics(
+                solver.scene._envs_idx,
+                links_state=solver.links_state,
+                links_info=solver.links_info,
+                joints_state=solver.joints_state,
+                joints_info=solver.joints_info,
+                dofs_state=solver.dofs_state,
+                dofs_info=solver.dofs_info,
+                entities_info=solver.entities_info,
+                rigid_global_info=solver._rigid_global_info,
+                static_rigid_sim_config=solver._static_rigid_sim_config,
+            )
         solver.update_vgeoms()
         kernel_update_all_vverts(
             vverts_info=solver.vverts_info,
@@ -402,6 +416,15 @@ class RaycasterSensor(RigidSensorMixin, Sensor[RaycasterOptions, RaycasterShared
         self._shared_metadata.max_ranges = concat_with_tensor(self._shared_metadata.max_ranges, self._options.max_range)
         no_hit_value = self._options.no_hit_value if self._options.no_hit_value is not None else self._options.max_range
         self._shared_metadata.no_hit_values = concat_with_tensor(self._shared_metadata.no_hit_values, no_hit_value)
+
+        # When multi-solver merge is active, the merge kernel uses distance comparison to
+        # pick the closer hit.  This only works if no_hit_value >= max_range; otherwise a
+        # "no hit" from one BVH could shadow a real hit from the other.
+        if self._shared_metadata.extra_visual_bvhs and no_hit_value < self._options.max_range:
+            gs.raise_exception(
+                f"no_hit_value ({no_hit_value}) must be >= max_range ({self._options.max_range}) "
+                f"when multi-solver visual raycasting is active (the merge kernel compares raw distances)."
+            )
 
     @classmethod
     def reset(cls, shared_metadata: RaycasterSharedMetadata, shared_ground_truth_cache: torch.Tensor, envs_idx):

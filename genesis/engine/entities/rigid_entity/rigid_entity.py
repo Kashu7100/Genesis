@@ -1941,10 +1941,11 @@ class KinematicEntity(Entity):
     @use_visual_raycasting.setter
     def use_visual_raycasting(self, value: bool):
         if self._is_built:
-            gs.logger.warning(
-                "use_visual_raycasting is set after scene.build(). "
-                "The raycaster BVH has already been sized and this change will NOT take effect. "
-                "Set this flag before calling scene.build()."
+            gs.raise_exception(
+                "use_visual_raycasting cannot be changed after scene.build(). "
+                "The raycaster BVH has already been sized. "
+                "Set this flag before calling scene.build(), or use "
+                "gs.materials.Kinematic(use_visual_raycasting=True)."
             )
         self._use_visual_raycasting = value
 
