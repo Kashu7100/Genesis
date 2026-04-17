@@ -291,6 +291,7 @@ class RaycasterSensor(RigidSensorMixin, Sensor[RaycasterOptions, RaycasterShared
                 rigid_global_info=solver._rigid_global_info,
                 static_rigid_sim_config=solver._static_rigid_sim_config,
             )
+            solver._is_forward_pos_updated = True
         solver.update_vgeoms()
         kernel_update_all_vverts(
             vverts_info=solver.vverts_info,

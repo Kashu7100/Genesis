@@ -404,6 +404,20 @@ class RigidSensorMixin(Generic[RigidSensorMetadataMixinT]):
             # Record static sensor: identity transform will be used for link pose.
             self._shared_metadata._sensor_link_solvers.append(None)
             self._shared_metadata._sensor_link_indices.append(-1)
+            # Append dummy entries to keep all per-sensor arrays aligned.
+            self._shared_metadata.links_idx = concat_with_tensor(self._shared_metadata.links_idx, 0)
+            self._shared_metadata.offsets_pos = concat_with_tensor(
+                self._shared_metadata.offsets_pos,
+                (0.0, 0.0, 0.0),
+                expand=(batch_size, 1, 3),
+                dim=1,
+            )
+            self._shared_metadata.offsets_quat = concat_with_tensor(
+                self._shared_metadata.offsets_quat,
+                euler_to_quat([(0.0, 0.0, 0.0)]),
+                expand=(batch_size, 1, 4),
+                dim=1,
+            )
             return
 
         entity = sim.entities[self._options.entity_idx]
