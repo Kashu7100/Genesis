@@ -1,4 +1,5 @@
 import math
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, Type
 
@@ -453,8 +454,6 @@ class RaycasterSensor(RigidSensorMixin, Sensor[RaycasterOptions, RaycasterShared
         where each sensor column is fetched from its own solver.  Static sensors (no entity)
         get identity transforms.
         """
-        from collections import defaultdict
-
         solvers_list = shared_metadata._sensor_link_solvers
         indices_list = shared_metadata._sensor_link_indices
         n_sensors = len(solvers_list)
@@ -488,6 +487,29 @@ class RaycasterSensor(RigidSensorMixin, Sensor[RaycasterOptions, RaycasterShared
         return links_pos, links_quat
 
     @classmethod
+    def _cast_visual_rays(cls, solver, bvh, shared_metadata, links_pos, links_quat, output_cache):
+        """Cast rays against a single solver's visual BVH."""
+        kernel_cast_rays_visual(
+            solver.vverts_state,
+            solver.vfaces_info,
+            bvh.nodes,
+            bvh.morton_codes,
+            links_pos,
+            links_quat,
+            shared_metadata.ray_starts,
+            shared_metadata.ray_dirs,
+            shared_metadata.max_ranges,
+            shared_metadata.no_hit_values,
+            shared_metadata.return_world_frame,
+            shared_metadata.points_to_sensor_idx,
+            shared_metadata.sensor_cache_offsets,
+            shared_metadata.sensor_point_offsets,
+            shared_metadata.sensor_point_counts,
+            output_cache,
+            gs.EPS,
+        )
+
+    @classmethod
     def _update_shared_ground_truth_cache(
         cls, shared_metadata: RaycasterSharedMetadata, shared_ground_truth_cache: torch.Tensor
     ):
@@ -498,24 +520,13 @@ class RaycasterSensor(RigidSensorMixin, Sensor[RaycasterOptions, RaycasterShared
 
         # Cast against primary BVH
         if shared_metadata.use_visual_bvh:
-            kernel_cast_rays_visual(
-                shared_metadata.solver.vverts_state,
-                shared_metadata.solver.vfaces_info,
-                shared_metadata.bvh.nodes,
-                shared_metadata.bvh.morton_codes,
+            cls._cast_visual_rays(
+                shared_metadata.solver,
+                shared_metadata.bvh,
+                shared_metadata,
                 links_pos,
                 links_quat,
-                shared_metadata.ray_starts,
-                shared_metadata.ray_dirs,
-                shared_metadata.max_ranges,
-                shared_metadata.no_hit_values,
-                shared_metadata.return_world_frame,
-                shared_metadata.points_to_sensor_idx,
-                shared_metadata.sensor_cache_offsets,
-                shared_metadata.sensor_point_offsets,
-                shared_metadata.sensor_point_counts,
                 shared_ground_truth_cache,
-                gs.EPS,
             )
         else:
             kernel_cast_rays(
@@ -545,24 +556,13 @@ class RaycasterSensor(RigidSensorMixin, Sensor[RaycasterOptions, RaycasterShared
             if shared_metadata._secondary_cache is None:
                 shared_metadata._secondary_cache = torch.full_like(shared_ground_truth_cache, float("inf"))
             shared_metadata._secondary_cache.fill_(float("inf"))
-            kernel_cast_rays_visual(
-                entry.solver.vverts_state,
-                entry.solver.vfaces_info,
-                entry.bvh.nodes,
-                entry.bvh.morton_codes,
+            cls._cast_visual_rays(
+                entry.solver,
+                entry.bvh,
+                shared_metadata,
                 links_pos,
                 links_quat,
-                shared_metadata.ray_starts,
-                shared_metadata.ray_dirs,
-                shared_metadata.max_ranges,
-                shared_metadata.no_hit_values,
-                shared_metadata.return_world_frame,
-                shared_metadata.points_to_sensor_idx,
-                shared_metadata.sensor_cache_offsets,
-                shared_metadata.sensor_point_offsets,
-                shared_metadata.sensor_point_counts,
                 shared_metadata._secondary_cache,
-                gs.EPS,
             )
             kernel_merge_ray_hits(
                 shared_ground_truth_cache,

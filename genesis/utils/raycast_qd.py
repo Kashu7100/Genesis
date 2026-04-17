@@ -11,6 +11,10 @@ from genesis.engine.solvers.rigid.rigid_solver import func_update_all_verts
 from genesis.utils.misc import qd_to_numpy
 from genesis.utils.raycast import RayHit
 
+# Position used to push non-participating visual vertices outside any
+# reasonable ray max_range so the BVH naturally skips them.
+_VVERT_INVALIDATION_POS = 1e10
+
 if TYPE_CHECKING:
     from genesis.engine.scene import Scene
 
@@ -407,7 +411,9 @@ def kernel_invalidate_vverts_range(
     degenerate AABBs that no ray will ever intersect."""
     _B = vverts_state.pos.shape[1]
     for i_vv, i_b in qd.ndrange(n_vverts, _B):
-        vverts_state.pos[vvert_start + i_vv, i_b] = qd.math.vec3(1e10, 1e10, 1e10)
+        vverts_state.pos[vvert_start + i_vv, i_b] = qd.math.vec3(
+            _VVERT_INVALIDATION_POS, _VVERT_INVALIDATION_POS, _VVERT_INVALIDATION_POS
+        )
 
 
 @qd.kernel

@@ -209,36 +209,25 @@ class RasterizerContext:
             return np.intersect1d(geom_active_envs_idx, rendered_envs_idx)
         return rendered_envs_idx
 
+    def _seg_key_for_geom(self, geom):
+        if self.segmentation_level == "geom":
+            return (geom.entity.idx, geom.link.idx, geom.idx)
+        elif self.segmentation_level == "link":
+            return (geom.entity.idx, geom.link.idx)
+        elif self.segmentation_level == "entity":
+            return geom.entity.idx
+        gs.raise_exception(f"Unsupported segmentation level: {self.segmentation_level}")
+
     def add_rigid_node(self, geom, obj, **kwargs):
         rigid_node = self.add_node(obj, **kwargs)
         self.rigid_nodes[geom.uid] = rigid_node
-
-        # create segemtation id
-        if self.segmentation_level == "geom":
-            seg_key = (geom.entity.idx, geom.link.idx, geom.idx)
-        elif self.segmentation_level == "link":
-            seg_key = (geom.entity.idx, geom.link.idx)
-        elif self.segmentation_level == "entity":
-            seg_key = geom.entity.idx
-        else:
-            gs.raise_exception(f"Unsupported segmentation level: {self.segmentation_level}")
-        self.create_node_seg(seg_key, rigid_node)
+        self.create_node_seg(self._seg_key_for_geom(geom), rigid_node)
 
     def add_skinned_node(self, geom, obj, i_b, **kwargs):
         """Add a per-env node for a vgeom with custom vertex positions."""
         skinned_node = self.add_node(obj, **kwargs)
         self.skinned_nodes[(i_b, geom.uid)] = skinned_node
-
-        # Use same segmentation key logic as add_rigid_node
-        if self.segmentation_level == "geom":
-            seg_key = (geom.entity.idx, geom.link.idx, geom.idx)
-        elif self.segmentation_level == "link":
-            seg_key = (geom.entity.idx, geom.link.idx)
-        elif self.segmentation_level == "entity":
-            seg_key = geom.entity.idx
-        else:
-            gs.raise_exception(f"Unsupported segmentation level: {self.segmentation_level}")
-        self.create_node_seg(seg_key, skinned_node)
+        self.create_node_seg(self._seg_key_for_geom(geom), skinned_node)
 
     def add_static_node(self, entity, obj, i_b, **kwargs):
         static_node = self.add_node(obj, **kwargs)

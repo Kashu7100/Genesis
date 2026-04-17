@@ -103,8 +103,10 @@ def main():
         tmp = tempfile.NamedTemporaryFile(suffix=".obj", delete=False)
         mesh.export(tmp.name)
 
-        entity = scene.add_entity(morph=gs.morphs.Mesh(file=tmp.name, pos=(0, 0, 0), fixed=True))
-        entity.use_visual_raycasting = True
+        entity = scene.add_entity(
+            morph=gs.morphs.Mesh(file=tmp.name, pos=(0, 0, 0), fixed=True),
+            material=gs.materials.Kinematic(use_visual_raycasting=True),
+        )
 
         cam = scene.add_camera(res=(640, 480), pos=(0, -3.0, 1.0), lookat=(0, 0, 0.8), fov=45)
 

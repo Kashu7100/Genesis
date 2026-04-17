@@ -135,10 +135,11 @@ def main():
     # 2) Static box — NOT opted-in (use_visual_raycasting=False, default).
     #    Visible in the 3D viewer but INVISIBLE to both depth cameras.
     #    This verifies phase-3 per-entity filtering.
-    box_verts = trimesh.creation.box(extents=(0.3, 0.3, 0.3)).vertices.astype(np.float32)
+    box_tri = trimesh.creation.box(extents=(0.3, 0.3, 0.3))
+    box_verts = box_tri.vertices.astype(np.float32)
     box_verts[:, 2] += 0.15
     box_verts[:, 1] += 1.0  # place behind the robot
-    box_faces = trimesh.creation.box(extents=(0.3, 0.3, 0.3)).faces.astype(np.int32)
+    box_faces = box_tri.faces.astype(np.int32)
 
     mesh_box = trimesh.Trimesh(vertices=box_verts, faces=box_faces, process=False)
     tmp_box = tempfile.NamedTemporaryFile(suffix=".obj", delete=False)
