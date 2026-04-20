@@ -337,6 +337,10 @@ class RigidSolver(KinematicSolver):
         self.n_fixed_verts_ = max(1, self.n_fixed_verts)
         self.n_candidate_equalities_ = max(1, self.n_equalities + self._options.max_dynamic_constraints)
 
+        # Resolve precision-dependent tolerance default
+        if self._options.tolerance is None:
+            self._options.tolerance = 1e-5 if gs.qd_float == qd.f32 else 1e-8
+
         super().build()
 
         self._init_mass_mat()
@@ -395,17 +399,6 @@ class RigidSolver(KinematicSolver):
         return self.n_envs <= gpu_cores
 
     def _build_static_config(self):
-        prefer_parallel_linesearch = self._options.prefer_parallel_linesearch
-        # FIXME: Enable gs.metal once Quadrants supports shared memory atomics on Apple Metal.
-        # FIXME: CUDA Graph is not supported on Windows for now due to faulty static linking on 'libcudadevrt.a'.
-        if (
-            gs.backend in (gs.cpu, gs.metal)
-            or self._enable_mujoco_compatibility
-            or self.sim.options.requires_grad
-            or sys.platform == "win32"
-        ):
-            prefer_parallel_linesearch = False
-
         static_rigid_sim_config = dict(
             backend=gs.backend,
             para_level=self.sim._para_level,
@@ -423,10 +416,13 @@ class RigidSolver(KinematicSolver):
             sparse_solve=self._options.sparse_solve,
             integrator=self._integrator,
             solver_type=self._options.constraint_solver,
-            prefer_parallel_linesearch={None: -1, False: 0, True: 1}[prefer_parallel_linesearch],
             broadphase_traversal=self._resolve_broadphase_traversal(),
             parallel_init=self._should_use_parallel_init(),
         )
+
+        # Prefer the monolith solver on CPU (always faster there, perf dispatch is a waste of effort)
+        if gs.backend == gs.cpu or self.sim.options.requires_grad:
+            static_rigid_sim_config["prefer_decomposed_solver"] = 0
 
         if self.is_active:
             # TODO: These alternative tiled algorithms are designed to reduce the impact of latency. However, naive
