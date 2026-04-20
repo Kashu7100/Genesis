@@ -511,6 +511,9 @@ class RasterizerContext:
 
     def _update_rigid_custom_vverts(self, entity, geoms):
         """Per-env vertex buffer updates for entities with custom vverts (e.g., SMPL skin)."""
+        if not entity._custom_vverts_dirty:
+            return
+        entity._custom_vverts_dirty = False
         custom_vverts = entity._custom_vverts  # shape: (B, n_vverts_entity, 3)
 
         for geom in geoms:

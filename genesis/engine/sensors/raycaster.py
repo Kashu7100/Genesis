@@ -277,41 +277,49 @@ class RaycasterSensor(RigidSensorMixin, Sensor[RaycasterOptions, RaycasterShared
     @classmethod
     def _update_visual_bvh_for_solver(cls, solver, aabb, bvh):
         """Update a visual-mesh BVH for a single solver."""
-        # Ensure link poses are valid (FK may not have run yet at build time).
-        if not solver._is_forward_pos_updated:
-            kernel_forward_kinematics(
-                solver.scene._envs_idx,
-                links_state=solver.links_state,
-                links_info=solver.links_info,
-                joints_state=solver.joints_state,
-                joints_info=solver.joints_info,
-                dofs_state=solver.dofs_state,
-                dofs_info=solver.dofs_info,
-                entities_info=solver.entities_info,
-                rigid_global_info=solver._rigid_global_info,
+        # Check whether any opted-in entity relies on FK-derived vertex positions
+        # (i.e. it participates in visual raycasting but has no custom vverts).
+        # If every opted-in entity supplies custom vverts, the expensive
+        # FK → vgeom → vvert transform pipeline can be skipped entirely.
+        needs_fk = any(e.use_visual_raycasting and not e.has_custom_vverts for e in solver.entities)
+
+        if needs_fk:
+            if not solver._is_forward_pos_updated:
+                kernel_forward_kinematics(
+                    solver.scene._envs_idx,
+                    links_state=solver.links_state,
+                    links_info=solver.links_info,
+                    joints_state=solver.joints_state,
+                    joints_info=solver.joints_info,
+                    dofs_state=solver.dofs_state,
+                    dofs_info=solver.dofs_info,
+                    entities_info=solver.entities_info,
+                    rigid_global_info=solver._rigid_global_info,
+                    static_rigid_sim_config=solver._static_rigid_sim_config,
+                )
+                solver._is_forward_pos_updated = True
+            solver.update_vgeoms()
+            kernel_update_all_vverts(
+                vverts_info=solver.vverts_info,
+                vgeoms_info=solver.vgeoms_info,
+                vgeoms_state=solver.vgeoms_state,
+                vverts_state=solver.vverts_state,
                 static_rigid_sim_config=solver._static_rigid_sim_config,
             )
-            solver._is_forward_pos_updated = True
-        solver.update_vgeoms()
-        kernel_update_all_vverts(
-            vverts_info=solver.vverts_info,
-            vgeoms_info=solver.vgeoms_info,
-            vgeoms_state=solver.vgeoms_state,
-            vverts_state=solver.vverts_state,
-            static_rigid_sim_config=solver._static_rigid_sim_config,
-        )
+
         for entity in solver.entities:
             if entity.use_visual_raycasting and entity.has_custom_vverts:
-                # Opted-in entity with custom vertices: copy them in.
                 kernel_copy_custom_vverts(
                     np.ascontiguousarray(entity._custom_vverts, dtype=gs.np_float),
                     solver.vverts_state,
                     entity.vvert_start,
                 )
             elif not entity.use_visual_raycasting:
-                # Entity did not opt in: move its vverts far away so its AABBs
-                # are outside any ray's max_range and the BVH skips them.
-                kernel_invalidate_vverts_range(solver.vverts_state, entity.vvert_start, entity.n_vverts)
+                # Push vverts to 1e10 so the BVH skips them.  Only needed the
+                # first time, or after FK ran (which overwrites all positions).
+                if needs_fk or not getattr(entity, "_raycast_vverts_invalidated", False):
+                    kernel_invalidate_vverts_range(solver.vverts_state, entity.vvert_start, entity.n_vverts)
+                    entity._raycast_vverts_invalidated = True
         kernel_update_visual_aabbs(
             vverts_state=solver.vverts_state,
             vfaces_info=solver.vfaces_info,

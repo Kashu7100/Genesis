@@ -104,6 +104,7 @@ class KinematicEntity(Entity):
 
         # Custom visual vertex state (set via set_vverts)
         self._custom_vverts: np.ndarray | None = None  # (B, n_vverts, 3)
+        self._custom_vverts_dirty: bool = False
         self._use_visual_raycasting: bool = material.use_visual_raycasting
 
         self._load_model()
@@ -1974,11 +1975,11 @@ class KinematicEntity(Entity):
         """
         if isinstance(vverts, torch.Tensor):
             vverts = vverts.detach().cpu().numpy()
-        vverts = np.asarray(vverts, dtype=np.float32)
+        vverts = np.asarray(vverts, dtype=gs.np_float)
         B = self._solver._B
 
         if self._custom_vverts is None:
-            self._custom_vverts = np.zeros((B, self.n_vverts, 3), dtype=np.float32)
+            self._custom_vverts = np.zeros((B, self.n_vverts, 3), dtype=gs.np_float)
 
         if self._solver.n_envs == 0:
             if vverts.shape != (self.n_vverts, 3):
@@ -1995,6 +1996,7 @@ class KinematicEntity(Entity):
             if vverts.shape != (len(envs_idx), self.n_vverts, 3):
                 gs.raise_exception(f"Expected vverts shape ({len(envs_idx)}, {self.n_vverts}, 3), got {vverts.shape}")
             self._custom_vverts[envs_idx] = vverts
+        self._custom_vverts_dirty = True
 
     # ------------------------------------------------------------------------------------
     # ------------------------------------ link / joint ----------------------------------
