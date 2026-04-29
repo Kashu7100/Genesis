@@ -398,23 +398,25 @@ class RigidSensorMixin(Generic[RigidSensorMetadataMixinT]):
 
         batch_size = sim._B
 
-        # If entity_idx is < 0, this is a static sensor (not attached to any link)
+        # If entity_idx is < 0, this is a static sensor (not attached to any link).
+        # The link pose is identity, but the user-provided pos_offset / euler_offset still
+        # define the sensor's pose in world space (raycaster bakes them into ray_starts at
+        # build time), so they must be appended like in the attached branch below.
         if self._options.entity_idx is None or self._options.entity_idx < 0:
             self._link = None
             # Record static sensor: identity transform will be used for link pose.
             self._shared_metadata._sensor_link_solvers.append(None)
             self._shared_metadata._sensor_link_indices.append(-1)
-            # Append dummy entries to keep all per-sensor arrays aligned.
             self._shared_metadata.links_idx = concat_with_tensor(self._shared_metadata.links_idx, 0)
             self._shared_metadata.offsets_pos = concat_with_tensor(
                 self._shared_metadata.offsets_pos,
-                (0.0, 0.0, 0.0),
+                self._options.pos_offset,
                 expand=(batch_size, 1, 3),
                 dim=1,
             )
             self._shared_metadata.offsets_quat = concat_with_tensor(
                 self._shared_metadata.offsets_quat,
-                euler_to_quat([(0.0, 0.0, 0.0)]),
+                euler_to_quat([self._options.euler_offset]),
                 expand=(batch_size, 1, 4),
                 dim=1,
             )

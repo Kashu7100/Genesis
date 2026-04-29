@@ -435,8 +435,9 @@ class RaycasterSensor(RigidSensorMixin, Sensor[RaycasterOptions, RaycasterShared
 
         # When multi-solver merge is active, the merge kernel uses distance comparison to
         # pick the closer hit.  This only works if no_hit_value >= max_range; otherwise a
-        # "no hit" from one BVH could shadow a real hit from the other.
-        if self._shared_metadata.extra_visual_bvhs and no_hit_value < self._options.max_range:
+        # "no hit" from one BVH could shadow a real hit from the other. The negated form
+        # also rejects NaN (every IEEE 754 comparison with NaN is False).
+        if self._shared_metadata.extra_visual_bvhs and not (no_hit_value >= self._options.max_range):
             gs.raise_exception(
                 f"no_hit_value ({no_hit_value}) must be >= max_range ({self._options.max_range}) "
                 f"when multi-solver visual raycasting is active (the merge kernel compares raw distances)."

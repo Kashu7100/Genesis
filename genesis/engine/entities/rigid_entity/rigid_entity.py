@@ -1979,7 +1979,12 @@ class KinematicEntity(Entity):
         B = self._solver._B
 
         if self._custom_vverts is None:
-            self._custom_vverts = np.zeros((B, self.n_vverts, 3), dtype=gs.np_float)
+            # Initialize with the raycast-invalidation sentinel so envs that have not yet been
+            # populated by a partial set_vverts(envs_idx=...) call are pushed outside any sensible
+            # ray range and rendered off-screen, instead of collapsing to the world origin.
+            from genesis.utils.raycast_qd import _VVERT_INVALIDATION_POS
+
+            self._custom_vverts = np.full((B, self.n_vverts, 3), _VVERT_INVALIDATION_POS, dtype=gs.np_float)
 
         if self._solver.n_envs == 0:
             if vverts.shape != (self.n_vverts, 3):
