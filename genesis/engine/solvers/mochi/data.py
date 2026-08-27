@@ -20,6 +20,7 @@ class COLLIDER_TYPE(IntEnum):
     SPHERE = 2
     BOX = 3
     GRID = 4
+    POINT_CLOUD = 5
 
 
 class INTEGRATOR(IntEnum):
@@ -423,22 +424,33 @@ def get_mochi_contact_state(solver, max_pairs, max_hits):
 
 @dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
 class MochiSoftInfo:
-    # Vertices: rest position, row-sum lumped mass (convergence weights) and owning entity.
+    # Vertices: rest position, row-sum lumped mass (convergence weights), owning entity and point-cloud collider weight
+    # (nodal area of shell vertices, zero elsewhere).
     verts_rest: qd.Tensor
     verts_mass: qd.Tensor
     verts_entity_idx: qd.Tensor
+    verts_collider_weight: qd.Tensor
     # Tetrahedra: vertex indices, rest edge matrix and its inverse (node 3 as origin), rest volume and owning entity.
     elems_v: qd.Tensor
     elems_Dm: qd.Tensor
     elems_Dm_inv: qd.Tensor
     elems_vol: qd.Tensor
     elems_entity_idx: qd.Tensor
+    # Shell triangles: vertices, opposite vertices of the neighboring triangles across the three edges (-1 across a
+    # boundary edge), owning entity, rest area, inverse rest metric and rest second fundamental form.
+    shell_elems_v: qd.Tensor
+    shell_elems_hinge: qd.Tensor
+    shell_elems_entity_idx: qd.Tensor
+    shell_elems_area: qd.Tensor
+    shell_elems_A_inv: qd.Tensor
+    shell_elems_B: qd.Tensor
     # Boundary contact samples: triangle vertices, barycentric coordinates, rest area weight and owning entity.
     samples_tri: qd.Tensor
     samples_bary: qd.Tensor
     samples_weight: qd.Tensor
     samples_entity_idx: qd.Tensor
-    # Per deformable entity: mass, material, contact parameters, vertex and sample ranges.
+    # Per deformable entity: kind (0 solid, 1 shell), mass, material, contact parameters, vertex and sample ranges.
+    entities_kind: qd.Tensor
     entities_mass: qd.Tensor
     entities_has_gravity: qd.Tensor
     entities_model: qd.Tensor
@@ -447,6 +459,11 @@ class MochiSoftInfo:
     entities_rho: qd.Tensor
     entities_mass_damping: qd.Tensor
     entities_stiffness_damping: qd.Tensor
+    entities_membrane_mu: qd.Tensor
+    entities_membrane_lambda: qd.Tensor
+    entities_bending_alpha: qd.Tensor
+    entities_bending_beta: qd.Tensor
+    entities_collider_radius: qd.Tensor
     entities_penalty_coefficient: qd.Tensor
     entities_penalty_smoothing_half_distance: qd.Tensor
     entities_penalty_threshold: qd.Tensor
@@ -482,19 +499,28 @@ def get_mochi_soft_info(solver):
         solver.n_soft_samples_,
         solver.n_soft_entities_,
     )
+    n_sh_ = solver.n_shell_elems_
     return MochiSoftInfo(
         verts_rest=V(dtype=gs.qd_vec3, shape=(n_sv_,)),
         verts_mass=V(dtype=gs.qd_float, shape=(n_sv_,)),
         verts_entity_idx=V(dtype=gs.qd_int, shape=(n_sv_,)),
+        verts_collider_weight=V(dtype=gs.qd_float, shape=(n_sv_,)),
         elems_v=V(dtype=gs.qd_ivec4, shape=(n_el_,)),
         elems_Dm=V(dtype=gs.qd_mat3, shape=(n_el_,)),
         elems_Dm_inv=V(dtype=gs.qd_mat3, shape=(n_el_,)),
         elems_vol=V(dtype=gs.qd_float, shape=(n_el_,)),
         elems_entity_idx=V(dtype=gs.qd_int, shape=(n_el_,)),
+        shell_elems_v=V(dtype=gs.qd_ivec3, shape=(n_sh_,)),
+        shell_elems_hinge=V(dtype=gs.qd_ivec3, shape=(n_sh_,)),
+        shell_elems_entity_idx=V(dtype=gs.qd_int, shape=(n_sh_,)),
+        shell_elems_area=V(dtype=gs.qd_float, shape=(n_sh_,)),
+        shell_elems_A_inv=V_MAT(n=2, m=2, dtype=gs.qd_float, shape=(n_sh_,)),
+        shell_elems_B=V_MAT(n=2, m=2, dtype=gs.qd_float, shape=(n_sh_,)),
         samples_tri=V(dtype=gs.qd_ivec3, shape=(n_ss_,)),
         samples_bary=V(dtype=gs.qd_vec3, shape=(n_ss_,)),
         samples_weight=V(dtype=gs.qd_float, shape=(n_ss_,)),
         samples_entity_idx=V(dtype=gs.qd_int, shape=(n_ss_,)),
+        entities_kind=V(dtype=gs.qd_int, shape=(n_se_,)),
         entities_mass=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_has_gravity=V(dtype=gs.qd_bool, shape=(n_se_,)),
         entities_model=V(dtype=gs.qd_int, shape=(n_se_,)),
@@ -503,6 +529,11 @@ def get_mochi_soft_info(solver):
         entities_rho=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_mass_damping=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_stiffness_damping=V(dtype=gs.qd_float, shape=(n_se_,)),
+        entities_membrane_mu=V(dtype=gs.qd_float, shape=(n_se_,)),
+        entities_membrane_lambda=V(dtype=gs.qd_float, shape=(n_se_,)),
+        entities_bending_alpha=V(dtype=gs.qd_float, shape=(n_se_,)),
+        entities_bending_beta=V(dtype=gs.qd_float, shape=(n_se_,)),
+        entities_collider_radius=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_penalty_coefficient=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_penalty_smoothing_half_distance=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_penalty_threshold=V(dtype=gs.qd_float, shape=(n_se_,)),
@@ -547,6 +578,11 @@ class MochiSoftState:
     # Stage-start deformation gradient (stiffness damping) and the 12x12 Hessian block of every tetrahedron.
     elems_F_stage_start: qd.Tensor
     elems_H: qd.Tensor
+    # Shell triangles: stage-start membrane and bending strains (stiffness damping) and the 18x18 Hessian block of
+    # the six-vertex stencil.
+    shell_elems_eps_stage_start: qd.Tensor
+    shell_elems_s_stage_start: qd.Tensor
+    shell_elems_H: qd.Tensor
     # Conservative per-step world bounds of every entity.
     entities_step_aabb_min: qd.Tensor
     entities_step_aabb_max: qd.Tensor
@@ -588,11 +624,24 @@ class MochiSoftState:
     sc_hit_pos: qd.Tensor
     sc_hit_normal: qd.Tensor
     sc_hit_distance: qd.Tensor
+    # Active samples against the point-cloud colliders of the shells: colliding side as above, collider vertex.
+    n_pc_hits: qd.Tensor
+    pc_hit_kind_a: qd.Tensor
+    pc_hit_sample_a: qd.Tensor
+    pc_hit_link_a: qd.Tensor
+    pc_hit_r_a: qd.Tensor
+    pc_hit_vert_b: qd.Tensor
+    pc_hit_D: qd.Tensor
+    pc_hit_force: qd.Tensor
+    pc_hit_pos: qd.Tensor
+    pc_hit_normal: qd.Tensor
+    pc_hit_distance: qd.Tensor
 
 
-def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits):
+def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max_pc_hits):
     _B = solver._B
     n_sv_, n_el_, n_se_ = solver.n_soft_verts_, solver.n_soft_elems_, solver.n_soft_entities_
+    n_sh_ = solver.n_shell_elems_
     return MochiSoftState(
         verts_pos=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
         verts_vel=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
@@ -607,6 +656,9 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits):
         verts_contact_force=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
         elems_F_stage_start=V(dtype=gs.qd_mat3, shape=(n_el_, _B)),
         elems_H=V_MAT(n=12, m=12, dtype=gs.qd_float, shape=(n_el_, _B)),
+        shell_elems_eps_stage_start=V_MAT(n=2, m=2, dtype=gs.qd_float, shape=(n_sh_, _B)),
+        shell_elems_s_stage_start=V_MAT(n=2, m=2, dtype=gs.qd_float, shape=(n_sh_, _B)),
+        shell_elems_H=V_MAT(n=18, m=18, dtype=gs.qd_float, shape=(n_sh_, _B)),
         entities_step_aabb_min=V(dtype=gs.qd_vec3, shape=(n_se_, _B)),
         entities_step_aabb_max=V(dtype=gs.qd_vec3, shape=(n_se_, _B)),
         n_pairs=V(dtype=gs.qd_int, shape=(_B,)),
@@ -641,4 +693,15 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits):
         sc_hit_pos=V(dtype=gs.qd_vec3, shape=(max_sc_hits, _B)),
         sc_hit_normal=V(dtype=gs.qd_vec3, shape=(max_sc_hits, _B)),
         sc_hit_distance=V(dtype=gs.qd_float, shape=(max_sc_hits, _B)),
+        n_pc_hits=V(dtype=gs.qd_int, shape=(_B,)),
+        pc_hit_kind_a=V(dtype=gs.qd_int, shape=(max_pc_hits, _B)),
+        pc_hit_sample_a=V(dtype=gs.qd_int, shape=(max_pc_hits, _B)),
+        pc_hit_link_a=V(dtype=gs.qd_int, shape=(max_pc_hits, _B)),
+        pc_hit_r_a=V(dtype=gs.qd_vec3, shape=(max_pc_hits, _B)),
+        pc_hit_vert_b=V(dtype=gs.qd_int, shape=(max_pc_hits, _B)),
+        pc_hit_D=V(dtype=gs.qd_mat3, shape=(max_pc_hits, _B)),
+        pc_hit_force=V(dtype=gs.qd_vec3, shape=(max_pc_hits, _B)),
+        pc_hit_pos=V(dtype=gs.qd_vec3, shape=(max_pc_hits, _B)),
+        pc_hit_normal=V(dtype=gs.qd_vec3, shape=(max_pc_hits, _B)),
+        pc_hit_distance=V(dtype=gs.qd_float, shape=(max_pc_hits, _B)),
     )

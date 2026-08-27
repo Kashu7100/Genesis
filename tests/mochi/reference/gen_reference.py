@@ -341,12 +341,67 @@ def case_soft_cube_drop(physics):
     }
 
 
+def structured_sheet(n_cells, size, center):
+    """Vertices and triangles of a square sheet in the x-y plane split into n_cells^2 cells of 2 triangles (Z-up frame,
+    consistently wound with normals along +z)."""
+    axis = np.linspace(-0.5 * size, 0.5 * size, n_cells + 1)
+    X, Y = np.meshgrid(axis, axis, indexing="ij")
+    verts = np.stack([X.reshape(-1), Y.reshape(-1), np.zeros(X.size)], axis=-1) + np.asarray(center)
+    faces = []
+    for i in range(n_cells):
+        for j in range(n_cells):
+            a = i * (n_cells + 1) + j
+            b = a + 1
+            c = a + (n_cells + 1)
+            d = c + 1
+            faces.append([a, b, d])
+            faces.append([a, d, c])
+    return verts.astype(np.float64), np.array(faces, dtype=np.int64)
+
+
+def case_cloth_drop(physics):
+    """Square shell (0.4 m, 4x4 cells, E = 1e4, nu = 0.3, rho = 200, t = 1 mm) dropped from 0.3 m onto a plane with
+    friction 0.5, g = 9.8, dt = 1/60, backward Euler, 90 steps, tight Newton tolerances."""
+    dt, n_steps = 1.0 / 60.0, 90
+    verts_zup, faces = structured_sheet(4, 0.4, (0.0, 0.0, 0.3))
+    verts = np.stack([verts_zup[:, 0], verts_zup[:, 2], -verts_zup[:, 1]], axis=-1)
+    scene = physics.create_scene("cloth_drop")
+    scene.set_gravity([0.0, -9.8, 0.0])
+    _set_solver(physics, scene, max_iter=8, abs_tol=1e-10, rel_tol=1e-12)
+    scene.create_rigid_actor(
+        name="plane",
+        shape=physics.create_plane_shape(normal=[0.0, 1.0, 0.0], distance=0.0),
+        is_static=True,
+        contact=_contact_params(physics),
+    )
+    params = physics.experimental.ShellActorParams()
+    params.name = "cloth"
+    params.shape = physics.create_tri_mesh_shape(coordinates=verts.reshape((-1,)), connectivity=faces.reshape((-1,)))
+    params.material = physics.experimental.shell_material_params_from3d_isotropic(1e4, 0.3, 200.0, 1e-3)
+    params.contact = _contact_params(physics)
+    params.collider_type = physics.ColliderType.NONE
+    cloth = physics.experimental.create_shell_actor(scene, params)
+    cloth.register_query(physics.QueryType.NODE_POSITIONS)
+    positions = []
+    for _ in range(n_steps):
+        scene.step(dt)
+        positions.append(_soft_world_positions(cloth))
+    return {
+        "dt": dt,
+        "gravity": 9.8,
+        "rest_positions": verts,
+        "faces": faces,
+        "positions": np.array(positions),
+    }
+
+
 CASES = {
     "box_drop_plane": case_box_drop_plane,
     "double_pendulum": case_double_pendulum,
     "two_boxes_stack": case_two_boxes_stack,
     "box_slide_friction": case_box_slide_friction,
     "soft_cube_drop": case_soft_cube_drop,
+    "cloth_drop": case_cloth_drop,
 }
 
 

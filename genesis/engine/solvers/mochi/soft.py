@@ -36,6 +36,7 @@ from .data import (
 from .integration import BDF2_ALPHA_2
 from .lie import skew
 from .newton import func_is_env_active
+from .shell import func_shell_elastic, func_shell_rest_data, func_shell_strains
 from .soft_materials import (
     func_elastic_energy,
     func_elastic_stress,
@@ -43,6 +44,12 @@ from .soft_materials import (
     func_stiffness_damping_block,
     func_stiffness_damping_stress,
 )
+
+# Kinds of deformable entities.
+SOFT_KIND_SOLID = 0
+SOFT_KIND_SHELL = 1
+# Guard of the shell geometry (degenerate metrics, normals and averaged normals).
+SHELL_TINY = 1e-30
 
 # Consistent mass matrix of a linear tetrahedron, in units of rho V / 20.
 CONSISTENT_MASS = ((2.0, 1.0, 1.0, 1.0), (1.0, 2.0, 1.0, 1.0), (1.0, 1.0, 2.0, 1.0), (1.0, 1.0, 1.0, 2.0))
@@ -80,6 +87,12 @@ ENTITY_PARAMS = (
     "sdf_cell_x",
     "sdf_cell_y",
     "sdf_cell_z",
+    "kind",
+    "membrane_mu",
+    "membrane_lambda",
+    "bending_alpha",
+    "bending_beta",
+    "collider_radius",
 )
 
 
@@ -131,6 +144,7 @@ def kernel_init_soft_fields(
             soft_info.verts_rest[i_v][k] = verts_rest[i_v, k]
         soft_info.verts_entity_idx[i_v] = verts_entity_idx[i_v]
         soft_info.verts_mass[i_v] = 0.0
+        soft_info.verts_collider_weight[i_v] = 0.0
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_e in range(n_entities):
@@ -160,6 +174,12 @@ def kernel_init_soft_fields(
             soft_info.entities_sdf_res[i_e][k] = qd.cast(entities_params[i_e, 22 + k], gs.qd_int)
             soft_info.entities_sdf_origin[i_e][k] = entities_params[i_e, 25 + k]
             soft_info.entities_sdf_cell[i_e][k] = entities_params[i_e, 28 + k]
+        soft_info.entities_kind[i_e] = qd.cast(entities_params[i_e, 31], gs.qd_int)
+        soft_info.entities_membrane_mu[i_e] = entities_params[i_e, 32]
+        soft_info.entities_membrane_lambda[i_e] = entities_params[i_e, 33]
+        soft_info.entities_bending_alpha[i_e] = entities_params[i_e, 34]
+        soft_info.entities_bending_beta[i_e] = entities_params[i_e, 35]
+        soft_info.entities_collider_radius[i_e] = entities_params[i_e, 36]
         for i_l in range(n_links):
             soft_info.entities_links_pair_enabled[i_e, i_l] = entities_links_pair_enabled[i_e, i_l]
         for j_e in range(n_entities):
@@ -411,6 +431,7 @@ def kernel_soft_zero_assembly(
         if func_is_env_active(i_b, mochi_state, skip_ls_done):
             soft_state.n_soft_hits[i_b] = 0
             soft_state.n_sc_hits[i_b] = 0
+            soft_state.n_pc_hits[i_b] = 0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_v, i_b in qd.ndrange(n_verts, _B):
         if func_is_env_active(i_b, mochi_state, skip_ls_done):
@@ -423,6 +444,11 @@ def kernel_soft_zero_assembly(
         for i_el, i_b in qd.ndrange(n_elems, _B):
             if func_is_env_active(i_b, mochi_state, skip_ls_done):
                 soft_state.elems_H[i_el, i_b] = qd.Matrix.zero(gs.qd_float, 12, 12)
+        n_shell_elems = soft_state.shell_elems_H.shape[0]
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_t, i_b in qd.ndrange(n_shell_elems, _B):
+            if func_is_env_active(i_b, mochi_state, skip_ls_done):
+                soft_state.shell_elems_H[i_t, i_b] = qd.Matrix.zero(gs.qd_float, 18, 18)
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_p, i_b in qd.ndrange(max_pairs, _B):
         if func_is_env_active(i_b, mochi_state, skip_ls_done) and i_p < soft_state.n_pairs[i_b]:
@@ -458,10 +484,13 @@ def kernel_soft_assemble_elements(
     for i_el, i_b in qd.ndrange(n_elems, _B):
         if not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
+        vol = soft_info.elems_vol[i_el]
+        if vol <= 0.0:
+            # Padding element of a scene without solids.
+            continue
         i_e = soft_info.elems_entity_idx[i_el]
         v = soft_info.elems_v[i_el]
         h = mochi_state.dt_stage[i_b]
-        vol = soft_info.elems_vol[i_el]
         rho = soft_info.entities_rho[i_e]
         mu = soft_info.entities_mu[i_e]
         lam = soft_info.entities_lam[i_e]
@@ -742,9 +771,12 @@ def kernel_soft_contact_eval(
         if not is_valid or d > band:
             continue
 
-        # Colliding normal of the deformed triangle and stage displacement of the sample, in the collider frame.
+        # Colliding normal of the deformed triangle and stage displacement of the sample, in the collider frame. Shell
+        # samples carry no orientation: the collider gradient serves as their normal.
         normal_world = gu.qd_normalize((x1 - x0).cross(x2 - x0), EPS)
         normal_geom = gu.qd_inv_transform_by_quat(normal_world, quat_g)
+        if soft_info.entities_kind[i_e] == SOFT_KIND_SHELL:
+            normal_geom = -gu.qd_normalize(grad, EPS)
         pos_start = (
             bary[0] * soft_state.verts_pos_stage_start[tri[0], i_b]
             + bary[1] * soft_state.verts_pos_stage_start[tri[1], i_b]
@@ -1024,6 +1056,59 @@ def func_soft_matvec(
             if not soft_state.verts_is_fixed[v_b[j], i_b]:
                 func_add_soft_vec(dst, v_b[j], i_b, -bary_b[j] * g, soft_info)
 
+    n_shell_elems = soft_state.shell_elems_H.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_t, i_b in qd.ndrange(n_shell_elems, _B):
+        if not mochi_state.pcg_is_active[i_b]:
+            continue
+        nodes = func_shell_nodes(i_t, soft_info)
+        x = qd.Vector.zero(gs.qd_float, 18)
+        for a in qd.static(range(6)):
+            i_v = nodes[a]
+            if i_v >= 0 and not soft_state.verts_is_fixed[i_v, i_b]:
+                sv = func_read_soft_vec(src, i_v, i_b, soft_info)
+                for k in qd.static(range(3)):
+                    x[3 * a + k] = sv[k]
+        y = soft_state.shell_elems_H[i_t, i_b] @ x
+        for a in qd.static(range(6)):
+            i_v = nodes[a]
+            if i_v >= 0 and not soft_state.verts_is_fixed[i_v, i_b]:
+                func_add_soft_vec(
+                    dst, i_v, i_b, qd.Vector([y[3 * a], y[3 * a + 1], y[3 * a + 2]], dt=gs.qd_float), soft_info
+                )
+
+    max_pc_hits = soft_state.pc_hit_kind_a.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_h, i_b in qd.ndrange(max_pc_hits, _B):
+        if not mochi_state.pcg_is_active[i_b] or i_h >= soft_state.n_pc_hits[i_b]:
+            continue
+        D = soft_state.pc_hit_D[i_h, i_b]
+        kind_a = soft_state.pc_hit_kind_a[i_h, i_b]
+        i_la = soft_state.pc_hit_link_a[i_h, i_b]
+        r_a = soft_state.pc_hit_r_a[i_h, i_b]
+        i_vb = soft_state.pc_hit_vert_b[i_h, i_b]
+        tri_a = soft_info.samples_tri[soft_state.pc_hit_sample_a[i_h, i_b]]
+        bary_a = soft_info.samples_bary[soft_state.pc_hit_sample_a[i_h, i_b]]
+        dp = qd.Vector.zero(gs.qd_float, 3)
+        if kind_a == 1:
+            for i in qd.static(range(3)):
+                if not soft_state.verts_is_fixed[tri_a[i], i_b]:
+                    dp += bary_a[i] * func_read_soft_vec(src, tri_a[i], i_b, soft_info)
+        elif i_la >= 0:
+            dp += func_soft_point_displacement(i_la, i_b, r_a, src, dyn_state, dyn_info, rigid_config)
+        dp_b = qd.Vector.zero(gs.qd_float, 3)
+        if not soft_state.verts_is_fixed[i_vb, i_b]:
+            dp_b = func_read_soft_vec(src, i_vb, i_b, soft_info)
+        g = D @ (dp - dp_b)
+        if kind_a == 1:
+            for i in qd.static(range(3)):
+                if not soft_state.verts_is_fixed[tri_a[i], i_b]:
+                    func_add_soft_vec(dst, tri_a[i], i_b, bary_a[i] * g, soft_info)
+        elif i_la >= 0:
+            func_soft_point_force_add(i_la, i_b, r_a, -(D @ dp_b), dst, dyn_state, dyn_info, rigid_config)
+        if not soft_state.verts_is_fixed[i_vb, i_b]:
+            func_add_soft_vec(dst, i_vb, i_b, -g, soft_info)
+
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_v, i_b in qd.ndrange(n_verts, _B):
         if mochi_state.pcg_is_active[i_b] and soft_state.verts_is_fixed[i_v, i_b]:
@@ -1173,6 +1258,63 @@ def kernel_soft_condense_dense(
                             for r in qd.static(range(3)):
                                 qd.atomic_add(mochi_state.H_dense[i_b, j_d + r, k_d], bary_b[j] * column[r])
                                 qd.atomic_add(mochi_state.H_dense[i_b, k_d, j_d + r], bary_b[j] * column[r])
+                    i_anc = dyn_info.links.parent_idx[I_anc]
+
+    n_shell_elems = soft_state.shell_elems_H.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_t, i_b in qd.ndrange(n_shell_elems, _B):
+        if not mochi_state.is_active[i_b]:
+            continue
+        nodes = func_shell_nodes(i_t, soft_info)
+        K = soft_state.shell_elems_H[i_t, i_b]
+        for a in qd.static(range(6)):
+            for c in qd.static(range(6)):
+                if nodes[a] >= 0 and nodes[c] >= 0:
+                    i_d = func_soft_dof(nodes[a], 0, soft_info)
+                    j_d = func_soft_dof(nodes[c], 0, soft_info)
+                    for r in qd.static(range(3)):
+                        for cc in qd.static(range(3)):
+                            qd.atomic_add(mochi_state.H_dense[i_b, i_d + r, j_d + cc], K[3 * a + r, 3 * c + cc])
+
+    max_pc_hits = soft_state.pc_hit_kind_a.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_h, i_b in qd.ndrange(max_pc_hits, _B):
+        if not mochi_state.is_active[i_b] or i_h >= soft_state.n_pc_hits[i_b]:
+            continue
+        D = soft_state.pc_hit_D[i_h, i_b]
+        kind_a = soft_state.pc_hit_kind_a[i_h, i_b]
+        i_vb = soft_state.pc_hit_vert_b[i_h, i_b]
+        b_d = func_soft_dof(i_vb, 0, soft_info)
+        for r in qd.static(range(3)):
+            for c in qd.static(range(3)):
+                qd.atomic_add(mochi_state.H_dense[i_b, b_d + r, b_d + c], D[r, c])
+        if kind_a == 1:
+            tri_a = soft_info.samples_tri[soft_state.pc_hit_sample_a[i_h, i_b]]
+            bary_a = soft_info.samples_bary[soft_state.pc_hit_sample_a[i_h, i_b]]
+            for i in qd.static(range(3)):
+                i_d = func_soft_dof(tri_a[i], 0, soft_info)
+                for k in qd.static(range(3)):
+                    k_d = func_soft_dof(tri_a[k], 0, soft_info)
+                    for r in qd.static(range(3)):
+                        for c in qd.static(range(3)):
+                            qd.atomic_add(mochi_state.H_dense[i_b, i_d + r, k_d + c], bary_a[i] * bary_a[k] * D[r, c])
+                for r in qd.static(range(3)):
+                    for c in qd.static(range(3)):
+                        qd.atomic_add(mochi_state.H_dense[i_b, i_d + r, b_d + c], -bary_a[i] * D[r, c])
+                        qd.atomic_add(mochi_state.H_dense[i_b, b_d + c, i_d + r], -bary_a[i] * D[r, c])
+        else:
+            i_la = soft_state.pc_hit_link_a[i_h, i_b]
+            if i_la >= 0:
+                r_a = soft_state.pc_hit_r_a[i_h, i_b]
+                i_anc = i_la
+                while i_anc != -1:
+                    I_anc = [i_anc, i_b] if qd.static(rigid_config.batch_links_info) else i_anc
+                    for k_d in range(dyn_info.links.dof_start[I_anc], dyn_info.links.dof_end[I_anc]):
+                        vel, ang = func_link_dof_jacobian(i_la, k_d, i_b, dyn_state)
+                        column = -(D @ (vel + ang.cross(r_a)))
+                        for r in qd.static(range(3)):
+                            qd.atomic_add(mochi_state.H_dense[i_b, b_d + r, k_d], column[r])
+                            qd.atomic_add(mochi_state.H_dense[i_b, k_d, b_d + r], column[r])
                     i_anc = dyn_info.links.parent_idx[I_anc]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
@@ -1602,6 +1744,8 @@ def kernel_soft_collider_eval(
         h = soft_info.entities_penalty_smoothing_half_distance[e_b]
         if d > 2.0 * h:
             continue
+        if kind_a == 1 and soft_info.entities_kind[e_a] == SOFT_KIND_SHELL:
+            normal_a = -gu.qd_normalize(grad, EPS)
 
         # Stage displacement of the sample relative to the collider point (which moves with the tetrahedron).
         pos_b_start = qd.Vector.zero(gs.qd_float, 3)
@@ -1719,6 +1863,464 @@ def kernel_soft_set_pair_enabled(
 def kernel_soft_collider_query(bvh: qd.template(), query_aabbs: qd.template()) -> qd.i32:
     """Intersect the sample points with the tetrahedron hierarchy; returns 1 when the result buffer overflowed."""
     return 1 if bvh.query(query_aabbs) else 0
+
+
+# ------------------------------------------------------------------------------------
+# --------------------------------------- shells -------------------------------------
+# ------------------------------------------------------------------------------------
+
+
+@qd.func
+def func_shell_nodes(i_t, soft_info: MochiSoftInfo):
+    """The six stencil vertices of a shell triangle (-1 for a missing opposite vertex)."""
+    v = soft_info.shell_elems_v[i_t]
+    hinge = soft_info.shell_elems_hinge[i_t]
+    return qd.Vector([v[0], v[1], v[2], hinge[0], hinge[1], hinge[2]], dt=gs.qd_int)
+
+
+@qd.func
+def func_shell_gather(i_t, i_b, field: qd.Tensor, soft_info: MochiSoftInfo):
+    """Positions of the six stencil vertices (missing ones take the first vertex, they are extrapolated later)."""
+    nodes = func_shell_nodes(i_t, soft_info)
+    x = qd.Matrix.zero(gs.qd_float, 6, 3)
+    for a in qd.static(range(6)):
+        i_v = nodes[a] if nodes[a] >= 0 else nodes[0]
+        pos = field[i_v, i_b]
+        for k in qd.static(range(3)):
+            x[a, k] = pos[k]
+    return x
+
+
+@qd.func
+def func_shell_gather_rest(i_t, soft_info: MochiSoftInfo):
+    nodes = func_shell_nodes(i_t, soft_info)
+    X = qd.Matrix.zero(gs.qd_float, 6, 3)
+    for a in qd.static(range(6)):
+        i_v = nodes[a] if nodes[a] >= 0 else nodes[0]
+        pos = soft_info.verts_rest[i_v]
+        for k in qd.static(range(3)):
+            X[a, k] = pos[k]
+    return X
+
+
+@qd.func
+def func_shell_missing(i_t, soft_info: MochiSoftInfo):
+    hinge = soft_info.shell_elems_hinge[i_t]
+    return qd.Vector([hinge[0] < 0, hinge[1] < 0, hinge[2] < 0])
+
+
+@qd.kernel
+def kernel_init_shell_fields(
+    shell_elems_v: qd.types.ndarray(),
+    shell_elems_hinge: qd.types.ndarray(),
+    shell_elems_entity_idx: qd.types.ndarray(),
+    soft_info: MochiSoftInfo,
+    rigid_config: qd.template(),
+):
+    """Rest data of the shell triangles (area, inverse metric, rest curvature), lumped vertex masses and point-cloud
+    collider weights (nodal areas)."""
+    n_tris = shell_elems_v.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_t in range(n_tris):
+        for k in qd.static(range(3)):
+            soft_info.shell_elems_v[i_t][k] = shell_elems_v[i_t, k]
+            soft_info.shell_elems_hinge[i_t][k] = shell_elems_hinge[i_t, k]
+        soft_info.shell_elems_entity_idx[i_t] = shell_elems_entity_idx[i_t]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_t in range(n_tris):
+        i_e = soft_info.shell_elems_entity_idx[i_t]
+        X = func_shell_gather_rest(i_t, soft_info)
+        area, A_inv, B = func_shell_rest_data(X, func_shell_missing(i_t, soft_info), SHELL_TINY)
+        soft_info.shell_elems_area[i_t] = area
+        soft_info.shell_elems_A_inv[i_t] = A_inv
+        soft_info.shell_elems_B[i_t] = B
+        rho = soft_info.entities_rho[i_e]
+        is_collider = soft_info.entities_collider_type[i_e] == COLLIDER_TYPE.POINT_CLOUD
+        for k in qd.static(range(3)):
+            i_v = soft_info.shell_elems_v[i_t][k]
+            qd.atomic_add(soft_info.verts_mass[i_v], rho * area / 3.0)
+            if is_collider:
+                qd.atomic_add(soft_info.verts_collider_weight[i_v], area / 3.0)
+
+
+@qd.kernel
+def kernel_shell_stage_start(
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    """Stage-start membrane and bending strains of every shell triangle (stiffness damping)."""
+    n_tris = soft_state.shell_elems_H.shape[0]
+    _B = soft_state.verts_pos.shape[1]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_t, i_b in qd.ndrange(n_tris, _B):
+        x = func_shell_gather(i_t, i_b, soft_state.verts_pos_stage_start, soft_info)
+        X = func_shell_gather_rest(i_t, soft_info)
+        eps_m, s = func_shell_strains(
+            x,
+            X,
+            func_shell_missing(i_t, soft_info),
+            soft_info.shell_elems_A_inv[i_t],
+            soft_info.shell_elems_B[i_t],
+            SHELL_TINY,
+        )
+        soft_state.shell_elems_eps_stage_start[i_t, i_b] = eps_m
+        soft_state.shell_elems_s_stage_start[i_t, i_b] = s
+
+
+@qd.kernel
+def kernel_shell_assemble(
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    assem_obj: qd.template(),
+    assem_res: qd.template(),
+    assem_dres: qd.template(),
+    skip_ls_done: qd.template(),
+):
+    """Membrane, bending, inertia (consistent mass), gravity and damping of every shell triangle of the running
+    environments: residual into the vertex degrees of freedom, 18x18 tangent block per triangle and its diagonal
+    blocks into the vertex preconditioner."""
+    n_tris = soft_state.shell_elems_H.shape[0]
+    _B = soft_state.verts_pos.shape[1]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_t, i_b in qd.ndrange(n_tris, _B):
+        if not func_is_env_active(i_b, mochi_state, skip_ls_done):
+            continue
+        i_e = soft_info.shell_elems_entity_idx[i_t]
+        nodes = func_shell_nodes(i_t, soft_info)
+        is_missing = func_shell_missing(i_t, soft_info)
+        h = mochi_state.dt_stage[i_b]
+        area = soft_info.shell_elems_area[i_t]
+        rho = soft_info.entities_rho[i_e]
+        factor = soft_info.entities_stiffness_damping[i_e] / h
+        scale = 1.0 + factor
+        ss_weight = factor / scale
+        x = func_shell_gather(i_t, i_b, soft_state.verts_pos, soft_info)
+        X = func_shell_gather_rest(i_t, soft_info)
+        energy, res, K, _eps_m, _s = func_shell_elastic(
+            x,
+            X,
+            is_missing,
+            area,
+            soft_info.shell_elems_A_inv[i_t],
+            soft_info.shell_elems_B[i_t],
+            scale * soft_info.entities_membrane_lambda[i_e],
+            scale * soft_info.entities_membrane_mu[i_e],
+            scale * soft_info.entities_bending_alpha[i_e],
+            scale * soft_info.entities_bending_beta[i_e],
+            ss_weight,
+            soft_state.shell_elems_eps_stage_start[i_t, i_b],
+            soft_state.shell_elems_s_stage_start[i_t, i_b],
+            SHELL_TINY,
+            True,
+            assem_dres,
+        )
+
+        # Inertia, mass damping and gravity on the three vertices with the consistent mass rho A [2 1 1; ...] / 12.
+        m_unit = rho * area / 12.0
+        c_inertia = m_unit / (h * h)
+        c_damping = m_unit * soft_info.entities_mass_damping[i_e] / h
+        for f in qd.static(range(3)):
+            i_f = nodes[f]
+            for g in qd.static(range(3)):
+                i_g = nodes[g]
+                m_fg = 2.0 if qd.static(f == g) else 1.0
+                a_g = (
+                    soft_state.verts_pos[i_g, i_b]
+                    - soft_state.verts_pos_stage_start[i_g, i_b]
+                    - h * soft_state.verts_vel_stage_start[i_g, i_b]
+                )
+                b_g = soft_state.verts_pos[i_g, i_b] - soft_state.verts_pos_stage_start[i_g, i_b]
+                for k in qd.static(range(3)):
+                    res[3 * f + k] += m_fg * (c_inertia * a_g[k] + c_damping * b_g[k])
+                    if qd.static(assem_dres):
+                        K[3 * f + k, 3 * g + k] += m_fg * (c_inertia + c_damping)
+                if qd.static(assem_obj):
+                    a_f = (
+                        soft_state.verts_pos[i_f, i_b]
+                        - soft_state.verts_pos_stage_start[i_f, i_b]
+                        - h * soft_state.verts_vel_stage_start[i_f, i_b]
+                    )
+                    b_f = soft_state.verts_pos[i_f, i_b] - soft_state.verts_pos_stage_start[i_f, i_b]
+                    energy += 0.5 * m_fg * (c_inertia * a_f.dot(a_g) + c_damping * b_f.dot(b_g))
+        if soft_info.entities_has_gravity[i_e]:
+            gravity = mochi_info.gravity[i_b]
+            for f in qd.static(range(3)):
+                for k in qd.static(range(3)):
+                    res[3 * f + k] -= rho * area / 3.0 * gravity[k]
+                if qd.static(assem_obj):
+                    energy -= rho * area / 3.0 * gravity.dot(soft_state.verts_pos[nodes[f], i_b])
+
+        if qd.static(assem_res):
+            for a in qd.static(range(6)):
+                if nodes[a] >= 0:
+                    func_add_soft_vec(
+                        mochi_state.res,
+                        nodes[a],
+                        i_b,
+                        qd.Vector([res[3 * a], res[3 * a + 1], res[3 * a + 2]], dt=gs.qd_float),
+                        soft_info,
+                    )
+        if qd.static(assem_obj):
+            qd.atomic_add(mochi_state.obj[i_b], energy)
+        if qd.static(assem_dres):
+            soft_state.shell_elems_H[i_t, i_b] = K
+            for a in qd.static(range(6)):
+                if nodes[a] >= 0:
+                    block = qd.Matrix.zero(gs.qd_float, 3, 3)
+                    for r in qd.static(range(3)):
+                        for c in qd.static(range(3)):
+                            block[r, c] = K[3 * a + r, 3 * a + c]
+                    qd.atomic_add(soft_state.verts_H_diag[nodes[a], i_b], block)
+
+
+# ------------------------------------------------------------------------------------
+# ------------------------------ point-cloud colliders (shells) ----------------------
+# ------------------------------------------------------------------------------------
+
+
+@qd.kernel
+def kernel_pc_collider_aabbs(
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    point_aabbs: qd.template(),
+    rigid_config: qd.template(),
+):
+    """Bounds of the collider spheres of the shell vertices (radius plus the contact band; empty for other vertices)."""
+    n_verts = soft_state.verts_pos.shape[0]
+    _B = soft_state.verts_pos.shape[1]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_b, i_v in qd.ndrange(_B, n_verts):
+        aabb_min = qd.Vector([gs.qd_float(1e30)] * 3, dt=gs.qd_float)
+        aabb_max = -aabb_min
+        i_e = soft_info.verts_entity_idx[i_v]
+        if (
+            soft_info.entities_collider_type[i_e] == COLLIDER_TYPE.POINT_CLOUD
+            and soft_info.verts_collider_weight[i_v] > 0.0
+        ):
+            pad = (
+                soft_info.entities_collider_radius[i_e]
+                + soft_info.entities_penalty_threshold[i_e]
+                + 2.0 * soft_info.entities_penalty_smoothing_half_distance[i_e]
+            )
+            pos = soft_state.verts_pos[i_v, i_b]
+            aabb_min = pos - pad
+            aabb_max = pos + pad
+        point_aabbs[i_b, i_v].min = aabb_min
+        point_aabbs[i_b, i_v].max = aabb_max
+
+
+@qd.kernel
+def kernel_pc_collider_eval(
+    query_result: qd.template(),
+    query_result_count: qd.template(),
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+    n_rigid_samples: int,
+    assem_obj: qd.template(),
+    assem_res: qd.template(),
+    assem_dres: qd.template(),
+    skip_ls_done: qd.template(),
+    record: qd.template(),
+    errno: qd.Tensor,
+):
+    """Evaluate every (collider vertex, sample point) candidate against the sphere of the vertex: signed distance
+    |p - x_b| - r with radial gradient, contact stiffness scaled by the nodal area over r^2, response on the sample and
+    on the vertex."""
+    n_results = qd.min(query_result_count[None], query_result.shape[0])
+    max_hits = soft_state.pc_hit_kind_a.shape[0]
+    EPS = mochi_info.EPS[None]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_r in range(n_results):
+        i_b = query_result[i_r][0]
+        i_vb = query_result[i_r][1]
+        i_q = query_result[i_r][2]
+        if not func_is_env_active(i_b, mochi_state, skip_ls_done):
+            continue
+        e_b = soft_info.verts_entity_idx[i_vb]
+        if soft_info.entities_collider_type[e_b] != COLLIDER_TYPE.POINT_CLOUD:
+            continue
+        w_b = soft_info.verts_collider_weight[i_vb]
+        if w_b <= 0.0:
+            continue
+
+        kind_a = 0
+        i_la = -1
+        e_a = -1
+        i_sample = i_q
+        pos = qd.Vector.zero(gs.qd_float, 3)
+        pos_start = qd.Vector.zero(gs.qd_float, 3)
+        normal_a = qd.Vector.zero(gs.qd_float, 3)
+        w = gs.qd_float(0.0)
+        k_a = gs.qd_float(0.0)
+        falloff_a = gs.qd_float(0.0)
+        mu_a = gs.qd_float(0.0)
+        c_visc_a = gs.qd_float(0.0)
+        c_ndamp_a = gs.qd_float(0.0)
+        is_enabled = True
+        is_shell_a = False
+        if i_q < n_rigid_samples:
+            i_la = mochi_info.samples.link_idx[i_q]
+            i_ga = mochi_info.samples.geom_idx[i_q]
+            is_enabled = soft_info.entities_links_pair_enabled[e_b, i_la]
+            pos_a = dyn_state.links.pos[i_la, i_b]
+            quat_a = dyn_state.links.quat[i_la, i_b]
+            pos = gu.qd_transform_by_trans_quat(mochi_info.samples.pos[i_q], pos_a, quat_a)
+            pos_start = gu.qd_transform_by_trans_quat(
+                mochi_info.samples.pos[i_q],
+                mochi_state.links_pos_stage_start[i_la, i_b],
+                mochi_state.links_quat_stage_start[i_la, i_b],
+            )
+            normal_a = gu.qd_transform_by_quat(mochi_info.samples.normal[i_q], quat_a)
+            w = mochi_info.samples.weight[i_q]
+            k_a = mochi_info.geoms.penalty_coefficient[i_ga]
+            falloff_a = mochi_info.geoms.friction_falloff_vel[i_ga]
+            mu_a = mochi_info.geoms.friction[i_ga]
+            c_visc_a = mochi_info.geoms.viscous_friction[i_ga]
+            c_ndamp_a = mochi_info.geoms.normal_viscous_damping[i_ga]
+        else:
+            kind_a = 1
+            i_sample = i_q - n_rigid_samples
+            e_a = soft_info.samples_entity_idx[i_sample]
+            is_enabled = (e_a != e_b) and soft_info.entities_pair_enabled[e_a, e_b]
+            is_shell_a = soft_info.entities_kind[e_a] == SOFT_KIND_SHELL
+            tri = soft_info.samples_tri[i_sample]
+            bary = soft_info.samples_bary[i_sample]
+            x0 = soft_state.verts_pos[tri[0], i_b]
+            x1 = soft_state.verts_pos[tri[1], i_b]
+            x2 = soft_state.verts_pos[tri[2], i_b]
+            pos = bary[0] * x0 + bary[1] * x1 + bary[2] * x2
+            pos_start = (
+                bary[0] * soft_state.verts_pos_stage_start[tri[0], i_b]
+                + bary[1] * soft_state.verts_pos_stage_start[tri[1], i_b]
+                + bary[2] * soft_state.verts_pos_stage_start[tri[2], i_b]
+            )
+            normal_a = gu.qd_normalize((x1 - x0).cross(x2 - x0), EPS)
+            w = soft_info.samples_weight[i_sample]
+            k_a = soft_info.entities_penalty_coefficient[e_a]
+            falloff_a = soft_info.entities_friction_falloff_vel[e_a]
+            mu_a = soft_info.entities_friction[e_a]
+            c_visc_a = soft_info.entities_viscous_friction[e_a]
+            c_ndamp_a = soft_info.entities_normal_viscous_damping[e_a]
+        if not is_enabled:
+            continue
+
+        x_b = soft_state.verts_pos[i_vb, i_b]
+        diff = pos - x_b
+        dist = diff.norm()
+        if dist <= EPS:
+            continue
+        grad = diff / dist
+        radius = soft_info.entities_collider_radius[e_b]
+        d = dist - radius
+        thr = soft_info.entities_penalty_threshold[e_b]
+        h = soft_info.entities_penalty_smoothing_half_distance[e_b]
+        if d > thr + 2.0 * h:
+            continue
+        if is_shell_a:
+            normal_a = -grad
+        p_rel = (pos - pos_start) - (x_b - soft_state.verts_pos_stage_start[i_vb, i_b])
+        d_start = d - grad.dot(p_rel)
+
+        k = qd.sqrt(k_a * soft_info.entities_penalty_coefficient[e_b]) * w_b / (radius * radius)
+        falloff = qd.sqrt(falloff_a * soft_info.entities_friction_falloff_vel[e_b])
+        mu = qd.sqrt(mu_a * soft_info.entities_friction[e_b])
+        c_visc = qd.sqrt(c_visc_a * soft_info.entities_viscous_friction[e_b])
+        c_ndamp = qd.sqrt(c_ndamp_a * soft_info.entities_normal_viscous_damping[e_b])
+        max_align = soft_info.entities_max_alignment_normals[e_b]
+        energy, force, dforce, _ = collision_response(
+            d,
+            grad,
+            normal_a,
+            p_rel,
+            d_start,
+            k,
+            h,
+            thr,
+            mu,
+            falloff,
+            c_visc,
+            c_ndamp,
+            max_align,
+            mochi_state.dt_stage[i_b],
+            EPS,
+            mochi_config,
+        )
+        wf = w * force
+        D = -w * dforce
+        r_a = pos - dyn_state.links.pos[qd.max(i_la, 0), i_b]
+        is_dynamic_a = kind_a == 1 or mochi_info.links.is_dynamic[i_la]
+
+        if qd.static(assem_obj):
+            qd.atomic_add(mochi_state.obj[i_b], w * energy)
+        if qd.static(assem_res):
+            if kind_a == 0:
+                if is_dynamic_a:
+                    torque = r_a.cross(wf)
+                    for kk in qd.static(range(3)):
+                        qd.atomic_add(mochi_state.links_res[i_la, i_b][kk], -wf[kk])
+                        qd.atomic_add(mochi_state.links_res[i_la, i_b][3 + kk], -torque[kk])
+            else:
+                tri = soft_info.samples_tri[i_sample]
+                bary = soft_info.samples_bary[i_sample]
+                for i in qd.static(range(3)):
+                    func_add_soft_vec(mochi_state.res, tri[i], i_b, -(bary[i]) * wf, soft_info)
+            func_add_soft_vec(mochi_state.res, i_vb, i_b, wf, soft_info)
+        if qd.static(assem_dres):
+            if kind_a == 0:
+                if is_dynamic_a:
+                    S_a = skew(r_a)
+                    DS = D @ S_a
+                    SD = S_a @ D
+                    SDS = S_a @ D @ S_a
+                    for kk in qd.static(range(3)):
+                        for ll in qd.static(range(3)):
+                            qd.atomic_add(mochi_state.H_diag[i_la, i_b][kk, ll], D[kk, ll])
+                            qd.atomic_add(mochi_state.H_diag[i_la, i_b][kk, 3 + ll], -DS[kk, ll])
+                            qd.atomic_add(mochi_state.H_diag[i_la, i_b][3 + kk, ll], SD[kk, ll])
+                            qd.atomic_add(mochi_state.H_diag[i_la, i_b][3 + kk, 3 + ll], -SDS[kk, ll])
+            else:
+                tri = soft_info.samples_tri[i_sample]
+                bary = soft_info.samples_bary[i_sample]
+                for i in qd.static(range(3)):
+                    qd.atomic_add(soft_state.verts_H_diag[tri[i], i_b], (bary[i] * bary[i]) * D)
+            qd.atomic_add(soft_state.verts_H_diag[i_vb, i_b], D)
+        if qd.static(assem_dres or record):
+            i_h = qd.atomic_add(soft_state.n_pc_hits[i_b], 1)
+            if i_h < max_hits:
+                soft_state.pc_hit_kind_a[i_h, i_b] = kind_a
+                soft_state.pc_hit_sample_a[i_h, i_b] = i_sample
+                soft_state.pc_hit_link_a[i_h, i_b] = i_la if (kind_a == 0 and is_dynamic_a) else -1
+                soft_state.pc_hit_r_a[i_h, i_b] = r_a
+                soft_state.pc_hit_vert_b[i_h, i_b] = i_vb
+                soft_state.pc_hit_D[i_h, i_b] = D
+                soft_state.pc_hit_force[i_h, i_b] = wf
+                soft_state.pc_hit_pos[i_h, i_b] = pos
+                soft_state.pc_hit_normal[i_h, i_b] = grad
+                soft_state.pc_hit_distance[i_h, i_b] = d
+            else:
+                qd.atomic_or(errno[i_b], array_class.ErrorCode.OVERFLOW_MOCHI_CONTACTS)
+        if qd.static(record):
+            if kind_a == 0:
+                qd.atomic_add(dyn_state.links.contact_force[i_la, i_b], wf)
+            else:
+                tri = soft_info.samples_tri[i_sample]
+                bary = soft_info.samples_bary[i_sample]
+                for i in qd.static(range(3)):
+                    qd.atomic_add(soft_state.verts_contact_force[tri[i], i_b], bary[i] * wf)
+            qd.atomic_add(soft_state.verts_contact_force[i_vb, i_b], -wf)
 
 
 @qd.data_oriented

@@ -35,6 +35,15 @@ points inside the body, so a few millimeters of interpenetration remain) and its
 mapping, as in mochi; a soft body never collides with itself. Mesh soft bodies reasonably finely
 (`maxvolume=..., nobisect=False`) where sharp rigid features touch them.
 
+Thin shells (`gs.materials.Mochi.Shell`) use the surface triangles of a `Mesh` (or primitive) morph as elements: a
+Saint Venant-Kirchhoff membrane on the metric of the mid-surface and a Koiter-type bending term on its discrete
+curvature, both thickness-integrated from `E`, `nu`, `rho` and `thickness` (each stiffness can be overridden). Shell
+samples carry no orientation (the contact normal comes from the collider, so both sides collide), and shells act as
+colliders through spheres of radius `collider_radius` placed at their vertices (`collider_type="point_cloud"`); a shell
+never collides with itself. Consistently wound meshes are required. Light cloth has little inertia: use a lower
+`penalty_coefficient` (1e7 Pa/m) or a larger `explosion_rel_tol` so that the sudden contact residual of an impact is
+not mistaken for a divergence.
+
 Velocities are recovered by finite differences over the step as in mochi: `get_dofs_velocity()` returns
 `sin(dq)/dt` for revolute joints and the sine-based angular velocity `vee(((R - R_prev)/dt) R^T)` for spherical and
 free joints, which differ from `dq/dt` by a factor `1 - (dq)^2/6`.

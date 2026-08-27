@@ -98,9 +98,16 @@ from .newton import (
 from .rigid_assembly import kernel_assemble_links
 from .soft import (
     ENTITY_PARAMS,
+    SOFT_KIND_SHELL,
+    SOFT_KIND_SOLID,
     SoftTetLBVH,
     build_soft_samples,
+    kernel_init_shell_fields,
     kernel_init_soft_fields,
+    kernel_pc_collider_aabbs,
+    kernel_pc_collider_eval,
+    kernel_shell_assemble,
+    kernel_shell_stage_start,
     kernel_soft_apply_increment,
     kernel_soft_assemble_elements,
     kernel_soft_broadphase,
@@ -199,7 +206,7 @@ class MochiSolver(KinematicSolver):
         if isinstance(morph, (gs.morphs.Terrain, gs.morphs.USD, gs.morphs.Drone)):
             gs.raise_exception(f"Morph {type(morph).__name__} is not supported by the MochiSolver.")
 
-        if isinstance(material, gs.materials.Mochi.Elastic):
+        if isinstance(material, (gs.materials.Mochi.Elastic, gs.materials.Mochi.Shell)):
             if not isinstance(morph, (gs.morphs.Box, gs.morphs.Sphere, gs.morphs.Cylinder, gs.morphs.Mesh)):
                 gs.raise_exception(
                     f"Morph {type(morph).__name__} is not supported for deformable Mochi bodies (Box, Sphere, "
@@ -288,6 +295,7 @@ class MochiSolver(KinematicSolver):
         self.n_soft_entities_ = max(1, self.n_soft_entities)
         self.n_soft_verts_ = max(1, self.n_soft_verts)
         self.n_soft_elems_ = max(1, self.n_soft_elems)
+        self.n_shell_elems_ = max(1, self.n_shell_elems)
         self.n_dofs_total_ = max(1, self.n_dofs_total)
 
         if gs.qd_float == qd.f32 and any(
@@ -586,9 +594,24 @@ class MochiSolver(KinematicSolver):
             verts_entity_idx = np.concatenate(
                 [np.full(entity.n_vertices, entity.idx_in_solver, dtype=gs.np_int) for entity in entities]
             )
-            elems_v = np.concatenate([entity.elems + entity.v_start for entity in entities]).astype(gs.np_int)
+            solids = [entity for entity in entities if not entity.is_shell]
+            shells = [entity for entity in entities if entity.is_shell]
+            elems_v = np.concatenate(
+                [np.zeros((0, 4), dtype=gs.np_int)] + [entity.elems + entity.v_start for entity in solids]
+            ).astype(gs.np_int)
             elems_entity_idx = np.concatenate(
-                [np.full(entity.n_elements, entity.idx_in_solver, dtype=gs.np_int) for entity in entities]
+                [np.zeros((0,), dtype=gs.np_int)]
+                + [np.full(entity.n_elements, entity.idx_in_solver, dtype=gs.np_int) for entity in solids]
+            )
+            shell_elems_v = np.concatenate(
+                [np.zeros((0, 3), dtype=gs.np_int)] + [entity.elems + entity.v_start for entity in shells]
+            ).astype(gs.np_int)
+            shell_elems_hinge = np.concatenate(
+                [np.zeros((0, 3), dtype=gs.np_int)] + [self._shell_hinges(entity) for entity in shells]
+            ).astype(gs.np_int)
+            shell_elems_entity_idx = np.concatenate(
+                [np.zeros((0,), dtype=gs.np_int)]
+                + [np.full(entity.n_elements, entity.idx_in_solver, dtype=gs.np_int) for entity in shells]
             )
             bary, ref_weights = TRIANGLE_QUADRATURES[options.boundary_element_type]
             samples_tri, samples_bary, samples_weight, samples_entity_idx = [], [], [], []
@@ -616,10 +639,7 @@ class MochiSolver(KinematicSolver):
                     [
                         entity.mass,
                         float(entity.material.has_gravity),
-                        float(ELASTIC_MODEL_BY_NAME[entity.material.model]),
-                        entity.material.mu,
-                        entity.material.lam,
-                        entity.material.rho,
+                        *self._solid_material_params(entity),
                         entity.material.mass_damping,
                         entity.material.stiffness_damping,
                         entity.material.penalty_coefficient,
@@ -639,6 +659,8 @@ class MochiSolver(KinematicSolver):
                         *grid["res"],
                         *grid["origin"],
                         *grid["cell"],
+                        float(SOFT_KIND_SHELL if entity.is_shell else SOFT_KIND_SOLID),
+                        *self._shell_material_params(entity),
                     ]
                     for entity, grid, sdf_start in zip(entities, sdf_grids, sdf_starts)
                 ],
@@ -649,6 +671,9 @@ class MochiSolver(KinematicSolver):
             verts_entity_idx = np.zeros((0,), dtype=gs.np_int)
             elems_v = np.zeros((0, 4), dtype=gs.np_int)
             elems_entity_idx = np.zeros((0,), dtype=gs.np_int)
+            shell_elems_v = np.zeros((0, 3), dtype=gs.np_int)
+            shell_elems_hinge = np.zeros((0, 3), dtype=gs.np_int)
+            shell_elems_entity_idx = np.zeros((0,), dtype=gs.np_int)
             samples_tri = np.zeros((0, 3), dtype=gs.np_int)
             samples_bary = np.zeros((0, 3), dtype=gs.np_float)
             samples_weight = np.zeros((0,), dtype=gs.np_float)
@@ -674,23 +699,37 @@ class MochiSolver(KinematicSolver):
         # Deformable colliders: every rigid and deformable sample point is located in the deformed tetrahedra through
         # a bounding-volume hierarchy rebuilt at every assembly.
         self._has_soft_colliders = any(
-            grid["collider_type"] != COLLIDER_TYPE.NONE for grid in (sdf_grids if self.has_soft else ())
+            grid["collider_type"] == COLLIDER_TYPE.GRID for grid in (sdf_grids if self.has_soft else ())
+        )
+        self._has_pc_colliders = any(
+            grid["collider_type"] == COLLIDER_TYPE.POINT_CLOUD for grid in (sdf_grids if self.has_soft else ())
         )
         self._n_soft_queries = self.n_samples + n_samples
         self._max_sc_hits = max(1, 2 * self._n_soft_queries) if self._has_soft_colliders else 1
-        if self._has_soft_colliders:
-            self._soft_tet_aabb = AABB(_B, self.n_soft_elems_)
+        self._max_pc_hits = max(1, 4 * self._n_soft_queries) if self._has_pc_colliders else 1
+        if self._has_soft_colliders or self._has_pc_colliders:
             self._soft_query_aabb = AABB(_B, max(1, self._n_soft_queries))
+            queries_entity_idx = np.concatenate([np.full(self.n_samples, -1, dtype=gs.np_int), samples_entity_idx])
+        if self._has_pc_colliders:
+            self._pc_aabb = AABB(_B, self.n_soft_verts_)
+            n_results_per_point = max(1, -(-8 * self._n_soft_queries // self.n_soft_verts_))
+            self._pc_bvh = SoftTetLBVH(
+                self._pc_aabb, verts_entity_idx, queries_entity_idx, max_n_query_result_per_aabb=n_results_per_point
+            )
+        if self._has_soft_colliders or self._has_pc_colliders:
+            self._soft_tet_aabb = AABB(_B, self.n_soft_elems_)
+        if self._has_soft_colliders:
             # A sample point overlaps the bounds of many tetrahedra before the inclusion test; those of its own entity
             # are filtered out by the hierarchy.
             n_results_per_tet = max(1, -(-16 * self._n_soft_queries // self.n_soft_elems_))
-            queries_entity_idx = np.concatenate([np.full(self.n_samples, -1, dtype=gs.np_int), samples_entity_idx])
             self._soft_tet_bvh = SoftTetLBVH(
                 self._soft_tet_aabb, elems_entity_idx, queries_entity_idx, max_n_query_result_per_aabb=n_results_per_tet
             )
 
         self.soft_info = get_mochi_soft_info(self)
-        self.soft_state = get_mochi_soft_state(self, self._max_soft_pairs, self._max_soft_hits, self._max_sc_hits)
+        self.soft_state = get_mochi_soft_state(
+            self, self._max_soft_pairs, self._max_soft_hits, self._max_sc_hits, self._max_pc_hits
+        )
         kernel_init_soft_fields(
             verts_rest,
             verts_entity_idx,
@@ -708,6 +747,10 @@ class MochiSolver(KinematicSolver):
             self.soft_state,
             self.rigid_config,
         )
+        if self.n_shell_elems > 0:
+            kernel_init_shell_fields(
+                shell_elems_v, shell_elems_hinge, shell_elems_entity_idx, self.soft_info, self.rigid_config
+            )
 
         # Render geometry of the deformable surfaces.
         n_soft_vverts_ = max(1, self.n_soft_vverts)
@@ -720,12 +763,57 @@ class MochiSolver(KinematicSolver):
             kernel_soft_init_render(vert_idx, self._soft_vverts_vert_idx)
         self._envs_offset = np.asarray(self._scene.envs_offset, dtype=gs.np_float).reshape((_B, 3))
 
+    @staticmethod
+    def _shell_hinges(entity):
+        """Opposite vertex (global index) of the neighboring triangle across each edge of every shell triangle, -1
+        across a boundary edge. Edge e is the edge opposite the local vertex e."""
+        faces = np.asarray(entity.elems, dtype=np.int64)
+        edge_to_faces = {}
+        for i_f, face in enumerate(faces):
+            for e in range(3):
+                key = tuple(sorted((int(face[(e + 1) % 3]), int(face[(e + 2) % 3]))))
+                edge_to_faces.setdefault(key, []).append(i_f)
+        hinges = np.full((len(faces), 3), -1, dtype=gs.np_int)
+        for i_f, face in enumerate(faces):
+            for e in range(3):
+                key = tuple(sorted((int(face[(e + 1) % 3]), int(face[(e + 2) % 3]))))
+                for j_f in edge_to_faces[key]:
+                    if j_f != i_f:
+                        other = [int(v) for v in faces[j_f] if int(v) not in key]
+                        hinges[i_f, e] = other[0] + entity.v_start
+                        break
+        return hinges
+
+    @staticmethod
+    def _solid_material_params(entity):
+        """(model, mu, lambda, density) columns: the elastic model of a solid, the areal density of a shell."""
+        material = entity.material
+        if entity.is_shell:
+            return (0.0, 0.0, 0.0, material.areal_density)
+        return (float(ELASTIC_MODEL_BY_NAME[material.model]), material.mu, material.lam, material.rho)
+
+    @staticmethod
+    def _shell_material_params(entity):
+        material = entity.material
+        if entity.is_shell:
+            return (
+                material.membrane_mu,
+                material.membrane_lambda,
+                material.bending_alpha,
+                material.bending_beta,
+                material.collider_radius,
+            )
+        return (0.0, 0.0, 0.0, 0.0, 0.0)
+
     def _build_soft_sdf_grid(self, entity):
-        """Rest-shape signed distance grid of a deformable collider (igl over the boundary triangles), or an empty grid
-        for a body that does not act as a collider."""
-        if entity.material.collider_type == "none":
+        """Rest-shape signed distance grid of a deformable solid collider (igl over the boundary triangles); shells are
+        point-cloud colliders and bodies that do not act as colliders get an empty grid."""
+        if entity.material.collider_type == "none" or entity.is_shell:
+            collider_type = COLLIDER_TYPE.NONE
+            if entity.is_shell and entity.material.collider_type != "none":
+                collider_type = COLLIDER_TYPE.POINT_CLOUD
             return {
-                "collider_type": COLLIDER_TYPE.NONE,
+                "collider_type": collider_type,
                 "values": np.zeros((0,), dtype=gs.np_float),
                 "res": (1, 1, 1),
                 "origin": (0.0, 0.0, 0.0),
@@ -849,6 +937,8 @@ class MochiSolver(KinematicSolver):
             kernel_soft_step_start(
                 self.mochi_state, self.soft_info, self.soft_state, self.rigid_config, self.mochi_config
             )
+            if self.n_shell_elems > 0:
+                kernel_shell_stage_start(self.soft_info, self.soft_state, self.rigid_config)
         self._forward_kinematics()
         kernel_store_stage_start_poses(self.dyn_state, self.mochi_state, self.rigid_config)
         kernel_reset_newton(self.mochi_state, self.rigid_config)
@@ -937,7 +1027,7 @@ class MochiSolver(KinematicSolver):
                 record,
                 self._errno,
             )
-            if self._has_soft_colliders:
+            if self._has_soft_colliders or self._has_pc_colliders:
                 kernel_soft_collider_aabbs(
                     self.dyn_state,
                     self.mochi_info,
@@ -949,6 +1039,33 @@ class MochiSolver(KinematicSolver):
                     self.n_samples,
                     self.rigid_config,
                 )
+            if self._has_pc_colliders:
+                kernel_pc_collider_aabbs(
+                    self.mochi_state, self.soft_info, self.soft_state, self._pc_aabb.aabbs, self.rigid_config
+                )
+                self._pc_bvh.build()
+                if kernel_soft_collider_query(self._pc_bvh, self._soft_query_aabb.aabbs):
+                    gs.raise_exception("Exceeding the capacity of the point-cloud collider queries.")
+                kernel_pc_collider_eval(
+                    self._pc_bvh.query_result,
+                    self._pc_bvh.query_result_count,
+                    self.dyn_state,
+                    self.dyn_info,
+                    self.mochi_info,
+                    self.mochi_state,
+                    self.soft_info,
+                    self.soft_state,
+                    self.rigid_config,
+                    self.mochi_config,
+                    self.n_samples,
+                    assem_obj,
+                    assem_res,
+                    assem_dres,
+                    skip_ls_done,
+                    record,
+                    self._errno,
+                )
+            if self._has_soft_colliders:
                 self._soft_tet_bvh.build()
                 if kernel_soft_collider_query(self._soft_tet_bvh, self._soft_query_aabb.aabbs):
                     gs.raise_exception("Exceeding the capacity of the deformable collider queries.")
@@ -1030,6 +1147,18 @@ class MochiSolver(KinematicSolver):
                 assem_dres,
                 skip_ls_done,
             )
+            if self.n_shell_elems > 0:
+                kernel_shell_assemble(
+                    self.mochi_info,
+                    self.mochi_state,
+                    self.soft_info,
+                    self.soft_state,
+                    self.rigid_config,
+                    assem_obj,
+                    assem_res,
+                    assem_dres,
+                    skip_ls_done,
+                )
         if assem_res:
             if self.has_soft:
                 kernel_soft_dirichlet(
@@ -1549,7 +1678,11 @@ class MochiSolver(KinematicSolver):
 
     @property
     def n_soft_elems(self):
-        return sum(entity.n_elements for entity in self._soft_entities)
+        return sum(entity.n_elements for entity in self._soft_entities if not entity.is_shell)
+
+    @property
+    def n_shell_elems(self):
+        return sum(entity.n_elements for entity in self._soft_entities if entity.is_shell)
 
     @property
     def n_soft_surfaces(self):

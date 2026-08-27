@@ -57,12 +57,13 @@ def load_tet_files(node_path):
 
 class MochiSoftEntity(Entity):
     """
-    Deformable body simulated by the MochiSolver: a tetrahedral mesh whose vertex positions are unknowns of the
-    implicit solve, under the constitutive model of its `gs.materials.Mochi.Elastic` material.
+    Deformable body simulated by the MochiSolver: a tetrahedral mesh (`gs.materials.Mochi.Elastic`) or a thin shell
+    made of the surface triangles of the morph (`gs.materials.Mochi.Shell`), whose vertex positions are unknowns of the
+    implicit solve.
 
-    The simulation mesh is tetrahedralized from the morph surface (tetgen options on the morph), or read directly from
-    a tetgen '.node' / '.ele' file pair given as a `gs.morphs.Mesh`. Its boundary triangles carry the contact samples
-    and the render mesh.
+    The solid simulation mesh is tetrahedralized from the morph surface (tetgen options on the morph), or read directly
+    from a tetgen '.node' / '.ele' file pair given as a `gs.morphs.Mesh`. The boundary triangles (all triangles of a
+    shell) carry the contact samples and the render mesh.
     """
 
     def __init__(
@@ -81,6 +82,7 @@ class MochiSoftEntity(Entity):
         vface_start,
         name=None,
     ):
+        self._is_shell = isinstance(material, gs.materials.Mochi.Shell)
         super().__init__(idx, scene, morph, solver, material, surface, name=name)
         self._idx_in_solver = idx_in_solver
         self._v_start = v_start
@@ -92,20 +94,25 @@ class MochiSoftEntity(Entity):
 
         self.sample()
 
-        # Boundary triangles (outward winding) and the tetrahedron owning each of them.
-        self._surface_tri_np, self._surface_el_np = self._boundary_triangles(self.elems)
+        # Boundary triangles (outward winding) and the tetrahedron owning each of them; all triangles of a shell.
+        if self._is_shell:
+            self._surface_tri_np = self.elems
+            self._surface_el_np = np.arange(len(self.elems), dtype=gs.np_int)
+        else:
+            self._surface_tri_np, self._surface_el_np = self._boundary_triangles(self.elems)
 
     def _get_morph_identifier(self) -> str:
         morph = self._morph
+        prefix = "shell" if self._is_shell else "soft"
         if isinstance(morph, gs.morphs.Box):
-            return "soft_box"
+            return f"{prefix}_box"
         if isinstance(morph, gs.morphs.Sphere):
-            return "soft_sphere"
+            return f"{prefix}_sphere"
         if isinstance(morph, gs.morphs.Cylinder):
-            return "soft_cylinder"
+            return f"{prefix}_cylinder"
         if isinstance(morph, gs.morphs.Mesh):
-            return f"soft_{os.path.splitext(os.path.basename(morph.file))[0]}"
-        return "soft_body"
+            return f"{prefix}_{os.path.splitext(os.path.basename(morph.file))[0]}"
+        return f"{prefix}_body"
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- instantiation ----------------------------------
@@ -115,6 +122,8 @@ class MochiSoftEntity(Entity):
         """Build the render geoms and the tetrahedral simulation mesh from the morph."""
         morph = self._morph
         if isinstance(morph, gs.morphs.Mesh) and morph.file.endswith(TET_NODE_FORMAT):
+            if self._is_shell:
+                gs.raise_exception("Shells are surface meshes: a tetrahedral mesh file cannot be used for a shell.")
             verts, elems = load_tet_files(morph.file)
             verts = verts * np.asarray(morph.scale, dtype=np.float64) + np.asarray(morph.pos, dtype=np.float64)
             self.instantiate(verts, elems)
@@ -150,6 +159,11 @@ class MochiSoftEntity(Entity):
             )
             vvert_start += len(mesh.verts)
             vface_start += len(mesh.faces)
+
+        if self._is_shell:
+            # The welded surface triangles are the shell elements.
+            self.instantiate(surface_verts + morph.pos, surface_faces)
+            return
 
         # File meshes are tetrahedralized untranslated so that the result and its cache are shared across placements;
         # primitives keep the position baked in, as the rest state is sensitive to the exact refinement.
@@ -187,11 +201,12 @@ class MochiSoftEntity(Entity):
         init_positions = init_positions + gu.transform_by_quat(
             np.array(self._morph.offset_pos, dtype=gs.np_float), morph_quat
         )
-        # Positive orientation of every tetrahedron (node 3 as origin).
-        D = np.stack([init_positions[elems[:, k]] - init_positions[elems[:, 3]] for k in range(3)], axis=-1)
-        is_inverted = np.linalg.det(D) < 0.0
-        elems = elems.copy()
-        elems[is_inverted, 1], elems[is_inverted, 2] = elems[is_inverted, 2], elems[is_inverted, 1]
+        if elems.shape[1] == 4:
+            # Positive orientation of every tetrahedron (node 3 as origin).
+            D = np.stack([init_positions[elems[:, k]] - init_positions[elems[:, 3]] for k in range(3)], axis=-1)
+            is_inverted = np.linalg.det(D) < 0.0
+            elems = elems.copy()
+            elems[is_inverted, 1], elems[is_inverted, 2] = elems[is_inverted, 2], elems[is_inverted, 1]
         self.init_positions = init_positions.astype(gs.np_float)
         self.elems = elems
 
@@ -275,6 +290,10 @@ class MochiSoftEntity(Entity):
         return self._idx_in_solver
 
     @property
+    def is_shell(self):
+        return self._is_shell
+
+    @property
     def n_vertices(self):
         return len(self.init_positions)
 
@@ -340,11 +359,21 @@ class MochiSoftEntity(Entity):
 
     @property
     def volume(self):
+        if self._is_shell:
+            return 0.0
         D = np.stack(
             [self.init_positions[self.elems[:, k]] - self.init_positions[self.elems[:, 3]] for k in range(3)], -1
         )
         return float(np.abs(np.linalg.det(D)).sum() / 6.0)
 
     @property
+    def area(self):
+        """Total area of the surface triangles."""
+        tri = self.init_positions[self._surface_tri_np]
+        return float(0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=-1).sum())
+
+    @property
     def mass(self):
+        if self._is_shell:
+            return self.material.areal_density * self.area
         return self.material.rho * self.volume
