@@ -152,6 +152,12 @@ class MochiSolverState:
         self.links_ang_prev = gs.zeros((_B, 2, solver.n_links, 3), **args)
         self.links_vsym_prev = gs.zeros((_B, 2, solver.n_links, 3, 3), **args)
         self.n_hist = gs.zeros((_B,), dtype=gs.tc_int, requires_grad=False, scene=self.scene)
+        # Deformable bodies: vertex positions and velocities with their multistep history.
+        n_soft_verts = solver.n_soft_verts
+        self.soft_pos = gs.zeros((_B, n_soft_verts, 3), **args)
+        self.soft_vel = gs.zeros((_B, n_soft_verts, 3), **args)
+        self.soft_pos_prev = gs.zeros((_B, 2, n_soft_verts, 3), **args)
+        self.soft_vel_prev = gs.zeros((_B, 2, n_soft_verts, 3), **args)
 
     def serializable(self):
         self.scene = None

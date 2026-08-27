@@ -22,6 +22,7 @@ def make_static_config(**overrides):
         "has_grid_colliders": False,
         "record_contacts": True,
         "batch_links_info": False,
+        "has_soft": False,
     }
     config.update(overrides)
     return MochiStaticConfig(**config)

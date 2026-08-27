@@ -261,11 +261,92 @@ def case_double_pendulum(physics):
     return {"dt": dt, "angles": np.array(angles), "velocities": np.array(velocities)}
 
 
+def structured_cube_tets(n_cells, size, center):
+    """Vertices and tetrahedra of a cube split into n_cells^3 cells of 6 tetrahedra each (Freudenthal), Z-up frame."""
+    axis = np.linspace(-0.5 * size, 0.5 * size, n_cells + 1)
+    grid = np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), axis=-1) + np.asarray(center)
+    verts = grid.reshape((-1, 3))
+
+    def vid(i, j, k):
+        return (i * (n_cells + 1) + j) * (n_cells + 1) + k
+
+    tets = []
+    for i in range(n_cells):
+        for j in range(n_cells):
+            for k in range(n_cells):
+                corner = np.array([i, j, k])
+                for perm in ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)):
+                    p1 = corner.copy()
+                    p1[perm[0]] += 1
+                    p2 = p1.copy()
+                    p2[perm[1]] += 1
+                    tets.append([vid(*corner), vid(*p1), vid(*p2), vid(*(corner + 1))])
+    return verts.astype(np.float64), np.array(tets, dtype=np.int64)
+
+
+def _soft_world_positions(actor):
+    root = actor.get_root_transform()
+    translation = np.array(root.translation.tolist() if hasattr(root.translation, "tolist") else root.translation)
+    x, y, z, w = np.array(root.rotation.tolist() if hasattr(root.rotation, "tolist") else root.rotation)
+    R = np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+    local = np.array(actor.get_node_positions_local()).reshape((-1, 3))
+    return local @ R.T + translation
+
+
+def case_soft_cube_drop(physics):
+    """Soft cube (side 0.2 m, 3x3x3 vertices, 48 tetrahedra, E = 1e5, nu = 0.45, rho = 1000) dropped from height 0.3 m
+    onto a plane with friction 0.5, g = 9.8, dt = 1/60, backward Euler, 90 steps, tight Newton tolerances."""
+    dt, n_steps = 1.0 / 60.0, 90
+    # Built Z-up (Genesis frame), then rotated into the Y-up scene: (x, y, z) -> (x, z, -y).
+    verts_zup, tets = structured_cube_tets(2, 0.2, (0.0, 0.0, 0.3))
+    verts = np.stack([verts_zup[:, 0], verts_zup[:, 2], -verts_zup[:, 1]], axis=-1)
+    scene = physics.create_scene("soft_cube_drop")
+    scene.set_gravity([0.0, -9.8, 0.0])
+    _set_solver(physics, scene, max_iter=8, abs_tol=1e-10, rel_tol=1e-12)
+    scene.create_rigid_actor(
+        name="plane",
+        shape=physics.create_plane_shape(normal=[0.0, 1.0, 0.0], distance=0.0),
+        is_static=True,
+        contact=_contact_params(physics),
+    )
+    material = physics.SoftMaterialParams()
+    material.type = physics.SoftMaterialType.NEO_HOOKEAN
+    material.neo_hookean.youngs_modulus = 1e5
+    material.neo_hookean.poisson_ratio = 0.45
+    material.density = 1000.0
+    cube = scene.create_soft_actor(
+        name="cube",
+        shape=physics.create_tet_mesh_shape(coordinates=verts.reshape((-1,)), connectivity=tets.reshape((-1,))),
+        material=material,
+        contact=_contact_params(physics),
+    )
+    # mochi recenters the local frame of a soft actor every step: world positions follow from the root transform.
+    cube.register_query(physics.QueryType.NODE_POSITIONS)
+    positions = []
+    for _ in range(n_steps):
+        scene.step(dt)
+        positions.append(_soft_world_positions(cube))
+    return {
+        "dt": dt,
+        "gravity": 9.8,
+        "rest_positions": verts,
+        "tets": tets,
+        "positions": np.array(positions),
+    }
+
+
 CASES = {
     "box_drop_plane": case_box_drop_plane,
     "double_pendulum": case_double_pendulum,
     "two_boxes_stack": case_two_boxes_stack,
     "box_slide_friction": case_box_slide_friction,
+    "soft_cube_drop": case_soft_cube_drop,
 }
 
 

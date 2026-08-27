@@ -22,9 +22,15 @@ Contact parameters (per material, combined per pair by geometric mean):
 
 Supported: free and fixed rigid bodies, articulated bodies (URDF/MJCF kinematic trees with fixed, revolute, prismatic,
 spherical and free joints; joint damping, armature, stiffness, soft range limits, force/velocity/position drives through
-the usual `control_dofs_*` / `set_dofs_kp` / `set_dofs_kv` API), plane/sphere/box analytic colliders and grid colliders
-for meshes, backward Euler and BDF2 time integration. Contact between the links of one entity is disabled, equality
-constraints are ignored and drive forces are not clamped to the force range. Deformable bodies are the next stage.
+the usual `control_dofs_*` / `set_dofs_kp` / `set_dofs_kv` API), deformable bodies (`gs.materials.Mochi.Elastic`:
+linear tetrahedra with a stable neo-Hookean, Saint Venant-Kirchhoff or linear material, mass and stiffness damping,
+fixed vertices through `set_vertices_fixed`, tetrahedralized by tetgen from Box/Sphere/Cylinder/Mesh morphs or read from
+tetgen `.node`/`.ele` files), plane/sphere/box analytic colliders and grid colliders for meshes, backward Euler and
+BDF2 time integration. Contact between the links of one entity is disabled, equality constraints are ignored and drive
+forces are not clamped to the force range. Deformable bodies collide through the quadrature samples of their boundary
+triangles against the rigid colliders only: they do not act as colliders themselves (no soft-soft contact, and a rigid
+body smaller than the boundary triangles of a soft body passes through it), so mesh them finely enough
+(`maxvolume=..., nobisect=False`) for the rigid bodies that touch them.
 
 Velocities are recovered by finite differences over the step as in mochi: `get_dofs_velocity()` returns
 `sin(dq)/dt` for revolute joints and the sine-based angular velocity `vee(((R - R_prev)/dt) R^T)` for spherical and

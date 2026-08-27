@@ -361,6 +361,13 @@ class Raytracer:
                     for vgeom in fem_entity.vgeoms:
                         self.add_deformable(str(vgeom.uid))
 
+        # Deformable Mochi entities
+        if self.sim.mochi_solver.has_soft:
+            for soft_entity in self.sim.mochi_solver.soft_entities:
+                if soft_entity.surface.vis_mode == "visual":
+                    for vgeom in soft_entity.vgeoms:
+                        self.add_deformable(str(vgeom.uid))
+
     def get_transform(self, matrix):
         if matrix is None:
             return None
@@ -803,6 +810,28 @@ class Raytracer:
                             np.array([]),
                             np.array([]),
                         )
+
+        # Deformable Mochi entities
+        if self.sim.mochi_solver.has_soft:
+            vverts_pos, _, _ = self.sim.mochi_solver.get_soft_state_render(self.sim.cur_substep_local)
+            vverts_all = miscu.qd_to_numpy(vverts_pos, self.rendered_envs_idx[0], keepdim=False, transpose=True)
+
+            for soft_entity in self.sim.mochi_solver.soft_entities:
+                if soft_entity.surface.vis_mode != "visual":
+                    continue
+
+                for vgeom in soft_entity.vgeoms:
+                    render_verts = vverts_all[vgeom.vvert_start : vgeom.vvert_end]
+                    vertex_normals = trimesh.Trimesh(
+                        vertices=render_verts, faces=vgeom.vmesh.faces, process=False
+                    ).vertex_normals
+                    self.update_deformable(
+                        str(vgeom.uid),
+                        render_verts,
+                        vgeom.vmesh.faces,
+                        vertex_normals,
+                        np.array([]) if vgeom.uvs is None else vgeom.uvs,
+                    )
 
         # FEM entities
         if self.sim.fem_solver.is_active:

@@ -16,7 +16,8 @@ from .articulated import (
     func_jacobian_transpose_add,
     func_link_dof_jacobian,
 )
-from .data import MochiContactState, MochiInfo, MochiState
+from .data import MochiContactState, MochiInfo, MochiSoftInfo, MochiSoftState, MochiState
+from .soft import func_soft_matvec, func_soft_precondition
 
 
 @qd.func
@@ -152,7 +153,10 @@ def func_matvec(
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     contact_state: MochiContactState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
     rigid_config: qd.template(),
+    mochi_config: qd.template(),
 ):
     """dst = H src for the running conjugate gradient environments, applying the projected blocks on the fly."""
     n_dofs = mochi_state.res.shape[0]
@@ -189,6 +193,32 @@ def func_matvec(
         func_jacobian_transpose_add(i_la, i_b, H_off @ v_b, dst, dyn_state, dyn_info, rigid_config)
         func_jacobian_transpose_add(i_lb, i_b, H_off.transpose() @ v_a, dst, dyn_state, dyn_info, rigid_config)
 
+    if qd.static(mochi_config.has_soft):
+        func_soft_matvec(src, dst, dyn_state, dyn_info, mochi_info, mochi_state, soft_info, soft_state, rigid_config)
+
+
+@qd.func
+def func_apply_preconditioner(
+    r: qd.Tensor,
+    z: qd.Tensor,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+):
+    """z = M^-1 r: Jacobi on the rigid degrees of freedom, block Jacobi (3x3 per vertex) on the deformable ones."""
+    n_dofs = mochi_state.res.shape[0]
+    _B = mochi_state.is_active.shape[0]
+    EPS = mochi_info.EPS[None]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_d, i_b in qd.ndrange(n_dofs, _B):
+        if mochi_state.pcg_is_active[i_b]:
+            z[i_d, i_b] = r[i_d, i_b] / qd.max(mochi_state.pcg_diag[i_d, i_b], EPS)
+    if qd.static(mochi_config.has_soft):
+        func_soft_precondition(r, z, mochi_state, soft_info, soft_state, rigid_config, EPS)
+
 
 @qd.kernel
 def kernel_pcg_init(
@@ -196,13 +226,15 @@ def kernel_pcg_init(
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
     mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
     rigid_config: qd.template(),
+    mochi_config: qd.template(),
 ):
-    """Start the conjugate gradient from dx = 0 with the Jacobi preconditioner built from the projected diagonal."""
+    """Start the conjugate gradient from dx = 0 with the preconditioner built from the projected diagonal."""
     n_dofs = mochi_state.res.shape[0]
     n_links = mochi_state.H_diag.shape[0]
     _B = mochi_state.is_active.shape[0]
-    EPS = mochi_info.EPS[None]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_b in range(_B):
@@ -228,12 +260,14 @@ def kernel_pcg_init(
                 column = qd.Vector([vel[0], vel[1], vel[2], ang[0], ang[1], ang[2]], dt=gs.qd_float)
                 qd.atomic_add(mochi_state.pcg_diag[i_d, i_b], column.dot(H @ column))
             i_a = dyn_info.links.parent_idx[I_a]
+    func_apply_preconditioner(
+        mochi_state.pcg_r, mochi_state.pcg_z, mochi_info, mochi_state, soft_info, soft_state, rigid_config, mochi_config
+    )
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_d, i_b in qd.ndrange(n_dofs, _B):
         if mochi_state.pcg_is_active[i_b]:
             r = mochi_state.pcg_r[i_d, i_b]
-            z = r / qd.max(mochi_state.pcg_diag[i_d, i_b], EPS)
-            mochi_state.pcg_z[i_d, i_b] = z
+            z = mochi_state.pcg_z[i_d, i_b]
             mochi_state.pcg_p[i_d, i_b] = z
             qd.atomic_add(mochi_state.pcg_rTz[i_b], r * z)
             qd.atomic_add(mochi_state.pcg_rTr[i_b], r * r)
@@ -251,15 +285,27 @@ def kernel_pcg_iter(
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     contact_state: MochiContactState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
     rigid_config: qd.template(),
+    mochi_config: qd.template(),
 ):
     n_dofs = mochi_state.res.shape[0]
     _B = mochi_state.is_active.shape[0]
     rel_tol = mochi_info.pcg_rel_tol[None]
-    EPS = mochi_info.EPS[None]
 
     func_matvec(
-        mochi_state.pcg_p, mochi_state.pcg_Ap, dyn_state, dyn_info, mochi_info, mochi_state, contact_state, rigid_config
+        mochi_state.pcg_p,
+        mochi_state.pcg_Ap,
+        dyn_state,
+        dyn_info,
+        mochi_info,
+        mochi_state,
+        contact_state,
+        soft_info,
+        soft_state,
+        rigid_config,
+        mochi_config,
     )
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
@@ -282,11 +328,15 @@ def kernel_pcg_iter(
         if mochi_state.pcg_is_active[i_b]:
             alpha = mochi_state.pcg_rTz[i_b] / mochi_state.pcg_pTAp[i_b]
             mochi_state.dx[i_d, i_b] += alpha * mochi_state.pcg_p[i_d, i_b]
-            r = mochi_state.pcg_r[i_d, i_b] - alpha * mochi_state.pcg_Ap[i_d, i_b]
-            z = r / qd.max(mochi_state.pcg_diag[i_d, i_b], EPS)
-            mochi_state.pcg_r[i_d, i_b] = r
-            mochi_state.pcg_z[i_d, i_b] = z
-            qd.atomic_add(mochi_state.pcg_rTz_new[i_b], r * z)
+            mochi_state.pcg_r[i_d, i_b] = mochi_state.pcg_r[i_d, i_b] - alpha * mochi_state.pcg_Ap[i_d, i_b]
+    func_apply_preconditioner(
+        mochi_state.pcg_r, mochi_state.pcg_z, mochi_info, mochi_state, soft_info, soft_state, rigid_config, mochi_config
+    )
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_d, i_b in qd.ndrange(n_dofs, _B):
+        if mochi_state.pcg_is_active[i_b]:
+            r = mochi_state.pcg_r[i_d, i_b]
+            qd.atomic_add(mochi_state.pcg_rTz_new[i_b], r * mochi_state.pcg_z[i_d, i_b])
             qd.atomic_add(mochi_state.pcg_rTr[i_b], r * r)
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_b in range(_B):

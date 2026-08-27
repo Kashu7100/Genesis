@@ -11,7 +11,7 @@ import torch
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.engine.entities.mochi_entity import MochiEntity
+from genesis.engine.entities.mochi_entity import MochiEntity, MochiSoftEntity
 from genesis.engine.states.solvers import MochiSolverState
 from genesis.options.solvers import MochiOptions
 from genesis.utils import array_class
@@ -45,6 +45,7 @@ from ..rigid.abd.misc import (
 from .articulated import kernel_assemble_joints, kernel_project_links_residual, kernel_update_conv_weights
 from .colliders import query_collider
 from .contact import (
+    TRIANGLE_QUADRATURES,
     build_geom_samples,
     kernel_broadphase_pairs,
     kernel_conservative_bounds,
@@ -65,6 +66,8 @@ from .data import (
     MochiStaticConfig,
     get_mochi_contact_state,
     get_mochi_info,
+    get_mochi_soft_info,
+    get_mochi_soft_state,
     get_mochi_state,
 )
 from .integration import (
@@ -91,6 +94,36 @@ from .newton import (
     kernel_store_initial_norms,
 )
 from .rigid_assembly import kernel_assemble_links
+from .soft import (
+    ENTITY_PARAMS,
+    build_soft_samples,
+    kernel_init_soft_fields,
+    kernel_soft_apply_increment,
+    kernel_soft_assemble_elements,
+    kernel_soft_broadphase,
+    kernel_soft_condense_dense,
+    kernel_soft_conservative_bounds,
+    kernel_soft_contact_eval,
+    kernel_soft_dirichlet,
+    kernel_soft_get_entity_state,
+    kernel_soft_get_state,
+    kernel_soft_get_state_render,
+    kernel_soft_get_vertices_field,
+    kernel_soft_init_render,
+    kernel_soft_pairs_to_blocks,
+    kernel_soft_post_stage,
+    kernel_soft_set_entity_contact_params,
+    kernel_soft_set_links_pair_enabled,
+    kernel_soft_set_state,
+    kernel_soft_set_vertices_fixed,
+    kernel_soft_set_vertices_positions,
+    kernel_soft_set_vertices_velocities,
+    kernel_soft_step_start,
+    kernel_soft_store_ls_ref,
+    kernel_soft_update_conv_weights,
+    kernel_soft_zero_assembly,
+)
+from .soft_materials import ELASTIC_MODEL_BY_NAME
 
 if TYPE_CHECKING:
     from genesis.engine.scene import Scene
@@ -115,12 +148,13 @@ _AUTO_COLLIDER_TYPE_BY_GEOM_TYPE = {
 
 class MochiSolver(KinematicSolver):
     """
-    Fully-implicit rigid body solver with smooth penalty contact.
+    Fully-implicit multi-physics solver with smooth penalty contact.
 
-    Every substep solves one nonlinear system over the generalized coordinates of all free bodies, whose residual is
-    the gradient of an incremental potential (inertia, gravity, damping and the contact penalty with its friction and
-    damping terms) and whose Hessian is assembled from per-link and per-contact-pair blocks. The solve is a damped
-    Newton iteration with a line search; contact is re-detected at every iterate.
+    Every substep solves one nonlinear system over the generalized coordinates of all rigid and articulated bodies and
+    the vertex positions of all deformable bodies, whose residual is the gradient of an incremental potential (inertia,
+    gravity, damping, elasticity and the contact penalty with its friction and damping terms) and whose Hessian is
+    assembled from per-link, per-contact-pair and per-tetrahedron blocks. The solve is a damped Newton iteration with a
+    line search; contact is re-detected at every iterate.
     """
 
     def __init__(self, scene: "Scene", sim: "Simulator", options: MochiOptions) -> None:
@@ -135,16 +169,46 @@ class MochiSolver(KinematicSolver):
         self._external_state_subscriber = Subscriber(
             frozenset({StateChange.GEOMETRY, StateChange.DYNAMICS}), callback=self._on_external_state_change
         )
+        # Deformable bodies live outside the kinematic tree.
+        self._soft_entities = gs.List()
+        self.soft_info = None
+        self.soft_state = None
+        self._soft_vverts_render = None
+        self._soft_vverts_vert_idx = None
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- add_entity -------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def add_entity(self, idx, material, morph, surface, visualize_contact=False, name=None) -> MochiEntity:
+    def add_entity(self, idx, material, morph, surface, visualize_contact=False, name=None):
         if isinstance(morph, (tuple, list)):
             gs.raise_exception("Heterogeneous morphs are not supported by the MochiSolver.")
         if isinstance(morph, (gs.morphs.Terrain, gs.morphs.USD, gs.morphs.Drone)):
             gs.raise_exception(f"Morph {type(morph).__name__} is not supported by the MochiSolver.")
+
+        if isinstance(material, gs.materials.Mochi.Elastic):
+            if not isinstance(morph, (gs.morphs.Box, gs.morphs.Sphere, gs.morphs.Cylinder, gs.morphs.Mesh)):
+                gs.raise_exception(
+                    f"Morph {type(morph).__name__} is not supported for deformable Mochi bodies (Box, Sphere, "
+                    "Cylinder or Mesh expected)."
+                )
+            entity = MochiSoftEntity(
+                scene=self._scene,
+                solver=self,
+                material=material,
+                morph=morph,
+                surface=surface,
+                idx=idx,
+                idx_in_solver=self.n_soft_entities,
+                v_start=self.n_soft_verts,
+                el_start=self.n_soft_elems,
+                s_start=self.n_soft_surfaces,
+                vvert_start=self.n_soft_vverts,
+                vface_start=self.n_soft_vfaces,
+                name=name,
+            )
+            self._soft_entities.append(entity)
+            return entity
 
         morph._enable_mujoco_compatibility = self._enable_mujoco_compatibility
 
@@ -205,7 +269,17 @@ class MochiSolver(KinematicSolver):
         if not self.is_active:
             return
 
-        if gs.qd_float == qd.f32 and any(entity.material.penalty_coefficient >= 1e8 for entity in self._entities):
+        self._n_soft_entities = self.n_soft_entities
+        self._n_soft_verts = self.n_soft_verts
+        self._n_soft_elems = self.n_soft_elems
+        self.n_soft_entities_ = max(1, self.n_soft_entities)
+        self.n_soft_verts_ = max(1, self.n_soft_verts)
+        self.n_soft_elems_ = max(1, self.n_soft_elems)
+        self.n_dofs_total_ = max(1, self.n_dofs_total)
+
+        if gs.qd_float == qd.f32 and any(
+            entity.material.penalty_coefficient >= 1e8 for entity in (*self._entities, *self._soft_entities)
+        ):
             gs.logger.warning(
                 "MochiSolver runs in single precision with a contact stiffness of 1e8 Pa/m or more: the Newton system "
                 "is ill-conditioned and contact accuracy degrades. Consider `gs.init(precision='64')`."
@@ -217,6 +291,7 @@ class MochiSolver(KinematicSolver):
             self._scene._envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, True
         )
         self._init_mochi()
+        self._init_soft()
         self._init_sdf()
         self.subscribe(self._external_state_subscriber)
         kernel_reset_history(
@@ -349,11 +424,14 @@ class MochiSolver(KinematicSolver):
                     f"Entity '{entity.uid}' defines {entity.n_equalities} equality constraint(s), which the MochiSolver "
                     "does not enforce."
                 )
-        dofs_entity_mass = np.zeros(self.n_dofs_, dtype=gs.np_float)
+        dofs_entity_mass = np.zeros(self.n_dofs_total_, dtype=gs.np_float)
         for entity in self._entities:
             dofs_entity_mass[entity.dof_start : entity.dof_end] = sum(link.inertial_mass for link in entity.links)
+        for entity in self._soft_entities:
+            dof_start = self.n_dofs + 3 * entity.v_start
+            dofs_entity_mass[dof_start : dof_start + entity.n_dofs] = entity.mass
 
-        self._layers = sorted({entity.material.contact_layer for entity in self._entities})
+        self._layers = sorted({entity.material.contact_layer for entity in (*self._entities, *self._soft_entities)})
         n_layers = len(self._layers)
         self._layers_pair_enabled = np.ones((n_layers, n_layers), dtype=bool)
         self._entities_pair_enabled = np.ones((self.n_entities, self.n_entities), dtype=bool)
@@ -427,11 +505,11 @@ class MochiSolver(KinematicSolver):
         self._max_hits = max(1, 2 * n_samples) if options.record_contacts else 1
 
         use_dense_direct = options.linear_solver == "ldlt" or (
-            options.linear_solver == "auto" and self.n_dofs <= options.dense_solver_max_dofs
+            options.linear_solver == "auto" and self.n_dofs_total <= options.dense_solver_max_dofs
         )
         self._n_pcg_iterations = options.n_pcg_iterations
         if self._n_pcg_iterations is None:
-            self._n_pcg_iterations = min(max(1, self.n_dofs), 1000)
+            self._n_pcg_iterations = min(max(1, self.n_dofs_total), 1000)
 
         self.mochi_config = MochiStaticConfig(
             backend=gs.backend,
@@ -450,6 +528,7 @@ class MochiSolver(KinematicSolver):
             has_grid_colliders=self._has_grid_colliders,
             record_contacts=options.record_contacts,
             batch_links_info=self._options.batch_links_info,
+            has_soft=self.has_soft,
         )
         self.mochi_info = get_mochi_info(self)
         self.mochi_state = get_mochi_state(self, self._max_pairs, use_dense_direct)
@@ -480,6 +559,137 @@ class MochiSolver(KinematicSolver):
             self.rigid_config,
         )
 
+    def _init_soft(self):
+        """Rest data, contact samples and material parameters of the deformable bodies."""
+        options = self._options
+        entities = self._soft_entities
+        n_links_ = self.n_links_
+        _B = self._B
+
+        if self.has_soft:
+            verts_rest = np.concatenate([entity.init_positions for entity in entities]).astype(gs.np_float)
+            verts_entity_idx = np.concatenate(
+                [np.full(entity.n_vertices, entity.idx_in_solver, dtype=gs.np_int) for entity in entities]
+            )
+            elems_v = np.concatenate([entity.elems + entity.v_start for entity in entities]).astype(gs.np_int)
+            elems_entity_idx = np.concatenate(
+                [np.full(entity.n_elements, entity.idx_in_solver, dtype=gs.np_int) for entity in entities]
+            )
+            bary, ref_weights = TRIANGLE_QUADRATURES[options.boundary_element_type]
+            samples_tri, samples_bary, samples_weight, samples_entity_idx = [], [], [], []
+            entities_sample_range = np.zeros((len(entities), 2), dtype=gs.np_int)
+            n_samples = 0
+            for entity in entities:
+                tri, sample_bary, weight = build_soft_samples(
+                    entity.init_positions, entity.surface_triangles, bary, ref_weights
+                )
+                samples_tri.append(tri + entity.v_start)
+                samples_bary.append(sample_bary)
+                samples_weight.append(weight)
+                samples_entity_idx.append(np.full(len(weight), entity.idx_in_solver, dtype=gs.np_int))
+                entities_sample_range[entity.idx_in_solver] = (n_samples, n_samples + len(weight))
+                n_samples += len(weight)
+            samples_tri = np.concatenate(samples_tri).astype(gs.np_int)
+            samples_bary = np.concatenate(samples_bary).astype(gs.np_float)
+            samples_weight = np.concatenate(samples_weight).astype(gs.np_float)
+            samples_entity_idx = np.concatenate(samples_entity_idx)
+            entities_params = np.array(
+                [
+                    [
+                        entity.mass,
+                        float(entity.material.has_gravity),
+                        float(ELASTIC_MODEL_BY_NAME[entity.material.model]),
+                        entity.material.mu,
+                        entity.material.lam,
+                        entity.material.rho,
+                        entity.material.mass_damping,
+                        entity.material.stiffness_damping,
+                        entity.material.penalty_coefficient,
+                        entity.material.penalty_smoothing_half_distance,
+                        entity.material.penalty_threshold,
+                        entity.material.friction,
+                        entity.material.friction_falloff_vel,
+                        entity.material.viscous_friction,
+                        entity.material.normal_viscous_damping,
+                        entity.material.max_alignment_normals,
+                        entity.v_start,
+                        entity.v_end,
+                        entities_sample_range[entity.idx_in_solver, 0],
+                        entities_sample_range[entity.idx_in_solver, 1],
+                    ]
+                    for entity in entities
+                ],
+                dtype=gs.np_float,
+            ).reshape((-1, len(ENTITY_PARAMS)))
+        else:
+            verts_rest = np.zeros((0, 3), dtype=gs.np_float)
+            verts_entity_idx = np.zeros((0,), dtype=gs.np_int)
+            elems_v = np.zeros((0, 4), dtype=gs.np_int)
+            elems_entity_idx = np.zeros((0,), dtype=gs.np_int)
+            samples_tri = np.zeros((0, 3), dtype=gs.np_int)
+            samples_bary = np.zeros((0, 3), dtype=gs.np_float)
+            samples_weight = np.zeros((0,), dtype=gs.np_float)
+            samples_entity_idx = np.zeros((0,), dtype=gs.np_int)
+            entities_params = np.zeros((0, len(ENTITY_PARAMS)), dtype=gs.np_float)
+            entities_sample_range = np.zeros((0, 2), dtype=gs.np_int)
+            n_samples = 0
+        self._n_soft_samples = n_samples
+        self.n_soft_samples_ = max(1, n_samples)
+        self._max_samples_per_soft_entity = int(
+            max(1, (entities_sample_range[:, 1] - entities_sample_range[:, 0]).max(initial=0))
+        )
+
+        n_collider_geoms = sum(1 for geom in self.geoms if self._resolve_collider_type(geom) != COLLIDER_TYPE.NONE)
+        self._max_soft_pairs = options.max_contact_pairs_per_env
+        if self._max_soft_pairs is None:
+            self._max_soft_pairs = max(1, len(entities) * n_collider_geoms)
+        self._max_soft_hits = max(1, 2 * n_samples)
+
+        self.soft_info = get_mochi_soft_info(self)
+        self.soft_state = get_mochi_soft_state(self, self._max_soft_pairs, self._max_soft_hits)
+        kernel_init_soft_fields(
+            verts_rest,
+            verts_entity_idx,
+            elems_v,
+            elems_entity_idx,
+            samples_tri,
+            samples_bary,
+            samples_weight,
+            samples_entity_idx,
+            entities_params,
+            self._compute_soft_links_pair_enabled(),
+            self.soft_info,
+            self.soft_state,
+            self.rigid_config,
+        )
+
+        # Render geometry of the deformable surfaces.
+        n_soft_vverts_ = max(1, self.n_soft_vverts)
+        self._soft_vverts_render = array_class.V_VEC(3, dtype=qd.f32, shape=(n_soft_vverts_, _B))
+        self._soft_vverts_vert_idx = array_class.V(dtype=gs.qd_int, shape=(n_soft_vverts_,))
+        if self.n_soft_vverts > 0:
+            vert_idx = np.concatenate(
+                [vgeom.sim_verts_idx + entity.v_start for entity in entities for vgeom in entity.vgeoms]
+            ).astype(gs.np_int)
+            kernel_soft_init_render(vert_idx, self._soft_vverts_vert_idx)
+        self._envs_offset = np.asarray(self._scene.envs_offset, dtype=gs.np_float).reshape((_B, 3))
+
+    def _compute_soft_links_pair_enabled(self):
+        """Deformable entity / rigid link contact filter from the contact layers."""
+        links = self.links
+        enabled = np.ones((self.n_soft_entities_, self.n_links_), dtype=bool)
+        if self.has_soft and self.n_links > 0:
+            entities_layer = np.array(
+                [self._layers.index(entity.material.contact_layer) for entity in self._soft_entities], dtype=int
+            )
+            links_layer = np.array(
+                [self._layers.index(link.entity.material.contact_layer) for link in links], dtype=int
+            )
+            enabled[: self.n_soft_entities, : self.n_links] = self._layers_pair_enabled[
+                entities_layer[:, None], links_layer[None, :]
+            ]
+        return enabled
+
     def _init_sdf(self):
         if not self._has_grid_colliders:
             self.sdf = SDF(self)
@@ -492,8 +702,8 @@ class MochiSolver(KinematicSolver):
     def _compute_links_pair_enabled(self):
         """Link pair filter: layers, entity pairs, and never a link against itself or another link of its entity."""
         links = self.links
-        links_layer = np.array([self._layers.index(link.entity.material.contact_layer) for link in links])
-        links_entity = np.array([link._entity_idx_in_solver for link in links])
+        links_layer = np.array([self._layers.index(link.entity.material.contact_layer) for link in links], dtype=int)
+        links_entity = np.array([link._entity_idx_in_solver for link in links], dtype=int)
         enabled = self._layers_pair_enabled[links_layer[:, None], links_layer[None, :]]
         enabled &= self._entities_pair_enabled[links_entity[:, None], links_entity[None, :]]
         enabled &= links_entity[:, None] != links_entity[None, :]
@@ -542,6 +752,10 @@ class MochiSolver(KinematicSolver):
             self.rigid_config,
             self.mochi_config,
         )
+        if self.has_soft:
+            kernel_soft_step_start(
+                self.mochi_state, self.soft_info, self.soft_state, self.rigid_config, self.mochi_config
+            )
         self._forward_kinematics()
         kernel_store_stage_start_poses(self.dyn_state, self.mochi_state, self.rigid_config)
         kernel_reset_newton(self.mochi_state, self.rigid_config)
@@ -557,10 +771,25 @@ class MochiSolver(KinematicSolver):
             self.rigid_config,
             self._errno,
         )
+        if self.has_soft:
+            kernel_soft_conservative_bounds(self.mochi_info, self.soft_info, self.soft_state, self.rigid_config)
+            kernel_soft_broadphase(
+                self.dyn_state,
+                self.dyn_info,
+                self.mochi_info,
+                self.mochi_state,
+                self.contact_state,
+                self.soft_info,
+                self.soft_state,
+                self.rigid_config,
+                self._errno,
+            )
         self._newton_solve()
         kernel_post_stage(
             self.dyn_state, self.dyn_info, self.rigid_info, self.mochi_info, self.mochi_state, self.rigid_config
         )
+        if self.has_soft:
+            kernel_soft_post_stage(self.mochi_state, self.soft_state, self.rigid_config)
         self._forward_kinematics()
         self._is_forward_pos_updated = True
         self._is_forward_vel_updated = True
@@ -579,6 +808,10 @@ class MochiSolver(KinematicSolver):
             skip_ls_done,
             record,
         )
+        if self.has_soft:
+            kernel_soft_zero_assembly(
+                self.mochi_state, self.soft_state, self.rigid_config, assem_dres, skip_ls_done, record
+            )
         kernel_contact_eval(
             self.dyn_state,
             self.dyn_info,
@@ -593,6 +826,24 @@ class MochiSolver(KinematicSolver):
             record,
             self._errno,
         )
+        if self.has_soft:
+            kernel_soft_contact_eval(
+                self.dyn_state,
+                self.dyn_info,
+                self.sdf._sdf_info,
+                self.mochi_info,
+                self.mochi_state,
+                self.soft_info,
+                self.soft_state,
+                self.rigid_config,
+                self.mochi_config,
+                self._max_samples_per_soft_entity,
+                assem_res,
+                assem_dres,
+                skip_ls_done,
+                record,
+                self._errno,
+            )
         kernel_pairs_to_blocks(
             self.dyn_state,
             self.dyn_info,
@@ -629,7 +880,34 @@ class MochiSolver(KinematicSolver):
             assem_dres,
             skip_ls_done,
         )
+        if self.has_soft:
+            kernel_soft_pairs_to_blocks(
+                self.dyn_state,
+                self.mochi_info,
+                self.mochi_state,
+                self.soft_state,
+                self.rigid_config,
+                assem_obj,
+                assem_res,
+                assem_dres,
+                skip_ls_done,
+            )
+            kernel_soft_assemble_elements(
+                self.mochi_info,
+                self.mochi_state,
+                self.soft_info,
+                self.soft_state,
+                self.rigid_config,
+                assem_obj,
+                assem_res,
+                assem_dres,
+                skip_ls_done,
+            )
         if assem_res:
+            if self.has_soft:
+                kernel_soft_dirichlet(
+                    self.mochi_state, self.soft_info, self.soft_state, self.rigid_config, skip_ls_done
+                )
             kernel_project_links_residual(
                 self.dyn_state, self.dyn_info, self.mochi_info, self.mochi_state, self.rigid_config, skip_ls_done
             )
@@ -640,9 +918,22 @@ class MochiSolver(KinematicSolver):
             kernel_condense_dense(
                 self.dyn_state, self.dyn_info, self.mochi_info, self.mochi_state, self.contact_state, self.rigid_config
             )
+            if self.has_soft:
+                kernel_soft_condense_dense(
+                    self.dyn_state, self.dyn_info, self.mochi_state, self.soft_info, self.soft_state, self.rigid_config
+                )
             kernel_cholesky_solve_dense(self.mochi_info, self.mochi_state, self.rigid_config)
         else:
-            kernel_pcg_init(self.dyn_state, self.dyn_info, self.mochi_info, self.mochi_state, self.rigid_config)
+            kernel_pcg_init(
+                self.dyn_state,
+                self.dyn_info,
+                self.mochi_info,
+                self.mochi_state,
+                self.soft_info,
+                self.soft_state,
+                self.rigid_config,
+                self.mochi_config,
+            )
             for i_iter in range(self._n_pcg_iterations):
                 kernel_pcg_iter(
                     self.dyn_state,
@@ -650,7 +941,10 @@ class MochiSolver(KinematicSolver):
                     self.mochi_info,
                     self.mochi_state,
                     self.contact_state,
+                    self.soft_info,
+                    self.soft_state,
                     self.rigid_config,
+                    self.mochi_config,
                 )
                 if (i_iter + 1) % PCG_CHECK_PERIOD == 0 and kernel_pcg_any_active(self.mochi_state) == 0:
                     break
@@ -658,8 +952,14 @@ class MochiSolver(KinematicSolver):
     def _newton_solve(self):
         options = self._options
         kernel_update_conv_weights(self.dyn_state, self.dyn_info, self.mochi_info, self.mochi_state, self.rigid_config)
+        if self.has_soft:
+            kernel_soft_update_conv_weights(
+                self.mochi_info, self.mochi_state, self.soft_info, self.soft_state, self.rigid_config
+            )
         self._assemble(assem_res=True, assem_dres=True, skip_ls_done=False)
         kernel_store_initial_norms(self.rigid_info, self.mochi_state, self.rigid_config)
+        if self.has_soft:
+            kernel_soft_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, False)
         kernel_convergence_check(self.mochi_info, self.mochi_state, self.rigid_config, False, self._errno)
 
         n_linesearch = options.n_linesearch_iterations
@@ -673,10 +973,14 @@ class MochiSolver(KinematicSolver):
                 break
             self._linear_solve()
             kernel_linesearch_begin(self.rigid_info, self.mochi_state, self.rigid_config)
+            if self.has_soft:
+                kernel_soft_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, False)
             for i_ls in range(max(1, n_linesearch)):
                 kernel_apply_increment(
                     self.dyn_info, self.rigid_info, self.mochi_info, self.mochi_state, self.rigid_config
                 )
+                if self.has_soft:
+                    kernel_soft_apply_increment(self.mochi_state, self.soft_info, self.soft_state, self.rigid_config)
                 self._forward_kinematics()
                 self._assemble(assem_res=True, assem_dres=False, skip_ls_done=True)
                 kernel_linesearch_decide(
@@ -687,6 +991,8 @@ class MochiSolver(KinematicSolver):
                     self.mochi_config,
                     i_ls == max(1, n_linesearch) - 1,
                 )
+                if self.has_soft:
+                    kernel_soft_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, True)
             kernel_convergence_check(self.mochi_info, self.mochi_state, self.rigid_config, True, self._errno)
 
     def substep_post_coupling(self, f):
@@ -716,6 +1022,16 @@ class MochiSolver(KinematicSolver):
 
     def update_geoms_render_T(self):
         kernel_update_geoms_render_T(self._geoms_render_T, self.dyn_state, self.rigid_info, self.rigid_config)
+
+    def get_soft_state_render(self, f):
+        """Environment-offset render vertex positions of the deformable surfaces, shape (n_vverts, B), as (positions,
+        None, None) (UVs and faces are read from the visual geoms)."""
+        if not self.has_soft or self.n_soft_vverts == 0:
+            return None, None, None
+        kernel_soft_get_state_render(
+            self._soft_vverts_render, self._soft_vverts_vert_idx, self._envs_offset, self.soft_state, self.rigid_config
+        )
+        return self._soft_vverts_render, None, None
 
     # ------------------------------------------------------------------------------------
     # -------------------------------- state get/set -------------------------------------
@@ -753,6 +1069,15 @@ class MochiSolver(KinematicSolver):
             qd_to_torch(self.mochi_state.links_vsym_prev, copy=True).permute((2, 0, 1, 3, 4)).contiguous()
         )
         state.n_hist = qd_to_torch(self.mochi_state.n_hist, copy=True).contiguous()
+        if self.has_soft:
+            kernel_soft_get_state(
+                state.soft_pos,
+                state.soft_vel,
+                state.soft_pos_prev,
+                state.soft_vel_prev,
+                self.soft_state,
+                self.rigid_config,
+            )
         self._queried_states.append(state)
         return state
 
@@ -781,7 +1106,18 @@ class MochiSolver(KinematicSolver):
             self._scene._envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, False
         )
         kernel_update_geom_aabbs(self.geoms_init_AABB, self.dyn_state, self.rigid_config)
+        if self.has_soft:
+            kernel_soft_set_state(
+                envs_idx,
+                state.soft_pos,
+                state.soft_vel,
+                state.soft_pos_prev,
+                state.soft_vel_prev,
+                self.soft_state,
+                self.rigid_config,
+            )
         self._is_external_state_dirty = False
+        self._is_contacts_recorded = False
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- contact API ------------------------------------
@@ -980,12 +1316,20 @@ class MochiSolver(KinematicSolver):
         i_a, i_b = self._layers.index(layer_a), self._layers.index(layer_b)
         self._layers_pair_enabled[i_a, i_b] = self._layers_pair_enabled[i_b, i_a] = is_enabled
         kernel_set_links_pair_enabled(self._compute_links_pair_enabled(), self.mochi_info, self.rigid_config)
+        if self.has_soft:
+            kernel_soft_set_links_pair_enabled(
+                self._compute_soft_links_pair_enabled(), self.soft_info, self.rigid_config
+            )
 
     def enable_entity_contact(self, entity_a, entity_b, is_enabled: bool = True):
         """Enable or disable contact between two entities (symmetric)."""
         i_a, i_b = entity_a._idx_in_solver, entity_b._idx_in_solver
         self._entities_pair_enabled[i_a, i_b] = self._entities_pair_enabled[i_b, i_a] = is_enabled
         kernel_set_links_pair_enabled(self._compute_links_pair_enabled(), self.mochi_info, self.rigid_config)
+        if self.has_soft:
+            kernel_soft_set_links_pair_enabled(
+                self._compute_soft_links_pair_enabled(), self.soft_info, self.rigid_config
+            )
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
@@ -1040,6 +1384,125 @@ class MochiSolver(KinematicSolver):
     @property
     def n_samples(self):
         return self._n_samples
+
+    # ------------------------------------------------------------------------------------
+    # --------------------------------- deformable bodies --------------------------------
+    # ------------------------------------------------------------------------------------
+
+    @property
+    def is_active(self):
+        return self.n_links > 0 or self.n_soft_entities > 0
+
+    @property
+    def has_soft(self):
+        return self.n_soft_entities > 0
+
+    @property
+    def soft_entities(self):
+        return self._soft_entities
+
+    @property
+    def n_soft_entities(self):
+        return len(self._soft_entities)
+
+    @property
+    def n_soft_verts(self):
+        return sum(entity.n_vertices for entity in self._soft_entities)
+
+    @property
+    def n_soft_elems(self):
+        return sum(entity.n_elements for entity in self._soft_entities)
+
+    @property
+    def n_soft_surfaces(self):
+        return sum(entity.n_surfaces for entity in self._soft_entities)
+
+    @property
+    def n_soft_vverts(self):
+        return sum(entity.n_vverts for entity in self._soft_entities)
+
+    @property
+    def n_soft_vfaces(self):
+        return sum(entity.n_vfaces for entity in self._soft_entities)
+
+    @property
+    def n_soft_samples(self):
+        return self._n_soft_samples
+
+    @property
+    def n_dofs_total(self):
+        """Degrees of freedom of the Newton system: rigid, then 3 per deformable vertex."""
+        return self.n_dofs + 3 * self.n_soft_verts
+
+    def _soft_field_of_entity(self, entity, field, envs_idx):
+        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+        out = torch.empty((len(envs_idx), entity.n_vertices, 3), dtype=gs.tc_float, device=gs.device)
+        kernel_soft_get_vertices_field(envs_idx, entity.v_start, out, field, self.rigid_config)
+        return out[0] if self.n_envs == 0 else out
+
+    def _soft_values_of_entity(self, entity, values, envs_idx):
+        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+        values = torch.as_tensor(values, dtype=gs.tc_float, device=gs.device)
+        if values.ndim == 2:
+            values = values[None].expand(len(envs_idx), -1, -1)
+        if values.shape != (len(envs_idx), entity.n_vertices, 3):
+            gs.raise_exception(
+                f"Expected an array of shape ({len(envs_idx)}, {entity.n_vertices}, 3) or ({entity.n_vertices}, 3), "
+                f"got {tuple(values.shape)}."
+            )
+        return envs_idx, values.contiguous()
+
+    def get_soft_entity_state(self, entity, pos, vel):
+        kernel_soft_get_entity_state(entity.v_start, pos, vel, self.soft_state, self.rigid_config)
+
+    def get_soft_vertices_position(self, entity, envs_idx=None):
+        return self._soft_field_of_entity(entity, self.soft_state.verts_pos, envs_idx)
+
+    def get_soft_vertices_velocity(self, entity, envs_idx=None):
+        return self._soft_field_of_entity(entity, self.soft_state.verts_vel, envs_idx)
+
+    def get_soft_vertices_contact_force(self, entity, envs_idx=None):
+        self._record_contacts()
+        return self._soft_field_of_entity(entity, self.soft_state.verts_contact_force, envs_idx)
+
+    def set_soft_vertices_position(self, entity, pos, envs_idx=None):
+        envs_idx, pos = self._soft_values_of_entity(entity, pos, envs_idx)
+        kernel_soft_set_vertices_positions(envs_idx, entity.v_start, pos, self.soft_state, self.rigid_config)
+        self._is_external_state_dirty = True
+        self._is_contacts_recorded = False
+
+    def set_soft_vertices_velocity(self, entity, vel, envs_idx=None):
+        envs_idx, vel = self._soft_values_of_entity(entity, vel, envs_idx)
+        kernel_soft_set_vertices_velocities(envs_idx, entity.v_start, vel, self.soft_state, self.rigid_config)
+        self._is_external_state_dirty = True
+
+    def set_soft_vertices_fixed(self, entity, verts_idx, is_fixed, envs_idx=None):
+        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+        verts_idx = np.asarray(verts_idx, dtype=gs.np_int) + entity.v_start
+        kernel_soft_set_vertices_fixed(envs_idx, verts_idx, int(bool(is_fixed)), self.soft_state, self.rigid_config)
+        self._is_external_state_dirty = True
+
+    def set_soft_entity_contact_params(self, entity, **params):
+        material = entity.material
+        keys = (
+            "penalty_coefficient",
+            "friction",
+            "penalty_smoothing_half_distance",
+            "penalty_threshold",
+            "friction_falloff_vel",
+            "viscous_friction",
+            "normal_viscous_damping",
+        )
+        values = []
+        for key in keys:
+            value = params.get(key)
+            if value is None:
+                value = getattr(material, key)
+            else:
+                setattr(material, key, value)
+            values.append(float(value))
+        kernel_soft_set_entity_contact_params(entity.idx_in_solver, np.array(values, dtype=gs.np_float), self.soft_info)
+        self._is_contacts_recorded = False
 
 
 @qd.kernel
