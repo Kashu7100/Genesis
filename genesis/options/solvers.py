@@ -913,6 +913,153 @@ class FEMOptions(Options):
     enable_vertex_constraints: StrictBool = False
 
 
+class MochiOptions(Options):
+    """
+    Options configuring the MochiSolver.
+
+    MochiSolver is a fully-implicit solver: at every substep it solves a single nonlinear system in which the inertia
+    of every rigid body and a smooth signed-distance penalty contact model (regularized Coulomb friction, viscous
+    normal damping) are assembled together. There is no separate collision response stage: contact is re-detected at
+    every Newton iterate and enters the same residual and Hessian as the inertia, which is what keeps large time steps
+    stable and is the prerequisite for coupling deformable bodies into the same system without a coupler.
+
+    Note
+    ----
+    Double precision (`gs.init(precision="64")`) is recommended. The default contact stiffness of 1e9 Pa/m combined
+    with a 1 mm activation threshold makes the Newton system ill-conditioned in single precision.
+
+    Parameters
+    ----------
+    dt : float, optional
+        Time duration for each simulation step in seconds. If none, it will inherit from `SimOptions`. Defaults to None.
+    gravity : tuple, optional
+        Gravity force in N/kg. If none, it will inherit from `SimOptions`. Defaults to None.
+    integrator : str, optional
+        Time integration scheme: "backward_euler" (first order, strongly damped) or "bdf2" (second order, closer to
+        energy-conserving; needs the previous two steps so the first step of a fresh or reset scene falls back to
+        backward Euler). Defaults to "backward_euler".
+    use_newton_euler_inertia : bool, optional
+        Whether the rotational inertia enters as the Newton-Euler residual `I dw/dt + w x I w` instead of the
+        variational merit of the rotation. The merit form derives from a potential and is what the line search
+        monitors; the Newton-Euler form is exact for gyroscopic effects but its Hessian is approximate. Defaults to
+        False.
+    n_newton_iterations : int, optional
+        Maximum number of Newton iterations per substep. Defaults to 4.
+    newton_abs_tol : float, optional
+        Absolute tolerance on the mass-weighted residual norm (unit acceleration under gravity gives a norm of order
+        one). Defaults to 1e-3.
+    newton_rel_tol : float, optional
+        Relative tolerance on the mass-weighted residual norm with respect to its value at the first iteration.
+        Defaults to 1e-6.
+    explosion_control : bool, optional
+        Whether a substep whose residual grows beyond `explosion_rel_tol` times its initial value or beyond
+        `explosion_abs_tol` is flagged as diverged: the affected environment is reset to its previous pose with zero
+        velocity and an error is raised at the next error check. Defaults to True.
+    explosion_abs_tol : float, optional
+        Absolute residual norm above which the solve is considered diverged. Defaults to 1e9.
+    explosion_rel_tol : float, optional
+        Residual growth factor above which the solve is considered diverged. Defaults to 1e4.
+    linesearch_type : str, optional
+        Step acceptance rule: "residual_norm" accepts the first trial whose residual norm does not exceed the current
+        one, "armijo" requires a sufficient decrease of the incremental potential (costs an extra energy assembly per
+        trial), "none" always takes the full Newton step. Defaults to "residual_norm".
+    n_linesearch_iterations : int, optional
+        Maximum number of step halvings per Newton iteration. The last trial is kept even if it did not improve.
+        Defaults to 4.
+    linesearch_alpha : float, optional
+        Step size reduction factor between two line search trials. Defaults to 0.5.
+    linesearch_wolfe1 : float, optional
+        Sufficient decrease parameter of the Armijo rule. Defaults to 1e-4.
+    linear_solver : str, optional
+        Linear solver for the Newton system: "ldlt" (dense Cholesky, exact, cubic in the number of degrees of
+        freedom), "pcg" (block-Jacobi preconditioned conjugate gradient, linear per iteration), or "auto" (dense when
+        the system has at most `dense_solver_max_dofs` degrees of freedom, PCG otherwise). Defaults to "auto".
+    dense_solver_max_dofs : int, optional
+        Largest system size solved with the dense solver under "auto". Defaults to 50.
+    n_pcg_iterations : int, optional
+        Maximum number of conjugate gradient iterations. If None, the number of degrees of freedom capped at 1000.
+        Defaults to None.
+    pcg_rel_tol : float, optional
+        Relative tolerance of the conjugate gradient solve. Defaults to 1e-5.
+    friction_model : str, optional
+        Regularization of the Coulomb friction force around zero sliding velocity: "c1" has compact support (exact
+        Coulomb beyond `friction_falloff_vel`), "cinf" is smooth everywhere (never exactly Coulomb, better
+        conditioned). Defaults to "c1".
+    use_fitted_friction_hessian : bool, optional
+        Whether the friction Hessian uses a quadratic fit that is the same in every tangential direction. The exact
+        Hessian converges faster close to the solution but can stall the Newton iterations at the stick-slip
+        transition. Defaults to True.
+    friction_with_collider_normal : bool, optional
+        Whether the friction plane is defined by the collider's distance gradient (True) or by the colliding surface
+        normal (False). Defaults to True.
+    fade_friction : bool, optional
+        Whether friction fades out as the colliding surface normal and the collider gradient become aligned, i.e. as a
+        sample point passes through the far side of a thin collider. Defaults to True.
+    max_alignment_normals : float, optional
+        Cosine of the angle between the colliding surface normal and the collider gradient above which a contact is
+        disabled, so that a fully embedded body can escape instead of being trapped. Defaults to 0.0.
+    implicit_normal_force_for_dissipation : bool, optional
+        Whether friction and damping scale with the normal force evaluated at the current iterate instead of the one
+        recovered at the start of the step. The implicit form is required for an accurate coefficient of restitution
+        through normal damping; the explicit form is cheaper and smoother. Defaults to False.
+    boundary_element_type : str, optional
+        Quadrature rule placing contact sample points on the collision triangles: "P1Q1" (centroid), "P1Q3" (3 points
+        per triangle, degree 2), "P1Q6" (6 points, degree 4). More points resolve contact patches better at a
+        proportional cost. Defaults to "P1Q3".
+    max_contact_pairs_per_env : int, optional
+        Capacity of the list of (link, collider geom) pairs whose bounding boxes overlap within a substep. If None, the
+        number of possible pairs. Defaults to None.
+    broadphase_margin : float, optional
+        Absolute padding of the per-step conservative bounding boxes in meters. Defaults to 0.01.
+    record_contacts : bool, optional
+        Whether individual contact points are stored for readback through `entity.get_contacts()`. Defaults to True.
+    batch_links_info : bool, optional
+        Whether to batch link info. Defaults to False.
+    batch_joints_info : bool, optional
+        Whether to batch joint info. Defaults to False.
+    batch_dofs_info : bool, optional
+        Whether to batch DOF info. Defaults to False.
+    """
+
+    dt: PositiveFloat | None = None
+    gravity: Vec3FType | None = None
+    integrator: Literal["backward_euler", "bdf2"] = "backward_euler"
+    use_newton_euler_inertia: StrictBool = False
+    n_newton_iterations: PositiveInt = 4
+    newton_abs_tol: PositiveFloat = 1e-3
+    newton_rel_tol: PositiveFloat = 1e-6
+    explosion_control: StrictBool = True
+    explosion_abs_tol: PositiveFloat = 1e9
+    explosion_rel_tol: PositiveFloat = 1e4
+    linesearch_type: Literal["none", "residual_norm", "armijo"] = "residual_norm"
+    n_linesearch_iterations: NonNegativeInt = 4
+    linesearch_alpha: PositiveFloat = 0.5
+    linesearch_wolfe1: PositiveFloat = 1e-4
+    linear_solver: Literal["auto", "ldlt", "pcg"] = "auto"
+    dense_solver_max_dofs: PositiveInt = 50
+    n_pcg_iterations: PositiveInt | None = None
+    pcg_rel_tol: PositiveFloat = 1e-5
+    friction_model: Literal["c1", "cinf"] = "c1"
+    use_fitted_friction_hessian: StrictBool = True
+    friction_with_collider_normal: StrictBool = True
+    fade_friction: StrictBool = True
+    max_alignment_normals: float = 0.0
+    implicit_normal_force_for_dissipation: StrictBool = False
+    boundary_element_type: Literal["P1Q1", "P1Q3", "P1Q6"] = "P1Q3"
+    max_contact_pairs_per_env: PositiveInt | None = None
+    broadphase_margin: NonNegativeFloat = 0.01
+    record_contacts: StrictBool = True
+    batch_links_info: StrictBool = False
+    batch_joints_info: StrictBool = False
+    batch_dofs_info: StrictBool = False
+
+    def model_post_init(self, context: Any) -> None:
+        if not (0.0 < self.linesearch_alpha < 1.0):
+            gs.raise_exception("`linesearch_alpha` must be strictly between 0 and 1.")
+        if not (-1.0 <= self.max_alignment_normals <= 1.0):
+            gs.raise_exception("`max_alignment_normals` must be in [-1, 1].")
+
+
 class SFOptions(Options):
     """
     Options configuring the SFSolver.

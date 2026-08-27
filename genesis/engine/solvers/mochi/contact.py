@@ -1,0 +1,565 @@
+# Portions of this file are derived from Meta Platforms, Inc. and affiliates' "mochi" physics library
+# (mochi_core / mochi_physics), licensed under the Apache License, Version 2.0.
+# SPDX-License-Identifier: Apache-2.0
+"""Contact of the MochiSolver: surface sample points, conservative broadphase over (link, collider geom) pairs, and
+the assembly of the smooth penalty response into the residual and Hessian blocks."""
+
+import numpy as np
+import quadrants as qd
+
+import genesis as gs
+import genesis.utils.geom as gu
+from genesis.utils import array_class
+
+from .colliders import query_collider
+from .contact_utils import collision_response
+from .data import COLLIDER_TYPE, MochiContactState, MochiInfo, MochiState
+from .lie import skew
+from .newton import func_is_env_active
+
+# Barycentric coordinates and reference weights (integrating to 1/2, the reference triangle area) of the triangle
+# quadrature rules placing the contact samples: centroid, degree-2 and degree-4 (Dunavant) rules.
+TRIANGLE_QUADRATURES = {
+    "P1Q1": (np.array([[1 / 3, 1 / 3, 1 / 3]]), np.array([0.5])),
+    "P1Q3": (
+        np.array([[2 / 3, 1 / 6, 1 / 6], [1 / 6, 2 / 3, 1 / 6], [1 / 6, 1 / 6, 2 / 3]]),
+        np.array([1 / 6, 1 / 6, 1 / 6]),
+    ),
+    "P1Q6": (
+        np.array(
+            [
+                [0.816847572980459, 0.091576213509771, 0.091576213509771],
+                [0.091576213509771, 0.816847572980459, 0.091576213509771],
+                [0.091576213509771, 0.091576213509771, 0.816847572980459],
+                [0.108103018168070, 0.445948490915965, 0.445948490915965],
+                [0.445948490915965, 0.108103018168070, 0.445948490915965],
+                [0.445948490915965, 0.445948490915965, 0.108103018168070],
+            ]
+        ),
+        np.array([0.109951743655322 / 2] * 3 + [0.223381589678011 / 2] * 3),
+    ),
+}
+
+# Motion bound of the per-step conservative bounding boxes: the stage-start speed is doubled and a large acceleration
+# is added so that the pairs found at the start of the step cover every iterate of the solve.
+CONSERVATIVE_SPEED_SCALE = 2.0
+CONSERVATIVE_MAX_ACCEL = 400.0
+
+
+def build_geom_samples(geom, quadrature):
+    """Quadrature points of the collision triangles of a geom, expressed in the link frame, with their area weights
+    and outward normals. Returns (positions, normals, weights)."""
+    bary, ref_weights = TRIANGLE_QUADRATURES[quadrature]
+    verts = gu.transform_by_trans_quat(geom.init_verts, geom.init_pos, geom.init_quat)
+    faces = geom.init_faces
+    tri = verts[faces]
+    edge_1 = tri[:, 1] - tri[:, 0]
+    edge_2 = tri[:, 2] - tri[:, 0]
+    cross = np.cross(edge_1, edge_2)
+    areas_2 = np.linalg.norm(cross, axis=-1)
+    normals = cross / np.maximum(areas_2, gs.EPS)[:, None]
+    # The quadrature weights of the reference triangle integrate to 1/2; the physical weight scales by |det J| = 2 A.
+    positions = np.einsum("qk,fkd->fqd", bary, tri).reshape((-1, 3))
+    normals = np.repeat(normals, len(bary), axis=0)
+    weights = (ref_weights[None, :] * areas_2[:, None]).reshape((-1,))
+    return positions, normals, weights
+
+
+@qd.kernel
+def kernel_init_mochi_fields(
+    links_is_dynamic: qd.types.ndarray(),
+    links_has_gravity: qd.types.ndarray(),
+    links_mass: qd.types.ndarray(),
+    links_inertia: qd.types.ndarray(),
+    links_damping: qd.types.ndarray(),
+    links_layer: qd.types.ndarray(),
+    links_sample_start: qd.types.ndarray(),
+    links_sample_end: qd.types.ndarray(),
+    links_samples_aabb_min: qd.types.ndarray(),
+    links_samples_aabb_max: qd.types.ndarray(),
+    geoms_collider_type: qd.types.ndarray(),
+    geoms_contact_params: qd.types.ndarray(),
+    samples_pos: qd.types.ndarray(),
+    samples_normal: qd.types.ndarray(),
+    samples_weight: qd.types.ndarray(),
+    samples_link_idx: qd.types.ndarray(),
+    samples_geom_idx: qd.types.ndarray(),
+    links_pair_enabled: qd.types.ndarray(),
+    gravity: qd.types.ndarray(),
+    mochi_info: MochiInfo,
+    rigid_config: qd.template(),
+):
+    n_links = links_is_dynamic.shape[0]
+    n_geoms = geoms_collider_type.shape[0]
+    n_samples = samples_weight.shape[0]
+    _B = gravity.shape[0]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_l in range(n_links):
+        mochi_info.links.is_dynamic[i_l] = links_is_dynamic[i_l]
+        mochi_info.links.has_gravity[i_l] = links_has_gravity[i_l]
+        mochi_info.links.mass[i_l] = links_mass[i_l]
+        mochi_info.links.damping[i_l] = links_damping[i_l]
+        mochi_info.links.layer[i_l] = links_layer[i_l]
+        mochi_info.links.sample_start[i_l] = links_sample_start[i_l]
+        mochi_info.links.sample_end[i_l] = links_sample_end[i_l]
+        trace = gs.qd_float(0.0)
+        for k, l in qd.static(qd.ndrange(3, 3)):
+            mochi_info.links.inertia[i_l][k, l] = links_inertia[i_l, k, l]
+        for k in qd.static(range(3)):
+            trace += links_inertia[i_l, k, k]
+        for k, l in qd.static(qd.ndrange(3, 3)):
+            mochi_info.links.second_moment[i_l][k, l] = -links_inertia[i_l, k, l]
+        for k in qd.static(range(3)):
+            mochi_info.links.second_moment[i_l][k, k] += 0.5 * trace
+            mochi_info.links.samples_aabb_min[i_l][k] = links_samples_aabb_min[i_l, k]
+            mochi_info.links.samples_aabb_max[i_l][k] = links_samples_aabb_max[i_l, k]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_g in range(n_geoms):
+        mochi_info.geoms.collider_type[i_g] = geoms_collider_type[i_g]
+        mochi_info.geoms.penalty_coefficient[i_g] = geoms_contact_params[i_g, 0]
+        mochi_info.geoms.penalty_smoothing_half_distance[i_g] = geoms_contact_params[i_g, 1]
+        mochi_info.geoms.penalty_threshold[i_g] = geoms_contact_params[i_g, 2]
+        mochi_info.geoms.friction[i_g] = geoms_contact_params[i_g, 3]
+        mochi_info.geoms.friction_falloff_vel[i_g] = geoms_contact_params[i_g, 4]
+        mochi_info.geoms.viscous_friction[i_g] = geoms_contact_params[i_g, 5]
+        mochi_info.geoms.normal_viscous_damping[i_g] = geoms_contact_params[i_g, 6]
+        mochi_info.geoms.max_alignment_normals[i_g] = geoms_contact_params[i_g, 7]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_s in range(n_samples):
+        for k in qd.static(range(3)):
+            mochi_info.samples.pos[i_s][k] = samples_pos[i_s, k]
+            mochi_info.samples.normal[i_s][k] = samples_normal[i_s, k]
+        mochi_info.samples.weight[i_s] = samples_weight[i_s]
+        mochi_info.samples.link_idx[i_s] = samples_link_idx[i_s]
+        mochi_info.samples.geom_idx[i_s] = samples_geom_idx[i_s]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_la, i_lb in qd.ndrange(n_links, n_links):
+        mochi_info.links_pair_enabled[i_la, i_lb] = links_pair_enabled[i_la, i_lb]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
+    for i_b in range(_B):
+        for k in qd.static(range(3)):
+            mochi_info.gravity[i_b][k] = gravity[i_b, k]
+
+
+@qd.kernel
+def kernel_set_links_pair_enabled(
+    links_pair_enabled: qd.types.ndarray(),
+    mochi_info: MochiInfo,
+    rigid_config: qd.template(),
+):
+    n_links = links_pair_enabled.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_la, i_lb in qd.ndrange(n_links, n_links):
+        mochi_info.links_pair_enabled[i_la, i_lb] = links_pair_enabled[i_la, i_lb]
+
+
+@qd.kernel
+def kernel_zero_assembly(
+    dyn_state: array_class.DynState,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    rigid_config: qd.template(),
+    assem_obj: qd.template(),
+    assem_res: qd.template(),
+    assem_dres: qd.template(),
+    skip_ls_done: qd.template(),
+    record: qd.template(),
+):
+    n_dofs = mochi_state.res.shape[0]
+    n_links = mochi_state.H_diag.shape[0]
+    max_pairs = contact_state.pair_link_a.shape[0]
+    _B = mochi_state.is_active.shape[0]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
+    for i_b in range(_B):
+        if func_is_env_active(i_b, mochi_state, skip_ls_done):
+            if qd.static(assem_obj):
+                mochi_state.obj[i_b] = 0.0
+            if qd.static(record):
+                contact_state.n_hits_total[i_b] = 0
+    if qd.static(assem_res):
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_d, i_b in qd.ndrange(n_dofs, _B):
+            if func_is_env_active(i_b, mochi_state, skip_ls_done):
+                mochi_state.res[i_d, i_b] = 0.0
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_l, i_b in qd.ndrange(n_links, _B):
+        if func_is_env_active(i_b, mochi_state, skip_ls_done):
+            if qd.static(assem_dres):
+                mochi_state.H_diag[i_l, i_b] = qd.Matrix.zero(gs.qd_float, 6, 6)
+            if qd.static(record):
+                dyn_state.links.contact_force[i_l, i_b] = qd.Vector.zero(gs.qd_float, 3)
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_p, i_b in qd.ndrange(max_pairs, _B):
+        if func_is_env_active(i_b, mochi_state, skip_ls_done) and i_p < contact_state.n_pairs[i_b]:
+            contact_state.acc_f[i_p, i_b] = qd.Vector.zero(gs.qd_float, 3)
+            contact_state.acc_q[i_p, i_b] = qd.Vector.zero(gs.qd_float, 3)
+            contact_state.acc_D[i_p, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
+            contact_state.acc_SD[i_p, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
+            contact_state.acc_SDS[i_p, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
+            contact_state.acc_obj[i_p, i_b] = 0.0
+            contact_state.n_hits[i_p, i_b] = 0
+
+
+@qd.kernel
+def kernel_conservative_bounds(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    rigid_config: qd.template(),
+):
+    """World bounds of every link's sample cloud that hold for the whole step, and the motion padding of every link,
+    evaluated at the stage-start configuration."""
+    n_links = dyn_state.links.pos.shape[0]
+    _B = dyn_state.links.pos.shape[1]
+    dt = mochi_info.dt[None]
+    margin = mochi_info.broadphase_margin[None]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_l, i_b in qd.ndrange(n_links, _B):
+        I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
+        aabb_min = mochi_info.links.samples_aabb_min[i_l]
+        aabb_max = mochi_info.links.samples_aabb_max[i_l]
+        pad = margin
+        if mochi_info.links.is_dynamic[i_l]:
+            dof_start = dyn_info.links.dof_start[I_l]
+            vel = qd.Vector(
+                [
+                    dyn_state.dofs.vel[dof_start, i_b],
+                    dyn_state.dofs.vel[dof_start + 1, i_b],
+                    dyn_state.dofs.vel[dof_start + 2, i_b],
+                ],
+                dt=gs.qd_float,
+            )
+            omega = qd.Vector(
+                [
+                    dyn_state.dofs.vel[dof_start + 3, i_b],
+                    dyn_state.dofs.vel[dof_start + 4, i_b],
+                    dyn_state.dofs.vel[dof_start + 5, i_b],
+                ],
+                dt=gs.qd_float,
+            )
+            radius = qd.max(aabb_min.norm(), aabb_max.norm())
+            speed = vel.norm() + omega.norm() * radius
+            speed = CONSERVATIVE_SPEED_SCALE * speed + CONSERVATIVE_MAX_ACCEL * dt
+            if mochi_info.links.has_gravity[i_l]:
+                speed += mochi_info.gravity[i_b].norm() * dt
+            pad += speed * dt
+        contact_state.links_step_pad[i_l, i_b] = pad
+
+        pos = dyn_state.links.pos[i_l, i_b]
+        quat = dyn_state.links.quat[i_l, i_b]
+        world_min = qd.Vector([gs.qd_float(1e30)] * 3, dt=gs.qd_float)
+        world_max = -world_min
+        for corner in qd.static(range(8)):
+            local = qd.Vector.zero(gs.qd_float, 3)
+            for k in qd.static(range(3)):
+                local[k] = aabb_max[k] if qd.static((corner >> k) & 1) else aabb_min[k]
+            world = gu.qd_transform_by_trans_quat(local, pos, quat)
+            world_min = qd.min(world_min, world)
+            world_max = qd.max(world_max, world)
+        contact_state.links_step_aabb_min[i_l, i_b] = world_min - pad
+        contact_state.links_step_aabb_max[i_l, i_b] = world_max + pad
+
+
+@qd.kernel
+def kernel_broadphase_pairs(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    rigid_config: qd.template(),
+    errno: qd.Tensor,
+):
+    """Enumerate the (link with samples, collider geom) pairs whose conservative bounds overlap within the step. Both
+    orderings of two links are emitted when both carry samples and colliders."""
+    n_links = dyn_state.links.pos.shape[0]
+    n_geoms = dyn_state.geoms.pos.shape[0]
+    _B = dyn_state.links.pos.shape[1]
+    max_pairs = contact_state.pair_link_a.shape[0]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
+    for i_b in range(_B):
+        contact_state.n_pairs[i_b] = 0
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_la, i_gb, i_b in qd.ndrange(n_links, n_geoms, _B):
+        if not mochi_state.is_active[i_b]:
+            continue
+        if mochi_info.links.sample_end[i_la] <= mochi_info.links.sample_start[i_la]:
+            continue
+        if mochi_info.geoms.collider_type[i_gb] == COLLIDER_TYPE.NONE:
+            continue
+        i_lb = dyn_info.geoms.link_idx[i_gb]
+        if i_lb == i_la:
+            continue
+        if not (mochi_info.links.is_dynamic[i_la] or mochi_info.links.is_dynamic[i_lb]):
+            continue
+        if not mochi_info.links_pair_enabled[i_la, i_lb]:
+            continue
+        # A plane is a half-space: its mesh bounds say nothing about the penetration side, so it is never culled.
+        if mochi_info.geoms.collider_type[i_gb] != COLLIDER_TYPE.PLANE:
+            band = (
+                contact_state.links_step_pad[i_lb, i_b]
+                + mochi_info.geoms.penalty_threshold[i_gb]
+                + 2.0 * mochi_info.geoms.penalty_smoothing_half_distance[i_gb]
+            )
+            geom_min = dyn_state.geoms.aabb_min[i_gb, i_b] - band
+            geom_max = dyn_state.geoms.aabb_max[i_gb, i_b] + band
+            if (contact_state.links_step_aabb_max[i_la, i_b] < geom_min).any():
+                continue
+            if (contact_state.links_step_aabb_min[i_la, i_b] > geom_max).any():
+                continue
+        i_p = qd.atomic_add(contact_state.n_pairs[i_b], 1)
+        if i_p < max_pairs:
+            contact_state.pair_link_a[i_p, i_b] = i_la
+            contact_state.pair_link_b[i_p, i_b] = i_lb
+            contact_state.pair_geom_b[i_p, i_b] = i_gb
+        else:
+            qd.atomic_or(errno[i_b], array_class.ErrorCode.OVERFLOW_MOCHI_CONTACT_PAIRS)
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
+    for i_b in range(_B):
+        contact_state.n_pairs[i_b] = qd.min(contact_state.n_pairs[i_b], max_pairs)
+
+
+@qd.func
+def func_pair_param(value_a, value_b, is_static_b: qd.template()):
+    """Geometric mean of the two bodies' parameter, or the colliding body's value against a static collider."""
+    value = qd.sqrt(value_a * value_b)
+    if qd.static(is_static_b):
+        value = value_a
+    return value
+
+
+@qd.kernel
+def kernel_contact_eval(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    sdf_info: array_class.SDFInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+    max_samples_per_link: int,
+    skip_ls_done: qd.template(),
+    record: qd.template(),
+    errno: qd.Tensor,
+):
+    """Evaluate every sample of every candidate pair against its collider at the current iterate and accumulate the
+    per-pair force, torque and Hessian sums. Contact is re-detected here at every call, so the set of active samples
+    follows the Newton iterates."""
+    max_pairs = contact_state.pair_link_a.shape[0]
+    _B = mochi_state.is_active.shape[0]
+    max_hits = contact_state.hit_sample.shape[0]
+    EPS = mochi_info.EPS[None]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_p, i_s_, i_b in qd.ndrange(max_pairs, max_samples_per_link, _B):
+        if not func_is_env_active(i_b, mochi_state, skip_ls_done):
+            continue
+        if i_p >= contact_state.n_pairs[i_b]:
+            continue
+        i_la = contact_state.pair_link_a[i_p, i_b]
+        i_s = mochi_info.links.sample_start[i_la] + i_s_
+        if i_s >= mochi_info.links.sample_end[i_la]:
+            continue
+        i_lb = contact_state.pair_link_b[i_p, i_b]
+        i_gb = contact_state.pair_geom_b[i_p, i_b]
+        i_ga = mochi_info.samples.geom_idx[i_s]
+        contype_a = dyn_info.geoms.contype[i_ga]
+        conaffinity_a = dyn_info.geoms.conaffinity[i_ga]
+        contype_b = dyn_info.geoms.contype[i_gb]
+        conaffinity_b = dyn_info.geoms.conaffinity[i_gb]
+        if (contype_a & conaffinity_b) == 0 and (contype_b & conaffinity_a) == 0:
+            continue
+
+        pos_a = dyn_state.links.pos[i_la, i_b]
+        quat_a = dyn_state.links.quat[i_la, i_b]
+        pos = gu.qd_transform_by_trans_quat(mochi_info.samples.pos[i_s], pos_a, quat_a)
+        thr = mochi_info.geoms.penalty_threshold[i_gb]
+        h = mochi_info.geoms.penalty_smoothing_half_distance[i_gb]
+        band = thr + 2.0 * h
+        if mochi_info.geoms.collider_type[i_gb] != COLLIDER_TYPE.PLANE:
+            if (pos < dyn_state.geoms.aabb_min[i_gb, i_b] - band).any():
+                continue
+            if (pos > dyn_state.geoms.aabb_max[i_gb, i_b] + band).any():
+                continue
+
+        pos_g = dyn_state.geoms.pos[i_gb, i_b]
+        quat_g = dyn_state.geoms.quat[i_gb, i_b]
+        pos_geom = gu.qd_inv_transform_by_trans_quat(pos, pos_g, quat_g)
+        is_valid, d, grad = query_collider(i_gb, pos_geom, dyn_info.geoms, mochi_info.geoms, sdf_info, mochi_config)
+        if not is_valid or d > band:
+            continue
+
+        # Colliding normal and stage displacement of the sample, in the collider frame.
+        normal_world = gu.qd_transform_by_quat(mochi_info.samples.normal[i_s], quat_a)
+        normal_geom = gu.qd_inv_transform_by_quat(normal_world, quat_g)
+        pos_start = gu.qd_transform_by_trans_quat(
+            mochi_info.samples.pos[i_s],
+            mochi_state.links_pos_stage_start[i_la, i_b],
+            mochi_state.links_quat_stage_start[i_la, i_b],
+        )
+        pos_geom_start = gu.qd_inv_transform_by_trans_quat(
+            pos_start, mochi_state.geoms_pos_stage_start[i_gb, i_b], mochi_state.geoms_quat_stage_start[i_gb, i_b]
+        )
+        p_rel = pos_geom - pos_geom_start
+        d_start = d - grad.dot(p_rel)
+
+        is_static_b = not mochi_info.links.is_dynamic[i_lb]
+        k = qd.sqrt(mochi_info.geoms.penalty_coefficient[i_ga] * mochi_info.geoms.penalty_coefficient[i_gb])
+        falloff = qd.sqrt(mochi_info.geoms.friction_falloff_vel[i_ga] * mochi_info.geoms.friction_falloff_vel[i_gb])
+        if is_static_b:
+            k = mochi_info.geoms.penalty_coefficient[i_ga]
+            falloff = mochi_info.geoms.friction_falloff_vel[i_ga]
+        mu = qd.sqrt(mochi_info.geoms.friction[i_ga] * mochi_info.geoms.friction[i_gb])
+        c_visc = qd.sqrt(mochi_info.geoms.viscous_friction[i_ga] * mochi_info.geoms.viscous_friction[i_gb])
+        c_ndamp = qd.sqrt(mochi_info.geoms.normal_viscous_damping[i_ga] * mochi_info.geoms.normal_viscous_damping[i_gb])
+        max_align = mochi_info.geoms.max_alignment_normals[i_gb]
+
+        energy, force_geom, dforce_geom, _ = collision_response(
+            d,
+            grad,
+            normal_geom,
+            p_rel,
+            d_start,
+            k,
+            h,
+            thr,
+            mu,
+            falloff,
+            c_visc,
+            c_ndamp,
+            max_align,
+            mochi_state.dt_stage[i_b],
+            EPS,
+            mochi_config,
+        )
+
+        w = mochi_info.samples.weight[i_s]
+        R_g = gu.qd_quat_to_R(quat_g, EPS)
+        force = R_g @ force_geom
+        D = -w * (R_g @ dforce_geom @ R_g.transpose())
+        r_b = pos - dyn_state.links.pos[i_lb, i_b]
+        S_b = skew(r_b)
+        qd.atomic_add(contact_state.acc_f[i_p, i_b], w * force)
+        qd.atomic_add(contact_state.acc_q[i_p, i_b], w * r_b.cross(force))
+        qd.atomic_add(contact_state.acc_D[i_p, i_b], D)
+        qd.atomic_add(contact_state.acc_SD[i_p, i_b], S_b @ D)
+        qd.atomic_add(contact_state.acc_SDS[i_p, i_b], S_b @ D @ S_b)
+        qd.atomic_add(contact_state.acc_obj[i_p, i_b], w * energy)
+        qd.atomic_add(contact_state.n_hits[i_p, i_b], 1)
+
+        if qd.static(record):
+            qd.atomic_add(dyn_state.links.contact_force[i_la, i_b], w * force)
+            qd.atomic_add(dyn_state.links.contact_force[i_lb, i_b], -w * force)
+            i_h = qd.atomic_add(contact_state.n_hits_total[i_b], 1)
+            if i_h < max_hits:
+                contact_state.hit_link_a[i_h, i_b] = i_la
+                contact_state.hit_geom_a[i_h, i_b] = i_ga
+                contact_state.hit_link_b[i_h, i_b] = i_lb
+                contact_state.hit_geom_b[i_h, i_b] = i_gb
+                contact_state.hit_sample[i_h, i_b] = i_s
+                contact_state.hit_pos[i_h, i_b] = pos
+                contact_state.hit_normal[i_h, i_b] = gu.qd_normalize(R_g @ grad, EPS)
+                contact_state.hit_force[i_h, i_b] = w * force
+                contact_state.hit_distance[i_h, i_b] = d
+                contact_state.hit_weight[i_h, i_b] = w
+            else:
+                qd.atomic_or(errno[i_b], array_class.ErrorCode.OVERFLOW_MOCHI_CONTACTS)
+
+
+@qd.kernel
+def kernel_pairs_to_blocks(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    rigid_config: qd.template(),
+    assem_obj: qd.template(),
+    assem_res: qd.template(),
+    assem_dres: qd.template(),
+    skip_ls_done: qd.template(),
+):
+    """Expand the per-pair sums into the residual and the 6x6 Hessian blocks of the two links.
+
+    With the point Jacobians J_a = [I, -[p - t_a]x] and J_b = -[I, -[p - t_b]x] and the per-sample matrix D = -w df/dp,
+    the blocks J^T D J only need the sums of D, [r_b]x D and [r_b]x D [r_b]x, since [p - t_a]x = [r_b]x - [t_a - t_b]x.
+    """
+    max_pairs = contact_state.pair_link_a.shape[0]
+    _B = mochi_state.is_active.shape[0]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_p, i_b in qd.ndrange(max_pairs, _B):
+        if not func_is_env_active(i_b, mochi_state, skip_ls_done):
+            continue
+        if i_p >= contact_state.n_pairs[i_b] or contact_state.n_hits[i_p, i_b] == 0:
+            continue
+        i_la = contact_state.pair_link_a[i_p, i_b]
+        i_lb = contact_state.pair_link_b[i_p, i_b]
+        I_la = [i_la, i_b] if qd.static(rigid_config.batch_links_info) else i_la
+        I_lb = [i_lb, i_b] if qd.static(rigid_config.batch_links_info) else i_lb
+        is_dynamic_a = mochi_info.links.is_dynamic[i_la]
+        is_dynamic_b = mochi_info.links.is_dynamic[i_lb]
+        dof_a = dyn_info.links.dof_start[I_la]
+        dof_b = dyn_info.links.dof_start[I_lb]
+
+        F = contact_state.acc_f[i_p, i_b]
+        Q = contact_state.acc_q[i_p, i_b]
+        c = dyn_state.links.pos[i_la, i_b] - dyn_state.links.pos[i_lb, i_b]
+
+        if qd.static(assem_obj):
+            qd.atomic_add(mochi_state.obj[i_b], contact_state.acc_obj[i_p, i_b])
+
+        if qd.static(assem_res):
+            if is_dynamic_a:
+                torque_a = Q - c.cross(F)
+                for k in qd.static(range(3)):
+                    qd.atomic_add(mochi_state.res[dof_a + k, i_b], -F[k])
+                    qd.atomic_add(mochi_state.res[dof_a + 3 + k, i_b], -torque_a[k])
+            if is_dynamic_b:
+                for k in qd.static(range(3)):
+                    qd.atomic_add(mochi_state.res[dof_b + k, i_b], F[k])
+                    qd.atomic_add(mochi_state.res[dof_b + 3 + k, i_b], Q[k])
+
+        if qd.static(assem_dres):
+            Dbar = contact_state.acc_D[i_p, i_b]
+            Sh = contact_state.acc_SD[i_p, i_b]
+            Sh2 = contact_state.acc_SDS[i_p, i_b]
+            ShT = Sh.transpose()
+            C = skew(c)
+            if is_dynamic_a:
+                AA_tr = Dbar @ C + ShT
+                AA_rr = Sh @ C - C @ ShT - Sh2 - C @ Dbar @ C
+                for k, l in qd.static(qd.ndrange(3, 3)):
+                    qd.atomic_add(mochi_state.H_diag[i_la, i_b][k, l], Dbar[k, l])
+                    qd.atomic_add(mochi_state.H_diag[i_la, i_b][k, 3 + l], AA_tr[k, l])
+                    qd.atomic_add(mochi_state.H_diag[i_la, i_b][3 + k, l], AA_tr[l, k])
+                    qd.atomic_add(mochi_state.H_diag[i_la, i_b][3 + k, 3 + l], AA_rr[k, l])
+            if is_dynamic_b:
+                for k, l in qd.static(qd.ndrange(3, 3)):
+                    qd.atomic_add(mochi_state.H_diag[i_lb, i_b][k, l], Dbar[k, l])
+                    qd.atomic_add(mochi_state.H_diag[i_lb, i_b][k, 3 + l], ShT[k, l])
+                    qd.atomic_add(mochi_state.H_diag[i_lb, i_b][3 + k, l], Sh[k, l])
+                    qd.atomic_add(mochi_state.H_diag[i_lb, i_b][3 + k, 3 + l], -Sh2[k, l])
+            if is_dynamic_a and is_dynamic_b:
+                AB_rt = -Sh + C @ Dbar
+                AB_rr = Sh2 + C @ ShT
+                H_off = qd.Matrix.zero(gs.qd_float, 6, 6)
+                for k, l in qd.static(qd.ndrange(3, 3)):
+                    H_off[k, l] = -Dbar[k, l]
+                    H_off[k, 3 + l] = -ShT[k, l]
+                    H_off[3 + k, l] = AB_rt[k, l]
+                    H_off[3 + k, 3 + l] = AB_rr[k, l]
+                mochi_state.H_off[i_p, i_b] = H_off

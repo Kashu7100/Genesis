@@ -11,6 +11,7 @@ from genesis.options.solvers import (
     LegacyCouplerOptions,
     SAPCouplerOptions,
     FEMOptions,
+    MochiOptions,
     MPMOptions,
     PBDOptions,
     RigidOptions,
@@ -25,6 +26,7 @@ from .entities import HybridEntity
 from .solvers import (
     KinematicSolver,
     FEMSolver,
+    MochiSolver,
     MPMSolver,
     PBDSolver,
     RigidSolver,
@@ -71,6 +73,8 @@ class Simulator(RBC):
         An SFOptions object that contains all the options for the SFSolver.
     pbd_options : gs.PBDOptions
         A PBDOptions object that contains all the options for the PBDSolver.
+    mochi_options : gs.MochiOptions
+        A MochiOptions object that contains all the options for the MochiSolver.
     coupler_options : gs.CouplerOptions
         A CouplerOptions object that contains all the options for the coupler.
     """
@@ -87,6 +91,7 @@ class Simulator(RBC):
         fem_options: FEMOptions,
         sf_options: SFOptions,
         pbd_options: PBDOptions,
+        mochi_options: MochiOptions,
         coupler_options: BaseCouplerOptions,
     ):
         self._scene = scene
@@ -101,6 +106,7 @@ class Simulator(RBC):
         self.fem_options = fem_options
         self.sf_options = sf_options
         self.pbd_options = pbd_options
+        self.mochi_options = mochi_options
         self.coupler_options = coupler_options
 
         self._dt: float = options.dt
@@ -122,6 +128,7 @@ class Simulator(RBC):
         self.pbd_solver = PBDSolver(self.scene, self, self.pbd_options)
         self.fem_solver = FEMSolver(self.scene, self, self.fem_options)
         self.sf_solver = SFSolver(self.scene, self, self.sf_options)
+        self.mochi_solver = MochiSolver(self.scene, self, self.mochi_options)
 
         self._solvers: list["Solver"] = gs.List(
             [
@@ -133,6 +140,7 @@ class Simulator(RBC):
                 self.pbd_solver,
                 self.fem_solver,
                 self.sf_solver,
+                self.mochi_solver,
             ]
         )
 
@@ -162,6 +170,10 @@ class Simulator(RBC):
     def _add_entity(self, morph: Morph, material, surface, visualize_contact=False, name: str | None = None):
         if isinstance(material, gs.materials.Tool):
             entity = self.tool_solver.add_entity(self.n_entities, material, morph, surface, name=name)
+        elif isinstance(material, gs.materials.Mochi.Base):
+            entity = self.mochi_solver.add_entity(
+                self.n_entities, material, morph, surface, visualize_contact, name=name
+            )
         elif isinstance(material, gs.materials.Rigid):
             entity = self.rigid_solver.add_entity(
                 self.n_entities, material, morph, surface, visualize_contact, name=name
@@ -206,6 +218,20 @@ class Simulator(RBC):
                 if not isinstance(solver, RigidSolver):
                     self._rigid_only = False
         self._coupler.build()
+
+        if self.mochi_solver.is_active:
+            other_solvers = [
+                solver
+                for solver in self._active_solvers
+                if solver is not self.mochi_solver and type(solver) is not KinematicSolver
+            ]
+            if other_solvers:
+                gs.raise_exception(
+                    "MochiSolver cannot run alongside other physics solvers: "
+                    f"{[type(solver).__name__ for solver in other_solvers]}."
+                )
+            if self._requires_grad:
+                gs.raise_exception("MochiSolver does not support differentiable simulation.")
 
         if self.n_envs > 0 and self.sf_solver.is_active:
             gs.raise_exception("Batching is not supported for SF solver as of now.")
@@ -274,8 +300,11 @@ class Simulator(RBC):
         # This will trigger GPU sync, but it is not a big deal at the point, since we are going to enqueue very large
         # kernel right away. Moreover, if computations are still not done at this point, then the queue will just
         # continue growing endlessly, which will not make the simulation faster either.
-        if self.rigid_solver.is_active and self._cur_substep_global % RATE_CHECK_ERRNO == 0:
-            self.rigid_solver.check_errno()
+        if self._cur_substep_global % RATE_CHECK_ERRNO == 0:
+            if self.rigid_solver.is_active:
+                self.rigid_solver.check_errno()
+            if self.mochi_solver.is_active:
+                self.mochi_solver.check_errno()
 
         if self._rigid_only and not self._requires_grad:  # "Only Advance!" --Thomas Wade :P
             for _ in range(self._substeps):

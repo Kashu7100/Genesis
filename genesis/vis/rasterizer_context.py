@@ -403,6 +403,8 @@ class RasterizerContext:
             yield self.sim.rigid_solver
         if self.sim.kinematic_solver.is_active:
             yield self.sim.kinematic_solver
+        if self.sim.mochi_solver.is_active:
+            yield self.sim.mochi_solver
 
     def on_rigid(self):
         # Reuse a single pyrender material per genesis surface so that geoms sharing one surface (e.g. the many

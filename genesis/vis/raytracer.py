@@ -291,6 +291,27 @@ class Raytracer:
                         uvs=np.array([]) if geom.uvs is None else geom.uvs,
                     )
 
+        # mochi entities
+        if self.sim.mochi_solver.is_active:
+            for mochi_entity in self.sim.mochi_solver.entities:
+                if mochi_entity.surface.vis_mode == "visual":
+                    geoms = mochi_entity.vgeoms
+                else:
+                    geoms = mochi_entity.geoms
+
+                for geom in geoms:
+                    if "sdf" in mochi_entity.surface.vis_mode:
+                        mesh = geom.get_sdf_trimesh()
+                    else:
+                        mesh = geom.get_trimesh()
+                    self.add_rigid_batch(
+                        name=str(geom.uid),
+                        vertices=mesh.vertices,
+                        triangles=mesh.faces,
+                        normals=mesh.vertex_normals,
+                        uvs=np.array([]) if geom.uvs is None else geom.uvs,
+                    )
+
         # kinematic entities
         if self.sim.kinematic_solver.is_active:
             for kinematic_entity in self.sim.kinematic_solver.entities:
@@ -676,7 +697,7 @@ class Raytracer:
                 self.update_rigid(str(tool_entity.uid), T)
 
         # rigid-like entities (rigid + kinematic)
-        for solver in (self.sim.rigid_solver, self.sim.kinematic_solver):
+        for solver in (self.sim.rigid_solver, self.sim.kinematic_solver, self.sim.mochi_solver):
             if not solver.is_active:
                 continue
 

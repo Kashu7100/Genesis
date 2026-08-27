@@ -11,6 +11,7 @@ from .pbd_entity import (
     PBDParticleEntity,
 )
 from .rigid_entity import KinematicEntity, RigidEntity
+from .mochi_entity import MochiEntity
 from .sph_entity import SPHEntity
 from .sf_entity import SFParticleEntity
 from .tool_entity import ToolEntity

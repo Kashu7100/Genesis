@@ -23,6 +23,7 @@ from genesis.options import (
     BaseCouplerOptions,
     LegacyCouplerOptions,
     FEMOptions,
+    MochiOptions,
     MPMOptions,
     PBDOptions,
     ProfilingOptions,
@@ -102,6 +103,7 @@ class Scene(RBC):
         fem_options: FEMOptions | None = None,
         sf_options: SFOptions | None = None,
         pbd_options: PBDOptions | None = None,
+        mochi_options: MochiOptions | None = None,
         coupler_options: BaseCouplerOptions | None = None,
         vis_options: VisOptions | None = None,
         viewer_options: ViewerOptions | None = None,
@@ -123,6 +125,7 @@ class Scene(RBC):
         fem_options = fem_options or FEMOptions()
         sf_options = sf_options or SFOptions()
         pbd_options = pbd_options or PBDOptions()
+        mochi_options = mochi_options or MochiOptions()
         coupler_options = coupler_options or LegacyCouplerOptions()
         vis_options = vis_options or VisOptions()
         viewer_options = viewer_options or ViewerOptions()
@@ -144,6 +147,7 @@ class Scene(RBC):
             fem_options,
             sf_options,
             pbd_options,
+            mochi_options,
             coupler_options,
             vis_options,
             viewer_options,
@@ -161,6 +165,7 @@ class Scene(RBC):
         self.fem_options = fem_options.model_copy_from(sim_options)
         self.sf_options = sf_options.model_copy_from(sim_options)
         self.pbd_options = pbd_options.model_copy_from(sim_options)
+        self.mochi_options = mochi_options.model_copy_from(sim_options)
         self.profiling_options = profiling_options
 
         self.vis_options = vis_options
@@ -179,6 +184,7 @@ class Scene(RBC):
             fem_options=self.fem_options,
             sf_options=self.sf_options,
             pbd_options=self.pbd_options,
+            mochi_options=self.mochi_options,
             coupler_options=self.coupler_options,
         )
 
@@ -221,6 +227,7 @@ class Scene(RBC):
         fem_options: FEMOptions,
         sf_options: SFOptions,
         pbd_options: PBDOptions,
+        mochi_options: MochiOptions,
         coupler_options: BaseCouplerOptions,
         vis_options: VisOptions,
         viewer_options: ViewerOptions,
@@ -256,6 +263,9 @@ class Scene(RBC):
 
         if not isinstance(pbd_options, PBDOptions):
             gs.raise_exception("`pbd_options` should be an instance of `PBDOptions`.")
+
+        if not isinstance(mochi_options, MochiOptions):
+            gs.raise_exception("`mochi_options` should be an instance of `MochiOptions`.")
 
         if not isinstance(vis_options, VisOptions):
             gs.raise_exception("`vis_options` should be an instance of `VisOptions`.")
@@ -380,7 +390,9 @@ class Scene(RBC):
         if is_heterogeneous:
             morph = tuple(morph)
             morph_for_checks = morph[0]
-            if not isinstance(material, (gs.materials.Rigid, gs.materials.Kinematic)):
+            if isinstance(material, gs.materials.Mochi.Base) or not isinstance(
+                material, (gs.materials.Rigid, gs.materials.Kinematic)
+            ):
                 gs.raise_exception(
                     "Heterogeneous morphs (iterable of morphs) are only supported for Rigid and Kinematic materials."
                 )
@@ -488,8 +500,11 @@ class Scene(RBC):
         for morph_variant in morphs_to_configure:
             if isinstance(morph_variant, gs.morphs.FileMorph):
                 # Rigid entities will convexify geom by default
+                # Mochi entities keep the authored surface: contact samples the true collision triangles.
                 if morph_variant.convexify is None:
-                    morph_variant.convexify = isinstance(material, gs.materials.Rigid)
+                    morph_variant.convexify = isinstance(material, gs.materials.Rigid) and not isinstance(
+                        material, gs.materials.Mochi.Base
+                    )
                 # Decimation simplifies away the very surface detail that a non-convex collision mesh is kept for, so
                 # it defaults off when convexify is off and on otherwise. Only applies to meshes that skip
                 # watertightening (already-watertight inputs); watertighten does its own feature-preserving QEM.
@@ -1777,6 +1792,11 @@ class Scene(RBC):
     def pbd_solver(self):
         """The scene's `pbd_solver`, managing all the `PBDEntity` in the scene."""
         return self._sim.pbd_solver
+
+    @property
+    def mochi_solver(self):
+        """The scene's `mochi_solver`, managing all the `MochiEntity` in the scene."""
+        return self._sim.mochi_solver
 
     @property
     def segmentation_idx_dict(self):
