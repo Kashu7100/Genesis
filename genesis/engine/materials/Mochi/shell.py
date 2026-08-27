@@ -50,6 +50,14 @@ class Shell(Base["MochiSoftEntity"]):
         "auto".
     collider_radius : float, optional
         Radius in m of the collider spheres at the vertices. Default is 0.01.
+    self_contact : bool, optional
+        Whether the samples of this shell collide against its own collider spheres (point-cloud collider only).
+        Default is False.
+    self_contact_exclusion_ratio : float, optional
+        Samples whose rest position lies within `collider_radius * self_contact_exclusion_ratio` plus the penalty
+        threshold of a vertex do not collide with the sphere of that vertex (neighbors along the shell); the rest
+        distance to the second-nearest vertices must exceed this range plus the contact band. Must be larger than 1.
+        Default is 1.5.
     has_gravity : bool, optional
         Whether gravity acts on this body. Default is True.
     contact_layer : str, optional
@@ -76,6 +84,8 @@ class Shell(Base["MochiSoftEntity"]):
     max_alignment_normals: ValidFloat = 0.0
     collider_type: ShellColliderType = "auto"
     collider_radius: PositiveFloat = 1e-2
+    self_contact: StrictBool = False
+    self_contact_exclusion_ratio: Annotated[ValidFloat, Field(gt=1.0)] = 1.5
     has_gravity: StrictBool = True
     contact_layer: str = "default"
 

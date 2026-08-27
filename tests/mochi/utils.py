@@ -18,11 +18,15 @@ def make_static_config(**overrides):
         "friction_with_collider_normal": True,
         "fade_friction": True,
         "implicit_normal_force_for_dissipation": False,
-        "use_dense_direct": True,
+        "has_dense": True,
+        "use_tiled_cholesky": False,
+        "cholesky_tile_size": 16,
+        "tiled_n_dofs": 16,
         "has_grid_colliders": False,
         "record_contacts": True,
         "batch_links_info": False,
         "has_soft": False,
+        "has_equalities": False,
     }
     config.update(overrides)
     return MochiStaticConfig(**config)

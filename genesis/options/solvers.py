@@ -971,11 +971,16 @@ class MochiOptions(Options):
     linesearch_wolfe1 : float, optional
         Sufficient decrease parameter of the Armijo rule. Defaults to 1e-4.
     linear_solver : str, optional
-        Linear solver for the Newton system: "ldlt" (dense Cholesky, exact, cubic in the number of degrees of
-        freedom), "pcg" (block-Jacobi preconditioned conjugate gradient, linear per iteration), or "auto" (dense when
-        the system has at most `dense_solver_max_dofs` degrees of freedom, PCG otherwise). Defaults to "auto".
+        Linear solver for the Newton system: "ldlt" (dense Cholesky of every simulation island, exact, cubic in the
+        number of degrees of freedom of the island), "pcg" (block-Jacobi preconditioned conjugate gradient, linear per
+        iteration), or "auto" (dense when the largest island of the environment has at most `dense_solver_max_dofs`
+        degrees of freedom, PCG otherwise). Bodies coupled by the contact candidates of the step form an island.
+        Defaults to "auto".
     dense_solver_max_dofs : int, optional
-        Largest system size solved with the dense solver under "auto". Defaults to 50.
+        Largest island solved with the dense solver under "auto". Defaults to 50.
+    dense_matrix_max_dofs : int, optional
+        Largest total number of degrees of freedom for which the dense matrix of the system is allocated (memory
+        quadratic in this number per environment); beyond it every environment is solved with PCG. Defaults to 256.
     n_pcg_iterations : int, optional
         Maximum number of conjugate gradient iterations. If None, the number of degrees of freedom capped at 1000.
         Defaults to None.
@@ -1006,6 +1011,11 @@ class MochiOptions(Options):
         Quadrature rule placing contact sample points on the collision triangles: "P1Q1" (centroid), "P1Q3" (3 points
         per triangle, degree 2), "P1Q6" (6 points, degree 4). More points resolve contact patches better at a
         proportional cost. Defaults to "P1Q3".
+    equality_stiffness : float, optional
+        Stiffness of the penalty enforcing the equality constraints of the articulations (connect, weld and joint
+        couplings; loop closures): the constraint violation is penalized by `0.5 * k * |c|^2`. Defaults to 1e6.
+    equality_damping : float, optional
+        Damping of the equality constraint penalty, `0.5 * (d / dt) * |c - c_prev|^2`. Defaults to 0.
     max_contact_pairs_per_env : int, optional
         Capacity of the list of (link, collider geom) pairs whose bounding boxes overlap within a substep. If None, the
         number of possible pairs. Defaults to None.
@@ -1043,6 +1053,7 @@ class MochiOptions(Options):
     linesearch_wolfe1: PositiveFloat = 1e-4
     linear_solver: Literal["auto", "ldlt", "pcg"] = "auto"
     dense_solver_max_dofs: PositiveInt = 50
+    dense_matrix_max_dofs: PositiveInt = 256
     n_pcg_iterations: PositiveInt | None = None
     pcg_rel_tol: PositiveFloat = 1e-5
     friction_model: Literal["c1", "cinf"] = "c1"
@@ -1052,6 +1063,8 @@ class MochiOptions(Options):
     max_alignment_normals: float = 0.0
     implicit_normal_force_for_dissipation: StrictBool = False
     boundary_element_type: Literal["P1Q1", "P1Q3", "P1Q6"] = "P1Q3"
+    equality_stiffness: PositiveFloat = 1e6
+    equality_damping: NonNegativeFloat = 0.0
     max_contact_pairs_per_env: PositiveInt | None = None
     broadphase_margin: NonNegativeFloat = 0.01
     record_contacts: StrictBool = True

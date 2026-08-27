@@ -17,6 +17,7 @@ from genesis.engine.states.entities import MochiSoftEntityState
 from genesis.utils.misc import tensor_to_array
 
 from ..base_entity import Entity
+from .mochi_entity import filter_entity_contacts
 
 TET_NODE_FORMAT = ".node"
 
@@ -315,6 +316,15 @@ class MochiSoftEntity(Entity):
         """Net contact force applied to each vertex, shape (n_vertices, 3) or (n_envs, n_vertices, 3)."""
         return self._solver.get_soft_vertices_contact_force(self, envs_idx)
 
+    def get_contacts(self, with_entity=None, exclude_self_contact=False, is_padded=False):
+        """
+        Contact points of the most recent `scene.step()` involving this body (and `with_entity` if given), with the
+        keys documented in `MochiEntity.get_contacts`. On the side of this body a contact point carries the vertices of
+        the surface element (`verts_a` / `verts_b`, local to this body, -1 padded) and the weights spreading the force
+        over them (`bary_a` / `bary_b`).
+        """
+        return filter_entity_contacts(self._solver, self, with_entity, exclude_self_contact, is_padded)
+
     def set_position(self, pos, envs_idx=None):
         """Move the body: a (3,) or (n_envs, 3) offset of the rest positions, or full vertex positions of shape
         (n_vertices, 3) or (n_envs, n_vertices, 3)."""
@@ -331,12 +341,21 @@ class MochiSoftEntity(Entity):
             vel = vel[..., None, :].expand(*vel.shape[:-1], self.n_vertices, 3)
         self._solver.set_soft_vertices_velocity(self, vel, envs_idx)
 
-    def set_vertices_fixed(self, verts_idx_local, is_fixed=True, envs_idx=None):
-        """Fix the given vertices at their current position (Dirichlet condition), or release them."""
+    def _sanitize_vertices_idx(self, verts_idx_local):
         verts_idx = np.atleast_1d(np.asarray(tensor_to_array(verts_idx_local), dtype=gs.np_int))
         if verts_idx.min(initial=0) < 0 or verts_idx.max(initial=-1) >= self.n_vertices:
             gs.raise_exception("Vertex index out of range.")
-        self._solver.set_soft_vertices_fixed(self, verts_idx, is_fixed, envs_idx)
+        return verts_idx
+
+    def set_vertices_fixed(self, verts_idx_local, is_fixed=True, envs_idx=None):
+        """Fix the given vertices at their current position (Dirichlet condition), or release them."""
+        self._solver.set_soft_vertices_fixed(self, self._sanitize_vertices_idx(verts_idx_local), is_fixed, envs_idx)
+
+    def set_vertices_target(self, verts_idx_local, pos, envs_idx=None):
+        """Prescribe the positions the given vertices must reach at the end of the next step (moving Dirichlet
+        condition); the vertices become fixed until released with `set_vertices_fixed(..., is_fixed=False)`. `pos`
+        has shape (n_verts_idx, 3) or (n_envs, n_verts_idx, 3)."""
+        self._solver.set_soft_vertices_target(self, self._sanitize_vertices_idx(verts_idx_local), pos, envs_idx)
 
     def set_contact_params(
         self,

@@ -17,6 +17,8 @@ from .articulated import (
     func_link_dof_jacobian,
 )
 from .data import MochiContactState, MochiInfo, MochiSoftInfo, MochiSoftState, MochiState
+from .equalities import MochiEqualitiesInfo, MochiEqualitiesState
+from .islands import MochiIslandState
 from .soft import func_soft_matvec, func_soft_precondition
 
 
@@ -60,9 +62,14 @@ def kernel_condense_dense(
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     contact_state: MochiContactState,
+    island_state: MochiIslandState,
+    eq_info: MochiEqualitiesInfo,
+    eq_state: MochiEqualitiesState,
     rigid_config: qd.template(),
+    has_equalities: qd.template(),
 ):
-    """Assemble the dense Hessian of every running environment from the projected blocks and the joint diagonal."""
+    """Assemble the dense Hessian of every environment solved directly from the projected blocks, the joint diagonal
+    and the equality constraint couplings."""
     n_dofs = mochi_state.res.shape[0]
     n_links = mochi_state.H_diag.shape[0]
     max_pairs = contact_state.pair_link_a.shape[0]
@@ -70,17 +77,17 @@ def kernel_condense_dense(
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_b, i_d, j_d in qd.ndrange(_B, n_dofs, n_dofs):
-        if mochi_state.is_active[i_b]:
+        if mochi_state.is_active[i_b] and island_state.uses_dense[i_b]:
             mochi_state.H_dense[i_b, i_d, j_d] = 0.0
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_d, i_b in qd.ndrange(n_dofs, _B):
-        if mochi_state.is_active[i_b]:
+        if mochi_state.is_active[i_b] and island_state.uses_dense[i_b]:
             mochi_state.H_dense[i_b, i_d, i_d] = mochi_state.dofs_H_diag[i_d, i_b]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_l, i_b in qd.ndrange(n_links, _B):
-        if not mochi_state.is_active[i_b] or not mochi_info.links.is_dynamic[i_l]:
+        if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or not mochi_info.links.is_dynamic[i_l]:
             continue
         func_add_projected_block(
             i_l, i_l, i_b, mochi_state.H_diag[i_l, i_b], mochi_state.H_dense, dyn_state, dyn_info, rigid_config, False
@@ -88,7 +95,7 @@ def kernel_condense_dense(
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_p, i_b in qd.ndrange(max_pairs, _B):
-        if not mochi_state.is_active[i_b] or i_p >= contact_state.n_pairs[i_b]:
+        if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or i_p >= contact_state.n_pairs[i_b]:
             continue
         if contact_state.n_hits[i_p, i_b] == 0:
             continue
@@ -100,48 +107,38 @@ def kernel_condense_dense(
             i_la, i_lb, i_b, mochi_state.H_off[i_p, i_b], mochi_state.H_dense, dyn_state, dyn_info, rigid_config, True
         )
 
-
-@qd.kernel
-def kernel_cholesky_solve_dense(
-    mochi_info: MochiInfo,
-    mochi_state: MochiState,
-    rigid_config: qd.template(),
-):
-    """In-place Cholesky factorization of the dense matrix of every running environment followed by the two
-    triangular solves. The pivot is floored relative to the original diagonal so a nearly singular row still factors."""
-    n_dofs = mochi_state.res.shape[0]
-    _B = mochi_state.is_active.shape[0]
-    EPS = mochi_info.EPS[None]
-
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
-        if not mochi_state.is_active[i_b]:
-            continue
-        for i_d in range(n_dofs):
-            diag = mochi_state.H_dense[i_b, i_d, i_d]
-            tmp = diag
-            for k_d in range(i_d):
-                tmp = tmp - mochi_state.H_dense[i_b, i_d, k_d] ** 2
-            mochi_state.H_dense[i_b, i_d, i_d] = qd.sqrt(qd.max(tmp, EPS * qd.max(diag, EPS)))
-            inv = 1.0 / mochi_state.H_dense[i_b, i_d, i_d]
-            for j_d in range(i_d + 1, n_dofs):
-                dot = gs.qd_float(0.0)
-                for k_d in range(i_d):
-                    dot = dot + mochi_state.H_dense[i_b, j_d, k_d] * mochi_state.H_dense[i_b, i_d, k_d]
-                mochi_state.H_dense[i_b, j_d, i_d] = (mochi_state.H_dense[i_b, j_d, i_d] - dot) * inv
-        # L y = res
-        for i_d in range(n_dofs):
-            s = mochi_state.res[i_d, i_b]
-            for k_d in range(i_d):
-                s = s - mochi_state.H_dense[i_b, i_d, k_d] * mochi_state.dx[k_d, i_b]
-            mochi_state.dx[i_d, i_b] = s / mochi_state.H_dense[i_b, i_d, i_d]
-        # L^T dx = y
-        for i_d_ in range(n_dofs):
-            i_d = n_dofs - 1 - i_d_
-            s = mochi_state.dx[i_d, i_b]
-            for k_d in range(i_d + 1, n_dofs):
-                s = s - mochi_state.H_dense[i_b, k_d, i_d] * mochi_state.dx[k_d, i_b]
-            mochi_state.dx[i_d, i_b] = s / mochi_state.H_dense[i_b, i_d, i_d]
+    if qd.static(has_equalities):
+        n_eq = eq_info.eq_type.shape[0]
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_eq, i_b in qd.ndrange(n_eq, _B):
+            if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]):
+                continue
+            if eq_info.eq_type[i_eq] == gs.EQUALITY_TYPE.JOINT:
+                h12 = eq_state.joint_h12[i_eq, i_b]
+                if h12 != 0.0:
+                    i_j1 = eq_info.eq_obj1id[i_eq]
+                    i_j2 = eq_info.eq_obj2id[i_eq]
+                    I_j1 = [i_j1, i_b] if qd.static(rigid_config.batch_joints_info) else i_j1
+                    I_j2 = [i_j2, i_b] if qd.static(rigid_config.batch_joints_info) else i_j2
+                    i_d1 = dyn_info.joints.dof_start[I_j1]
+                    i_d2 = dyn_info.joints.dof_start[I_j2]
+                    mochi_state.H_dense[i_b, i_d1, i_d2] += h12
+                    mochi_state.H_dense[i_b, i_d2, i_d1] += h12
+            else:
+                i_la = eq_info.eq_obj1id[i_eq]
+                i_lb = eq_info.eq_obj2id[i_eq]
+                if mochi_info.links.is_dynamic[i_la] and mochi_info.links.is_dynamic[i_lb]:
+                    func_add_projected_block(
+                        i_la,
+                        i_lb,
+                        i_b,
+                        eq_state.H_off[i_eq, i_b],
+                        mochi_state.H_dense,
+                        dyn_state,
+                        dyn_info,
+                        rigid_config,
+                        True,
+                    )
 
 
 @qd.func
@@ -155,6 +152,8 @@ def func_matvec(
     contact_state: MochiContactState,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
+    eq_info: MochiEqualitiesInfo,
+    eq_state: MochiEqualitiesState,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
 ):
@@ -193,6 +192,36 @@ def func_matvec(
         func_jacobian_transpose_add(i_la, i_b, H_off @ v_b, dst, dyn_state, dyn_info, rigid_config)
         func_jacobian_transpose_add(i_lb, i_b, H_off.transpose() @ v_a, dst, dyn_state, dyn_info, rigid_config)
 
+    if qd.static(mochi_config.has_equalities):
+        n_eq = eq_info.eq_type.shape[0]
+        _B_eq = mochi_state.is_active.shape[0]
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_eq, i_b in qd.ndrange(n_eq, _B_eq):
+            if not mochi_state.pcg_is_active[i_b]:
+                continue
+            if eq_info.eq_type[i_eq] == gs.EQUALITY_TYPE.JOINT:
+                h12 = eq_state.joint_h12[i_eq, i_b]
+                if h12 != 0.0:
+                    i_j1 = eq_info.eq_obj1id[i_eq]
+                    i_j2 = eq_info.eq_obj2id[i_eq]
+                    I_j1 = [i_j1, i_b] if qd.static(rigid_config.batch_joints_info) else i_j1
+                    I_j2 = [i_j2, i_b] if qd.static(rigid_config.batch_joints_info) else i_j2
+                    i_d1 = dyn_info.joints.dof_start[I_j1]
+                    i_d2 = dyn_info.joints.dof_start[I_j2]
+                    qd.atomic_add(dst[i_d1, i_b], h12 * src[i_d2, i_b])
+                    qd.atomic_add(dst[i_d2, i_b], h12 * src[i_d1, i_b])
+            else:
+                i_la = eq_info.eq_obj1id[i_eq]
+                i_lb = eq_info.eq_obj2id[i_eq]
+                if mochi_info.links.is_dynamic[i_la] and mochi_info.links.is_dynamic[i_lb]:
+                    H_off = eq_state.H_off[i_eq, i_b]
+                    v_a = func_jacobian_times_dofs(i_la, i_b, src, dyn_state, dyn_info, rigid_config)
+                    v_b = func_jacobian_times_dofs(i_lb, i_b, src, dyn_state, dyn_info, rigid_config)
+                    func_jacobian_transpose_add(i_la, i_b, H_off @ v_b, dst, dyn_state, dyn_info, rigid_config)
+                    func_jacobian_transpose_add(
+                        i_lb, i_b, H_off.transpose() @ v_a, dst, dyn_state, dyn_info, rigid_config
+                    )
+
     if qd.static(mochi_config.has_soft):
         func_soft_matvec(src, dst, dyn_state, dyn_info, mochi_info, mochi_state, soft_info, soft_state, rigid_config)
 
@@ -228,17 +257,19 @@ def kernel_pcg_init(
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
+    island_state: MochiIslandState,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
 ):
-    """Start the conjugate gradient from dx = 0 with the preconditioner built from the projected diagonal."""
+    """Start the conjugate gradient from dx = 0 with the preconditioner built from the projected diagonal, for the
+    running environments not solved directly."""
     n_dofs = mochi_state.res.shape[0]
     n_links = mochi_state.H_diag.shape[0]
     _B = mochi_state.is_active.shape[0]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_b in range(_B):
-        mochi_state.pcg_is_active[i_b] = mochi_state.is_active[i_b]
+        mochi_state.pcg_is_active[i_b] = mochi_state.is_active[i_b] and not island_state.uses_dense[i_b]
         mochi_state.pcg_rTz[i_b] = 0.0
         mochi_state.pcg_rTr[i_b] = 0.0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
@@ -287,6 +318,8 @@ def kernel_pcg_iter(
     contact_state: MochiContactState,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
+    eq_info: MochiEqualitiesInfo,
+    eq_state: MochiEqualitiesState,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
 ):
@@ -304,6 +337,8 @@ def kernel_pcg_iter(
         contact_state,
         soft_info,
         soft_state,
+        eq_info,
+        eq_state,
         rigid_config,
         mochi_config,
     )

@@ -2,6 +2,7 @@
 # (mochi_core / mochi_physics), licensed under the Apache License, Version 2.0.
 # SPDX-License-Identifier: Apache-2.0
 import dataclasses
+import math
 import sys
 from typing import TYPE_CHECKING
 
@@ -17,7 +18,7 @@ from genesis.engine.entities.mochi_entity import MochiEntity, MochiSoftEntity
 from genesis.engine.states.solvers import MochiSolverState
 from genesis.options.solvers import MochiOptions
 from genesis.utils import array_class
-from genesis.utils.misc import qd_to_numpy, qd_to_torch, tensor_to_array
+from genesis.utils.misc import fits_in_gpu_shared_memory, qd_to_numpy, qd_to_torch, tensor_to_array
 from genesis.utils.sdf import SDF
 
 from ..base_solver import StateChange, Subscriber
@@ -52,6 +53,7 @@ from .contact import (
     kernel_broadphase_pairs,
     kernel_conservative_bounds,
     kernel_contact_eval,
+    kernel_gather_contact_records,
     kernel_init_mochi_fields,
     kernel_pairs_to_blocks,
     kernel_set_links_pair_enabled,
@@ -66,11 +68,18 @@ from .data import (
     MochiInfo,
     MochiState,
     MochiStaticConfig,
+    get_mochi_contact_records,
     get_mochi_contact_state,
     get_mochi_info,
     get_mochi_soft_info,
     get_mochi_soft_state,
     get_mochi_state,
+)
+from .equalities import (
+    get_mochi_equalities_info,
+    get_mochi_equalities_state,
+    kernel_assemble_equalities,
+    kernel_equalities_stage_start,
 )
 from .integration import (
     kernel_post_stage,
@@ -78,13 +87,14 @@ from .integration import (
     kernel_step_start,
     kernel_store_stage_start_poses,
 )
+from .islands import get_mochi_island_state, kernel_build_islands, kernel_cholesky_solve_islands
 from .linear_solver import (
-    kernel_cholesky_solve_dense,
     kernel_condense_dense,
     kernel_pcg_any_active,
     kernel_pcg_init,
     kernel_pcg_iter,
 )
+from .linear_solver_tiled import kernel_cholesky_solve_tiled
 from .newton import (
     kernel_any_active,
     kernel_apply_increment,
@@ -141,6 +151,7 @@ from .soft import (
     kernel_soft_set_state,
     kernel_soft_set_vertices_fixed,
     kernel_soft_set_vertices_positions,
+    kernel_soft_set_vertices_target,
     kernel_soft_set_vertices_velocities,
     kernel_soft_step_start,
     kernel_soft_store_ls_ref,
@@ -330,6 +341,15 @@ class MochiSolver(KinematicSolver):
         )
         self._init_mochi()
         self._init_soft()
+        # Unified contact readback over every kind of recorded contact point.
+        max_records = self._max_hits
+        if self.has_soft:
+            max_records += self._max_soft_hits + self._max_sc_hits + self._max_pc_hits
+        self.contact_records = get_mochi_contact_records(self, max_records if self._options.record_contacts else 1)
+        self._links_entity_idx = np.array([link.entity.idx for link in self.links] or [-1], dtype=gs.np_int)
+        self._geoms_link_idx = np.array([geom.link.idx for geom in self.geoms] or [-1], dtype=gs.np_int)
+        self._soft_entities_idx = np.array([entity.idx for entity in self._soft_entities] or [-1], dtype=gs.np_int)
+        self.island_state = get_mochi_island_state(self, *self._island_nodes())
         self._init_sdf()
         self.subscribe(self._external_state_subscriber)
         kernel_reset_history(
@@ -456,12 +476,8 @@ class MochiSolver(KinematicSolver):
         links = self.links
         geoms = self.geoms
 
-        for entity in self._entities:
-            if entity.n_equalities > 0:
-                gs.logger.warning(
-                    f"Entity '{entity.uid}' defines {entity.n_equalities} equality constraint(s), which the MochiSolver "
-                    "does not enforce."
-                )
+        # Equality constraints (connect, weld, joint couplings) are enforced as stiff penalties.
+        self._equalities = [equality for entity in self._entities for equality in entity.equalities]
         dofs_entity_mass = np.zeros(self.n_dofs_total_, dtype=gs.np_float)
         for entity in self._entities:
             dofs_entity_mass[entity.dof_start : entity.dof_end] = sum(link.inertial_mass for link in entity.links)
@@ -544,8 +560,23 @@ class MochiSolver(KinematicSolver):
             self._max_pairs = max(1, n_links_with_samples * n_collider_geoms)
         self._max_hits = max(1, 2 * n_samples) if options.record_contacts else 1
 
-        use_dense_direct = options.linear_solver == "ldlt" or (
-            options.linear_solver == "auto" and self.n_dofs_total <= options.dense_solver_max_dofs
+        # The dense matrix is allocated for systems up to `dense_matrix_max_dofs`; an environment is solved directly,
+        # island by island, when its largest island fits `dense_solver_max_dofs` (every island under "ldlt").
+        has_dense = options.linear_solver != "pcg" and self.n_dofs_total <= options.dense_matrix_max_dofs
+        if options.linear_solver == "ldlt" and not has_dense:
+            gs.raise_exception(
+                f"The system has {self.n_dofs_total} degrees of freedom, more than 'dense_matrix_max_dofs' "
+                f"({options.dense_matrix_max_dofs}): increase it or use the 'pcg' linear solver."
+            )
+        self._dense_max_dofs = self.n_dofs_total if options.linear_solver == "ldlt" else options.dense_solver_max_dofs
+        # GPU: fused tiled factorization and solve of the whole matrix when the factor fits in shared memory.
+        cholesky_tile_size = 16 if (self.n_dofs_total <= 16 or 32 < self.n_dofs_total <= 48) else 32
+        tiled_n_dofs = max(math.ceil(self.n_dofs_total / cholesky_tile_size), 1) * cholesky_tile_size
+        use_tiled_cholesky = (
+            has_dense
+            and gs.backend != gs.cpu
+            and self.n_dofs_total >= 16
+            and fits_in_gpu_shared_memory(tiled_n_dofs, tiled_n_dofs + 1)
         )
         self._n_pcg_iterations = options.n_pcg_iterations
         if self._n_pcg_iterations is None:
@@ -564,15 +595,21 @@ class MochiSolver(KinematicSolver):
             friction_with_collider_normal=options.friction_with_collider_normal,
             fade_friction=options.fade_friction,
             implicit_normal_force_for_dissipation=options.implicit_normal_force_for_dissipation,
-            use_dense_direct=use_dense_direct,
+            has_dense=has_dense,
+            use_tiled_cholesky=use_tiled_cholesky,
+            cholesky_tile_size=cholesky_tile_size,
+            tiled_n_dofs=tiled_n_dofs,
             has_grid_colliders=self._has_grid_colliders,
             record_contacts=options.record_contacts,
             batch_links_info=self._options.batch_links_info,
             has_soft=self.has_soft,
+            has_equalities=len(self._equalities) > 0,
         )
         self.mochi_info = get_mochi_info(self)
-        self.mochi_state = get_mochi_state(self, self._max_pairs, use_dense_direct)
+        self.mochi_state = get_mochi_state(self, self._max_pairs, has_dense)
         self.contact_state = get_mochi_contact_state(self, self._max_pairs, self._max_hits)
+        self.eq_info = get_mochi_equalities_info(self, self._equalities)
+        self.eq_state = get_mochi_equalities_state(self, len(self._equalities))
 
         kernel_init_mochi_fields(
             np.array([not link.is_fixed for link in links], dtype=gs.np_bool),
@@ -696,6 +733,7 @@ class MochiSolver(KinematicSolver):
                         ),
                         *self._shell_material_params(entity),
                         *self._rod_material_params(entity),
+                        *self._self_contact_params(entity),
                     ]
                     for entity, grid, sdf_start in zip(entities, sdf_grids, sdf_starts)
                 ],
@@ -746,15 +784,22 @@ class MochiSolver(KinematicSolver):
         )
         self._n_soft_queries = self.n_samples + n_samples
         self._max_sc_hits = max(1, 2 * self._n_soft_queries) if self._has_soft_colliders else 1
-        self._max_pc_hits = max(1, 4 * self._n_soft_queries) if self._has_pc_colliders else 1
+        # Self-contact makes every sample overlap the spheres of its own neighborhood before the exclusion test.
+        has_self_contact = any((e.is_shell or e.is_rod) and e.material.self_contact for e in entities)
+        pc_hits_per_query, pc_results_per_point = (16, 32) if has_self_contact else (4, 8)
+        self._max_pc_hits = max(1, pc_hits_per_query * self._n_soft_queries) if self._has_pc_colliders else 1
         if self._has_soft_colliders or self._has_pc_colliders:
             self._soft_query_aabb = AABB(_B, max(1, self._n_soft_queries))
             queries_entity_idx = np.concatenate([np.full(self.n_samples, -1, dtype=gs.np_int), samples_entity_idx])
         if self._has_pc_colliders:
             self._pc_aabb = AABB(_B, self.n_soft_verts_)
-            n_results_per_point = max(1, -(-8 * self._n_soft_queries // self.n_soft_verts_))
+            n_results_per_point = max(1, -(-pc_results_per_point * self._n_soft_queries // self.n_soft_verts_))
             self._pc_bvh = SoftTetLBVH(
-                self._pc_aabb, verts_entity_idx, queries_entity_idx, max_n_query_result_per_aabb=n_results_per_point
+                self._pc_aabb,
+                verts_entity_idx,
+                queries_entity_idx,
+                max_n_query_result_per_aabb=n_results_per_point,
+                entities_self_contact=[int((e.is_shell or e.is_rod) and e.material.self_contact) for e in entities],
             )
         if self._has_soft_colliders or self._has_pc_colliders:
             self._soft_tet_aabb = AABB(_B, self.n_soft_elems_)
@@ -906,6 +951,32 @@ class MochiSolver(KinematicSolver):
             params = entity.material.resolve(entity.rod_radius)
             return (params["axial_stiffness"], params["torsional_stiffness"], params["linear_rotational_inertia"])
         return (0.0, 0.0, 0.0)
+
+    def _island_nodes(self):
+        """Island node of every link and of every degree of freedom: the rigid entities first (all links of an
+        articulation share one node), then the deformable entities."""
+        rigid_node = {entity.idx: i for i, entity in enumerate(self._entities)}
+        links_node = np.array([rigid_node[link.entity.idx] for link in self.links], dtype=gs.np_int)
+        dofs_node = np.zeros(self.n_dofs_total_, dtype=gs.np_int)
+        for link in self.links:
+            dofs_node[link.dof_start : link.dof_end] = rigid_node[link.entity.idx]
+        n_rigid = len(self._entities)
+        offset = self.n_dofs
+        for i_e, entity in enumerate(self._soft_entities):
+            dofs_node[offset : offset + 3 * entity.n_vertices] = n_rigid + i_e
+            offset += 3 * entity.n_vertices
+        for i_e, entity in enumerate(self._soft_entities):
+            if entity.is_rod:
+                dofs_node[offset : offset + len(entity.elems)] = n_rigid + i_e
+                offset += len(entity.elems)
+        return links_node, dofs_node
+
+    @staticmethod
+    def _self_contact_params(entity):
+        """(self-contact flag, rest-configuration exclusion ratio) columns of a point-cloud collider."""
+        if entity.is_shell or entity.is_rod:
+            return (float(entity.material.self_contact), entity.material.self_contact_exclusion_ratio)
+        return (0.0, 1.5)
 
     @staticmethod
     def _solid_material_params(entity):
@@ -1075,6 +1146,16 @@ class MochiSolver(KinematicSolver):
                 )
         self._forward_kinematics()
         kernel_store_stage_start_poses(self.dyn_state, self.mochi_state, self.rigid_config)
+        if self.mochi_config.has_equalities:
+            kernel_equalities_stage_start(
+                self.dyn_info,
+                self.rigid_info,
+                self.mochi_info,
+                self.mochi_state,
+                self.eq_info,
+                self.eq_state,
+                self.rigid_config,
+            )
         kernel_reset_newton(self.mochi_state, self.rigid_config)
         kernel_conservative_bounds(
             self.dyn_state, self.dyn_info, self.mochi_info, self.mochi_state, self.contact_state, self.rigid_config
@@ -1101,6 +1182,22 @@ class MochiSolver(KinematicSolver):
                 self.rigid_config,
                 self._errno,
             )
+        kernel_build_islands(
+            self.dyn_info,
+            self.mochi_info,
+            self.mochi_state,
+            self.contact_state,
+            self.soft_info,
+            self.soft_state,
+            self.island_state,
+            self.eq_info,
+            self._dense_max_dofs,
+            len(self._entities),
+            self.rigid_config,
+            self.has_soft,
+            self.mochi_config.has_dense,
+            self.mochi_config.has_equalities,
+        )
         self._newton_solve()
         kernel_post_stage(
             self.dyn_state, self.dyn_info, self.rigid_info, self.mochi_info, self.mochi_state, self.rigid_config
@@ -1260,6 +1357,21 @@ class MochiSolver(KinematicSolver):
             assem_dres,
             skip_ls_done,
         )
+        if self.mochi_config.has_equalities:
+            kernel_assemble_equalities(
+                self.dyn_state,
+                self.dyn_info,
+                self.rigid_info,
+                self.mochi_info,
+                self.mochi_state,
+                self.eq_info,
+                self.eq_state,
+                self.rigid_config,
+                assem_obj,
+                assem_res,
+                assem_dres,
+                skip_ls_done,
+            )
         if self.has_soft:
             kernel_soft_pairs_to_blocks(
                 self.dyn_state,
@@ -1318,40 +1430,62 @@ class MochiSolver(KinematicSolver):
             kernel_residual_norms(self.mochi_state, self.rigid_config, skip_ls_done)
 
     def _linear_solve(self):
-        if self.mochi_config.use_dense_direct:
-            kernel_condense_dense(
-                self.dyn_state, self.dyn_info, self.mochi_info, self.mochi_state, self.contact_state, self.rigid_config
-            )
-            if self.has_soft:
-                kernel_soft_condense_dense(
-                    self.dyn_state, self.dyn_info, self.mochi_state, self.soft_info, self.soft_state, self.rigid_config
-                )
-            kernel_cholesky_solve_dense(self.mochi_info, self.mochi_state, self.rigid_config)
-        else:
-            kernel_pcg_init(
+        # Environments whose largest island fits the dense limit are solved island by island by a direct
+        # factorization, the others by the matrix-free conjugate gradient.
+        kernel_pcg_init(
+            self.dyn_state,
+            self.dyn_info,
+            self.mochi_info,
+            self.mochi_state,
+            self.soft_info,
+            self.soft_state,
+            self.island_state,
+            self.rigid_config,
+            self.mochi_config,
+        )
+        for i_iter in range(self._n_pcg_iterations):
+            kernel_pcg_iter(
                 self.dyn_state,
                 self.dyn_info,
                 self.mochi_info,
                 self.mochi_state,
+                self.contact_state,
                 self.soft_info,
                 self.soft_state,
+                self.eq_info,
+                self.eq_state,
                 self.rigid_config,
                 self.mochi_config,
             )
-            for i_iter in range(self._n_pcg_iterations):
-                kernel_pcg_iter(
+            if (i_iter + 1) % PCG_CHECK_PERIOD == 0 and kernel_pcg_any_active(self.mochi_state) == 0:
+                break
+        if self.mochi_config.has_dense:
+            kernel_condense_dense(
+                self.dyn_state,
+                self.dyn_info,
+                self.mochi_info,
+                self.mochi_state,
+                self.contact_state,
+                self.island_state,
+                self.eq_info,
+                self.eq_state,
+                self.rigid_config,
+                self.mochi_config.has_equalities,
+            )
+            if self.has_soft:
+                kernel_soft_condense_dense(
                     self.dyn_state,
                     self.dyn_info,
-                    self.mochi_info,
                     self.mochi_state,
-                    self.contact_state,
                     self.soft_info,
                     self.soft_state,
+                    self.island_state,
                     self.rigid_config,
-                    self.mochi_config,
                 )
-                if (i_iter + 1) % PCG_CHECK_PERIOD == 0 and kernel_pcg_any_active(self.mochi_state) == 0:
-                    break
+            if self.mochi_config.use_tiled_cholesky:
+                kernel_cholesky_solve_tiled(self.mochi_info, self.mochi_state, self.island_state, self.mochi_config)
+            else:
+                kernel_cholesky_solve_islands(self.mochi_info, self.mochi_state, self.island_state, self.rigid_config)
 
     def _newton_solve(self):
         options = self._options
@@ -1563,28 +1697,48 @@ class MochiSolver(KinematicSolver):
     def get_contacts(self, as_tensor: bool = True, to_torch: bool = True, is_padded: bool = False):
         """
         Contact points of the current state, as a dict of arrays laid out (n_envs, n_contacts, ...) (see
-        `MochiEntity.get_contacts`). Without padding, the contact axis is trimmed to the largest per-environment
-        count and shorter environments carry -1 geom indices in their unused slots.
+        `MochiEntity.get_contacts` and `MochiSoftEntity.get_contacts`). Without padding, the contact axis is trimmed to
+        the largest per-environment count and shorter environments carry -1 indices in their unused slots.
         """
         self._record_contacts()
-        contact_state = self.contact_state
-        n_contacts = qd_to_torch(contact_state.n_hits_total, copy=True).clamp(max=self._max_hits)
+        kernel_gather_contact_records(
+            self._links_entity_idx,
+            self._geoms_link_idx,
+            self._soft_entities_idx,
+            self.mochi_info.samples,
+            self.contact_state,
+            self.soft_info,
+            self.soft_state,
+            self.contact_records,
+            self.rigid_config,
+            self.has_soft,
+        )
+        records = self.contact_records
+        n_contacts = qd_to_torch(records.n_records, copy=True)
         contact_data = {
-            "geom_a": qd_to_torch(contact_state.hit_geom_a, transpose=True, copy=True),
-            "geom_b": qd_to_torch(contact_state.hit_geom_b, transpose=True, copy=True),
-            "link_a": qd_to_torch(contact_state.hit_link_a, transpose=True, copy=True),
-            "link_b": qd_to_torch(contact_state.hit_link_b, transpose=True, copy=True),
-            "position": qd_to_torch(contact_state.hit_pos, transpose=True, copy=True),
-            "normal": qd_to_torch(contact_state.hit_normal, transpose=True, copy=True),
-            "distance": qd_to_torch(contact_state.hit_distance, transpose=True, copy=True),
-            "force_a": qd_to_torch(contact_state.hit_force, transpose=True, copy=True),
-            "weight": qd_to_torch(contact_state.hit_weight, transpose=True, copy=True),
+            "entity_a": qd_to_torch(records.entity_a, transpose=True, copy=True),
+            "entity_b": qd_to_torch(records.entity_b, transpose=True, copy=True),
+            "link_a": qd_to_torch(records.link_a, transpose=True, copy=True),
+            "link_b": qd_to_torch(records.link_b, transpose=True, copy=True),
+            "geom_a": qd_to_torch(records.geom_a, transpose=True, copy=True),
+            "geom_b": qd_to_torch(records.geom_b, transpose=True, copy=True),
+            "verts_a": qd_to_torch(records.verts_a, transpose=True, copy=True),
+            "bary_a": qd_to_torch(records.bary_a, transpose=True, copy=True),
+            "verts_b": qd_to_torch(records.verts_b, transpose=True, copy=True),
+            "bary_b": qd_to_torch(records.bary_b, transpose=True, copy=True),
+            "position": qd_to_torch(records.pos, transpose=True, copy=True),
+            "normal": qd_to_torch(records.normal, transpose=True, copy=True),
+            "distance": qd_to_torch(records.distance, transpose=True, copy=True),
+            "force_a": qd_to_torch(records.force, transpose=True, copy=True),
+            "weight": qd_to_torch(records.weight, transpose=True, copy=True),
         }
         contact_data["force_b"] = -contact_data["force_a"]
-        slots = torch.arange(self._max_hits, device=n_contacts.device)
+        slots = torch.arange(records.entity_a.shape[0], device=n_contacts.device)
         is_valid = slots[None, :] < n_contacts[:, None]
-        for key in ("geom_a", "geom_b", "link_a", "link_b"):
+        for key in ("entity_a", "entity_b", "link_a", "link_b", "geom_a", "geom_b"):
             contact_data[key] = torch.where(is_valid, contact_data[key], -1)
+        for key in ("verts_a", "verts_b"):
+            contact_data[key] = torch.where(is_valid[..., None], contact_data[key], -1)
         if is_padded:
             contact_data["n_contacts"] = n_contacts if self.n_envs > 0 else n_contacts[0]
         else:
@@ -1932,6 +2086,19 @@ class MochiSolver(KinematicSolver):
         verts_idx = np.asarray(verts_idx, dtype=gs.np_int) + entity.v_start
         kernel_soft_set_vertices_fixed(envs_idx, verts_idx, int(bool(is_fixed)), self.soft_state, self.rigid_config)
         self._is_external_state_dirty = True
+
+    def set_soft_vertices_target(self, entity, verts_idx, pos, envs_idx=None):
+        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+        verts_idx = np.asarray(verts_idx, dtype=gs.np_int) + entity.v_start
+        pos = torch.as_tensor(tensor_to_array(pos), dtype=gs.tc_float, device=gs.device)
+        if pos.shape == (len(verts_idx), 3):
+            pos = pos[None].expand(len(envs_idx), -1, -1)
+        if pos.shape != (len(envs_idx), len(verts_idx), 3):
+            gs.raise_exception(
+                f"Expected an array of shape ({len(envs_idx)}, {len(verts_idx)}, 3) or ({len(verts_idx)}, 3), got "
+                f"{tuple(pos.shape)}."
+            )
+        kernel_soft_set_vertices_target(envs_idx, verts_idx, pos.contiguous(), self.soft_state, self.rigid_config)
 
     def set_soft_entity_contact_params(self, entity, **params):
         material = entity.material

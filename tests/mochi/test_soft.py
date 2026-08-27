@@ -152,7 +152,7 @@ def test_soft_rigid_stack_batched(show_viewer):
         material=gs.materials.Mochi.Rigid(rho=2000.0),
     )
     scene.build(n_envs=2)
-    assert not scene.mochi_solver.mochi_config.use_dense_direct
+    assert not scene.mochi_solver.mochi_config.has_dense
     box.set_pos(np.array([[0.0, 0.0, 0.2], [0.1, 0.0, 0.25]]))
     for _ in range(150):
         scene.step()
@@ -179,7 +179,12 @@ def _kernel_shift_vertex(i_v: int, k: int, delta: float, soft_state: qd.template
 @pytest.mark.precision("64")
 def test_soft_hessian_finite_difference(show_viewer):
     scene = _mochi_scene(
-        show_viewer, 0.01, gravity=(0.0, 0.0, 0.0), n_newton_iterations=8, use_fitted_friction_hessian=False
+        show_viewer,
+        0.01,
+        gravity=(0.0, 0.0, 0.0),
+        n_newton_iterations=8,
+        use_fitted_friction_hessian=False,
+        linear_solver="ldlt",
     )
     scene.add_entity(gs.morphs.Plane(), material=gs.materials.Mochi.Rigid(friction=0.6))
     cube = scene.add_entity(
@@ -212,10 +217,20 @@ def test_soft_hessian_finite_difference(show_viewer):
         solver.mochi_info,
         solver.mochi_state,
         solver.contact_state,
+        solver.island_state,
+        solver.eq_info,
+        solver.eq_state,
         solver.rigid_config,
+        solver.mochi_config.has_equalities,
     )
     kernel_soft_condense_dense(
-        solver.dyn_state, solver.dyn_info, solver.mochi_state, solver.soft_info, solver.soft_state, solver.rigid_config
+        solver.dyn_state,
+        solver.dyn_info,
+        solver.mochi_state,
+        solver.soft_info,
+        solver.soft_state,
+        solver.island_state,
+        solver.rigid_config,
     )
     dof_start = solver.n_dofs
     H = qd_to_numpy(solver.mochi_state.H_dense)[0][dof_start:, dof_start:].copy()
@@ -336,10 +351,20 @@ def test_soft_soft_hessian_finite_difference(show_viewer):
         solver.mochi_info,
         solver.mochi_state,
         solver.contact_state,
+        solver.island_state,
+        solver.eq_info,
+        solver.eq_state,
         solver.rigid_config,
+        solver.mochi_config.has_equalities,
     )
     kernel_soft_condense_dense(
-        solver.dyn_state, solver.dyn_info, solver.mochi_state, solver.soft_info, solver.soft_state, solver.rigid_config
+        solver.dyn_state,
+        solver.dyn_info,
+        solver.mochi_state,
+        solver.soft_info,
+        solver.soft_state,
+        solver.island_state,
+        solver.rigid_config,
     )
     n_verts = solver.n_soft_verts
     H = qd_to_numpy(solver.mochi_state.H_dense)[0].copy()
@@ -358,3 +383,44 @@ def test_soft_soft_hessian_finite_difference(show_viewer):
     # direction and the curvature of the distance field (as mochi does), so it only approximates the exact Hessian; a
     # sign error in any coupling block would show up as a mismatch of the order of the contact stiffness.
     assert_allclose(H, H_fd, atol=2e-2 * np.abs(H).max(), rtol=0.0)
+
+
+@pytest.mark.precision("64")
+@pytest.mark.parametrize("integrator", ["backward_euler", "bdf2"])
+def test_soft_moving_dirichlet(show_viewer, integrator):
+    dt, v_drive = 0.01, np.array([0.2, 0.0, 0.1])
+    scene = _mochi_scene(
+        show_viewer,
+        dt,
+        gravity=(0.0, 0.0, 0.0),
+        n_newton_iterations=8,
+        integrator=integrator,
+        newton_abs_tol=1e-9,
+        newton_rel_tol=1e-12,
+    )
+    bar = scene.add_entity(
+        gs.morphs.Box(size=(0.1, 0.1, 0.3), pos=(0.0, 0.0, 1.0), maxvolume=0.001),
+        material=gs.materials.Mochi.Elastic(E=1e5, nu=0.3, rho=1000.0, mass_damping=2.0),
+    )
+    scene.build()
+    rest = tensor_to_array(bar.get_vertices_position())
+    top = np.flatnonzero(rest[:, 2] > rest[:, 2].max() - 1e-6)
+    n_steps = 60
+    for i_step in range(n_steps):
+        target = rest[top] + (i_step + 1) * dt * v_drive
+        bar.set_vertices_target(top, target)
+        scene.step()
+        pos = tensor_to_array(bar.get_vertices_position())
+        vel = tensor_to_array(bar.get_vertices_velocity())
+        # The driven vertices reach their prescribed positions exactly, and their finite-difference velocity is the
+        # drive velocity under both integrators (the BDF2 extrapolation is consistent with a constant velocity).
+        assert_allclose(pos[top], target, tol=1e-12)
+        assert_allclose(vel[top], v_drive, tol=1e-9)
+    # The free part of the bar is dragged along with the driven face.
+    assert np.all(np.linalg.norm(vel - v_drive, axis=1) < 0.5 * np.linalg.norm(v_drive))
+    assert_allclose(pos.mean(axis=0) - rest.mean(axis=0), n_steps * dt * v_drive, rtol=0.2, atol=1e-3)
+    # Released, the vertices are free again and keep moving with the body.
+    bar.set_vertices_fixed(top, is_fixed=False)
+    scene.step()
+    pos_next = tensor_to_array(bar.get_vertices_position())
+    assert np.linalg.norm(pos_next[top] - pos[top], axis=1).max() > 0.5 * dt * np.linalg.norm(v_drive)

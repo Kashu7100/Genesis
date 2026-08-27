@@ -13,7 +13,16 @@ from genesis.utils import array_class
 
 from .colliders import query_collider
 from .contact_utils import collision_response
-from .data import COLLIDER_TYPE, MochiContactState, MochiInfo, MochiState
+from .data import (
+    COLLIDER_TYPE,
+    MochiContactRecords,
+    MochiContactState,
+    MochiInfo,
+    MochiSamplesInfo,
+    MochiSoftInfo,
+    MochiSoftState,
+    MochiState,
+)
 from .lie import skew
 from .newton import func_is_env_active
 
@@ -559,3 +568,252 @@ def kernel_pairs_to_blocks(
                     H_off[3 + k, l] = AB_rt[k, l]
                     H_off[3 + k, 3 + l] = AB_rr[k, l]
                 mochi_state.H_off[i_p, i_b] = H_off
+
+
+# ------------------------------------------------------------------------------------
+# --------------------------------------- readback -----------------------------------
+# ------------------------------------------------------------------------------------
+
+
+@qd.func
+def func_write_record(
+    i_rec,
+    i_b,
+    entity_a,
+    entity_b,
+    link_a,
+    link_b,
+    geom_a,
+    geom_b,
+    verts_a,
+    bary_a,
+    verts_b,
+    bary_b,
+    pos,
+    normal,
+    force,
+    distance,
+    weight,
+    records: MochiContactRecords,
+):
+    records.entity_a[i_rec, i_b] = entity_a
+    records.entity_b[i_rec, i_b] = entity_b
+    records.link_a[i_rec, i_b] = link_a
+    records.link_b[i_rec, i_b] = link_b
+    records.geom_a[i_rec, i_b] = geom_a
+    records.geom_b[i_rec, i_b] = geom_b
+    records.verts_a[i_rec, i_b] = verts_a
+    records.bary_a[i_rec, i_b] = bary_a
+    records.verts_b[i_rec, i_b] = verts_b
+    records.bary_b[i_rec, i_b] = bary_b
+    records.pos[i_rec, i_b] = pos
+    records.normal[i_rec, i_b] = normal
+    records.force[i_rec, i_b] = force
+    records.distance[i_rec, i_b] = distance
+    records.weight[i_rec, i_b] = weight
+
+
+@qd.func
+def func_soft_sample_verts(i_s, soft_info: MochiSoftInfo):
+    """Entity-local vertices and weights of a deformable contact sample."""
+    i_e = soft_info.samples_entity_idx[i_s]
+    v_start = soft_info.entities_vert_start[i_e]
+    tri = soft_info.samples_tri[i_s]
+    verts = qd.Vector([tri[0] - v_start, tri[1] - v_start, tri[2] - v_start], dt=gs.qd_int)
+    return i_e, verts, soft_info.samples_bary[i_s]
+
+
+@qd.kernel
+def kernel_gather_contact_records(
+    links_entity_idx: qd.types.ndarray(),
+    geoms_link_idx: qd.types.ndarray(),
+    soft_entities_idx: qd.types.ndarray(),
+    samples_info: MochiSamplesInfo,
+    contact_state: MochiContactState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    records: MochiContactRecords,
+    rigid_config: qd.template(),
+    has_soft: qd.template(),
+):
+    """Compact the contact points recorded by the last evaluation (rigid samples on rigid colliders, then deformable
+    samples on rigid colliders, samples on deformable colliders and on point-cloud colliders) into the unified
+    per-environment readback records, resolving links, geoms and entities to scene indices."""
+    max_hits = contact_state.hit_sample.shape[0]
+    _B = records.n_records.shape[0]
+    no_verts3 = qd.Vector([-1, -1, -1], dt=gs.qd_int)
+    no_verts4 = qd.Vector([-1, -1, -1, -1], dt=gs.qd_int)
+    zero3 = qd.Vector.zero(gs.qd_float, 3)
+    zero4 = qd.Vector.zero(gs.qd_float, 4)
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_h, i_b in qd.ndrange(max_hits, _B):
+        n_rigid = qd.min(contact_state.n_hits_total[i_b], max_hits)
+        if i_h == 0:
+            records.n_records[i_b] = n_rigid
+        if i_h >= n_rigid:
+            continue
+        i_la = contact_state.hit_link_a[i_h, i_b]
+        i_lb = contact_state.hit_link_b[i_h, i_b]
+        func_write_record(
+            i_h,
+            i_b,
+            links_entity_idx[i_la],
+            links_entity_idx[i_lb],
+            i_la,
+            i_lb,
+            contact_state.hit_geom_a[i_h, i_b],
+            contact_state.hit_geom_b[i_h, i_b],
+            no_verts3,
+            zero3,
+            no_verts4,
+            zero4,
+            contact_state.hit_pos[i_h, i_b],
+            contact_state.hit_normal[i_h, i_b],
+            contact_state.hit_force[i_h, i_b],
+            contact_state.hit_distance[i_h, i_b],
+            contact_state.hit_weight[i_h, i_b],
+            records,
+        )
+
+    if qd.static(has_soft):
+        max_soft_hits = soft_state.hit_sample.shape[0]
+        max_sc_hits = soft_state.sc_hit_kind_a.shape[0]
+        max_pc_hits = soft_state.pc_hit_kind_a.shape[0]
+
+        # Deformable samples on rigid colliders.
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_h, i_b in qd.ndrange(max_soft_hits, _B):
+            n_rigid = qd.min(contact_state.n_hits_total[i_b], max_hits)
+            n_soft = qd.min(soft_state.n_soft_hits[i_b], max_soft_hits)
+            if i_h == 0:
+                qd.atomic_add(records.n_records[i_b], n_soft)
+            if i_h >= n_soft:
+                continue
+            i_e, verts_a, bary_a = func_soft_sample_verts(soft_state.hit_sample[i_h, i_b], soft_info)
+            i_gb = soft_state.hit_geom_b[i_h, i_b]
+            i_lb = geoms_link_idx[i_gb]
+            func_write_record(
+                n_rigid + i_h,
+                i_b,
+                soft_entities_idx[i_e],
+                links_entity_idx[i_lb],
+                -1,
+                i_lb,
+                -1,
+                i_gb,
+                verts_a,
+                bary_a,
+                no_verts4,
+                zero4,
+                soft_state.hit_pos[i_h, i_b],
+                soft_state.hit_normal[i_h, i_b],
+                soft_state.hit_force[i_h, i_b],
+                soft_state.hit_distance[i_h, i_b],
+                soft_info.samples_weight[soft_state.hit_sample[i_h, i_b]],
+                records,
+            )
+
+        # Samples of either kind on deformable (tetrahedral) colliders.
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_h, i_b in qd.ndrange(max_sc_hits, _B):
+            n_rigid = qd.min(contact_state.n_hits_total[i_b], max_hits)
+            n_soft = qd.min(soft_state.n_soft_hits[i_b], max_soft_hits)
+            n_sc = qd.min(soft_state.n_sc_hits[i_b], max_sc_hits)
+            if i_h == 0:
+                qd.atomic_add(records.n_records[i_b], n_sc)
+            if i_h >= n_sc:
+                continue
+            i_sample = soft_state.sc_hit_sample_a[i_h, i_b]
+            entity_a = -1
+            link_a = -1
+            geom_a = -1
+            verts_a = no_verts3
+            bary_a = zero3
+            weight = gs.qd_float(0.0)
+            if soft_state.sc_hit_kind_a[i_h, i_b] == 0:
+                link_a = samples_info.link_idx[i_sample]
+                geom_a = samples_info.geom_idx[i_sample]
+                entity_a = links_entity_idx[link_a]
+                weight = samples_info.weight[i_sample]
+            else:
+                i_ea, verts_a, bary_a = func_soft_sample_verts(i_sample, soft_info)
+                entity_a = soft_entities_idx[i_ea]
+                weight = soft_info.samples_weight[i_sample]
+            i_el = soft_state.sc_hit_elem_b[i_h, i_b]
+            i_eb = soft_info.elems_entity_idx[i_el]
+            v_start = soft_info.entities_vert_start[i_eb]
+            v = soft_info.elems_v[i_el]
+            verts_b = qd.Vector([v[0] - v_start, v[1] - v_start, v[2] - v_start, v[3] - v_start], dt=gs.qd_int)
+            func_write_record(
+                n_rigid + n_soft + i_h,
+                i_b,
+                entity_a,
+                soft_entities_idx[i_eb],
+                link_a,
+                -1,
+                geom_a,
+                -1,
+                verts_a,
+                bary_a,
+                verts_b,
+                soft_state.sc_hit_bary_b[i_h, i_b],
+                soft_state.sc_hit_pos[i_h, i_b],
+                soft_state.sc_hit_normal[i_h, i_b],
+                soft_state.sc_hit_force[i_h, i_b],
+                soft_state.sc_hit_distance[i_h, i_b],
+                weight,
+                records,
+            )
+
+        # Samples of either kind on point-cloud colliders (one collider vertex).
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_h, i_b in qd.ndrange(max_pc_hits, _B):
+            n_rigid = qd.min(contact_state.n_hits_total[i_b], max_hits)
+            n_soft = qd.min(soft_state.n_soft_hits[i_b], max_soft_hits)
+            n_sc = qd.min(soft_state.n_sc_hits[i_b], max_sc_hits)
+            n_pc = qd.min(soft_state.n_pc_hits[i_b], max_pc_hits)
+            if i_h == 0:
+                qd.atomic_add(records.n_records[i_b], n_pc)
+            if i_h >= n_pc:
+                continue
+            i_sample = soft_state.pc_hit_sample_a[i_h, i_b]
+            entity_a = -1
+            link_a = -1
+            geom_a = -1
+            verts_a = no_verts3
+            bary_a = zero3
+            weight = gs.qd_float(0.0)
+            if soft_state.pc_hit_kind_a[i_h, i_b] == 0:
+                link_a = samples_info.link_idx[i_sample]
+                geom_a = samples_info.geom_idx[i_sample]
+                entity_a = links_entity_idx[link_a]
+                weight = samples_info.weight[i_sample]
+            else:
+                i_ea, verts_a, bary_a = func_soft_sample_verts(i_sample, soft_info)
+                entity_a = soft_entities_idx[i_ea]
+                weight = soft_info.samples_weight[i_sample]
+            i_vb = soft_state.pc_hit_vert_b[i_h, i_b]
+            i_eb = soft_info.verts_entity_idx[i_vb]
+            verts_b = qd.Vector([i_vb - soft_info.entities_vert_start[i_eb], -1, -1, -1], dt=gs.qd_int)
+            bary_b = qd.Vector([1.0, 0.0, 0.0, 0.0], dt=gs.qd_float)
+            func_write_record(
+                n_rigid + n_soft + n_sc + i_h,
+                i_b,
+                entity_a,
+                soft_entities_idx[i_eb],
+                link_a,
+                -1,
+                geom_a,
+                -1,
+                verts_a,
+                bary_a,
+                verts_b,
+                bary_b,
+                soft_state.pc_hit_pos[i_h, i_b],
+                soft_state.pc_hit_normal[i_h, i_b],
+                soft_state.pc_hit_force[i_h, i_b],
+                soft_state.pc_hit_distance[i_h, i_b],
+                weight,
+                records,
+            )

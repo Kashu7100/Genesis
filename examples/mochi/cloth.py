@@ -1,5 +1,5 @@
 """Thin shells simulated by the MochiSolver: a cloth sheet draped over a rigid box, and a rigid ball caught by a sheet
-held at its corners.
+whose corners are held and then swayed sideways (moving Dirichlet targets).
 
 Light cloth carries little inertia, so the default contact stiffness of 1e9 Pa/m makes the residual jump by orders of
 magnitude when it lands on an edge and trips the divergence check; 1e7 Pa/m keeps the contact stiff enough for cloth.
@@ -77,15 +77,22 @@ def main():
         (np.abs(net.init_positions[corners, 0]) > 0.4 - 1e-6) & (np.abs(net.init_positions[corners, 1]) > 0.4 - 1e-6)
     ]
     net.set_vertices_fixed(corners)
+    corners_rest = net.init_positions[corners]
 
     for i_step in range(args.n_steps):
+        # After the ball has settled, drive the corners along a sinusoidal sway; they reach the prescribed positions
+        # exactly at the end of each step.
+        if i_step >= 120:
+            t = (i_step + 1 - 120) * scene.sim_options.dt
+            net.set_vertices_target(corners, corners_rest + np.array([0.15 * np.sin(np.pi * t), 0.0, 0.0]))
         scene.step()
         if i_step % 60 == 0:
             info = scene.mochi_solver.get_convergence_info()
             drape_z = float(drape.get_vertices_position()[:, 2].min())
             net_z = float(net.get_vertices_position()[:, 2].min())
             print(
-                f"step {i_step:4d}: drape zmin={drape_z:.4f} net zmin={net_z:.4f} ball z={float(ball.get_pos()[2]):.4f} "
+                f"step {i_step:4d}: drape zmin={drape_z:.4f} net zmin={net_z:.4f} ball x={float(ball.get_pos()[0]):.4f} "
+                f"z={float(ball.get_pos()[2]):.4f} "
                 f"box contact={float(box.get_links_net_contact_force()[0, 2]):.2f} N newton iterations={int(info['n_iter'][0])}"
             )
 

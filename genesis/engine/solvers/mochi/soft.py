@@ -34,6 +34,7 @@ from .data import (
     MochiState,
 )
 from .integration import BDF2_ALPHA_2
+from .islands import MochiIslandState
 from .lie import skew
 from .newton import func_is_env_active
 from .rod import (
@@ -106,6 +107,8 @@ ENTITY_PARAMS = (
     "axial_stiffness",
     "torsional_stiffness",
     "rot_inertia",
+    "self_contact",
+    "self_contact_exclusion_ratio",
 )
 
 
@@ -196,6 +199,8 @@ def kernel_init_soft_fields(
         soft_info.entities_axial_stiffness[i_e] = entities_params[i_e, 37]
         soft_info.entities_torsional_stiffness[i_e] = entities_params[i_e, 38]
         soft_info.entities_rot_inertia[i_e] = entities_params[i_e, 39]
+        soft_info.entities_self_contact[i_e] = qd.cast(entities_params[i_e, 40], gs.qd_int)
+        soft_info.entities_self_contact_exclusion_ratio[i_e] = entities_params[i_e, 41]
         for i_l in range(n_links):
             soft_info.entities_links_pair_enabled[i_e, i_l] = entities_links_pair_enabled[i_e, i_l]
         for j_e in range(n_entities):
@@ -245,6 +250,7 @@ def kernel_init_soft_fields(
         soft_state.verts_pos_stage_start[i_v, i_b] = pos
         soft_state.verts_vel_stage_start[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
         soft_state.verts_is_fixed[i_v, i_b] = False
+        soft_state.verts_target[i_v, i_b] = pos
         soft_state.verts_contact_force[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
 
 
@@ -314,12 +320,13 @@ def kernel_soft_step_start(
             if mochi_state.n_hist[i_b] >= 2:
                 pos = x1 + BDF2_ALPHA_2 * (soft_state.verts_pos_prev[1, i_v, i_b] - x1)
                 vel = v1 + BDF2_ALPHA_2 * (soft_state.verts_vel_prev[1, i_v, i_b] - v1)
-        if soft_state.verts_is_fixed[i_v, i_b]:
-            pos = x1
-            vel = qd.Vector.zero(gs.qd_float, 3)
         soft_state.verts_pos_step_start[i_v, i_b] = pos
         soft_state.verts_pos_stage_start[i_v, i_b] = pos
         soft_state.verts_vel_stage_start[i_v, i_b] = vel
+        # A fixed vertex takes its prescribed end-of-step position at once (its rows of the Newton system are
+        # identities); its velocity then follows by finite differences like that of any other vertex.
+        if soft_state.verts_is_fixed[i_v, i_b]:
+            pos = soft_state.verts_target[i_v, i_b]
         soft_state.verts_pos[i_v, i_b] = pos
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
@@ -874,6 +881,7 @@ def kernel_soft_contact_eval(
             if i_h < max_hits:
                 soft_state.hit_sample[i_h, i_b] = i_s
                 soft_state.hit_link_b[i_h, i_b] = -1 if is_static_b else i_lb
+                soft_state.hit_geom_b[i_h, i_b] = soft_state.pair_geom_b[i_p, i_b]
                 soft_state.hit_r_b[i_h, i_b] = r_b
                 soft_state.hit_D[i_h, i_b] = D
                 soft_state.hit_force[i_h, i_b] = w * force
@@ -1226,6 +1234,7 @@ def kernel_soft_condense_dense(
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
+    island_state: MochiIslandState,
     rigid_config: qd.template(),
 ):
     """Add the deformable blocks to the dense Hessian of every running environment and impose the Dirichlet rows and
@@ -1238,7 +1247,7 @@ def kernel_soft_condense_dense(
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_el, i_b in qd.ndrange(n_elems, _B):
-        if not mochi_state.is_active[i_b]:
+        if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]):
             continue
         v = soft_info.elems_v[i_el]
         K = soft_state.elems_H[i_el, i_b]
@@ -1252,7 +1261,7 @@ def kernel_soft_condense_dense(
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_h, i_b in qd.ndrange(max_hits, _B):
-        if not mochi_state.is_active[i_b] or i_h >= soft_state.n_soft_hits[i_b]:
+        if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or i_h >= soft_state.n_soft_hits[i_b]:
             continue
         i_s = soft_state.hit_sample[i_h, i_b]
         tri = soft_info.samples_tri[i_s]
@@ -1284,7 +1293,7 @@ def kernel_soft_condense_dense(
     max_sc_hits = soft_state.sc_hit_kind_a.shape[0]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_h, i_b in qd.ndrange(max_sc_hits, _B):
-        if not mochi_state.is_active[i_b] or i_h >= soft_state.n_sc_hits[i_b]:
+        if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or i_h >= soft_state.n_sc_hits[i_b]:
             continue
         D = soft_state.sc_hit_D[i_h, i_b]
         kind_a = soft_state.sc_hit_kind_a[i_h, i_b]
@@ -1333,7 +1342,7 @@ def kernel_soft_condense_dense(
     n_shell_elems = soft_state.shell_elems_H.shape[0]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_t, i_b in qd.ndrange(n_shell_elems, _B):
-        if not mochi_state.is_active[i_b]:
+        if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]):
             continue
         nodes = func_shell_nodes(i_t, soft_info)
         K = soft_state.shell_elems_H[i_t, i_b]
@@ -1349,7 +1358,7 @@ def kernel_soft_condense_dense(
     max_pc_hits = soft_state.pc_hit_kind_a.shape[0]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_h, i_b in qd.ndrange(max_pc_hits, _B):
-        if not mochi_state.is_active[i_b] or i_h >= soft_state.n_pc_hits[i_b]:
+        if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or i_h >= soft_state.n_pc_hits[i_b]:
             continue
         D = soft_state.pc_hit_D[i_h, i_b]
         kind_a = soft_state.pc_hit_kind_a[i_h, i_b]
@@ -1390,7 +1399,7 @@ def kernel_soft_condense_dense(
     n_rod_elems = soft_state.rod_elems_H.shape[0]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_r, i_b in qd.ndrange(n_rod_elems, _B):
-        if not mochi_state.is_active[i_b] or soft_info.rod_elems_L[i_r] <= 0.0:
+        if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or soft_info.rod_elems_L[i_r] <= 0.0:
             continue
         v = soft_info.rod_elems_v[i_r]
         T = soft_state.rod_elems_H[i_r, i_b]
@@ -1408,7 +1417,7 @@ def kernel_soft_condense_dense(
     n_rod_stencils = soft_state.rod_stencils_H.shape[0]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_s, i_b in qd.ndrange(n_rod_stencils, _B):
-        if not mochi_state.is_active[i_b] or soft_info.rod_stencils_L[i_s] <= 0.0:
+        if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or soft_info.rod_stencils_L[i_s] <= 0.0:
             continue
         dofs = func_rod_stencil_dofs(i_s, soft_info)
         K = soft_state.rod_stencils_H[i_s, i_b]
@@ -1418,7 +1427,7 @@ def kernel_soft_condense_dense(
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_v, i_b in qd.ndrange(n_verts, _B):
-        if not mochi_state.is_active[i_b] or not soft_state.verts_is_fixed[i_v, i_b]:
+        if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or not soft_state.verts_is_fixed[i_v, i_b]:
             continue
         for k in qd.static(range(3)):
             i_d = func_soft_dof(i_v, k, soft_info)
@@ -1525,6 +1534,7 @@ def kernel_soft_set_vertices_positions(
         i_v = v_start + i_v_
         value = qd.Vector([pos[i_b_, i_v_, 0], pos[i_b_, i_v_, 1], pos[i_b_, i_v_, 2]], dt=gs.qd_float)
         soft_state.verts_pos[i_v, i_b] = value
+        soft_state.verts_target[i_v, i_b] = value
         soft_state.verts_vel[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
         for j in qd.static(range(N_HISTORY)):
             soft_state.verts_pos_prev[j, i_v, i_b] = value
@@ -1564,9 +1574,30 @@ def kernel_soft_set_vertices_fixed(
         i_v = verts_idx[i_v_]
         soft_state.verts_is_fixed[i_v, i_b] = is_fixed != 0
         if is_fixed != 0:
+            soft_state.verts_target[i_v, i_b] = soft_state.verts_pos[i_v, i_b]
             soft_state.verts_vel[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
             for j in qd.static(range(N_HISTORY)):
                 soft_state.verts_vel_prev[j, i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
+
+
+@qd.kernel
+def kernel_soft_set_vertices_target(
+    envs_idx: qd.types.ndarray(),
+    verts_idx: qd.types.ndarray(),
+    pos: qd.types.ndarray(),
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    """Prescribe the end-of-step positions of the given vertices (moving Dirichlet condition): the vertices become
+    fixed and reach their target within the next step; their velocity history is kept."""
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_v_, i_b_ in qd.ndrange(verts_idx.shape[0], envs_idx.shape[0]):
+        i_b = envs_idx[i_b_]
+        i_v = verts_idx[i_v_]
+        soft_state.verts_is_fixed[i_v, i_b] = True
+        soft_state.verts_target[i_v, i_b] = qd.Vector(
+            [pos[i_b_, i_v_, 0], pos[i_b_, i_v_, 1], pos[i_b_, i_v_, 2]], dt=gs.qd_float
+        )
 
 
 @qd.kernel
@@ -2372,8 +2403,10 @@ def kernel_rod_step_start(
         )
         t_start = func_rod_tangent(i_r, i_b, soft_state.verts_pos_stage_start, soft_info)
         axis = func_rod_transport_axis(t_prev, t_start, twist_start, soft_state.rod_elems_axis[i_r, i_b], ROD_TINY)
-        soft_state.rod_elems_axis[i_r, i_b] = axis
         soft_state.rod_elems_axis_stage_start[i_r, i_b] = axis
+        # The warm start differs from the stage start where fixed nodes jumped to their prescribed positions.
+        t_warm = func_rod_tangent(i_r, i_b, soft_state.verts_pos, soft_info)
+        soft_state.rod_elems_axis[i_r, i_b] = func_rod_transport_axis(t_start, t_warm, 0.0, axis, ROD_TINY)
         v = soft_info.rod_elems_v[i_r]
         strain, _q = func_rod_axial_strain(
             soft_state.verts_pos_stage_start[v[0], i_b],
@@ -2752,7 +2785,10 @@ def kernel_pc_collider_eval(
             kind_a = 1
             i_sample = i_q - n_rigid_samples
             e_a = soft_info.samples_entity_idx[i_sample]
-            is_enabled = (e_a != e_b) and soft_info.entities_pair_enabled[e_a, e_b]
+            if e_a == e_b:
+                is_enabled = soft_info.entities_self_contact[e_a] != 0
+            else:
+                is_enabled = soft_info.entities_pair_enabled[e_a, e_b]
             is_shell_a = soft_info.entities_kind[e_a] != SOFT_KIND_SOLID
             tri = soft_info.samples_tri[i_sample]
             bary = soft_info.samples_bary[i_sample]
@@ -2787,6 +2823,19 @@ def kernel_pc_collider_eval(
         h = soft_info.entities_penalty_smoothing_half_distance[e_b]
         if d > thr + 2.0 * h:
             continue
+        if kind_a == 1 and e_a == e_b:
+            # Self-contact: samples lying near the vertex in the rest configuration (its own and the neighboring
+            # elements) never collide with the sphere of that vertex.
+            tri_a = soft_info.samples_tri[i_sample]
+            bary_a = soft_info.samples_bary[i_sample]
+            rest_a = (
+                bary_a[0] * soft_info.verts_rest[tri_a[0]]
+                + bary_a[1] * soft_info.verts_rest[tri_a[1]]
+                + bary_a[2] * soft_info.verts_rest[tri_a[2]]
+            )
+            exclusion = radius * soft_info.entities_self_contact_exclusion_ratio[e_b] + thr
+            if (rest_a - soft_info.verts_rest[i_vb]).norm() < exclusion:
+                continue
         if is_shell_a:
             normal_a = -grad
         p_rel = (pos - pos_start) - (x_b - soft_state.verts_pos_stage_start[i_vb, i_b])
@@ -2890,15 +2939,22 @@ class SoftTetLBVH(LBVH):
     """Bounding-volume hierarchy over the deformed tetrahedra of the deformable colliders, whose queries skip the
     tetrahedra of the entity owning the query sample (a body never collides with itself)."""
 
-    def __init__(self, aabb, tets_entity_idx, queries_entity_idx, max_n_query_result_per_aabb):
+    def __init__(
+        self, aabb, tets_entity_idx, queries_entity_idx, max_n_query_result_per_aabb, entities_self_contact=None
+    ):
         super().__init__(aabb, max_n_query_result_per_aabb=max_n_query_result_per_aabb)
         self.tets_entity = qd.field(gs.qd_int, shape=(max(1, len(tets_entity_idx)),))
         self.queries_entity = qd.field(gs.qd_int, shape=(max(1, len(queries_entity_idx)),))
+        n_entities = 1 if entities_self_contact is None else max(1, len(entities_self_contact))
+        self.entities_self_contact = qd.field(gs.qd_int, shape=(n_entities,))
         if len(tets_entity_idx) > 0:
             self.tets_entity.from_numpy(np.asarray(tets_entity_idx, dtype=gs.np_int))
         if len(queries_entity_idx) > 0:
             self.queries_entity.from_numpy(np.asarray(queries_entity_idx, dtype=gs.np_int))
+        if entities_self_contact is not None and len(entities_self_contact) > 0:
+            self.entities_self_contact.from_numpy(np.asarray(entities_self_contact, dtype=gs.np_int))
 
     @qd.func
     def filter(self, i_a, i_q):
-        return self.tets_entity[i_a] == self.queries_entity[i_q]
+        i_e = self.tets_entity[i_a]
+        return (i_e == self.queries_entity[i_q]) and (self.entities_self_contact[i_e] == 0)

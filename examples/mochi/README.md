@@ -24,7 +24,8 @@ Supported: free and fixed rigid bodies, articulated bodies (URDF/MJCF kinematic 
 spherical and free joints; joint damping, armature, stiffness, soft range limits, force/velocity/position drives through
 the usual `control_dofs_*` / `set_dofs_kp` / `set_dofs_kv` API), deformable bodies (`gs.materials.Mochi.Elastic`:
 linear tetrahedra with a stable neo-Hookean, Saint Venant-Kirchhoff or linear material, mass and stiffness damping,
-fixed vertices through `set_vertices_fixed`, tetrahedralized by tetgen from Box/Sphere/Cylinder/Mesh morphs or read from
+fixed vertices through `set_vertices_fixed` (or driven along a prescribed trajectory with `set_vertices_target`, a
+moving Dirichlet condition reached exactly at the end of every step), tetrahedralized by tetgen from Box/Sphere/Cylinder/Mesh morphs or read from
 tetgen `.node`/`.ele` files), plane/sphere/box analytic colliders and grid colliders for meshes, backward Euler and
 BDF2 time integration. Contact between the links of one entity is disabled, equality constraints are ignored and drive
 forces are not clamped to the force range. Deformable bodies collide through the quadrature samples of their boundary
@@ -57,3 +58,30 @@ Velocities are recovered by finite differences over the step as in mochi: `get_d
 free joints, which differ from `dq/dt` by a factor `1 - (dq)^2/6`.
 
 - `rigid_bodies.py`: sphere and cube dropped onto a table.
+
+Contact points are read back with `get_contacts()` on rigid and deformable entities alike (`with_entity` filters a
+pair). Every record carries the scene entities, links and geoms of both sides (-1 where a side is deformable), the
+entity-local vertices and barycentric weights the force is spread over on a deformable side (`verts_a`/`bary_a` for
+the sample side, `verts_b`/`bary_b` for the collider side; a point-cloud collider is a single vertex), the position,
+unit normal pointing away from side B, signed distance, force on A and quadrature weight of the sample.
+`get_vertices_contact_force()` gives the per-vertex net contact force of a deformable body.
+
+Shells and rods can collide with themselves through their point-cloud collider (`self_contact=True` on the material):
+every sample collides with the spheres of the vertices of its own body except those lying within
+`collider_radius * self_contact_exclusion_ratio` plus the penalty threshold of it in the rest configuration (its own
+and the neighboring elements). Choose the ratio so that the excluded range covers the nearest vertices while the next
+ones stay beyond the contact band (radius + threshold + two smoothing half distances), e.g. 3 for a rod whose segments
+are twice its radius.
+
+Bodies coupled by the contact candidates of a step (rigid entities, deformable bodies) form simulation islands. The
+direct linear solver (`linear_solver="auto"`, the default) factorizes the Newton matrix island by island whenever the
+largest island of an environment has at most `dense_solver_max_dofs` degrees of freedom, so a scene of many separate
+bodies keeps the exact solver; environments with a larger island fall back to the conjugate gradient. The dense matrix
+is only allocated up to `dense_matrix_max_dofs` degrees of freedom in total. On GPU, systems that fit in shared memory
+are factorized by a fused tiled Cholesky kernel. `solver.island_state.n_islands` exposes the island count per
+environment.
+
+Equality constraints of articulations (MJCF `connect`, `weld` and `joint` couplings, i.e. loop closures such as
+four-bar linkages) are enforced as stiff penalties inside the same Newton solve, `0.5 * k |c|^2` on the violation `c`
+with `MochiOptions.equality_stiffness` (1e6 by default, mochi's soft constraint default) and an optional damping
+`equality_damping` on its rate; the coupled bodies form one simulation island.

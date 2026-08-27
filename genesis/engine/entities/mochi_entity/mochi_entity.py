@@ -9,6 +9,39 @@ if TYPE_CHECKING:
     from genesis.engine.solvers.mochi import MochiSolver
 
 
+def filter_entity_contacts(solver, entity, with_entity, exclude_self_contact, is_padded):
+    """Contact points of the solver involving `entity` (and `with_entity`), see `MochiEntity.get_contacts`."""
+    contact_data = solver.get_contacts(as_tensor=True, to_torch=True, is_padded=is_padded)
+    n_contacts = contact_data["n_contacts"] if is_padded else None
+    if is_padded:
+        del contact_data["n_contacts"]
+
+    logical_operation = torch.logical_xor if exclude_self_contact else torch.logical_or
+    if with_entity is not None and entity.idx == with_entity.idx:
+        if exclude_self_contact:
+            gs.raise_exception("`with_entity` is self but `exclude_self_contact` is True.")
+        logical_operation = torch.logical_and
+
+    valid_mask = logical_operation(contact_data["entity_a"] == entity.idx, contact_data["entity_b"] == entity.idx)
+    if with_entity is not None and entity.idx != with_entity.idx:
+        valid_mask = torch.logical_and(
+            valid_mask,
+            torch.logical_or(contact_data["entity_a"] == with_entity.idx, contact_data["entity_b"] == with_entity.idx),
+        )
+    if n_contacts is not None:
+        slots = torch.arange(valid_mask.shape[-1], device=valid_mask.device)
+        if solver.n_envs == 0:
+            valid_mask = torch.logical_and(valid_mask, slots < n_contacts.reshape(()))
+        else:
+            valid_mask = torch.logical_and(valid_mask, slots[None, :] < n_contacts[:, None])
+
+    if solver.n_envs == 0 and not is_padded:
+        contact_data = {key: value[valid_mask] for key, value in contact_data.items()}
+    else:
+        contact_data["valid_mask"] = valid_mask
+    return contact_data
+
+
 class MochiEntity(RigidEntity):
     """
     Rigid entity simulated by the MochiSolver.
@@ -25,51 +58,15 @@ class MochiEntity(RigidEntity):
         Returns the contact points computed at the end of the most recent `scene.step()`, filtered to those involving
         this entity (and `with_entity` if given).
 
-        A contact point is a sample of the collision surface of link A pressed into the distance field of geom B. The
-        returned dict has the keys 'geom_a', 'geom_b', 'link_a', 'link_b', 'position', 'normal' (unit, pointing away
-        from B), 'distance' (signed, negative when penetrating), 'force_a' (force on A), 'force_b' (= -force_a),
-        'weight' (area of surface the sample stands for) and, for a parallelized scene, 'valid_mask'. Shapes are
-        (n_envs, n_contacts, ...) for a parallelized scene and (n_contacts, ...) otherwise.
+        A contact point is a sample of the collision surface of side A pressed into the distance field of side B
+        (a rigid geom, or a deformable body). The returned dict has the keys 'entity_a', 'entity_b' (scene entity
+        indices), 'link_a', 'link_b', 'geom_a', 'geom_b' (-1 for a deformable side), 'verts_a', 'bary_a', 'verts_b',
+        'bary_b' (entity-local vertices and weights a deformable side is spread over, -1 padded), 'position', 'normal'
+        (unit, pointing away from B), 'distance' (signed, negative when penetrating), 'force_a' (force on A),
+        'force_b' (= -force_a), 'weight' (surface measure the sample stands for) and, for a parallelized scene,
+        'valid_mask'. Shapes are (n_envs, n_contacts, ...) for a parallelized scene and (n_contacts, ...) otherwise.
         """
-        contact_data = self._solver.get_contacts(as_tensor=True, to_torch=True, is_padded=is_padded)
-        n_contacts = contact_data["n_contacts"] if is_padded else None
-        if is_padded:
-            del contact_data["n_contacts"]
-
-        logical_operation = torch.logical_xor if exclude_self_contact else torch.logical_or
-        if with_entity is not None and self.idx == with_entity.idx:
-            if exclude_self_contact:
-                gs.raise_exception("`with_entity` is self but `exclude_self_contact` is True.")
-            logical_operation = torch.logical_and
-
-        valid_mask = logical_operation(
-            torch.logical_and(contact_data["geom_a"] >= self.geom_start, contact_data["geom_a"] < self.geom_end),
-            torch.logical_and(contact_data["geom_b"] >= self.geom_start, contact_data["geom_b"] < self.geom_end),
-        )
-        if with_entity is not None and self.idx != with_entity.idx:
-            valid_mask = torch.logical_and(
-                valid_mask,
-                torch.logical_or(
-                    torch.logical_and(
-                        contact_data["geom_a"] >= with_entity.geom_start, contact_data["geom_a"] < with_entity.geom_end
-                    ),
-                    torch.logical_and(
-                        contact_data["geom_b"] >= with_entity.geom_start, contact_data["geom_b"] < with_entity.geom_end
-                    ),
-                ),
-            )
-        if n_contacts is not None:
-            slots = torch.arange(valid_mask.shape[-1], device=valid_mask.device)
-            if self._solver.n_envs == 0:
-                valid_mask = torch.logical_and(valid_mask, slots < n_contacts.reshape(()))
-            else:
-                valid_mask = torch.logical_and(valid_mask, slots[None, :] < n_contacts[:, None])
-
-        if self._solver.n_envs == 0 and not is_padded:
-            contact_data = {key: value[valid_mask] for key, value in contact_data.items()}
-        else:
-            contact_data["valid_mask"] = valid_mask
-        return contact_data
+        return filter_entity_contacts(self._solver, self, with_entity, exclude_self_contact, is_padded)
 
     def get_links_net_contact_force(self, envs_idx=None):
         self._solver._record_contacts()

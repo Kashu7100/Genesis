@@ -62,11 +62,15 @@ class MochiStaticConfig(metaclass=AutoInitMeta):
     friction_with_collider_normal: bool
     fade_friction: bool
     implicit_normal_force_for_dissipation: bool
-    use_dense_direct: bool
+    has_dense: bool
+    use_tiled_cholesky: bool
+    cholesky_tile_size: int
+    tiled_n_dofs: int
     has_grid_colliders: bool
     record_contacts: bool
     batch_links_info: bool
     has_soft: bool
+    has_equalities: bool
 
 
 # =========================================== build-time info ===========================================
@@ -171,6 +175,8 @@ class MochiInfo:
     dt: qd.Tensor
     joint_limit_stiffness: qd.Tensor
     joint_limit_damping: qd.Tensor
+    equality_stiffness: qd.Tensor
+    equality_damping: qd.Tensor
     gravity: qd.Tensor
     broadphase_margin: qd.Tensor
     newton_abs_tol: qd.Tensor
@@ -195,6 +201,8 @@ def get_mochi_info(solver):
         dt=_scalar(gs.qd_float, solver._substep_dt),
         joint_limit_stiffness=_scalar(gs.qd_float, options.joint_limit_stiffness),
         joint_limit_damping=_scalar(gs.qd_float, options.joint_limit_damping),
+        equality_stiffness=_scalar(gs.qd_float, options.equality_stiffness),
+        equality_damping=_scalar(gs.qd_float, options.equality_damping),
         gravity=V(dtype=gs.qd_vec3, shape=(solver._B,)),
         broadphase_margin=_scalar(gs.qd_float, options.broadphase_margin),
         newton_abs_tol=_scalar(gs.qd_float, options.newton_abs_tol),
@@ -290,12 +298,12 @@ class MochiState:
     pcg_is_active: qd.Tensor
 
 
-def get_mochi_state(solver, max_pairs, use_dense_direct):
+def get_mochi_state(solver, max_pairs, has_dense):
     _B = solver._B
     n_qs_, n_links_, n_geoms_ = solver.n_qs_, solver.n_links_, solver.n_geoms_
     # Rigid degrees of freedom of the kinematic tree, then 3 per vertex of the deformable bodies.
     n_dofs_rigid_, n_dofs_ = solver.n_dofs_, solver.n_dofs_total_
-    H_dense_shape = (_B, n_dofs_, n_dofs_) if use_dense_direct else ()
+    H_dense_shape = (_B, n_dofs_, n_dofs_) if has_dense else ()
     return MochiState(
         qpos_prev=V(dtype=gs.qd_float, shape=(N_HISTORY, n_qs_, _B)),
         dofs_vel_prev=V(dtype=gs.qd_float, shape=(N_HISTORY, n_dofs_rigid_, _B)),
@@ -419,6 +427,53 @@ def get_mochi_contact_state(solver, max_pairs, max_hits):
     )
 
 
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class MochiContactRecords:
+    # Unified readback of the contact points of every kind (rigid samples on rigid colliders, deformable samples on
+    # rigid colliders, any sample on deformable colliders), compacted per environment: scene entity, link and geom
+    # indices of the colliding side a and the collider side b (-1 where not applicable), the vertices (local to
+    # their entity, -1 padded) and weights the sample and the collider point are spread over, position, unit normal
+    # pointing away from b, signed distance, force on a and the quadrature weight of the sample.
+    n_records: qd.Tensor
+    entity_a: qd.Tensor
+    entity_b: qd.Tensor
+    link_a: qd.Tensor
+    link_b: qd.Tensor
+    geom_a: qd.Tensor
+    geom_b: qd.Tensor
+    verts_a: qd.Tensor
+    bary_a: qd.Tensor
+    verts_b: qd.Tensor
+    bary_b: qd.Tensor
+    pos: qd.Tensor
+    normal: qd.Tensor
+    force: qd.Tensor
+    distance: qd.Tensor
+    weight: qd.Tensor
+
+
+def get_mochi_contact_records(solver, max_records):
+    _B = solver._B
+    return MochiContactRecords(
+        n_records=V(dtype=gs.qd_int, shape=(_B,)),
+        entity_a=V(dtype=gs.qd_int, shape=(max_records, _B)),
+        entity_b=V(dtype=gs.qd_int, shape=(max_records, _B)),
+        link_a=V(dtype=gs.qd_int, shape=(max_records, _B)),
+        link_b=V(dtype=gs.qd_int, shape=(max_records, _B)),
+        geom_a=V(dtype=gs.qd_int, shape=(max_records, _B)),
+        geom_b=V(dtype=gs.qd_int, shape=(max_records, _B)),
+        verts_a=V(dtype=gs.qd_ivec3, shape=(max_records, _B)),
+        bary_a=V(dtype=gs.qd_vec3, shape=(max_records, _B)),
+        verts_b=V(dtype=gs.qd_ivec4, shape=(max_records, _B)),
+        bary_b=V(dtype=gs.qd_vec4, shape=(max_records, _B)),
+        pos=V(dtype=gs.qd_vec3, shape=(max_records, _B)),
+        normal=V(dtype=gs.qd_vec3, shape=(max_records, _B)),
+        force=V(dtype=gs.qd_vec3, shape=(max_records, _B)),
+        distance=V(dtype=gs.qd_float, shape=(max_records, _B)),
+        weight=V(dtype=gs.qd_float, shape=(max_records, _B)),
+    )
+
+
 # =========================================== deformable bodies ===========================================
 
 
@@ -479,6 +534,8 @@ class MochiSoftInfo:
     entities_axial_stiffness: qd.Tensor
     entities_torsional_stiffness: qd.Tensor
     entities_rot_inertia: qd.Tensor
+    entities_self_contact: qd.Tensor
+    entities_self_contact_exclusion_ratio: qd.Tensor
     entities_penalty_coefficient: qd.Tensor
     entities_penalty_smoothing_half_distance: qd.Tensor
     entities_penalty_threshold: qd.Tensor
@@ -564,6 +621,8 @@ def get_mochi_soft_info(solver):
         entities_axial_stiffness=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_torsional_stiffness=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_rot_inertia=V(dtype=gs.qd_float, shape=(n_se_,)),
+        entities_self_contact=V(dtype=gs.qd_int, shape=(n_se_,)),
+        entities_self_contact_exclusion_ratio=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_penalty_coefficient=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_penalty_smoothing_half_distance=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_penalty_threshold=V(dtype=gs.qd_float, shape=(n_se_,)),
@@ -603,6 +662,8 @@ class MochiSoftState:
     verts_pos_ls_ref: qd.Tensor
     # Dirichlet flags: fixed vertices keep their position.
     verts_is_fixed: qd.Tensor
+    # Prescribed end-of-step position of the fixed vertices (Dirichlet targets).
+    verts_target: qd.Tensor
     # Diagonal 3x3 Hessian block of every vertex (block-Jacobi preconditioner) and net contact force for readback.
     verts_H_diag: qd.Tensor
     verts_contact_force: qd.Tensor
@@ -654,6 +715,7 @@ class MochiSoftState:
     n_soft_hits: qd.Tensor
     hit_sample: qd.Tensor
     hit_link_b: qd.Tensor
+    hit_geom_b: qd.Tensor
     hit_r_b: qd.Tensor
     hit_D: qd.Tensor
     hit_force: qd.Tensor
@@ -704,6 +766,7 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         verts_vel_stage_start=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
         verts_pos_ls_ref=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
         verts_is_fixed=V(dtype=gs.qd_bool, shape=(n_sv_, _B)),
+        verts_target=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
         verts_H_diag=V(dtype=gs.qd_mat3, shape=(n_sv_, _B)),
         verts_contact_force=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
         elems_F_stage_start=V(dtype=gs.qd_mat3, shape=(n_el_, _B)),
@@ -743,6 +806,7 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         n_soft_hits=V(dtype=gs.qd_int, shape=(_B,)),
         hit_sample=V(dtype=gs.qd_int, shape=(max_soft_hits, _B)),
         hit_link_b=V(dtype=gs.qd_int, shape=(max_soft_hits, _B)),
+        hit_geom_b=V(dtype=gs.qd_int, shape=(max_soft_hits, _B)),
         hit_r_b=V(dtype=gs.qd_vec3, shape=(max_soft_hits, _B)),
         hit_D=V(dtype=gs.qd_mat3, shape=(max_soft_hits, _B)),
         hit_force=V(dtype=gs.qd_vec3, shape=(max_soft_hits, _B)),
