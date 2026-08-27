@@ -1,27 +1,67 @@
 # Portions of this file are derived from Meta Platforms, Inc. and affiliates' "mochi" physics library
 # (mochi_core / mochi_physics), licensed under the Apache License, Version 2.0.
 # SPDX-License-Identifier: Apache-2.0
-"""Linear solve of the Newton system H dx = res from its per-link diagonal and per-pair off-diagonal 6x6 blocks: a
-dense Cholesky factorization of the condensed matrix, or a block-Jacobi preconditioned conjugate gradient working
-directly on the blocks."""
+"""Linear solve of the Newton system H dx = res, where H is the projection of the per-link and per-contact-pair 6x6
+blocks onto the degrees of freedom through the link Jacobians plus the joint-space diagonal: a dense Cholesky
+factorization of the condensed matrix, or a Jacobi-preconditioned conjugate gradient applying the blocks on the fly."""
 
 import quadrants as qd
 
 import genesis as gs
 from genesis.utils import array_class
 
+from .articulated import (
+    func_jacobian_column_dot,
+    func_jacobian_times_dofs,
+    func_jacobian_transpose_add,
+    func_link_dof_jacobian,
+)
 from .data import MochiContactState, MochiInfo, MochiState
+
+
+@qd.func
+def func_add_projected_block(
+    i_la,
+    i_lb,
+    i_b,
+    block,
+    H_dense: qd.Tensor,
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    rigid_config: qd.template(),
+    is_symmetric_pair: qd.template(),
+):
+    """H_dense += J_a^T block J_b over the ancestor degrees of freedom of links a and b (and the transpose block when
+    the two links differ)."""
+    i_a = i_la
+    while i_a != -1:
+        I_a = [i_a, i_b] if qd.static(rigid_config.batch_links_info) else i_a
+        for i_d in range(dyn_info.links.dof_start[I_a], dyn_info.links.dof_end[I_a]):
+            vel, ang = func_link_dof_jacobian(i_la, i_d, i_b, dyn_state)
+            column = qd.Vector([vel[0], vel[1], vel[2], ang[0], ang[1], ang[2]], dt=gs.qd_float)
+            row = block.transpose() @ column
+            i_c = i_lb
+            while i_c != -1:
+                I_c = [i_c, i_b] if qd.static(rigid_config.batch_links_info) else i_c
+                for j_d in range(dyn_info.links.dof_start[I_c], dyn_info.links.dof_end[I_c]):
+                    value = func_jacobian_column_dot(i_lb, j_d, i_b, row, dyn_state)
+                    qd.atomic_add(H_dense[i_b, i_d, j_d], value)
+                    if qd.static(is_symmetric_pair):
+                        qd.atomic_add(H_dense[i_b, j_d, i_d], value)
+                i_c = dyn_info.links.parent_idx[I_c]
+        i_a = dyn_info.links.parent_idx[I_a]
 
 
 @qd.kernel
 def kernel_condense_dense(
+    dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     contact_state: MochiContactState,
     rigid_config: qd.template(),
 ):
-    """Scatter the Hessian blocks of every running environment into its dense matrix."""
+    """Assemble the dense Hessian of every running environment from the projected blocks and the joint diagonal."""
     n_dofs = mochi_state.res.shape[0]
     n_links = mochi_state.H_diag.shape[0]
     max_pairs = contact_state.pair_link_a.shape[0]
@@ -33,14 +73,17 @@ def kernel_condense_dense(
             mochi_state.H_dense[i_b, i_d, j_d] = 0.0
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_d, i_b in qd.ndrange(n_dofs, _B):
+        if mochi_state.is_active[i_b]:
+            mochi_state.H_dense[i_b, i_d, i_d] = mochi_state.dofs_H_diag[i_d, i_b]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_l, i_b in qd.ndrange(n_links, _B):
         if not mochi_state.is_active[i_b] or not mochi_info.links.is_dynamic[i_l]:
             continue
-        I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
-        dof_start = dyn_info.links.dof_start[I_l]
-        for k in qd.static(range(6)):
-            for l in qd.static(range(6)):
-                mochi_state.H_dense[i_b, dof_start + k, dof_start + l] = mochi_state.H_diag[i_l, i_b][k, l]
+        func_add_projected_block(
+            i_l, i_l, i_b, mochi_state.H_diag[i_l, i_b], mochi_state.H_dense, dyn_state, dyn_info, rigid_config, False
+        )
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_p, i_b in qd.ndrange(max_pairs, _B):
@@ -52,15 +95,9 @@ def kernel_condense_dense(
         i_lb = contact_state.pair_link_b[i_p, i_b]
         if not (mochi_info.links.is_dynamic[i_la] and mochi_info.links.is_dynamic[i_lb]):
             continue
-        I_la = [i_la, i_b] if qd.static(rigid_config.batch_links_info) else i_la
-        I_lb = [i_lb, i_b] if qd.static(rigid_config.batch_links_info) else i_lb
-        dof_a = dyn_info.links.dof_start[I_la]
-        dof_b = dyn_info.links.dof_start[I_lb]
-        for k in qd.static(range(6)):
-            for l in qd.static(range(6)):
-                value = mochi_state.H_off[i_p, i_b][k, l]
-                qd.atomic_add(mochi_state.H_dense[i_b, dof_a + k, dof_b + l], value)
-                qd.atomic_add(mochi_state.H_dense[i_b, dof_b + l, dof_a + k], value)
+        func_add_projected_block(
+            i_la, i_lb, i_b, mochi_state.H_off[i_p, i_b], mochi_state.H_dense, dyn_state, dyn_info, rigid_config, True
+        )
 
 
 @qd.kernel
@@ -107,37 +144,65 @@ def kernel_cholesky_solve_dense(
 
 
 @qd.func
-def func_apply_block_preconditioner(i_l, i_b, dof_start, src: qd.Tensor, dst: qd.Tensor, mochi_state: MochiState):
-    """Block-Jacobi preconditioner: the 3x3 translational and rotational diagonal blocks of the link are inverted
-    separately."""
-    H = mochi_state.H_diag[i_l, i_b]
-    H_t = qd.Matrix.zero(gs.qd_float, 3, 3)
-    H_r = qd.Matrix.zero(gs.qd_float, 3, 3)
-    v_t = qd.Vector.zero(gs.qd_float, 3)
-    v_r = qd.Vector.zero(gs.qd_float, 3)
-    for k, l in qd.static(qd.ndrange(3, 3)):
-        H_t[k, l] = H[k, l]
-        H_r[k, l] = H[3 + k, 3 + l]
-    for k in qd.static(range(3)):
-        v_t[k] = src[dof_start + k, i_b]
-        v_r[k] = src[dof_start + 3 + k, i_b]
-    z_t = H_t.inverse() @ v_t
-    z_r = H_r.inverse() @ v_r
-    for k in qd.static(range(3)):
-        dst[dof_start + k, i_b] = z_t[k]
-        dst[dof_start + 3 + k, i_b] = z_r[k]
+def func_matvec(
+    src: qd.Tensor,
+    dst: qd.Tensor,
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    rigid_config: qd.template(),
+):
+    """dst = H src for the running conjugate gradient environments, applying the projected blocks on the fly."""
+    n_dofs = mochi_state.res.shape[0]
+    n_links = mochi_state.H_diag.shape[0]
+    max_pairs = contact_state.pair_link_a.shape[0]
+    _B = mochi_state.is_active.shape[0]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_d, i_b in qd.ndrange(n_dofs, _B):
+        if mochi_state.pcg_is_active[i_b]:
+            dst[i_d, i_b] = mochi_state.dofs_H_diag[i_d, i_b] * src[i_d, i_b]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_l, i_b in qd.ndrange(n_links, _B):
+        if mochi_state.pcg_is_active[i_b] and mochi_info.links.is_dynamic[i_l]:
+            v = func_jacobian_times_dofs(i_l, i_b, src, dyn_state, dyn_info, rigid_config)
+            func_jacobian_transpose_add(
+                i_l, i_b, mochi_state.H_diag[i_l, i_b] @ v, dst, dyn_state, dyn_info, rigid_config
+            )
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_p, i_b in qd.ndrange(max_pairs, _B):
+        if not mochi_state.pcg_is_active[i_b] or i_p >= contact_state.n_pairs[i_b]:
+            continue
+        if contact_state.n_hits[i_p, i_b] == 0:
+            continue
+        i_la = contact_state.pair_link_a[i_p, i_b]
+        i_lb = contact_state.pair_link_b[i_p, i_b]
+        if not (mochi_info.links.is_dynamic[i_la] and mochi_info.links.is_dynamic[i_lb]):
+            continue
+        H_off = mochi_state.H_off[i_p, i_b]
+        v_a = func_jacobian_times_dofs(i_la, i_b, src, dyn_state, dyn_info, rigid_config)
+        v_b = func_jacobian_times_dofs(i_lb, i_b, src, dyn_state, dyn_info, rigid_config)
+        func_jacobian_transpose_add(i_la, i_b, H_off @ v_b, dst, dyn_state, dyn_info, rigid_config)
+        func_jacobian_transpose_add(i_lb, i_b, H_off.transpose() @ v_a, dst, dyn_state, dyn_info, rigid_config)
 
 
 @qd.kernel
 def kernel_pcg_init(
+    dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     rigid_config: qd.template(),
 ):
+    """Start the conjugate gradient from dx = 0 with the Jacobi preconditioner built from the projected diagonal."""
     n_dofs = mochi_state.res.shape[0]
     n_links = mochi_state.H_diag.shape[0]
     _B = mochi_state.is_active.shape[0]
+    EPS = mochi_info.EPS[None]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_b in range(_B):
@@ -149,17 +214,26 @@ def kernel_pcg_init(
         if mochi_state.pcg_is_active[i_b]:
             mochi_state.dx[i_d, i_b] = 0.0
             mochi_state.pcg_r[i_d, i_b] = mochi_state.res[i_d, i_b]
+            mochi_state.pcg_diag[i_d, i_b] = mochi_state.dofs_H_diag[i_d, i_b]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_l, i_b in qd.ndrange(n_links, _B):
-        if mochi_state.pcg_is_active[i_b] and mochi_info.links.is_dynamic[i_l]:
-            I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
-            dof_start = dyn_info.links.dof_start[I_l]
-            func_apply_block_preconditioner(i_l, i_b, dof_start, mochi_state.pcg_r, mochi_state.pcg_z, mochi_state)
+        if not mochi_state.pcg_is_active[i_b] or not mochi_info.links.is_dynamic[i_l]:
+            continue
+        H = mochi_state.H_diag[i_l, i_b]
+        i_a = i_l
+        while i_a != -1:
+            I_a = [i_a, i_b] if qd.static(rigid_config.batch_links_info) else i_a
+            for i_d in range(dyn_info.links.dof_start[I_a], dyn_info.links.dof_end[I_a]):
+                vel, ang = func_link_dof_jacobian(i_l, i_d, i_b, dyn_state)
+                column = qd.Vector([vel[0], vel[1], vel[2], ang[0], ang[1], ang[2]], dt=gs.qd_float)
+                qd.atomic_add(mochi_state.pcg_diag[i_d, i_b], column.dot(H @ column))
+            i_a = dyn_info.links.parent_idx[I_a]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_d, i_b in qd.ndrange(n_dofs, _B):
         if mochi_state.pcg_is_active[i_b]:
             r = mochi_state.pcg_r[i_d, i_b]
-            z = mochi_state.pcg_z[i_d, i_b]
+            z = r / qd.max(mochi_state.pcg_diag[i_d, i_b], EPS)
+            mochi_state.pcg_z[i_d, i_b] = z
             mochi_state.pcg_p[i_d, i_b] = z
             qd.atomic_add(mochi_state.pcg_rTz[i_b], r * z)
             qd.atomic_add(mochi_state.pcg_rTr[i_b], r * r)
@@ -172,6 +246,7 @@ def kernel_pcg_init(
 
 @qd.kernel
 def kernel_pcg_iter(
+    dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
     mochi_state: MochiState,
@@ -179,48 +254,13 @@ def kernel_pcg_iter(
     rigid_config: qd.template(),
 ):
     n_dofs = mochi_state.res.shape[0]
-    n_links = mochi_state.H_diag.shape[0]
-    max_pairs = contact_state.pair_link_a.shape[0]
     _B = mochi_state.is_active.shape[0]
     rel_tol = mochi_info.pcg_rel_tol[None]
+    EPS = mochi_info.EPS[None]
 
-    # Ap = H p from the blocks
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b in qd.ndrange(n_links, _B):
-        if mochi_state.pcg_is_active[i_b] and mochi_info.links.is_dynamic[i_l]:
-            I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
-            dof_start = dyn_info.links.dof_start[I_l]
-            p = qd.Vector.zero(gs.qd_float, 6)
-            for k in qd.static(range(6)):
-                p[k] = mochi_state.pcg_p[dof_start + k, i_b]
-            Ap = mochi_state.H_diag[i_l, i_b] @ p
-            for k in qd.static(range(6)):
-                mochi_state.pcg_Ap[dof_start + k, i_b] = Ap[k]
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_p, i_b in qd.ndrange(max_pairs, _B):
-        if not mochi_state.pcg_is_active[i_b] or i_p >= contact_state.n_pairs[i_b]:
-            continue
-        if contact_state.n_hits[i_p, i_b] == 0:
-            continue
-        i_la = contact_state.pair_link_a[i_p, i_b]
-        i_lb = contact_state.pair_link_b[i_p, i_b]
-        if not (mochi_info.links.is_dynamic[i_la] and mochi_info.links.is_dynamic[i_lb]):
-            continue
-        I_la = [i_la, i_b] if qd.static(rigid_config.batch_links_info) else i_la
-        I_lb = [i_lb, i_b] if qd.static(rigid_config.batch_links_info) else i_lb
-        dof_a = dyn_info.links.dof_start[I_la]
-        dof_b = dyn_info.links.dof_start[I_lb]
-        p_a = qd.Vector.zero(gs.qd_float, 6)
-        p_b = qd.Vector.zero(gs.qd_float, 6)
-        for k in qd.static(range(6)):
-            p_a[k] = mochi_state.pcg_p[dof_a + k, i_b]
-            p_b[k] = mochi_state.pcg_p[dof_b + k, i_b]
-        H_off = mochi_state.H_off[i_p, i_b]
-        Ap_a = H_off @ p_b
-        Ap_b = H_off.transpose() @ p_a
-        for k in qd.static(range(6)):
-            qd.atomic_add(mochi_state.pcg_Ap[dof_a + k, i_b], Ap_a[k])
-            qd.atomic_add(mochi_state.pcg_Ap[dof_b + k, i_b], Ap_b[k])
+    func_matvec(
+        mochi_state.pcg_p, mochi_state.pcg_Ap, dyn_state, dyn_info, mochi_info, mochi_state, contact_state, rigid_config
+    )
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_b in range(_B):
@@ -242,18 +282,11 @@ def kernel_pcg_iter(
         if mochi_state.pcg_is_active[i_b]:
             alpha = mochi_state.pcg_rTz[i_b] / mochi_state.pcg_pTAp[i_b]
             mochi_state.dx[i_d, i_b] += alpha * mochi_state.pcg_p[i_d, i_b]
-            mochi_state.pcg_r[i_d, i_b] -= alpha * mochi_state.pcg_Ap[i_d, i_b]
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b in qd.ndrange(n_links, _B):
-        if mochi_state.pcg_is_active[i_b] and mochi_info.links.is_dynamic[i_l]:
-            I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
-            dof_start = dyn_info.links.dof_start[I_l]
-            func_apply_block_preconditioner(i_l, i_b, dof_start, mochi_state.pcg_r, mochi_state.pcg_z, mochi_state)
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_b in qd.ndrange(n_dofs, _B):
-        if mochi_state.pcg_is_active[i_b]:
-            r = mochi_state.pcg_r[i_d, i_b]
-            qd.atomic_add(mochi_state.pcg_rTz_new[i_b], r * mochi_state.pcg_z[i_d, i_b])
+            r = mochi_state.pcg_r[i_d, i_b] - alpha * mochi_state.pcg_Ap[i_d, i_b]
+            z = r / qd.max(mochi_state.pcg_diag[i_d, i_b], EPS)
+            mochi_state.pcg_r[i_d, i_b] = r
+            mochi_state.pcg_z[i_d, i_b] = z
+            qd.atomic_add(mochi_state.pcg_rTz_new[i_b], r * z)
             qd.atomic_add(mochi_state.pcg_rTr[i_b], r * r)
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_b in range(_B):

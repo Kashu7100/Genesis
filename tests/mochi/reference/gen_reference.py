@@ -54,9 +54,15 @@ def _contact_params(physics, friction=0.5, normal_damping=0.0):
     return params
 
 
-def _set_solver(physics, scene, *, max_iter, integrator="backward_euler", implicit_normal_force=False):
+def _set_solver(
+    physics, scene, *, max_iter, integrator="backward_euler", implicit_normal_force=False, abs_tol=None, rel_tol=None
+):
     params = scene.get_solver_params()
     params.non_linear_solver.max_iter = max_iter
+    if abs_tol is not None:
+        params.non_linear_solver.abs_tol = abs_tol
+    if rel_tol is not None:
+        params.non_linear_solver.rel_tol = rel_tol
     params.integration_method = (
         physics.IntegrationMethod.BDF2 if integrator == "bdf2" else physics.IntegrationMethod.BACKWARD_EULER
     )
@@ -184,8 +190,80 @@ def case_box_slide_friction(physics):
     return {"dt": dt, "pos": np.array(pos), "vel": np.array(vel)}
 
 
+def case_double_pendulum(physics):
+    """Two 1 m links on revolute joints about x hanging from a fixed base, each carrying a 0.1 m cube (density 1000)
+    at its lower end, released from (0.6, -0.3) rad; g = 10, dt = 0.01, backward Euler, 8 Newton iterations."""
+    dt, n_steps, length, cube = 0.01, 200, 1.0, 0.1
+    scene = physics.create_scene("double_pendulum")
+    scene.set_gravity([0.0, -10.0, 0.0])
+    _set_solver(physics, scene, max_iter=8, abs_tol=1e-10, rel_tol=1e-12)
+    coords = (0.5 * cube * CUBE_COORDINATES + np.array([0.0, -length, 0.0])).reshape((-1,))
+    cube_shape = physics.create_tri_mesh_shape(coordinates=coords, connectivity=CUBE_CONNECTIVITY.reshape((-1,)))
+    base_shape = physics.create_tri_mesh_shape(
+        coordinates=(0.01 * CUBE_COORDINATES).reshape((-1,)), connectivity=CUBE_CONNECTIVITY.reshape((-1,))
+    )
+    identity = physics.TransformRT()
+    links = [
+        physics.ArticulatedLinkParams(
+            name="base",
+            parent_link=-1,
+            parent_joint_from_link=identity,
+            shape=base_shape,
+            collider_type=physics.ColliderType.NONE,
+        ),
+        physics.ArticulatedLinkParams(
+            name="link_0",
+            parent_link=0,
+            parent_joint_from_link=identity,
+            shape=cube_shape,
+            density=1000.0,
+            collider_type=physics.ColliderType.NONE,
+        ),
+        physics.ArticulatedLinkParams(
+            name="link_1",
+            parent_link=1,
+            parent_joint_from_link=identity,
+            shape=cube_shape,
+            density=1000.0,
+            collider_type=physics.ColliderType.NONE,
+        ),
+    ]
+    joints = [
+        physics.ArticulatedJointParams(
+            name="root", type=physics.ArticulatedJointType.HARD, parent_link_from_joint=identity
+        ),
+        physics.ArticulatedJointParams(
+            name="joint_0",
+            type=physics.ArticulatedJointType.REVOLUTE,
+            parent_link_from_joint=identity,
+            axis=[1.0, 0.0, 0.0],
+        ),
+        physics.ArticulatedJointParams(
+            name="joint_1",
+            type=physics.ArticulatedJointType.REVOLUTE,
+            parent_link_from_joint=physics.TransformRT(translation=[0.0, -length, 0.0]),
+            axis=[1.0, 0.0, 0.0],
+        ),
+    ]
+    actor = scene.create_articulated_actor(
+        name="pendulum", world_from_root=physics.TransformRT(translation=[0.0, 3.0, 0.0]), joints=joints, links=links
+    )
+    actor.set_articulated_pose_from_joints(np.array([0.6, -0.3]))
+    angles, velocities = [], []
+    pose = np.zeros(2)
+    joint_vel = np.zeros(2)
+    for _ in range(n_steps):
+        scene.step(dt)
+        actor.get_articulated_pose(pose)
+        actor.get_articulated_joint_velocities(joint_vel)
+        angles.append(pose.copy())
+        velocities.append(joint_vel.copy())
+    return {"dt": dt, "angles": np.array(angles), "velocities": np.array(velocities)}
+
+
 CASES = {
     "box_drop_plane": case_box_drop_plane,
+    "double_pendulum": case_double_pendulum,
     "two_boxes_stack": case_two_boxes_stack,
     "box_slide_friction": case_box_slide_friction,
 }

@@ -20,7 +20,14 @@ Contact parameters (per material, combined per pair by geometric mean):
 | `friction_falloff_vel` | 0.01 m/s | sliding speed below which friction is regularized |
 | `normal_viscous_damping` | 0 s/m | impact damping; the coefficient of restitution e at impact speed v follows from `c = (1-e)(1+4.5e)/(e(1+8e/3))/v` |
 
-Supported in this stage: free rigid bodies and fixed bodies, plane/sphere/box analytic colliders and grid colliders for
-meshes, backward Euler and BDF2 time integration. Articulated and deformable bodies are the next stages.
+Supported: free and fixed rigid bodies, articulated bodies (URDF/MJCF kinematic trees with fixed, revolute, prismatic,
+spherical and free joints; joint damping, armature, stiffness, soft range limits, force/velocity/position drives through
+the usual `control_dofs_*` / `set_dofs_kp` / `set_dofs_kv` API), plane/sphere/box analytic colliders and grid colliders
+for meshes, backward Euler and BDF2 time integration. Contact between the links of one entity is disabled, equality
+constraints are ignored and drive forces are not clamped to the force range. Deformable bodies are the next stage.
+
+Velocities are recovered by finite differences over the step as in mochi: `get_dofs_velocity()` returns
+`sin(dq)/dt` for revolute joints and the sine-based angular velocity `vee(((R - R_prev)/dt) R^T)` for spherical and
+free joints, which differ from `dq/dt` by a factor `1 - (dq)^2/6`.
 
 - `rigid_bodies.py`: sphere and cube dropped onto a table.

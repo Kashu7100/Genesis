@@ -13,9 +13,9 @@ class MochiEntity(RigidEntity):
     """
     Rigid entity simulated by the MochiSolver.
 
-    Loading, kinematics and pose/velocity access are shared with RigidEntity. Contact is the solver's smooth penalty
-    model, so the contact readback exposes the sample-based contact points and the constraint-based controls of the
-    rigid solver are unavailable.
+    Loading, kinematics, pose/velocity access and joint control are shared with RigidEntity. Contact is the solver's
+    smooth penalty model, so the contact readback exposes the sample-based contact points; the mass-matrix and
+    constraint-solver specific accessors of the rigid solver are unavailable.
     """
 
     _solver: "MochiSolver"
@@ -113,27 +113,6 @@ class MochiEntity(RigidEntity):
 
     def _raise_unsupported(self, name):
         gs.raise_exception(f"`{name}` is not supported by entities simulated by the MochiSolver.")
-
-    def control_dofs_force(self, force, dofs_idx_local=None, envs_idx=None):
-        self._raise_unsupported("control_dofs_force")
-
-    def control_dofs_velocity(self, velocity, dofs_idx_local=None, envs_idx=None):
-        self._raise_unsupported("control_dofs_velocity")
-
-    def control_dofs_position(self, position, dofs_idx_local=None, envs_idx=None):
-        self._raise_unsupported("control_dofs_position")
-
-    def control_dofs_position_velocity(self, position, velocity, dofs_idx_local=None, envs_idx=None):
-        self._raise_unsupported("control_dofs_position_velocity")
-
-    def set_dofs_kp(self, kp, dofs_idx_local=None, envs_idx=None):
-        self._raise_unsupported("set_dofs_kp")
-
-    def set_dofs_kv(self, kv, dofs_idx_local=None, envs_idx=None):
-        self._raise_unsupported("set_dofs_kv")
-
-    def get_dofs_control_force(self, dofs_idx_local=None, envs_idx=None):
-        self._raise_unsupported("get_dofs_control_force")
 
     def get_dofs_force(self, dofs_idx_local=None, envs_idx=None):
         self._raise_unsupported("get_dofs_force")

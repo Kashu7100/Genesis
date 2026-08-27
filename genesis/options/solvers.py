@@ -1013,6 +1013,12 @@ class MochiOptions(Options):
         Absolute padding of the per-step conservative bounding boxes in meters. Defaults to 0.01.
     record_contacts : bool, optional
         Whether individual contact points are stored for readback through `entity.get_contacts()`. Defaults to True.
+    joint_limit_stiffness : float, optional
+        Stiffness in N/m (N*m/rad) of the penalty holding revolute and prismatic joints inside their range. Joint
+        limits are soft: the violation at rest is the limit torque divided by this stiffness. Higher values reduce the
+        violation but stiffen the Newton system. Defaults to 1e4 (the original engine defaults to 100).
+    joint_limit_damping : float, optional
+        Damping in N*s/m (N*m*s/rad) of the joint limit penalty, resisting the velocity of the violation. Defaults to 0.
     batch_links_info : bool, optional
         Whether to batch link info. Defaults to False.
     batch_joints_info : bool, optional
@@ -1049,6 +1055,8 @@ class MochiOptions(Options):
     max_contact_pairs_per_env: PositiveInt | None = None
     broadphase_margin: NonNegativeFloat = 0.01
     record_contacts: StrictBool = True
+    joint_limit_stiffness: PositiveFloat = 1e4
+    joint_limit_damping: NonNegativeFloat = 0.0
     batch_links_info: StrictBool = False
     batch_joints_info: StrictBool = False
     batch_dofs_info: StrictBool = False

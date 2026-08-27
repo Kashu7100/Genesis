@@ -145,7 +145,11 @@ class MochiSolverState:
         self.i_pos_shift = gs.zeros((_B, solver.n_links, 3), **args)
         self.qpos_prev = gs.zeros((_B, 2, solver.n_qs), **args)
         self.dofs_vel_prev = gs.zeros((_B, 2, solver.n_dofs), **args)
+        self.links_vel = gs.zeros((_B, solver.n_links, 3), **args)
+        self.links_ang = gs.zeros((_B, solver.n_links, 3), **args)
         self.links_vsym = gs.zeros((_B, solver.n_links, 3, 3), **args)
+        self.links_vel_prev = gs.zeros((_B, 2, solver.n_links, 3), **args)
+        self.links_ang_prev = gs.zeros((_B, 2, solver.n_links, 3), **args)
         self.links_vsym_prev = gs.zeros((_B, 2, solver.n_links, 3, 3), **args)
         self.n_hist = gs.zeros((_B,), dtype=gs.tc_int, requires_grad=False, scene=self.scene)
 

@@ -85,11 +85,13 @@ def kernel_init_mochi_fields(
     samples_link_idx: qd.types.ndarray(),
     samples_geom_idx: qd.types.ndarray(),
     links_pair_enabled: qd.types.ndarray(),
+    dofs_entity_mass: qd.types.ndarray(),
     gravity: qd.types.ndarray(),
     mochi_info: MochiInfo,
     rigid_config: qd.template(),
 ):
     n_links = links_is_dynamic.shape[0]
+    n_dofs = dofs_entity_mass.shape[0]
     n_geoms = geoms_collider_type.shape[0]
     n_samples = samples_weight.shape[0]
     _B = gravity.shape[0]
@@ -140,6 +142,10 @@ def kernel_init_mochi_fields(
     for i_la, i_lb in qd.ndrange(n_links, n_links):
         mochi_info.links_pair_enabled[i_la, i_lb] = links_pair_enabled[i_la, i_lb]
 
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_d in range(n_dofs):
+        mochi_info.dofs_entity_mass[i_d] = dofs_entity_mass[i_d]
+
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_b in range(_B):
         for k in qd.static(range(3)):
@@ -173,6 +179,7 @@ def kernel_zero_assembly(
     n_dofs = mochi_state.res.shape[0]
     n_links = mochi_state.H_diag.shape[0]
     max_pairs = contact_state.pair_link_a.shape[0]
+    max_hits = contact_state.hit_sample.shape[0]
     _B = mochi_state.is_active.shape[0]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
@@ -182,18 +189,27 @@ def kernel_zero_assembly(
                 mochi_state.obj[i_b] = 0.0
             if qd.static(record):
                 contact_state.n_hits_total[i_b] = 0
-    if qd.static(assem_res):
-        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-        for i_d, i_b in qd.ndrange(n_dofs, _B):
-            if func_is_env_active(i_b, mochi_state, skip_ls_done):
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_d, i_b in qd.ndrange(n_dofs, _B):
+        if func_is_env_active(i_b, mochi_state, skip_ls_done):
+            if qd.static(assem_res):
                 mochi_state.res[i_d, i_b] = 0.0
+            if qd.static(assem_dres):
+                mochi_state.dofs_H_diag[i_d, i_b] = 0.0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_l, i_b in qd.ndrange(n_links, _B):
         if func_is_env_active(i_b, mochi_state, skip_ls_done):
+            if qd.static(assem_res):
+                mochi_state.links_res[i_l, i_b] = qd.Vector.zero(gs.qd_float, 6)
             if qd.static(assem_dres):
                 mochi_state.H_diag[i_l, i_b] = qd.Matrix.zero(gs.qd_float, 6, 6)
             if qd.static(record):
                 dyn_state.links.contact_force[i_l, i_b] = qd.Vector.zero(gs.qd_float, 3)
+    if qd.static(record):
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_h, i_b in qd.ndrange(max_hits, _B):
+            contact_state.hit_geom_a[i_h, i_b] = -1
+            contact_state.hit_geom_b[i_h, i_b] = -1
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_p, i_b in qd.ndrange(max_pairs, _B):
         if func_is_env_active(i_b, mochi_state, skip_ls_done) and i_p < contact_state.n_pairs[i_b]:
@@ -224,28 +240,12 @@ def kernel_conservative_bounds(
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_l, i_b in qd.ndrange(n_links, _B):
-        I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
         aabb_min = mochi_info.links.samples_aabb_min[i_l]
         aabb_max = mochi_info.links.samples_aabb_max[i_l]
         pad = margin
         if mochi_info.links.is_dynamic[i_l]:
-            dof_start = dyn_info.links.dof_start[I_l]
-            vel = qd.Vector(
-                [
-                    dyn_state.dofs.vel[dof_start, i_b],
-                    dyn_state.dofs.vel[dof_start + 1, i_b],
-                    dyn_state.dofs.vel[dof_start + 2, i_b],
-                ],
-                dt=gs.qd_float,
-            )
-            omega = qd.Vector(
-                [
-                    dyn_state.dofs.vel[dof_start + 3, i_b],
-                    dyn_state.dofs.vel[dof_start + 4, i_b],
-                    dyn_state.dofs.vel[dof_start + 5, i_b],
-                ],
-                dt=gs.qd_float,
-            )
+            vel = mochi_state.links_vel_stage_start[i_l, i_b]
+            omega = mochi_state.links_ang_stage_start[i_l, i_b]
             radius = qd.max(aabb_min.norm(), aabb_max.norm())
             speed = vel.norm() + omega.norm() * radius
             speed = CONSERVATIVE_SPEED_SCALE * speed + CONSERVATIVE_MAX_ACCEL * dt
@@ -508,12 +508,8 @@ def kernel_pairs_to_blocks(
             continue
         i_la = contact_state.pair_link_a[i_p, i_b]
         i_lb = contact_state.pair_link_b[i_p, i_b]
-        I_la = [i_la, i_b] if qd.static(rigid_config.batch_links_info) else i_la
-        I_lb = [i_lb, i_b] if qd.static(rigid_config.batch_links_info) else i_lb
         is_dynamic_a = mochi_info.links.is_dynamic[i_la]
         is_dynamic_b = mochi_info.links.is_dynamic[i_lb]
-        dof_a = dyn_info.links.dof_start[I_la]
-        dof_b = dyn_info.links.dof_start[I_lb]
 
         F = contact_state.acc_f[i_p, i_b]
         Q = contact_state.acc_q[i_p, i_b]
@@ -526,12 +522,12 @@ def kernel_pairs_to_blocks(
             if is_dynamic_a:
                 torque_a = Q - c.cross(F)
                 for k in qd.static(range(3)):
-                    qd.atomic_add(mochi_state.res[dof_a + k, i_b], -F[k])
-                    qd.atomic_add(mochi_state.res[dof_a + 3 + k, i_b], -torque_a[k])
+                    qd.atomic_add(mochi_state.links_res[i_la, i_b][k], -F[k])
+                    qd.atomic_add(mochi_state.links_res[i_la, i_b][3 + k], -torque_a[k])
             if is_dynamic_b:
                 for k in qd.static(range(3)):
-                    qd.atomic_add(mochi_state.res[dof_b + k, i_b], F[k])
-                    qd.atomic_add(mochi_state.res[dof_b + 3 + k, i_b], Q[k])
+                    qd.atomic_add(mochi_state.links_res[i_lb, i_b][k], F[k])
+                    qd.atomic_add(mochi_state.links_res[i_lb, i_b][3 + k], Q[k])
 
         if qd.static(assem_dres):
             Dbar = contact_state.acc_D[i_p, i_b]

@@ -113,43 +113,57 @@ def kernel_apply_increment(
     mochi_state: MochiState,
     rigid_config: qd.template(),
 ):
-    """Move every dynamic link of the environments still searching to the trial iterate: the line search reference
-    minus the scaled Newton step, composed on the rotation manifold."""
-    n_links = mochi_info.links.is_dynamic.shape[0]
+    """Move every joint of the environments still searching to the trial iterate: the line search reference minus the
+    scaled Newton step, composed in the tangent space of the joint (body-frame rotation increment for the quaternion
+    coordinates of free and spherical joints, as the kinematic solver's velocity convention)."""
+    n_joints = dyn_info.joints.type.shape[0]
     _B = mochi_state.is_active.shape[0]
     EPS = mochi_info.EPS[None]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b in qd.ndrange(n_links, _B):
-        if not mochi_info.links.is_dynamic[i_l] or not func_is_env_active(i_b, mochi_state, True):
+    for i_j, i_b in qd.ndrange(n_joints, _B):
+        if not func_is_env_active(i_b, mochi_state, True):
             continue
-        I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
-        q_start = dyn_info.links.q_start[I_l]
-        dof_start = dyn_info.links.dof_start[I_l]
+        I_j = [i_j, i_b] if qd.static(rigid_config.batch_joints_info) else i_j
+        joint_type = dyn_info.joints.type[I_j]
+        if joint_type == gs.JOINT_TYPE.FIXED:
+            continue
+        q_start = dyn_info.joints.q_start[I_j]
+        q_end = dyn_info.joints.q_end[I_j]
+        dof_start = dyn_info.joints.dof_start[I_j]
         alpha = mochi_state.ls_alpha[i_b]
-        for k in qd.static(range(3)):
-            rigid_info.qpos[q_start + k, i_b] = (
-                mochi_state.qpos_ls_ref[q_start + k, i_b] - alpha * mochi_state.dx[dof_start + k, i_b]
+        if joint_type == gs.JOINT_TYPE.FREE or joint_type == gs.JOINT_TYPE.SPHERICAL:
+            rot_offset = 0
+            if joint_type == gs.JOINT_TYPE.FREE:
+                rot_offset = 3
+                for k in qd.static(range(3)):
+                    rigid_info.qpos[q_start + k, i_b] = (
+                        mochi_state.qpos_ls_ref[q_start + k, i_b] - alpha * mochi_state.dx[dof_start + k, i_b]
+                    )
+            rotvec = -alpha * qd.Vector(
+                [
+                    mochi_state.dx[dof_start + rot_offset, i_b],
+                    mochi_state.dx[dof_start + rot_offset + 1, i_b],
+                    mochi_state.dx[dof_start + rot_offset + 2, i_b],
+                ],
+                dt=gs.qd_float,
             )
-        rotvec = -alpha * qd.Vector(
-            [
-                mochi_state.dx[dof_start + 3, i_b],
-                mochi_state.dx[dof_start + 4, i_b],
-                mochi_state.dx[dof_start + 5, i_b],
-            ],
-            dt=gs.qd_float,
-        )
-        quat_ref = qd.Vector(
-            [
-                mochi_state.qpos_ls_ref[q_start + 3, i_b],
-                mochi_state.qpos_ls_ref[q_start + 4, i_b],
-                mochi_state.qpos_ls_ref[q_start + 5, i_b],
-                mochi_state.qpos_ls_ref[q_start + 6, i_b],
-            ],
-            dt=gs.qd_float,
-        )
-        quat = gu.qd_transform_quat_by_quat(quat_ref, gu.qd_rotvec_to_quat(rotvec, EPS))
-        for k in qd.static(range(4)):
-            rigid_info.qpos[q_start + 3 + k, i_b] = quat[k]
+            quat_ref = qd.Vector(
+                [
+                    mochi_state.qpos_ls_ref[q_start + rot_offset, i_b],
+                    mochi_state.qpos_ls_ref[q_start + rot_offset + 1, i_b],
+                    mochi_state.qpos_ls_ref[q_start + rot_offset + 2, i_b],
+                    mochi_state.qpos_ls_ref[q_start + rot_offset + 3, i_b],
+                ],
+                dt=gs.qd_float,
+            )
+            quat = gu.qd_transform_quat_by_quat(gu.qd_rotvec_to_quat(rotvec, EPS), quat_ref)
+            for k in qd.static(range(4)):
+                rigid_info.qpos[q_start + rot_offset + k, i_b] = quat[k]
+        else:
+            for i_q_ in range(q_end - q_start):
+                rigid_info.qpos[q_start + i_q_, i_b] = (
+                    mochi_state.qpos_ls_ref[q_start + i_q_, i_b] - alpha * mochi_state.dx[dof_start + i_q_, i_b]
+                )
 
 
 @qd.kernel

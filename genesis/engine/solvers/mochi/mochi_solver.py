@@ -18,9 +18,22 @@ from genesis.utils import array_class
 from genesis.utils.misc import qd_to_numpy, qd_to_torch, tensor_to_array
 from genesis.utils.sdf import SDF
 
-from ..base_solver import StateChange, Subscriber, mutates
+from ..base_solver import StateChange, Subscriber
 from ..kinematic_solver import KinematicSolver
-from ..rigid.abd.accessor import kernel_get_kinematic_state, kernel_set_kinematic_state
+from ..rigid.abd.accessor import (
+    kernel_control_dofs_force,
+    kernel_control_dofs_position,
+    kernel_control_dofs_position_velocity,
+    kernel_control_dofs_velocity,
+    kernel_get_dofs_control_force,
+    kernel_get_kinematic_state,
+    kernel_set_dofs_armature,
+    kernel_set_dofs_damping,
+    kernel_set_dofs_kp,
+    kernel_set_dofs_kv,
+    kernel_set_dofs_limit,
+    kernel_set_dofs_stiffness,
+)
 from ..rigid.abd.forward_kinematics import kernel_forward_kinematics, kernel_update_geom_aabbs, kernel_update_geoms
 from ..rigid.abd.misc import (
     kernel_bit_reduction,
@@ -29,6 +42,7 @@ from ..rigid.abd.misc import (
     kernel_init_vert_fields,
     kernel_update_geoms_render_T,
 )
+from .articulated import kernel_assemble_joints, kernel_project_links_residual, kernel_update_conv_weights
 from .colliders import query_collider
 from .contact import (
     build_geom_samples,
@@ -76,7 +90,7 @@ from .newton import (
     kernel_residual_norms,
     kernel_store_initial_norms,
 )
-from .rigid_assembly import kernel_assemble_rigid, kernel_update_conv_weights
+from .rigid_assembly import kernel_assemble_links
 
 if TYPE_CHECKING:
     from genesis.engine.scene import Scene
@@ -115,8 +129,12 @@ class MochiSolver(KinematicSolver):
         self.sdf: SDF | None = None
         self._errno = None
         self._is_contacts_recorded = False
-        self._skip_next_external_sync = False
-        self._external_state_subscriber = Subscriber(frozenset({StateChange.GEOMETRY, StateChange.DYNAMICS}))
+        # Set when the kinematic state is changed from outside the solver; the multistep history is then rebuilt at
+        # the start of the next step.
+        self._is_external_state_dirty = False
+        self._external_state_subscriber = Subscriber(
+            frozenset({StateChange.GEOMETRY, StateChange.DYNAMICS}), callback=self._on_external_state_change
+        )
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- add_entity -------------------------------------
@@ -325,16 +343,15 @@ class MochiSolver(KinematicSolver):
         links = self.links
         geoms = self.geoms
 
-        # Every link is either a fixed root or a free root: articulated entities are the next stage of the port.
         for entity in self._entities:
             if entity.n_equalities > 0:
-                gs.raise_exception("Equality constraints are not supported by the MochiSolver.")
-        for link in links:
-            is_free_root = link.parent_idx == -1 and link.n_joints == 1 and link.joints[0].type == gs.JOINT_TYPE.FREE
-            if not (link.is_fixed or is_free_root):
-                gs.raise_exception(
-                    f"Link '{link.name}' is articulated. The MochiSolver only supports free and fixed rigid bodies."
+                gs.logger.warning(
+                    f"Entity '{entity.uid}' defines {entity.n_equalities} equality constraint(s), which the MochiSolver "
+                    "does not enforce."
                 )
+        dofs_entity_mass = np.zeros(self.n_dofs_, dtype=gs.np_float)
+        for entity in self._entities:
+            dofs_entity_mass[entity.dof_start : entity.dof_end] = sum(link.inertial_mass for link in entity.links)
 
         self._layers = sorted({entity.material.contact_layer for entity in self._entities})
         n_layers = len(self._layers)
@@ -457,6 +474,7 @@ class MochiSolver(KinematicSolver):
             samples_link_idx,
             samples_geom_idx,
             self._compute_links_pair_enabled(),
+            dofs_entity_mass,
             np.tile(np.asarray(self._init_gravity, dtype=gs.np_float), (self._B, 1)),
             self.mochi_info,
             self.rigid_config,
@@ -494,9 +512,12 @@ class MochiSolver(KinematicSolver):
         )
         kernel_update_geom_aabbs(self.geoms_init_AABB, self.dyn_state, self.rigid_config)
 
+    def _on_external_state_change(self, change, envs_idx):
+        self._is_external_state_dirty = True
+
     def _sync_external_state(self):
         # State set from outside the solver invalidates the multistep history and the rotation-derivative correction.
-        if self._external_state_subscriber.pending and not self._skip_next_external_sync:
+        if self._is_external_state_dirty:
             kernel_reset_history(
                 self._scene._envs_idx,
                 self.dyn_state,
@@ -505,8 +526,7 @@ class MochiSolver(KinematicSolver):
                 self.mochi_state,
                 self.rigid_config,
             )
-        self._external_state_subscriber.clear()
-        self._skip_next_external_sync = False
+            self._is_external_state_dirty = False
 
     def substep_pre_coupling(self, f):
         if not self.is_active:
@@ -585,7 +605,7 @@ class MochiSolver(KinematicSolver):
             assem_dres,
             skip_ls_done,
         )
-        kernel_assemble_rigid(
+        kernel_assemble_links(
             self.dyn_state,
             self.dyn_info,
             self.mochi_info,
@@ -597,19 +617,41 @@ class MochiSolver(KinematicSolver):
             assem_dres,
             skip_ls_done,
         )
+        kernel_assemble_joints(
+            self.dyn_state,
+            self.dyn_info,
+            self.rigid_info,
+            self.mochi_info,
+            self.mochi_state,
+            self.rigid_config,
+            assem_obj,
+            assem_res,
+            assem_dres,
+            skip_ls_done,
+        )
         if assem_res:
+            kernel_project_links_residual(
+                self.dyn_state, self.dyn_info, self.mochi_info, self.mochi_state, self.rigid_config, skip_ls_done
+            )
             kernel_residual_norms(self.mochi_state, self.rigid_config, skip_ls_done)
 
     def _linear_solve(self):
         if self.mochi_config.use_dense_direct:
             kernel_condense_dense(
-                self.dyn_info, self.mochi_info, self.mochi_state, self.contact_state, self.rigid_config
+                self.dyn_state, self.dyn_info, self.mochi_info, self.mochi_state, self.contact_state, self.rigid_config
             )
             kernel_cholesky_solve_dense(self.mochi_info, self.mochi_state, self.rigid_config)
         else:
-            kernel_pcg_init(self.dyn_info, self.mochi_info, self.mochi_state, self.rigid_config)
+            kernel_pcg_init(self.dyn_state, self.dyn_info, self.mochi_info, self.mochi_state, self.rigid_config)
             for i_iter in range(self._n_pcg_iterations):
-                kernel_pcg_iter(self.dyn_info, self.mochi_info, self.mochi_state, self.contact_state, self.rigid_config)
+                kernel_pcg_iter(
+                    self.dyn_state,
+                    self.dyn_info,
+                    self.mochi_info,
+                    self.mochi_state,
+                    self.contact_state,
+                    self.rigid_config,
+                )
                 if (i_iter + 1) % PCG_CHECK_PERIOD == 0 and kernel_pcg_any_active(self.mochi_state) == 0:
                     break
 
@@ -698,7 +740,15 @@ class MochiSolver(KinematicSolver):
         )
         state.qpos_prev = qd_to_torch(self.mochi_state.qpos_prev, copy=True).permute((2, 0, 1)).contiguous()
         state.dofs_vel_prev = qd_to_torch(self.mochi_state.dofs_vel_prev, copy=True).permute((2, 0, 1)).contiguous()
+        state.links_vel = qd_to_torch(self.mochi_state.links_vel, copy=True).permute((1, 0, 2)).contiguous()
+        state.links_ang = qd_to_torch(self.mochi_state.links_ang, copy=True).permute((1, 0, 2)).contiguous()
         state.links_vsym = qd_to_torch(self.mochi_state.links_vsym, copy=True).permute((1, 0, 2, 3)).contiguous()
+        state.links_vel_prev = (
+            qd_to_torch(self.mochi_state.links_vel_prev, copy=True).permute((2, 0, 1, 3)).contiguous()
+        )
+        state.links_ang_prev = (
+            qd_to_torch(self.mochi_state.links_ang_prev, copy=True).permute((2, 0, 1, 3)).contiguous()
+        )
         state.links_vsym_prev = (
             qd_to_torch(self.mochi_state.links_vsym_prev, copy=True).permute((2, 0, 1, 3, 4)).contiguous()
         )
@@ -706,37 +756,32 @@ class MochiSolver(KinematicSolver):
         self._queried_states.append(state)
         return state
 
-    @mutates(StateChange.GEOMETRY, StateChange.DYNAMICS)
     def set_state(self, f, state, envs_idx=None, *, partial: bool = False) -> None:
         if not self.is_active:
             return
+        # The kinematic state is restored (and subscribers notified) by the base class; the integration history is
+        # restored on top, leaving nothing for the external-state sync of the next step to rebuild.
+        super().set_state(f, state, envs_idx, partial=False)
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
-        kernel_set_kinematic_state(
-            envs_idx,
-            state.i_pos_shift,
-            state.qpos,
-            state.dofs_vel,
-            state.links_pos,
-            state.links_quat,
-            self.dyn_state,
-            self.rigid_info,
-            self.rigid_config,
-        )
         _kernel_set_history(
             envs_idx,
             state.qpos_prev,
             state.dofs_vel_prev,
+            state.links_vel,
+            state.links_ang,
             state.links_vsym,
+            state.links_vel_prev,
+            state.links_ang_prev,
             state.links_vsym_prev,
             state.n_hist,
             self.mochi_state,
             self.rigid_config,
         )
-        self._forward_kinematics()
-        self._is_forward_pos_updated = True
-        self._is_forward_vel_updated = True
-        # The restored history is self-consistent; the notification this setter emits must not reset it.
-        self._skip_next_external_sync = True
+        kernel_update_geoms(
+            self._scene._envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, False
+        )
+        kernel_update_geom_aabbs(self.geoms_init_AABB, self.dyn_state, self.rigid_config)
+        self._is_external_state_dirty = False
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- contact API ------------------------------------
@@ -825,6 +870,91 @@ class MochiSolver(KinematicSolver):
             "res_norm0": qd_to_torch(self.mochi_state.res_norm0, copy=True),
             "res_norm": qd_to_torch(self.mochi_state.res_norm_sq, copy=True).sqrt(),
         }
+
+    # ------------------------------------------------------------------------------------
+    # ------------------------------------ control ---------------------------------------
+    # ------------------------------------------------------------------------------------
+
+    def _set_dofs_info(self, tensor_list, dofs_idx, name, envs_idx=None):
+        tensor_list = list(tensor_list)
+        for j, tensor in enumerate(tensor_list):
+            tensor, dofs_idx, envs_idx_ = self._sanitize_io_variables(
+                tensor,
+                dofs_idx,
+                self.n_dofs,
+                "dofs_idx",
+                envs_idx,
+                batched=self._options.batch_dofs_info,
+                skip_allocation=True,
+            )
+            if self.n_envs == 0 and self._options.batch_dofs_info:
+                tensor = tensor[None]
+            tensor_list[j] = tensor
+        if name == "kp":
+            kernel_set_dofs_kp(dofs_idx, envs_idx_, *tensor_list, self.dyn_info, self.rigid_config)
+        elif name == "kv":
+            kernel_set_dofs_kv(dofs_idx, envs_idx_, *tensor_list, self.dyn_info, self.rigid_config)
+        elif name == "stiffness":
+            kernel_set_dofs_stiffness(dofs_idx, envs_idx_, *tensor_list, self.dyn_info, self.rigid_config)
+        elif name == "armature":
+            kernel_set_dofs_armature(dofs_idx, envs_idx_, *tensor_list, self.dyn_info, self.rigid_config)
+        elif name == "damping":
+            kernel_set_dofs_damping(dofs_idx, envs_idx_, *tensor_list, self.dyn_info, self.rigid_config)
+        elif name == "limit":
+            kernel_set_dofs_limit(dofs_idx, envs_idx_, *tensor_list, self.dyn_info, self.rigid_config)
+        else:
+            gs.raise_exception(f"Invalid `name` {name}.")
+
+    def set_dofs_kp(self, kp, dofs_idx=None, envs_idx=None):
+        self._set_dofs_info([kp], dofs_idx, "kp", envs_idx)
+
+    def set_dofs_kv(self, kv, dofs_idx=None, envs_idx=None):
+        self._set_dofs_info([kv], dofs_idx, "kv", envs_idx)
+
+    def set_dofs_stiffness(self, stiffness, dofs_idx=None, envs_idx=None):
+        self._set_dofs_info([stiffness], dofs_idx, "stiffness", envs_idx)
+
+    def set_dofs_armature(self, armature, dofs_idx=None, envs_idx=None):
+        self._set_dofs_info([armature], dofs_idx, "armature", envs_idx)
+
+    def set_dofs_damping(self, damping, dofs_idx=None, envs_idx=None):
+        self._set_dofs_info([damping], dofs_idx, "damping", envs_idx)
+
+    def set_dofs_limit(self, lower, upper, dofs_idx=None, envs_idx=None):
+        self._set_dofs_info([lower, upper], dofs_idx, "limit", envs_idx)
+
+    def _sanitize_control(self, tensor, dofs_idx, envs_idx):
+        tensor, dofs_idx, envs_idx = self._sanitize_io_variables(
+            tensor, dofs_idx, self.n_dofs, "dofs_idx", envs_idx, skip_allocation=True
+        )
+        if self.n_envs == 0:
+            tensor = tensor[None]
+        return tensor, dofs_idx, envs_idx
+
+    def control_dofs_force(self, force, dofs_idx=None, envs_idx=None):
+        force, dofs_idx, envs_idx = self._sanitize_control(force, dofs_idx, envs_idx)
+        kernel_control_dofs_force(dofs_idx, envs_idx, force, self.dyn_state, self.rigid_config)
+
+    def control_dofs_velocity(self, velocity, dofs_idx=None, envs_idx=None):
+        velocity, dofs_idx, envs_idx = self._sanitize_control(velocity, dofs_idx, envs_idx)
+        kernel_control_dofs_velocity(dofs_idx, envs_idx, velocity, self.dyn_state, self.rigid_config)
+
+    def control_dofs_position(self, position, dofs_idx=None, envs_idx=None):
+        position, dofs_idx, envs_idx = self._sanitize_control(position, dofs_idx, envs_idx)
+        kernel_control_dofs_position(dofs_idx, envs_idx, position, self.dyn_state, self.rigid_config)
+
+    def control_dofs_position_velocity(self, position, velocity, dofs_idx=None, envs_idx=None):
+        position, dofs_idx, envs_idx_ = self._sanitize_control(position, dofs_idx, envs_idx)
+        velocity, _, _ = self._sanitize_control(velocity, dofs_idx, envs_idx)
+        kernel_control_dofs_position_velocity(
+            dofs_idx, envs_idx_, position, velocity, self.dyn_state, self.rigid_config
+        )
+
+    def get_dofs_control_force(self, dofs_idx=None, envs_idx=None):
+        _tensor, dofs_idx, envs_idx = self._sanitize_io_variables(None, dofs_idx, self.n_dofs, "dofs_idx", envs_idx)
+        tensor = _tensor[None] if self.n_envs == 0 else _tensor
+        kernel_get_dofs_control_force(dofs_idx, envs_idx, tensor, self.dyn_state, self.dyn_info, self.rigid_config)
+        return _tensor
 
     def set_links_contact_params(self, links_idx, **params):
         links_idx = tensor_to_array(links_idx).reshape((-1,))
@@ -925,7 +1055,11 @@ def _kernel_set_history(
     envs_idx: qd.types.ndarray(),
     qpos_prev: qd.types.ndarray(),
     dofs_vel_prev: qd.types.ndarray(),
+    links_vel: qd.types.ndarray(),
+    links_ang: qd.types.ndarray(),
     links_vsym: qd.types.ndarray(),
+    links_vel_prev: qd.types.ndarray(),
+    links_ang_prev: qd.types.ndarray(),
     links_vsym_prev: qd.types.ndarray(),
     n_hist: qd.types.ndarray(),
     mochi_state: MochiState,
@@ -950,6 +1084,12 @@ def _kernel_set_history(
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_l, i_b_ in qd.ndrange(n_links, envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
+        for j in qd.static(range(3)):
+            mochi_state.links_vel[i_l, i_b][j] = links_vel[i_b, i_l, j]
+            mochi_state.links_ang[i_l, i_b][j] = links_ang[i_b, i_l, j]
+            for k in qd.static(range(N_HISTORY)):
+                mochi_state.links_vel_prev[k, i_l, i_b][j] = links_vel_prev[i_b, k, i_l, j]
+                mochi_state.links_ang_prev[k, i_l, i_b][j] = links_ang_prev[i_b, k, i_l, j]
         for j, l in qd.static(qd.ndrange(3, 3)):
             mochi_state.links_vsym[i_l, i_b][j, l] = links_vsym[i_b, i_l, j, l]
             for k in qd.static(range(N_HISTORY)):

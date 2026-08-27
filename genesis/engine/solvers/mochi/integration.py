@@ -1,8 +1,9 @@
 # Portions of this file are derived from Meta Platforms, Inc. and affiliates' "mochi" physics library
 # (mochi_core / mochi_physics), licensed under the Apache License, Version 2.0.
 # SPDX-License-Identifier: Apache-2.0
-"""Time integration of the MochiSolver: multistep history, stage-start extrapolation (backward Euler and BDF2) and
-the finite-difference velocity recovered from the solved poses."""
+"""Time integration of the MochiSolver: multistep history, stage-start extrapolation (backward Euler and BDF2) of the
+generalized coordinates and of the link velocities, and the finite-difference velocities recovered from the solved
+configuration."""
 
 import quadrants as qd
 
@@ -18,6 +19,33 @@ BDF2_ALPHA_2 = -1.0 / 3.0
 BDF2_BETA = 2.0 / 3.0
 
 
+@qd.func
+def func_read_quat(qpos: qd.Tensor, q_start, i_b):
+    return qd.Vector(
+        [qpos[q_start, i_b], qpos[q_start + 1, i_b], qpos[q_start + 2, i_b], qpos[q_start + 3, i_b]], dt=gs.qd_float
+    )
+
+
+@qd.func
+def func_read_quat_hist(qpos: qd.Tensor, slot, q_start, i_b):
+    return qd.Vector(
+        [
+            qpos[slot, q_start, i_b],
+            qpos[slot, q_start + 1, i_b],
+            qpos[slot, q_start + 2, i_b],
+            qpos[slot, q_start + 3, i_b],
+        ],
+        dt=gs.qd_float,
+    )
+
+
+@qd.func
+def func_quat_extrapolate(quat_1, quat_2, alpha, eps):
+    """quat_1 composed with alpha times the body-frame rotation from quat_1 to quat_2."""
+    rotvec = gu.qd_quat_to_rotvec(gu.qd_quat_mul(gu.qd_inv_quat(quat_1), quat_2), eps)
+    return gu.qd_transform_quat_by_quat(gu.qd_rotvec_to_quat(alpha * rotvec, eps), quat_1)
+
+
 @qd.kernel
 def kernel_step_start(
     dyn_state: array_class.DynState,
@@ -28,11 +56,12 @@ def kernel_step_start(
     rigid_config: qd.template(),
     mochi_config: qd.template(),
 ):
-    """Shift the multistep history by one step and build the stage-start reference of the new step: the previous pose
+    """Shift the multistep history by one step and build the stage-start reference of the new step: the previous state
     for backward Euler, the two-step extrapolation for BDF2, which is also the warm start of the Newton solve."""
     n_qs = rigid_info.qpos.shape[0]
     n_dofs = dyn_state.dofs.vel.shape[0]
     n_links = dyn_state.links.pos.shape[0]
+    n_joints = dyn_info.joints.type.shape[0]
     _B = mochi_state.n_hist.shape[0]
     EPS = mochi_info.EPS[None]
 
@@ -57,81 +86,69 @@ def kernel_step_start(
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_l, i_b in qd.ndrange(n_links, _B):
+        mochi_state.links_vel_prev[1, i_l, i_b] = mochi_state.links_vel_prev[0, i_l, i_b]
+        mochi_state.links_ang_prev[1, i_l, i_b] = mochi_state.links_ang_prev[0, i_l, i_b]
         mochi_state.links_vsym_prev[1, i_l, i_b] = mochi_state.links_vsym_prev[0, i_l, i_b]
+        mochi_state.links_vel_prev[0, i_l, i_b] = mochi_state.links_vel[i_l, i_b]
+        mochi_state.links_ang_prev[0, i_l, i_b] = mochi_state.links_ang[i_l, i_b]
         mochi_state.links_vsym_prev[0, i_l, i_b] = mochi_state.links_vsym[i_l, i_b]
 
+    # Step-start generalized coordinates, joint by joint: linear extrapolation of the coordinates of scalar joints
+    # and of free-joint translations, geodesic extrapolation of the quaternions.
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b in qd.ndrange(n_links, _B):
-        if not mochi_info.links.is_dynamic[i_l]:
-            continue
-        I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
-        q_start = dyn_info.links.q_start[I_l]
-        dof_start = dyn_info.links.dof_start[I_l]
-
+    for i_j, i_b in qd.ndrange(n_joints, _B):
+        I_j = [i_j, i_b] if qd.static(rigid_config.batch_joints_info) else i_j
+        joint_type = dyn_info.joints.type[I_j]
+        q_start = dyn_info.joints.q_start[I_j]
+        q_end = dyn_info.joints.q_end[I_j]
         is_bdf2 = False
         if qd.static(mochi_config.integrator == INTEGRATOR.BDF2):
             is_bdf2 = mochi_state.n_hist[i_b] >= 2
-
-        if is_bdf2:
-            for k in qd.static(range(3)):
-                x1 = mochi_state.qpos_prev[0, q_start + k, i_b]
-                x2 = mochi_state.qpos_prev[1, q_start + k, i_b]
-                mochi_state.qpos_step_start[q_start + k, i_b] = x1 + BDF2_ALPHA_2 * (x2 - x1)
-            quat1 = qd.Vector(
-                [
-                    mochi_state.qpos_prev[0, q_start + 3, i_b],
-                    mochi_state.qpos_prev[0, q_start + 4, i_b],
-                    mochi_state.qpos_prev[0, q_start + 5, i_b],
-                    mochi_state.qpos_prev[0, q_start + 6, i_b],
-                ],
-                dt=gs.qd_float,
-            )
-            quat2 = qd.Vector(
-                [
-                    mochi_state.qpos_prev[1, q_start + 3, i_b],
-                    mochi_state.qpos_prev[1, q_start + 4, i_b],
-                    mochi_state.qpos_prev[1, q_start + 5, i_b],
-                    mochi_state.qpos_prev[1, q_start + 6, i_b],
-                ],
-                dt=gs.qd_float,
-            )
-            # Lie extrapolation: exp(alpha_2 log(q_-2 q_-1^-1)) q_-1.
-            rotvec = gu.qd_quat_to_rotvec(gu.qd_quat_mul(quat2, gu.qd_inv_quat(quat1)), EPS)
-            quat0 = gu.qd_transform_quat_by_quat(quat1, gu.qd_rotvec_to_quat(BDF2_ALPHA_2 * rotvec, EPS))
+        for i_q in range(q_start, q_end):
+            x1 = mochi_state.qpos_prev[0, i_q, i_b]
+            value = x1
+            if is_bdf2:
+                value = x1 + BDF2_ALPHA_2 * (mochi_state.qpos_prev[1, i_q, i_b] - x1)
+            mochi_state.qpos_step_start[i_q, i_b] = value
+        if is_bdf2 and (joint_type == gs.JOINT_TYPE.FREE or joint_type == gs.JOINT_TYPE.SPHERICAL):
+            rot_offset = 3 if joint_type == gs.JOINT_TYPE.FREE else 0
+            quat_1 = func_read_quat_hist(mochi_state.qpos_prev, 0, q_start + rot_offset, i_b)
+            quat_2 = func_read_quat_hist(mochi_state.qpos_prev, 1, q_start + rot_offset, i_b)
+            quat_0 = func_quat_extrapolate(quat_1, quat_2, BDF2_ALPHA_2, EPS)
             for k in qd.static(range(4)):
-                mochi_state.qpos_step_start[q_start + 3 + k, i_b] = quat0[k]
-            for k in qd.static(range(6)):
-                v1 = mochi_state.dofs_vel_prev[0, dof_start + k, i_b]
-                v2 = mochi_state.dofs_vel_prev[1, dof_start + k, i_b]
-                mochi_state.dofs_vel_stage_start[dof_start + k, i_b] = v1 + BDF2_ALPHA_2 * (v2 - v1)
-            S1 = mochi_state.links_vsym_prev[0, i_l, i_b]
-            S2 = mochi_state.links_vsym_prev[1, i_l, i_b]
-            mochi_state.links_vsym_stage_start[i_l, i_b] = S1 + BDF2_ALPHA_2 * (S2 - S1)
-        else:
-            for k in qd.static(range(7)):
-                mochi_state.qpos_step_start[q_start + k, i_b] = mochi_state.qpos_prev[0, q_start + k, i_b]
-            for k in qd.static(range(6)):
-                mochi_state.dofs_vel_stage_start[dof_start + k, i_b] = mochi_state.dofs_vel_prev[0, dof_start + k, i_b]
-            mochi_state.links_vsym_stage_start[i_l, i_b] = mochi_state.links_vsym_prev[0, i_l, i_b]
+                mochi_state.qpos_step_start[q_start + rot_offset + k, i_b] = quat_0[k]
 
-        # Single-stage schemes: the stage starts at the step start, which is also the warm start of the solve.
-        for k in qd.static(range(7)):
-            mochi_state.qpos_stage_start[q_start + k, i_b] = mochi_state.qpos_step_start[q_start + k, i_b]
-            rigid_info.qpos[q_start + k, i_b] = mochi_state.qpos_step_start[q_start + k, i_b]
-
-
-@qd.kernel
-def kernel_set_qpos_from(
-    src: qd.Tensor,
-    rigid_info: array_class.RigidInfo,
-    rigid_config: qd.template(),
-):
-    """Copy a (n_qs, B) buffer into the generalized coordinates."""
-    n_qs = rigid_info.qpos.shape[0]
-    _B = rigid_info.qpos.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_q, i_b in qd.ndrange(n_qs, _B):
-        rigid_info.qpos[i_q, i_b] = src[i_q, i_b]
+        # Single-stage schemes: the stage starts at the step start, which is also the warm start of the solve.
+        mochi_state.qpos_stage_start[i_q, i_b] = mochi_state.qpos_step_start[i_q, i_b]
+        rigid_info.qpos[i_q, i_b] = mochi_state.qpos_step_start[i_q, i_b]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_d, i_b in qd.ndrange(n_dofs, _B):
+        v1 = mochi_state.dofs_vel_prev[0, i_d, i_b]
+        value = v1
+        if qd.static(mochi_config.integrator == INTEGRATOR.BDF2):  # noqa: SIM102
+            if mochi_state.n_hist[i_b] >= 2:
+                value = v1 + BDF2_ALPHA_2 * (mochi_state.dofs_vel_prev[1, i_d, i_b] - v1)
+        mochi_state.dofs_vel_stage_start[i_d, i_b] = value
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_l, i_b in qd.ndrange(n_links, _B):
+        vel_1 = mochi_state.links_vel_prev[0, i_l, i_b]
+        ang_1 = mochi_state.links_ang_prev[0, i_l, i_b]
+        vsym_1 = mochi_state.links_vsym_prev[0, i_l, i_b]
+        vel = vel_1
+        ang = ang_1
+        vsym = vsym_1
+        if qd.static(mochi_config.integrator == INTEGRATOR.BDF2):  # noqa: SIM102
+            if mochi_state.n_hist[i_b] >= 2:
+                vel = vel_1 + BDF2_ALPHA_2 * (mochi_state.links_vel_prev[1, i_l, i_b] - vel_1)
+                ang = ang_1 + BDF2_ALPHA_2 * (mochi_state.links_ang_prev[1, i_l, i_b] - ang_1)
+                vsym = vsym_1 + BDF2_ALPHA_2 * (mochi_state.links_vsym_prev[1, i_l, i_b] - vsym_1)
+        mochi_state.links_vel_stage_start[i_l, i_b] = vel
+        mochi_state.links_ang_stage_start[i_l, i_b] = ang
+        mochi_state.links_vsym_stage_start[i_l, i_b] = vsym
 
 
 @qd.kernel
@@ -164,68 +181,82 @@ def kernel_post_stage(
     mochi_state: MochiState,
     rigid_config: qd.template(),
 ):
-    """Recover the velocity of every dynamic link by finite differences over the stage. The angular velocity is the
+    """Recover the velocities by finite differences over the stage: per degree of freedom (in the tangent space of
+    its joint, so that the kinematic solver's velocity conventions hold), and per link (the angular velocity is the
     antisymmetric part of (R - R_start)/h R^T and the symmetric part is kept so the next step extrapolates the same
-    rotation increment. A diverged environment is reset to its previous pose at rest."""
+    rotation increment). A diverged environment is reset to its previous configuration at rest."""
+    n_joints = dyn_info.joints.type.shape[0]
     n_links = dyn_state.links.pos.shape[0]
     _B = dyn_state.links.pos.shape[1]
     EPS = mochi_info.EPS[None]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_j, i_b in qd.ndrange(n_joints, _B):
+        I_j = [i_j, i_b] if qd.static(rigid_config.batch_joints_info) else i_j
+        joint_type = dyn_info.joints.type[I_j]
+        if joint_type == gs.JOINT_TYPE.FIXED:
+            continue
+        q_start = dyn_info.joints.q_start[I_j]
+        q_end = dyn_info.joints.q_end[I_j]
+        dof_start = dyn_info.joints.dof_start[I_j]
+        if mochi_state.status[i_b] == SOLVE_STATUS.DIVERGED:
+            for i_q in range(q_start, q_end):
+                rigid_info.qpos[i_q, i_b] = mochi_state.qpos_prev[0, i_q, i_b]
+            for i_d in range(dof_start, dyn_info.joints.dof_end[I_j]):
+                dyn_state.dofs.vel[i_d, i_b] = 0.0
+            continue
+        h = mochi_state.dt_stage[i_b]
+        if joint_type == gs.JOINT_TYPE.FREE or joint_type == gs.JOINT_TYPE.SPHERICAL:
+            rot_offset = 0
+            if joint_type == gs.JOINT_TYPE.FREE:
+                rot_offset = 3
+                for k in qd.static(range(3)):
+                    dyn_state.dofs.vel[dof_start + k, i_b] = (
+                        rigid_info.qpos[q_start + k, i_b] - mochi_state.qpos_stage_start[q_start + k, i_b]
+                    ) / h
+            quat = func_read_quat(rigid_info.qpos, q_start + rot_offset, i_b)
+            quat_start = func_read_quat(mochi_state.qpos_stage_start, q_start + rot_offset, i_b)
+            # Body-frame angular velocity, the tangent space of the quaternion degrees of freedom.
+            rotvec = gu.qd_quat_to_rotvec(gu.qd_quat_mul(gu.qd_inv_quat(quat_start), quat), EPS)
+            # Sine-based finite-difference angular velocity, vee(((R - R_ss) / h) R^T) expressed in the joint frame,
+            # so that joint velocities match the rigid-body history (mochi convention).
+            angle = rotvec.norm()
+            sinc = gs.qd_float(1.0)
+            if angle > EPS:
+                sinc = qd.sin(angle) / angle
+            for k in qd.static(range(3)):
+                dyn_state.dofs.vel[dof_start + rot_offset + k, i_b] = rotvec[k] * sinc / h
+        else:
+            for i_q_ in range(q_end - q_start):
+                dq = rigid_info.qpos[q_start + i_q_, i_b] - mochi_state.qpos_stage_start[q_start + i_q_, i_b]
+                if joint_type == gs.JOINT_TYPE.REVOLUTE:
+                    # Sine-based finite difference of the joint rotation, consistent with the angular velocities.
+                    dq = qd.sin(dq)
+                dyn_state.dofs.vel[dof_start + i_q_, i_b] = dq / h
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_l, i_b in qd.ndrange(n_links, _B):
         if not mochi_info.links.is_dynamic[i_l]:
             continue
-        I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
-        q_start = dyn_info.links.q_start[I_l]
-        dof_start = dyn_info.links.dof_start[I_l]
-
         if mochi_state.status[i_b] == SOLVE_STATUS.DIVERGED:
-            for k in qd.static(range(7)):
-                rigid_info.qpos[q_start + k, i_b] = mochi_state.qpos_prev[0, q_start + k, i_b]
-            for k in qd.static(range(6)):
-                dyn_state.dofs.vel[dof_start + k, i_b] = 0.0
+            mochi_state.links_vel[i_l, i_b] = qd.Vector.zero(gs.qd_float, 3)
+            mochi_state.links_ang[i_l, i_b] = qd.Vector.zero(gs.qd_float, 3)
             mochi_state.links_vsym[i_l, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
             continue
-
         h = mochi_state.dt_stage[i_b]
-        pos = qd.Vector(
-            [rigid_info.qpos[q_start, i_b], rigid_info.qpos[q_start + 1, i_b], rigid_info.qpos[q_start + 2, i_b]],
-            dt=gs.qd_float,
-        )
-        quat = qd.Vector(
-            [
-                rigid_info.qpos[q_start + 3, i_b],
-                rigid_info.qpos[q_start + 4, i_b],
-                rigid_info.qpos[q_start + 5, i_b],
-                rigid_info.qpos[q_start + 6, i_b],
-            ],
-            dt=gs.qd_float,
-        )
-        pos_start = qd.Vector(
-            [
-                mochi_state.qpos_stage_start[q_start, i_b],
-                mochi_state.qpos_stage_start[q_start + 1, i_b],
-                mochi_state.qpos_stage_start[q_start + 2, i_b],
-            ],
-            dt=gs.qd_float,
-        )
-        quat_start = qd.Vector(
-            [
-                mochi_state.qpos_stage_start[q_start + 3, i_b],
-                mochi_state.qpos_stage_start[q_start + 4, i_b],
-                mochi_state.qpos_stage_start[q_start + 5, i_b],
-                mochi_state.qpos_stage_start[q_start + 6, i_b],
-            ],
-            dt=gs.qd_float,
-        )
-        vel = (pos - pos_start) / h
-        R = gu.qd_quat_to_R(quat, EPS)
-        R_start = gu.qd_quat_to_R(quat_start, EPS)
+        # The link poses still hold the solved configuration (forward kinematics ran on the accepted iterate).
+        pos = dyn_state.links.pos[i_l, i_b]
+        R = gu.qd_quat_to_R(dyn_state.links.quat[i_l, i_b], EPS)
+        R_start = gu.qd_quat_to_R(mochi_state.links_quat_stage_start[i_l, i_b], EPS)
         F = ((R - R_start) / h) @ R.transpose()
-        omega = vee(F)
-        for k in qd.static(range(3)):
-            dyn_state.dofs.vel[dof_start + k, i_b] = vel[k]
-            dyn_state.dofs.vel[dof_start + 3 + k, i_b] = omega[k]
+        # The translational history is the finite-difference velocity of the center of mass, the point at which
+        # the inertia is assembled (it differs from the link-origin velocity by (skew(w) + S) r_c).
+        I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
+        com_local = dyn_info.links.inertial_pos[I_l]
+        pos_c = pos + R @ com_local
+        pos_c_start = mochi_state.links_pos_stage_start[i_l, i_b] + R_start @ com_local
+        mochi_state.links_vel[i_l, i_b] = (pos_c - pos_c_start) / h
+        mochi_state.links_ang[i_l, i_b] = vee(F)
         mochi_state.links_vsym[i_l, i_b] = sym(F)
 
 
@@ -239,8 +270,8 @@ def kernel_reset_history(
     rigid_config: qd.template(),
 ):
     """Invalidate the multistep history of the given environments (their next step is a backward Euler step) and
-    rebuild the symmetric rotation-derivative correction from the current angular velocities, as required after the
-    state has been set from outside the solver."""
+    rebuild the link velocities from the kinematic solver's velocity state, as required after the state has been set
+    from outside the solver."""
     n_links = dyn_state.links.pos.shape[0]
     dt = mochi_info.dt[None]
     EPS = mochi_info.EPS[None]
@@ -252,17 +283,13 @@ def kernel_reset_history(
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_l, i_b_ in qd.ndrange(n_links, envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
+        vel = qd.Vector.zero(gs.qd_float, 3)
+        ang = qd.Vector.zero(gs.qd_float, 3)
         S = qd.Matrix.zero(gs.qd_float, 3, 3)
         if mochi_info.links.is_dynamic[i_l]:
-            I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
-            dof_start = dyn_info.links.dof_start[I_l]
-            omega = qd.Vector(
-                [
-                    dyn_state.dofs.vel[dof_start + 3, i_b],
-                    dyn_state.dofs.vel[dof_start + 4, i_b],
-                    dyn_state.dofs.vel[dof_start + 5, i_b],
-                ],
-                dt=gs.qd_float,
-            )
-            S = vsym_from_omega(omega, dt, EPS)
+            ang = dyn_state.links.cd_ang[i_l, i_b]
+            vel = dyn_state.links.cd_vel[i_l, i_b] + ang.cross(dyn_state.links.i_pos[i_l, i_b])
+            S = vsym_from_omega(ang, dt, EPS)
+        mochi_state.links_vel[i_l, i_b] = vel
+        mochi_state.links_ang[i_l, i_b] = ang
         mochi_state.links_vsym[i_l, i_b] = S

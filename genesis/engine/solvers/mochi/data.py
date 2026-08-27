@@ -163,8 +163,12 @@ class MochiInfo:
     samples: MochiSamplesInfo
     # Whether contact between two links is enabled (layer and entity filters folded in).
     links_pair_enabled: qd.Tensor
+    # Total mass of the entity owning each degree of freedom, scaling its convergence weight.
+    dofs_entity_mass: qd.Tensor
     # Runtime constants
     dt: qd.Tensor
+    joint_limit_stiffness: qd.Tensor
+    joint_limit_damping: qd.Tensor
     gravity: qd.Tensor
     broadphase_margin: qd.Tensor
     newton_abs_tol: qd.Tensor
@@ -185,7 +189,10 @@ def get_mochi_info(solver):
         geoms=get_mochi_geoms_info(solver),
         samples=get_mochi_samples_info(solver),
         links_pair_enabled=V(dtype=gs.qd_bool, shape=(solver.n_links_, solver.n_links_)),
+        dofs_entity_mass=V(dtype=gs.qd_float, shape=(solver.n_dofs_,)),
         dt=_scalar(gs.qd_float, solver._substep_dt),
+        joint_limit_stiffness=_scalar(gs.qd_float, options.joint_limit_stiffness),
+        joint_limit_damping=_scalar(gs.qd_float, options.joint_limit_damping),
         gravity=V(dtype=gs.qd_vec3, shape=(solver._B,)),
         broadphase_margin=_scalar(gs.qd_float, options.broadphase_margin),
         newton_abs_tol=_scalar(gs.qd_float, options.newton_abs_tol),
@@ -211,19 +218,26 @@ def _scalar(dtype, value):
 
 @dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
 class MochiState:
-    # Multistep history of the generalized coordinates, velocities and symmetric rotation-derivative correction:
-    # slot 0 is the previous step, slot 1 the one before.
+    # Multistep history of the generalized coordinates and velocities, and of the finite-difference link velocities
+    # (translational, angular, and the symmetric rotation-derivative correction): slot 0 is the previous step, slot 1
+    # the one before.
     qpos_prev: qd.Tensor
     dofs_vel_prev: qd.Tensor
+    links_vel_prev: qd.Tensor
+    links_ang_prev: qd.Tensor
     links_vsym_prev: qd.Tensor
-    # Symmetric part of the finite-difference rotation derivative of every link at the end of the last step. Together
-    # with the angular velocity it reproduces the rotation increment of that step exactly, which the rotation merit
-    # of the next step extrapolates from.
+    # Finite-difference velocity of every link at the end of the last step. Together with the angular velocity, the
+    # symmetric part of the rotation derivative reproduces the rotation increment of that step exactly, which the
+    # rotation merit of the next step extrapolates from.
+    links_vel: qd.Tensor
+    links_ang: qd.Tensor
     links_vsym: qd.Tensor
     # Step-start extrapolation and stage-start reference of the current solve (identical for single-stage schemes).
     qpos_step_start: qd.Tensor
     qpos_stage_start: qd.Tensor
     dofs_vel_stage_start: qd.Tensor
+    links_vel_stage_start: qd.Tensor
+    links_ang_stage_start: qd.Tensor
     links_vsym_stage_start: qd.Tensor
     links_pos_stage_start: qd.Tensor
     links_quat_stage_start: qd.Tensor
@@ -235,11 +249,14 @@ class MochiState:
     # time step of the current solve.
     n_hist: qd.Tensor
     dt_stage: qd.Tensor
-    # Newton system: residual (gradient of the incremental potential), step, convergence weights, per-link diagonal
-    # 6x6 blocks and per-contact-pair off-diagonal 6x6 blocks of the Hessian, and its dense condensation.
+    # Newton system. Link-space accumulators (residual 6-vector, diagonal 6x6 block per link, off-diagonal 6x6 block
+    # per contact pair) are projected onto the degrees of freedom through the link Jacobians; joint-space terms add
+    # to the residual and to the diagonal of the projected Hessian directly.
+    links_res: qd.Tensor
     res: qd.Tensor
     dx: qd.Tensor
     conv_w: qd.Tensor
+    dofs_H_diag: qd.Tensor
     H_diag: qd.Tensor
     H_off: qd.Tensor
     H_dense: qd.Tensor
@@ -258,6 +275,7 @@ class MochiState:
     obj: qd.Tensor
     obj_ref: qd.Tensor
     # Preconditioned conjugate gradient scratch.
+    pcg_diag: qd.Tensor
     pcg_r: qd.Tensor
     pcg_z: qd.Tensor
     pcg_p: qd.Tensor
@@ -277,11 +295,17 @@ def get_mochi_state(solver, max_pairs, use_dense_direct):
     return MochiState(
         qpos_prev=V(dtype=gs.qd_float, shape=(N_HISTORY, n_qs_, _B)),
         dofs_vel_prev=V(dtype=gs.qd_float, shape=(N_HISTORY, n_dofs_, _B)),
+        links_vel_prev=V(dtype=gs.qd_vec3, shape=(N_HISTORY, n_links_, _B)),
+        links_ang_prev=V(dtype=gs.qd_vec3, shape=(N_HISTORY, n_links_, _B)),
         links_vsym_prev=V(dtype=gs.qd_mat3, shape=(N_HISTORY, n_links_, _B)),
+        links_vel=V(dtype=gs.qd_vec3, shape=(n_links_, _B)),
+        links_ang=V(dtype=gs.qd_vec3, shape=(n_links_, _B)),
         links_vsym=V(dtype=gs.qd_mat3, shape=(n_links_, _B)),
         qpos_step_start=V(dtype=gs.qd_float, shape=(n_qs_, _B)),
         qpos_stage_start=V(dtype=gs.qd_float, shape=(n_qs_, _B)),
         dofs_vel_stage_start=V(dtype=gs.qd_float, shape=(n_dofs_, _B)),
+        links_vel_stage_start=V(dtype=gs.qd_vec3, shape=(n_links_, _B)),
+        links_ang_stage_start=V(dtype=gs.qd_vec3, shape=(n_links_, _B)),
         links_vsym_stage_start=V(dtype=gs.qd_mat3, shape=(n_links_, _B)),
         links_pos_stage_start=V(dtype=gs.qd_vec3, shape=(n_links_, _B)),
         links_quat_stage_start=V(dtype=gs.qd_vec4, shape=(n_links_, _B)),
@@ -290,9 +314,11 @@ def get_mochi_state(solver, max_pairs, use_dense_direct):
         qpos_ls_ref=V(dtype=gs.qd_float, shape=(n_qs_, _B)),
         n_hist=V(dtype=gs.qd_int, shape=(_B,)),
         dt_stage=V(dtype=gs.qd_float, shape=(_B,)),
+        links_res=V(dtype=gs.qd_vec6, shape=(n_links_, _B)),
         res=V(dtype=gs.qd_float, shape=(n_dofs_, _B)),
         dx=V(dtype=gs.qd_float, shape=(n_dofs_, _B)),
         conv_w=V(dtype=gs.qd_float, shape=(n_dofs_, _B)),
+        dofs_H_diag=V(dtype=gs.qd_float, shape=(n_dofs_, _B)),
         H_diag=V_MAT(n=6, m=6, dtype=gs.qd_float, shape=(n_links_, _B)),
         H_off=V_MAT(n=6, m=6, dtype=gs.qd_float, shape=(max_pairs, _B)),
         H_dense=V(dtype=gs.qd_float, shape=H_dense_shape),
@@ -309,6 +335,7 @@ def get_mochi_state(solver, max_pairs, use_dense_direct):
         ls_slope=V(dtype=gs.qd_float, shape=(_B,)),
         obj=V(dtype=gs.qd_float, shape=(_B,)),
         obj_ref=V(dtype=gs.qd_float, shape=(_B,)),
+        pcg_diag=V(dtype=gs.qd_float, shape=(n_dofs_, _B)),
         pcg_r=V(dtype=gs.qd_float, shape=(n_dofs_, _B)),
         pcg_z=V(dtype=gs.qd_float, shape=(n_dofs_, _B)),
         pcg_p=V(dtype=gs.qd_float, shape=(n_dofs_, _B)),
