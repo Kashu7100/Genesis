@@ -427,8 +427,9 @@ class MochiSoftInfo:
     verts_rest: qd.Tensor
     verts_mass: qd.Tensor
     verts_entity_idx: qd.Tensor
-    # Tetrahedra: vertex indices, inverse rest edge matrix (node 3 as origin), rest volume and owning entity.
+    # Tetrahedra: vertex indices, rest edge matrix and its inverse (node 3 as origin), rest volume and owning entity.
     elems_v: qd.Tensor
+    elems_Dm: qd.Tensor
     elems_Dm_inv: qd.Tensor
     elems_vol: qd.Tensor
     elems_entity_idx: qd.Tensor
@@ -458,8 +459,18 @@ class MochiSoftInfo:
     entities_vert_end: qd.Tensor
     entities_sample_start: qd.Tensor
     entities_sample_end: qd.Tensor
-    # Whether contact between a deformable entity and a rigid link is enabled (layer and entity filters).
+    # Whether the entity acts as a collider, and its rest-shape signed distance grid: offset into the flattened voxel
+    # array, resolution, position of the first voxel and cell size per axis (rest frame == world frame at build).
+    entities_collider_type: qd.Tensor
+    entities_sdf_start: qd.Tensor
+    entities_sdf_res: qd.Tensor
+    entities_sdf_origin: qd.Tensor
+    entities_sdf_cell: qd.Tensor
+    sdf_values: qd.Tensor
+    # Whether contact between a deformable entity and a rigid link, or between two deformable entities, is enabled
+    # (layer and entity filters).
     entities_links_pair_enabled: qd.Tensor
+    entities_pair_enabled: qd.Tensor
     # Offset of the first deformable degree of freedom in the Newton system (after the rigid degrees of freedom).
     dof_start: qd.Tensor
 
@@ -476,6 +487,7 @@ def get_mochi_soft_info(solver):
         verts_mass=V(dtype=gs.qd_float, shape=(n_sv_,)),
         verts_entity_idx=V(dtype=gs.qd_int, shape=(n_sv_,)),
         elems_v=V(dtype=gs.qd_ivec4, shape=(n_el_,)),
+        elems_Dm=V(dtype=gs.qd_mat3, shape=(n_el_,)),
         elems_Dm_inv=V(dtype=gs.qd_mat3, shape=(n_el_,)),
         elems_vol=V(dtype=gs.qd_float, shape=(n_el_,)),
         elems_entity_idx=V(dtype=gs.qd_int, shape=(n_el_,)),
@@ -503,7 +515,14 @@ def get_mochi_soft_info(solver):
         entities_vert_end=V(dtype=gs.qd_int, shape=(n_se_,)),
         entities_sample_start=V(dtype=gs.qd_int, shape=(n_se_,)),
         entities_sample_end=V(dtype=gs.qd_int, shape=(n_se_,)),
+        entities_collider_type=V(dtype=gs.qd_int, shape=(n_se_,)),
+        entities_sdf_start=V(dtype=gs.qd_int, shape=(n_se_,)),
+        entities_sdf_res=V(dtype=gs.qd_ivec3, shape=(n_se_,)),
+        entities_sdf_origin=V(dtype=gs.qd_vec3, shape=(n_se_,)),
+        entities_sdf_cell=V(dtype=gs.qd_vec3, shape=(n_se_,)),
+        sdf_values=V(dtype=gs.qd_float, shape=(solver.n_soft_sdf_voxels_,)),
         entities_links_pair_enabled=V(dtype=gs.qd_bool, shape=(n_se_, solver.n_links_)),
+        entities_pair_enabled=V(dtype=gs.qd_bool, shape=(n_se_, n_se_)),
         dof_start=_scalar(gs.qd_int, solver.n_dofs),
     )
 
@@ -554,9 +573,24 @@ class MochiSoftState:
     hit_pos: qd.Tensor
     hit_normal: qd.Tensor
     hit_distance: qd.Tensor
+    # Active samples against deformable colliders: colliding side (kind 0 = rigid link sample with lever arm r_a about
+    # the link origin, kind 1 = deformable sample), collider tetrahedron with the barycentric coordinates of the point,
+    # per-sample matrix D = -w df/dp, force on the colliding side and readback data.
+    n_sc_hits: qd.Tensor
+    sc_hit_kind_a: qd.Tensor
+    sc_hit_sample_a: qd.Tensor
+    sc_hit_link_a: qd.Tensor
+    sc_hit_r_a: qd.Tensor
+    sc_hit_elem_b: qd.Tensor
+    sc_hit_bary_b: qd.Tensor
+    sc_hit_D: qd.Tensor
+    sc_hit_force: qd.Tensor
+    sc_hit_pos: qd.Tensor
+    sc_hit_normal: qd.Tensor
+    sc_hit_distance: qd.Tensor
 
 
-def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits):
+def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits):
     _B = solver._B
     n_sv_, n_el_, n_se_ = solver.n_soft_verts_, solver.n_soft_elems_, solver.n_soft_entities_
     return MochiSoftState(
@@ -595,4 +629,16 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits):
         hit_pos=V(dtype=gs.qd_vec3, shape=(max_soft_hits, _B)),
         hit_normal=V(dtype=gs.qd_vec3, shape=(max_soft_hits, _B)),
         hit_distance=V(dtype=gs.qd_float, shape=(max_soft_hits, _B)),
+        n_sc_hits=V(dtype=gs.qd_int, shape=(_B,)),
+        sc_hit_kind_a=V(dtype=gs.qd_int, shape=(max_sc_hits, _B)),
+        sc_hit_sample_a=V(dtype=gs.qd_int, shape=(max_sc_hits, _B)),
+        sc_hit_link_a=V(dtype=gs.qd_int, shape=(max_sc_hits, _B)),
+        sc_hit_r_a=V(dtype=gs.qd_vec3, shape=(max_sc_hits, _B)),
+        sc_hit_elem_b=V(dtype=gs.qd_int, shape=(max_sc_hits, _B)),
+        sc_hit_bary_b=V(dtype=gs.qd_vec4, shape=(max_sc_hits, _B)),
+        sc_hit_D=V(dtype=gs.qd_mat3, shape=(max_sc_hits, _B)),
+        sc_hit_force=V(dtype=gs.qd_vec3, shape=(max_sc_hits, _B)),
+        sc_hit_pos=V(dtype=gs.qd_vec3, shape=(max_sc_hits, _B)),
+        sc_hit_normal=V(dtype=gs.qd_vec3, shape=(max_sc_hits, _B)),
+        sc_hit_distance=V(dtype=gs.qd_float, shape=(max_sc_hits, _B)),
     )

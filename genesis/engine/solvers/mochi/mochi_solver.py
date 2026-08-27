@@ -5,12 +5,14 @@ import dataclasses
 import sys
 from typing import TYPE_CHECKING
 
+import igl
 import numpy as np
 import quadrants as qd
 import torch
 
 import genesis as gs
 import genesis.utils.geom as gu
+from genesis.engine.bvh import AABB
 from genesis.engine.entities.mochi_entity import MochiEntity, MochiSoftEntity
 from genesis.engine.states.solvers import MochiSolverState
 from genesis.options.solvers import MochiOptions
@@ -96,11 +98,15 @@ from .newton import (
 from .rigid_assembly import kernel_assemble_links
 from .soft import (
     ENTITY_PARAMS,
+    SoftTetLBVH,
     build_soft_samples,
     kernel_init_soft_fields,
     kernel_soft_apply_increment,
     kernel_soft_assemble_elements,
     kernel_soft_broadphase,
+    kernel_soft_collider_aabbs,
+    kernel_soft_collider_eval,
+    kernel_soft_collider_query,
     kernel_soft_condense_dense,
     kernel_soft_conservative_bounds,
     kernel_soft_contact_eval,
@@ -114,6 +120,7 @@ from .soft import (
     kernel_soft_post_stage,
     kernel_soft_set_entity_contact_params,
     kernel_soft_set_links_pair_enabled,
+    kernel_soft_set_pair_enabled,
     kernel_soft_set_state,
     kernel_soft_set_vertices_fixed,
     kernel_soft_set_vertices_positions,
@@ -139,6 +146,12 @@ _COLLIDER_TYPE_BY_NAME = {
     "box": COLLIDER_TYPE.BOX,
     "sdf": COLLIDER_TYPE.GRID,
 }
+# Rest-shape signed distance grid of a deformable collider: cell size relative to the mean boundary edge length,
+# padding around the rest bounds and minimum resolution per axis.
+SOFT_SDF_CELL_RATIO = 0.25
+SOFT_SDF_PADDING = 5e-3
+SOFT_SDF_MIN_RES = 6
+
 _AUTO_COLLIDER_TYPE_BY_GEOM_TYPE = {
     gs.GEOM_TYPE.PLANE: COLLIDER_TYPE.PLANE,
     gs.GEOM_TYPE.SPHERE: COLLIDER_TYPE.SPHERE,
@@ -435,6 +448,8 @@ class MochiSolver(KinematicSolver):
         n_layers = len(self._layers)
         self._layers_pair_enabled = np.ones((n_layers, n_layers), dtype=bool)
         self._entities_pair_enabled = np.ones((self.n_entities, self.n_entities), dtype=bool)
+        self._soft_entities_pair_enabled = np.ones((self.n_soft_entities, self.n_soft_entities), dtype=bool)
+        self._soft_rigid_entities_pair_enabled = np.ones((self.n_soft_entities, self.n_entities), dtype=bool)
 
         geoms_collider_type = np.array([self._resolve_collider_type(geom) for geom in geoms], dtype=gs.np_int)
         self._has_grid_colliders = bool((geoms_collider_type == COLLIDER_TYPE.GRID).any())
@@ -593,6 +608,9 @@ class MochiSolver(KinematicSolver):
             samples_bary = np.concatenate(samples_bary).astype(gs.np_float)
             samples_weight = np.concatenate(samples_weight).astype(gs.np_float)
             samples_entity_idx = np.concatenate(samples_entity_idx)
+            sdf_grids = [self._build_soft_sdf_grid(entity) for entity in entities]
+            sdf_values = np.concatenate([grid["values"] for grid in sdf_grids]).astype(gs.np_float)
+            sdf_starts = np.cumsum([0] + [len(grid["values"]) for grid in sdf_grids[:-1]])
             entities_params = np.array(
                 [
                     [
@@ -616,8 +634,13 @@ class MochiSolver(KinematicSolver):
                         entity.v_end,
                         entities_sample_range[entity.idx_in_solver, 0],
                         entities_sample_range[entity.idx_in_solver, 1],
+                        float(grid["collider_type"]),
+                        float(sdf_start),
+                        *grid["res"],
+                        *grid["origin"],
+                        *grid["cell"],
                     ]
-                    for entity in entities
+                    for entity, grid, sdf_start in zip(entities, sdf_grids, sdf_starts)
                 ],
                 dtype=gs.np_float,
             ).reshape((-1, len(ENTITY_PARAMS)))
@@ -632,6 +655,7 @@ class MochiSolver(KinematicSolver):
             samples_entity_idx = np.zeros((0,), dtype=gs.np_int)
             entities_params = np.zeros((0, len(ENTITY_PARAMS)), dtype=gs.np_float)
             entities_sample_range = np.zeros((0, 2), dtype=gs.np_int)
+            sdf_values = np.zeros((0,), dtype=gs.np_float)
             n_samples = 0
         self._n_soft_samples = n_samples
         self.n_soft_samples_ = max(1, n_samples)
@@ -644,9 +668,29 @@ class MochiSolver(KinematicSolver):
         if self._max_soft_pairs is None:
             self._max_soft_pairs = max(1, len(entities) * n_collider_geoms)
         self._max_soft_hits = max(1, 2 * n_samples)
+        self._n_soft_sdf_voxels = len(sdf_values)
+        self.n_soft_sdf_voxels_ = max(1, len(sdf_values))
+
+        # Deformable colliders: every rigid and deformable sample point is located in the deformed tetrahedra through
+        # a bounding-volume hierarchy rebuilt at every assembly.
+        self._has_soft_colliders = any(
+            grid["collider_type"] != COLLIDER_TYPE.NONE for grid in (sdf_grids if self.has_soft else ())
+        )
+        self._n_soft_queries = self.n_samples + n_samples
+        self._max_sc_hits = max(1, 2 * self._n_soft_queries) if self._has_soft_colliders else 1
+        if self._has_soft_colliders:
+            self._soft_tet_aabb = AABB(_B, self.n_soft_elems_)
+            self._soft_query_aabb = AABB(_B, max(1, self._n_soft_queries))
+            # A sample point overlaps the bounds of many tetrahedra before the inclusion test; those of its own entity
+            # are filtered out by the hierarchy.
+            n_results_per_tet = max(1, -(-16 * self._n_soft_queries // self.n_soft_elems_))
+            queries_entity_idx = np.concatenate([np.full(self.n_samples, -1, dtype=gs.np_int), samples_entity_idx])
+            self._soft_tet_bvh = SoftTetLBVH(
+                self._soft_tet_aabb, elems_entity_idx, queries_entity_idx, max_n_query_result_per_aabb=n_results_per_tet
+            )
 
         self.soft_info = get_mochi_soft_info(self)
-        self.soft_state = get_mochi_soft_state(self, self._max_soft_pairs, self._max_soft_hits)
+        self.soft_state = get_mochi_soft_state(self, self._max_soft_pairs, self._max_soft_hits, self._max_sc_hits)
         kernel_init_soft_fields(
             verts_rest,
             verts_entity_idx,
@@ -658,6 +702,8 @@ class MochiSolver(KinematicSolver):
             samples_entity_idx,
             entities_params,
             self._compute_soft_links_pair_enabled(),
+            self._compute_soft_pair_enabled(),
+            sdf_values,
             self.soft_info,
             self.soft_state,
             self.rigid_config,
@@ -674,6 +720,51 @@ class MochiSolver(KinematicSolver):
             kernel_soft_init_render(vert_idx, self._soft_vverts_vert_idx)
         self._envs_offset = np.asarray(self._scene.envs_offset, dtype=gs.np_float).reshape((_B, 3))
 
+    def _build_soft_sdf_grid(self, entity):
+        """Rest-shape signed distance grid of a deformable collider (igl over the boundary triangles), or an empty grid
+        for a body that does not act as a collider."""
+        if entity.material.collider_type == "none":
+            return {
+                "collider_type": COLLIDER_TYPE.NONE,
+                "values": np.zeros((0,), dtype=gs.np_float),
+                "res": (1, 1, 1),
+                "origin": (0.0, 0.0, 0.0),
+                "cell": (1.0, 1.0, 1.0),
+            }
+        verts = np.asarray(entity.init_positions, dtype=np.float64)
+        faces = np.asarray(entity.surface_triangles, dtype=np.int64)
+        edges = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+        mean_edge = float(np.linalg.norm(verts[edges[:, 0]] - verts[edges[:, 1]], axis=1).mean())
+        lower = verts.min(axis=0) - SOFT_SDF_PADDING
+        upper = verts.max(axis=0) + SOFT_SDF_PADDING
+        # Voxels of at most a quarter of the mean boundary edge, and at least SOFT_SDF_MIN_RES per axis so that thin
+        # bodies are resolved through their thickness.
+        res = np.maximum(np.ceil((upper - lower) / (SOFT_SDF_CELL_RATIO * mean_edge)).astype(int) + 1, SOFT_SDF_MIN_RES)
+        cell = (upper - lower) / (res - 1)
+        axes = [lower[k] + cell[k] * np.arange(res[k]) for k in range(3)]
+        grid = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape((-1, 3))
+        values, *_ = igl.signed_distance(grid, verts, faces.astype(np.int32))
+        return {
+            "collider_type": COLLIDER_TYPE.GRID,
+            "values": np.asarray(values, dtype=gs.np_float),
+            "res": tuple(int(r) for r in res),
+            "origin": tuple(float(x) for x in lower),
+            "cell": tuple(float(c) for c in cell),
+        }
+
+    def _compute_soft_pair_enabled(self):
+        """Deformable entity pair contact filter from the contact layers (an entity never collides with itself)."""
+        enabled = np.ones((self.n_soft_entities_, self.n_soft_entities_), dtype=bool)
+        if self.has_soft:
+            entities_layer = np.array(
+                [self._layers.index(entity.material.contact_layer) for entity in self._soft_entities], dtype=int
+            )
+            n = self.n_soft_entities
+            enabled[:n, :n] = self._layers_pair_enabled[entities_layer[:, None], entities_layer[None, :]]
+            enabled[:n, :n] &= self._soft_entities_pair_enabled
+            np.fill_diagonal(enabled, False)
+        return enabled
+
     def _compute_soft_links_pair_enabled(self):
         """Deformable entity / rigid link contact filter from the contact layers."""
         links = self.links
@@ -685,9 +776,11 @@ class MochiSolver(KinematicSolver):
             links_layer = np.array(
                 [self._layers.index(link.entity.material.contact_layer) for link in links], dtype=int
             )
+            links_entity = np.array([link._entity_idx_in_solver for link in links], dtype=int)
             enabled[: self.n_soft_entities, : self.n_links] = self._layers_pair_enabled[
                 entities_layer[:, None], links_layer[None, :]
             ]
+            enabled[: self.n_soft_entities, : self.n_links] &= self._soft_rigid_entities_pair_enabled[:, links_entity]
         return enabled
 
     def _init_sdf(self):
@@ -844,6 +937,40 @@ class MochiSolver(KinematicSolver):
                 record,
                 self._errno,
             )
+            if self._has_soft_colliders:
+                kernel_soft_collider_aabbs(
+                    self.dyn_state,
+                    self.mochi_info,
+                    self.mochi_state,
+                    self.soft_info,
+                    self.soft_state,
+                    self._soft_tet_aabb.aabbs,
+                    self._soft_query_aabb.aabbs,
+                    self.n_samples,
+                    self.rigid_config,
+                )
+                self._soft_tet_bvh.build()
+                if kernel_soft_collider_query(self._soft_tet_bvh, self._soft_query_aabb.aabbs):
+                    gs.raise_exception("Exceeding the capacity of the deformable collider queries.")
+                kernel_soft_collider_eval(
+                    self._soft_tet_bvh.query_result,
+                    self._soft_tet_bvh.query_result_count,
+                    self.dyn_state,
+                    self.dyn_info,
+                    self.mochi_info,
+                    self.mochi_state,
+                    self.soft_info,
+                    self.soft_state,
+                    self.rigid_config,
+                    self.mochi_config,
+                    self.n_samples,
+                    assem_obj,
+                    assem_res,
+                    assem_dres,
+                    skip_ls_done,
+                    record,
+                    self._errno,
+                )
         kernel_pairs_to_blocks(
             self.dyn_state,
             self.dyn_info,
@@ -1320,16 +1447,27 @@ class MochiSolver(KinematicSolver):
             kernel_soft_set_links_pair_enabled(
                 self._compute_soft_links_pair_enabled(), self.soft_info, self.rigid_config
             )
+            kernel_soft_set_pair_enabled(self._compute_soft_pair_enabled(), self.soft_info, self.rigid_config)
 
     def enable_entity_contact(self, entity_a, entity_b, is_enabled: bool = True):
         """Enable or disable contact between two entities (symmetric)."""
+        is_soft_a = isinstance(entity_a, MochiSoftEntity)
+        is_soft_b = isinstance(entity_b, MochiSoftEntity)
         i_a, i_b = entity_a._idx_in_solver, entity_b._idx_in_solver
-        self._entities_pair_enabled[i_a, i_b] = self._entities_pair_enabled[i_b, i_a] = is_enabled
+        if is_soft_a and is_soft_b:
+            self._soft_entities_pair_enabled[i_a, i_b] = self._soft_entities_pair_enabled[i_b, i_a] = is_enabled
+        elif is_soft_a:
+            self._soft_rigid_entities_pair_enabled[i_a, i_b] = is_enabled
+        elif is_soft_b:
+            self._soft_rigid_entities_pair_enabled[i_b, i_a] = is_enabled
+        else:
+            self._entities_pair_enabled[i_a, i_b] = self._entities_pair_enabled[i_b, i_a] = is_enabled
         kernel_set_links_pair_enabled(self._compute_links_pair_enabled(), self.mochi_info, self.rigid_config)
         if self.has_soft:
             kernel_soft_set_links_pair_enabled(
                 self._compute_soft_links_pair_enabled(), self.soft_info, self.rigid_config
             )
+            kernel_soft_set_pair_enabled(self._compute_soft_pair_enabled(), self.soft_info, self.rigid_config)
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------

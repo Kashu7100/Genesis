@@ -28,9 +28,12 @@ fixed vertices through `set_vertices_fixed`, tetrahedralized by tetgen from Box/
 tetgen `.node`/`.ele` files), plane/sphere/box analytic colliders and grid colliders for meshes, backward Euler and
 BDF2 time integration. Contact between the links of one entity is disabled, equality constraints are ignored and drive
 forces are not clamped to the force range. Deformable bodies collide through the quadrature samples of their boundary
-triangles against the rigid colliders only: they do not act as colliders themselves (no soft-soft contact, and a rigid
-body smaller than the boundary triangles of a soft body passes through it), so mesh them finely enough
-(`maxvolume=..., nobisect=False`) for the rigid bodies that touch them.
+triangles against the rigid colliders, and act as colliders themselves (`collider_type="sdf"`, the default): a signed
+distance field of the rest shape is queried through the deformed tetrahedra, so rigid samples and the samples of other
+soft bodies are pushed out once they are inside the body. That path has no contact skin (contact only registers for
+points inside the body, so a few millimeters of interpenetration remain) and its tangent drops the derivatives of the
+mapping, as in mochi; a soft body never collides with itself. Mesh soft bodies reasonably finely
+(`maxvolume=..., nobisect=False`) where sharp rigid features touch them.
 
 Velocities are recovered by finite differences over the step as in mochi: `get_dofs_velocity()` returns
 `sin(dq)/dt` for revolute joints and the sine-based angular velocity `vee(((R - R_prev)/dt) R^T)` for spherical and

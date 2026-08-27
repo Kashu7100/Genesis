@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from genesis.engine.entities.mochi_entity import MochiSoftEntity
 
 ElasticModel = Literal["stable_neohookean", "stvk", "linear"]
+SoftColliderType = Literal["auto", "sdf", "none"]
 
 
 class Elastic(Base["MochiSoftEntity"]):
@@ -56,6 +57,11 @@ class Elastic(Base["MochiSoftEntity"]):
     max_alignment_normals : float, optional
         Cosine threshold between the colliding normal and the collider gradient above which contact is disabled.
         Default is 0.
+    collider_type : str, optional
+        Whether other bodies' sample points collide against this body: "sdf" (and "auto") builds a signed distance
+        field of the rest shape that is queried through the deformed tetrahedra (contact only registers for points
+        inside the body, the activation threshold is zero), "none" makes the body collide only through its own samples.
+        Default is "auto".
     has_gravity : bool, optional
         Whether gravity acts on this body. Default is True.
     contact_layer : str, optional
@@ -76,6 +82,7 @@ class Elastic(Base["MochiSoftEntity"]):
     viscous_friction: NonNegativeFloat = 0.0
     normal_viscous_damping: NonNegativeFloat = 0.0
     max_alignment_normals: ValidFloat = 0.0
+    collider_type: SoftColliderType = "auto"
     has_gravity: StrictBool = True
     contact_layer: str = "default"
 

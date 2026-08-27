@@ -24,12 +24,12 @@ def _write_tet_files(path_stem, verts, tets):
     node_path = f"{path_stem}.node"
     with open(node_path, "w") as f:
         f.write(f"{len(verts)} 3 0 0\n")
-        for i_v, vert in enumerate(verts):
-            f.write(f"{i_v} {float(vert[0])!r} {float(vert[1])!r} {float(vert[2])!r}\n")
+        f.writelines(
+            f"{i_v} {float(vert[0])!r} {float(vert[1])!r} {float(vert[2])!r}\n" for i_v, vert in enumerate(verts)
+        )
     with open(f"{path_stem}.ele", "w") as f:
         f.write(f"{len(tets)} 4 0\n")
-        for i_t, tet in enumerate(tets):
-            f.write(f"{i_t} {int(tet[0])} {int(tet[1])} {int(tet[2])} {int(tet[3])}\n")
+        f.writelines(f"{i_t} {int(tet[0])} {int(tet[1])} {int(tet[2])} {int(tet[3])}\n" for i_t, tet in enumerate(tets))
     return node_path
 
 
@@ -233,3 +233,128 @@ def test_soft_hessian_finite_difference(show_viewer):
     assert_allclose(H, H.T, atol=1e-9 * np.abs(H).max(), rtol=0.0)
     assert_allclose(H, H_fd, atol=1e-6 * np.abs(H).max(), rtol=0.0)
     assert np.linalg.eigvalsh(0.5 * (H + H.T)).min() > 0.0
+
+
+@pytest.mark.precision("64")
+def test_soft_soft_stack(show_viewer):
+    scene = _mochi_scene(show_viewer, 1.0 / 60.0, n_newton_iterations=8)
+    scene.add_entity(gs.morphs.Plane(), material=gs.materials.Mochi.Rigid())
+    bottom = scene.add_entity(
+        gs.morphs.Box(size=(0.3, 0.3, 0.1), pos=(0.0, 0.0, 0.05), maxvolume=0.0005, nobisect=False),
+        material=gs.materials.Mochi.Elastic(E=2e5, nu=0.4, rho=1000.0),
+    )
+    top = scene.add_entity(
+        gs.morphs.Box(size=(0.12, 0.12, 0.12), pos=(0.0, 0.0, 0.2), maxvolume=0.0005, nobisect=False),
+        material=gs.materials.Mochi.Elastic(E=1e5, nu=0.45, rho=1000.0),
+    )
+    scene.build()
+    for _ in range(150):
+        scene.step()
+    bottom_pos = tensor_to_array(bottom.get_vertices_position())
+    top_pos = tensor_to_array(top.get_vertices_position())
+    # The top cube rests on the slab (the soft collider has no contact skin, so it sinks a few millimeters in).
+    assert bottom_pos[:, 2].max() - 4e-3 < top_pos[:, 2].min() < bottom_pos[:, 2].max()
+    assert_allclose(top.get_vertices_velocity(), 0.0, atol=1e-5)
+    assert_allclose(
+        tensor_to_array(top.get_vertices_contact_force()).sum(axis=0), (0.0, 0.0, top.mass * 9.8), atol=1e-2
+    )
+    assert_allclose(
+        tensor_to_array(bottom.get_vertices_contact_force()).sum(axis=0), (0.0, 0.0, bottom.mass * 9.8), atol=1e-2
+    )
+
+
+@pytest.mark.precision("64")
+def test_rigid_ball_on_coarse_soft_slab(show_viewer):
+    radius = 0.03
+    scene = _mochi_scene(show_viewer, 1.0 / 60.0, n_newton_iterations=8)
+    scene.add_entity(gs.morphs.Plane(), material=gs.materials.Mochi.Rigid())
+    # The slab is far coarser than the ball: contact is carried by the ball's samples against the slab's distance field.
+    slab = scene.add_entity(
+        gs.morphs.Box(size=(0.6, 0.6, 0.1), pos=(0.0, 0.0, 0.05), maxvolume=0.004),
+        material=gs.materials.Mochi.Elastic(E=2e5, nu=0.4, rho=1000.0),
+    )
+    ball = scene.add_entity(
+        gs.morphs.Sphere(radius=radius, pos=(0.05, 0.02, 0.25)), material=gs.materials.Mochi.Rigid(rho=2000.0)
+    )
+    scene.build()
+    assert slab.n_vertices < 20
+    for _ in range(150):
+        scene.step()
+    slab_top = tensor_to_array(slab.get_vertices_position())[:, 2].max()
+    ball_z = float(tensor_to_array(ball.get_pos())[2])
+    assert slab_top + radius - 5e-3 < ball_z < slab_top + radius
+    ball_mass = float(tensor_to_array(ball.get_mass()))
+    assert_allclose(tensor_to_array(ball.get_links_net_contact_force())[0], (0.0, 0.0, ball_mass * 9.8), atol=1e-3)
+    assert_allclose(
+        tensor_to_array(slab.get_vertices_contact_force()).sum(axis=0), (0.0, 0.0, slab.mass * 9.8), atol=1e-2
+    )
+    assert_allclose(ball.get_dofs_velocity(), 0.0, atol=1e-6)
+
+
+@pytest.mark.precision("64")
+def test_soft_soft_hessian_finite_difference(show_viewer):
+    scene = _mochi_scene(
+        show_viewer,
+        0.01,
+        gravity=(0.0, 0.0, 0.0),
+        n_newton_iterations=8,
+        use_fitted_friction_hessian=False,
+        linear_solver="ldlt",
+    )
+    bottom = scene.add_entity(
+        gs.morphs.Box(size=(0.3, 0.3, 0.1), pos=(0.0, 0.0, 0.05), maxvolume=0.002),
+        material=gs.materials.Mochi.Elastic(E=1e5, nu=0.45, rho=1000.0),
+    )
+    top = scene.add_entity(
+        gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0.02, 0.01, 0.148), maxvolume=0.002),
+        material=gs.materials.Mochi.Elastic(E=1e5, nu=0.45, rho=1000.0),
+    )
+    scene.build()
+    solver = scene.mochi_solver
+    scene.step()
+    # Stretch both bodies about a common point so that every tetrahedron is in tension (exact projected tangent), the
+    # top cube is pressed into the slab and the samples slide (friction is active).
+    rng = np.random.default_rng(1)
+    for entity in (bottom, top):
+        pos = tensor_to_array(entity.get_vertices_position())
+        center = np.array([0.0, 0.0, 0.1 if entity is bottom else 0.2])
+        target = center + 1.01 * (pos - center) + 1e-6 * rng.standard_normal(pos.shape)
+        for i_v in range(entity.n_vertices):
+            for k in range(3):
+                _kernel_shift_vertex(entity.v_start + i_v, k, float(target[i_v, k] - pos[i_v, k]), solver.soft_state)
+
+    def assemble():
+        _kernel_activate_all_envs(solver.mochi_state, solver.rigid_config)
+        solver._assemble(assem_res=True, assem_dres=True, skip_ls_done=False)
+        return qd_to_numpy(solver.mochi_state.res)[:, 0].copy()
+
+    assemble()
+    assert int(qd_to_numpy(solver.soft_state.n_sc_hits)[0]) > 0
+    kernel_condense_dense(
+        solver.dyn_state,
+        solver.dyn_info,
+        solver.mochi_info,
+        solver.mochi_state,
+        solver.contact_state,
+        solver.rigid_config,
+    )
+    kernel_soft_condense_dense(
+        solver.dyn_state, solver.dyn_info, solver.mochi_state, solver.soft_info, solver.soft_state, solver.rigid_config
+    )
+    n_verts = solver.n_soft_verts
+    H = qd_to_numpy(solver.mochi_state.H_dense)[0].copy()
+    eps = 1e-6
+    H_fd = np.zeros_like(H)
+    for i_v in range(n_verts):
+        for k in range(3):
+            _kernel_shift_vertex(i_v, k, eps, solver.soft_state)
+            res_plus = assemble()
+            _kernel_shift_vertex(i_v, k, -2.0 * eps, solver.soft_state)
+            res_minus = assemble()
+            _kernel_shift_vertex(i_v, k, eps, solver.soft_state)
+            H_fd[:, 3 * i_v + k] = (res_plus - res_minus) / (2.0 * eps)
+    assert_allclose(H, H.T, atol=1e-9 * np.abs(H).max(), rtol=0.0)
+    # The deformable-collider tangent drops the derivatives of the barycentric weights, of the pulled-back gradient
+    # direction and the curvature of the distance field (as mochi does), so it only approximates the exact Hessian; a
+    # sign error in any coupling block would show up as a mismatch of the order of the contact stiffness.
+    assert_allclose(H, H_fd, atol=2e-2 * np.abs(H).max(), rtol=0.0)
