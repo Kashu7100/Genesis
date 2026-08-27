@@ -83,6 +83,9 @@ class MochiSoftEntity(Entity):
         name=None,
     ):
         self._is_shell = isinstance(material, gs.materials.Mochi.Shell)
+        self._is_rod = isinstance(material, gs.materials.Mochi.Rod)
+        if self._is_rod != isinstance(morph, gs.morphs.Rod):
+            gs.raise_exception("A `gs.morphs.Rod` morph requires a `gs.materials.Mochi.Rod` material, and conversely.")
         super().__init__(idx, scene, morph, solver, material, surface, name=name)
         self._idx_in_solver = idx_in_solver
         self._v_start = v_start
@@ -94,8 +97,12 @@ class MochiSoftEntity(Entity):
 
         self.sample()
 
-        # Boundary triangles (outward winding) and the tetrahedron owning each of them; all triangles of a shell.
-        if self._is_shell:
+        # Boundary triangles (outward winding) and the tetrahedron owning each of them; all triangles of a shell; none
+        # for a rod (its contact samples lie on the centerline).
+        if self._is_rod:
+            self._surface_tri_np = np.zeros((0, 3), dtype=gs.np_int)
+            self._surface_el_np = np.zeros((0,), dtype=gs.np_int)
+        elif self._is_shell:
             self._surface_tri_np = self.elems
             self._surface_el_np = np.arange(len(self.elems), dtype=gs.np_int)
         else:
@@ -103,6 +110,8 @@ class MochiSoftEntity(Entity):
 
     def _get_morph_identifier(self) -> str:
         morph = self._morph
+        if self._is_rod:
+            return "rod"
         prefix = "shell" if self._is_shell else "soft"
         if isinstance(morph, gs.morphs.Box):
             return f"{prefix}_box"
@@ -121,6 +130,9 @@ class MochiSoftEntity(Entity):
     def sample(self):
         """Build the render geoms and the tetrahedral simulation mesh from the morph."""
         morph = self._morph
+        if self._is_rod:
+            self._sample_rod()
+            return
         if isinstance(morph, gs.morphs.Mesh) and morph.file.endswith(TET_NODE_FORMAT):
             if self._is_shell:
                 gs.raise_exception("Shells are surface meshes: a tetrahedral mesh file cannot be used for a shell.")
@@ -175,6 +187,74 @@ class MochiSoftEntity(Entity):
         if is_mesh_morph:
             verts = verts + morph.pos
         self.instantiate(verts, elems)
+
+    def _sample_rod(self):
+        """Rod nodes and segments from the polyline of the morph, the reference material axes (an arbitrary
+        perpendicular of the first segment parallel transported along the rod), and the tube drawn around it."""
+        morph = self._morph
+        points = np.asarray(morph.points, dtype=gs.np_float) + np.asarray(morph.pos, dtype=gs.np_float)
+        n_nodes = len(points)
+        segments = np.stack([np.arange(n_nodes - 1), np.arange(1, n_nodes)], axis=-1)
+        if morph.is_closed_loop:
+            segments = np.concatenate([segments, [[n_nodes - 1, 0]]])
+        self.instantiate(points, segments)
+        verts = self.init_positions
+        tangents = verts[segments[:, 1]] - verts[segments[:, 0]]
+        tangents /= np.linalg.norm(tangents, axis=1)[:, None]
+        axes = np.zeros_like(tangents)
+        seed = np.array([0.0, 0.0, 1.0]) if abs(tangents[0][2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+        axes[0] = seed - tangents[0] * seed.dot(tangents[0])
+        axes[0] /= np.linalg.norm(axes[0])
+        for i_s in range(1, len(segments)):
+            # Parallel transport of the axis across the node (minimal rotation between consecutive tangents).
+            t0, t1 = tangents[i_s - 1], tangents[i_s]
+            c, v = t0.dot(t1), np.cross(t0, t1)
+            R = c * np.eye(3) + np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])
+            R = R + np.outer(v, v) / max(1.0 + c, 1e-300)
+            axis = R @ axes[i_s - 1]
+            axis -= t1 * axis.dot(t1)
+            axes[i_s] = axis / np.linalg.norm(axis)
+        self.rod_axes_ref = axes.astype(gs.np_float)
+        self.rod_radius = float(morph.radius)
+
+        # Tube: one ring of vertices per node, on the material frame of the segment following the node.
+        n_cs = morph.n_cross_section_segments
+        angles = np.linspace(0.0, 2.0 * np.pi, n_cs, endpoint=False)
+        offsets = np.stack([np.cos(angles), np.sin(angles)], axis=-1) * morph.radius
+        ring_nodes = np.repeat(np.arange(n_nodes), n_cs)
+        ring_elems = np.repeat(np.minimum(np.arange(n_nodes), len(segments) - 1), n_cs)
+        ring_offsets = np.tile(offsets, (n_nodes, 1))
+        tube_verts = np.zeros((n_nodes * n_cs, 3), dtype=gs.np_float)
+        for i_vv in range(n_nodes * n_cs):
+            i_v, i_s = ring_nodes[i_vv], ring_elems[i_vv]
+            binormal = np.cross(tangents[i_s], axes[i_s])
+            tube_verts[i_vv] = verts[i_v] + ring_offsets[i_vv, 0] * axes[i_s] + ring_offsets[i_vv, 1] * binormal
+        faces = []
+        n_rings = n_nodes if morph.is_closed_loop else n_nodes - 1
+        for i_ring in range(n_rings):
+            j_ring = (i_ring + 1) % n_nodes
+            for k in range(n_cs):
+                a, b = i_ring * n_cs + k, i_ring * n_cs + (k + 1) % n_cs
+                c, d = j_ring * n_cs + k, j_ring * n_cs + (k + 1) % n_cs
+                faces.append([a, b, d])
+                faces.append([a, d, c])
+        self.rod_vverts_node = ring_nodes.astype(gs.np_int)
+        self.rod_vverts_elem = ring_elems.astype(gs.np_int)
+        self.rod_vverts_offset = ring_offsets.astype(gs.np_float)
+        vmesh = gs.Mesh.from_trimesh(
+            trimesh.Trimesh(vertices=tube_verts, faces=np.array(faces), process=False), surface=self._surface
+        )
+        self._vgeoms = gs.List(
+            [
+                FEMVisGeom(
+                    entity=self,
+                    vvert_start=self._vvert_start,
+                    vface_start=self._vface_start,
+                    vmesh=vmesh,
+                    sim_verts_idx=self.rod_vverts_node,
+                )
+            ]
+        )
 
     @staticmethod
     def _boundary_triangles(elems):
@@ -294,6 +374,17 @@ class MochiSoftEntity(Entity):
         return self._is_shell
 
     @property
+    def is_rod(self):
+        return self._is_rod
+
+    @property
+    def n_rod_stencils(self):
+        """Interior nodes of a rod (all nodes of a closed loop)."""
+        if not self._is_rod:
+            return 0
+        return self.n_vertices if self._morph.is_closed_loop else max(0, self.n_vertices - 2)
+
+    @property
     def n_vertices(self):
         return len(self.init_positions)
 
@@ -373,7 +464,18 @@ class MochiSoftEntity(Entity):
         return float(0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=-1).sum())
 
     @property
+    def length(self):
+        """Total length of the rod centerline."""
+        if not self._is_rod:
+            return 0.0
+        return float(
+            np.linalg.norm(self.init_positions[self.elems[:, 1]] - self.init_positions[self.elems[:, 0]], axis=1).sum()
+        )
+
+    @property
     def mass(self):
+        if self._is_rod:
+            return self.material.resolve(self.rod_radius)["linear_density"] * self.length
         if self._is_shell:
             return self.material.areal_density * self.area
         return self.material.rho * self.volume

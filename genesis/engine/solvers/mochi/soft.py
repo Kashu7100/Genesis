@@ -36,6 +36,15 @@ from .data import (
 from .integration import BDF2_ALPHA_2
 from .lie import skew
 from .newton import func_is_env_active
+from .rod import (
+    ROD_TINY,
+    func_rod_axial,
+    func_rod_axial_strain,
+    func_rod_bend_twist,
+    func_rod_bend_twist_measures,
+    func_rod_normalize,
+    func_rod_transport_axis,
+)
 from .shell import func_shell_elastic, func_shell_rest_data, func_shell_strains
 from .soft_materials import (
     func_elastic_energy,
@@ -48,6 +57,7 @@ from .soft_materials import (
 # Kinds of deformable entities.
 SOFT_KIND_SOLID = 0
 SOFT_KIND_SHELL = 1
+SOFT_KIND_ROD = 2
 # Guard of the shell geometry (degenerate metrics, normals and averaged normals).
 SHELL_TINY = 1e-30
 
@@ -93,6 +103,9 @@ ENTITY_PARAMS = (
     "bending_alpha",
     "bending_beta",
     "collider_radius",
+    "axial_stiffness",
+    "torsional_stiffness",
+    "rot_inertia",
 )
 
 
@@ -180,6 +193,9 @@ def kernel_init_soft_fields(
         soft_info.entities_bending_alpha[i_e] = entities_params[i_e, 34]
         soft_info.entities_bending_beta[i_e] = entities_params[i_e, 35]
         soft_info.entities_collider_radius[i_e] = entities_params[i_e, 36]
+        soft_info.entities_axial_stiffness[i_e] = entities_params[i_e, 37]
+        soft_info.entities_torsional_stiffness[i_e] = entities_params[i_e, 38]
+        soft_info.entities_rot_inertia[i_e] = entities_params[i_e, 39]
         for i_l in range(n_links):
             soft_info.entities_links_pair_enabled[i_e, i_l] = entities_links_pair_enabled[i_e, i_l]
         for j_e in range(n_entities):
@@ -449,6 +465,18 @@ def kernel_soft_zero_assembly(
         for i_t, i_b in qd.ndrange(n_shell_elems, _B):
             if func_is_env_active(i_b, mochi_state, skip_ls_done):
                 soft_state.shell_elems_H[i_t, i_b] = qd.Matrix.zero(gs.qd_float, 18, 18)
+        n_rod_elems = soft_state.rod_elems_H.shape[0]
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_r, i_b in qd.ndrange(n_rod_elems, _B):
+            if func_is_env_active(i_b, mochi_state, skip_ls_done):
+                soft_state.rod_elems_H[i_r, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
+                soft_state.rod_elems_inertia[i_r, i_b] = 0.0
+                soft_state.rod_elems_twist_pcg[i_r, i_b] = 0.0
+        n_rod_stencils = soft_state.rod_stencils_H.shape[0]
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_s, i_b in qd.ndrange(n_rod_stencils, _B):
+            if func_is_env_active(i_b, mochi_state, skip_ls_done):
+                soft_state.rod_stencils_H[i_s, i_b] = qd.Matrix.zero(gs.qd_float, 11, 11)
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_p, i_b in qd.ndrange(max_pairs, _B):
         if func_is_env_active(i_b, mochi_state, skip_ls_done) and i_p < soft_state.n_pairs[i_b]:
@@ -775,7 +803,7 @@ def kernel_soft_contact_eval(
         # samples carry no orientation: the collider gradient serves as their normal.
         normal_world = gu.qd_normalize((x1 - x0).cross(x2 - x0), EPS)
         normal_geom = gu.qd_inv_transform_by_quat(normal_world, quat_g)
-        if soft_info.entities_kind[i_e] == SOFT_KIND_SHELL:
+        if soft_info.entities_kind[i_e] != SOFT_KIND_SOLID:
             normal_geom = -gu.qd_normalize(grad, EPS)
         pos_start = (
             bary[0] * soft_state.verts_pos_stage_start[tri[0], i_b]
@@ -1109,6 +1137,40 @@ def func_soft_matvec(
         if not soft_state.verts_is_fixed[i_vb, i_b]:
             func_add_soft_vec(dst, i_vb, i_b, -g, soft_info)
 
+    n_rod_elems = soft_state.rod_elems_H.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_r, i_b in qd.ndrange(n_rod_elems, _B):
+        if not mochi_state.pcg_is_active[i_b] or soft_info.rod_elems_L[i_r] <= 0.0:
+            continue
+        v = soft_info.rod_elems_v[i_r]
+        s0 = qd.Vector.zero(gs.qd_float, 3)
+        s1 = qd.Vector.zero(gs.qd_float, 3)
+        if not soft_state.verts_is_fixed[v[0], i_b]:
+            s0 = func_read_soft_vec(src, v[0], i_b, soft_info)
+        if not soft_state.verts_is_fixed[v[1], i_b]:
+            s1 = func_read_soft_vec(src, v[1], i_b, soft_info)
+        T = soft_state.rod_elems_H[i_r, i_b]
+        y = T @ (s0 - s1)
+        c_inertia = soft_state.rod_elems_inertia[i_r, i_b]
+        if not soft_state.verts_is_fixed[v[0], i_b]:
+            func_add_soft_vec(dst, v[0], i_b, y + c_inertia * s0, soft_info)
+        if not soft_state.verts_is_fixed[v[1], i_b]:
+            func_add_soft_vec(dst, v[1], i_b, -y + c_inertia * s1, soft_info)
+    n_rod_stencils = soft_state.rod_stencils_H.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_s, i_b in qd.ndrange(n_rod_stencils, _B):
+        if not mochi_state.pcg_is_active[i_b] or soft_info.rod_stencils_L[i_s] <= 0.0:
+            continue
+        dofs = func_rod_stencil_dofs(i_s, soft_info)
+        x = qd.Vector.zero(gs.qd_float, 11)
+        for p in qd.static(range(11)):
+            if func_rod_stencil_dof_is_free(i_s, p, i_b, soft_info, soft_state):
+                x[p] = src[dofs[p], i_b]
+        y = soft_state.rod_stencils_H[i_s, i_b] @ x
+        for p in qd.static(range(11)):
+            if func_rod_stencil_dof_is_free(i_s, p, i_b, soft_info, soft_state):
+                qd.atomic_add(dst[dofs[p], i_b], y[p])
+
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_v, i_b in qd.ndrange(n_verts, _B):
         if mochi_state.pcg_is_active[i_b] and soft_state.verts_is_fixed[i_v, i_b]:
@@ -1130,6 +1192,14 @@ def func_soft_precondition(
     """z = M^-1 r on the vertex degrees of freedom with the block-Jacobi preconditioner of the 3x3 vertex blocks."""
     n_verts = soft_state.verts_pos.shape[0]
     _B = soft_state.verts_pos.shape[1]
+    n_rod_elems = soft_state.rod_elems_H.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_r, i_b in qd.ndrange(n_rod_elems, _B):
+        if not mochi_state.pcg_is_active[i_b] or soft_info.rod_elems_L[i_r] <= 0.0:
+            continue
+        i_d = func_rod_twist_dof(i_r, soft_info)
+        diag = mochi_state.dofs_H_diag[i_d, i_b] + soft_state.rod_elems_twist_pcg[i_r, i_b]
+        z[i_d, i_b] = r[i_d, i_b] / qd.max(diag, eps)
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_v, i_b in qd.ndrange(n_verts, _B):
         if not mochi_state.pcg_is_active[i_b]:
@@ -1317,6 +1387,35 @@ def kernel_soft_condense_dense(
                             qd.atomic_add(mochi_state.H_dense[i_b, k_d, b_d + r], column[r])
                     i_anc = dyn_info.links.parent_idx[I_anc]
 
+    n_rod_elems = soft_state.rod_elems_H.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_r, i_b in qd.ndrange(n_rod_elems, _B):
+        if not mochi_state.is_active[i_b] or soft_info.rod_elems_L[i_r] <= 0.0:
+            continue
+        v = soft_info.rod_elems_v[i_r]
+        T = soft_state.rod_elems_H[i_r, i_b]
+        d0 = func_soft_dof(v[0], 0, soft_info)
+        d1 = func_soft_dof(v[1], 0, soft_info)
+        c_inertia = soft_state.rod_elems_inertia[i_r, i_b]
+        for r in qd.static(range(3)):
+            qd.atomic_add(mochi_state.H_dense[i_b, d0 + r, d0 + r], c_inertia)
+            qd.atomic_add(mochi_state.H_dense[i_b, d1 + r, d1 + r], c_inertia)
+            for c in qd.static(range(3)):
+                qd.atomic_add(mochi_state.H_dense[i_b, d0 + r, d0 + c], T[r, c])
+                qd.atomic_add(mochi_state.H_dense[i_b, d1 + r, d1 + c], T[r, c])
+                qd.atomic_add(mochi_state.H_dense[i_b, d0 + r, d1 + c], -T[r, c])
+                qd.atomic_add(mochi_state.H_dense[i_b, d1 + r, d0 + c], -T[r, c])
+    n_rod_stencils = soft_state.rod_stencils_H.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_s, i_b in qd.ndrange(n_rod_stencils, _B):
+        if not mochi_state.is_active[i_b] or soft_info.rod_stencils_L[i_s] <= 0.0:
+            continue
+        dofs = func_rod_stencil_dofs(i_s, soft_info)
+        K = soft_state.rod_stencils_H[i_s, i_b]
+        for p in qd.static(range(11)):
+            for q in qd.static(range(11)):
+                qd.atomic_add(mochi_state.H_dense[i_b, dofs[p], dofs[q]], K[p, q])
+
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_v, i_b in qd.ndrange(n_verts, _B):
         if not mochi_state.is_active[i_b] or not soft_state.verts_is_fixed[i_v, i_b]:
@@ -1483,6 +1582,53 @@ def kernel_soft_set_entity_contact_params(
     soft_info.entities_friction_falloff_vel[i_e] = params[4]
     soft_info.entities_viscous_friction[i_e] = params[5]
     soft_info.entities_normal_viscous_damping[i_e] = params[6]
+
+
+@qd.kernel
+def kernel_rod_get_state_render(
+    vverts_render: qd.Tensor,
+    rod_vverts_vvert: qd.Tensor,
+    rod_vverts_node: qd.Tensor,
+    rod_vverts_elem: qd.Tensor,
+    rod_vverts_offset: qd.Tensor,
+    envs_offset: qd.types.ndarray(),
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    """Tube vertices around the rod centerlines: node position plus the cross-section offset (radius times cosine and
+    sine of the ring angle) along the material axis of the segment and its binormal."""
+    n_vverts = rod_vverts_node.shape[0]
+    _B = soft_state.verts_pos.shape[1]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_vv, i_b in qd.ndrange(n_vverts, _B):
+        i_v = rod_vverts_node[i_vv]
+        i_r = rod_vverts_elem[i_vv]
+        offset = rod_vverts_offset[i_vv]
+        axis = soft_state.rod_elems_axis[i_r, i_b]
+        tangent = func_rod_tangent(i_r, i_b, soft_state.verts_pos, soft_info)
+        pos = soft_state.verts_pos[i_v, i_b] + offset[0] * axis + offset[1] * tangent.cross(axis)
+        for k in qd.static(range(3)):
+            vverts_render[rod_vverts_vvert[i_vv], i_b][k] = qd.cast(pos[k] + envs_offset[i_b, k], qd.f32)
+
+
+@qd.kernel
+def kernel_rod_init_render(
+    vverts: qd.types.ndarray(),
+    nodes: qd.types.ndarray(),
+    elems: qd.types.ndarray(),
+    offsets: qd.types.ndarray(),
+    rod_vverts_vvert: qd.Tensor,
+    rod_vverts_node: qd.Tensor,
+    rod_vverts_elem: qd.Tensor,
+    rod_vverts_offset: qd.Tensor,
+):
+    for i_vv in range(nodes.shape[0]):
+        rod_vverts_vvert[i_vv] = vverts[i_vv]
+        rod_vverts_node[i_vv] = nodes[i_vv]
+        rod_vverts_elem[i_vv] = elems[i_vv]
+        for k in qd.static(range(2)):
+            rod_vverts_offset[i_vv][k] = offsets[i_vv, k]
 
 
 @qd.kernel
@@ -1744,7 +1890,7 @@ def kernel_soft_collider_eval(
         h = soft_info.entities_penalty_smoothing_half_distance[e_b]
         if d > 2.0 * h:
             continue
-        if kind_a == 1 and soft_info.entities_kind[e_a] == SOFT_KIND_SHELL:
+        if kind_a == 1 and soft_info.entities_kind[e_a] != SOFT_KIND_SOLID:
             normal_a = -gu.qd_normalize(grad, EPS)
 
         # Stage displacement of the sample relative to the collider point (which moves with the tetrahedron).
@@ -2079,6 +2225,418 @@ def kernel_shell_assemble(
 
 
 # ------------------------------------------------------------------------------------
+# ---------------------------------------- rods --------------------------------------
+# ------------------------------------------------------------------------------------
+
+
+@qd.func
+def func_rod_twist_dof(i_r, soft_info: MochiSoftInfo):
+    return soft_info.twist_dof_start[None] + i_r
+
+
+@qd.func
+def func_rod_stencil_dofs(i_s, soft_info: MochiSoftInfo):
+    """Degrees of freedom of a stencil in the order [x0, theta0, x1, theta1, x2]."""
+    v = soft_info.rod_stencils_v[i_s]
+    e = soft_info.rod_stencils_e[i_s]
+    dofs = qd.Vector.zero(gs.qd_int, 11)
+    for k in qd.static(range(3)):
+        dofs[k] = func_soft_dof(v[0], k, soft_info)
+        dofs[4 + k] = func_soft_dof(v[1], k, soft_info)
+        dofs[8 + k] = func_soft_dof(v[2], k, soft_info)
+    dofs[3] = func_rod_twist_dof(e[0], soft_info)
+    dofs[7] = func_rod_twist_dof(e[1], soft_info)
+    return dofs
+
+
+@qd.func
+def func_rod_stencil_dof_is_free(i_s, p: qd.template(), i_b, soft_info: MochiSoftInfo, soft_state: MochiSoftState):
+    v = soft_info.rod_stencils_v[i_s]
+    is_free = True
+    if qd.static(p < 3):
+        is_free = not soft_state.verts_is_fixed[v[0], i_b]
+    elif qd.static(4 <= p < 7):
+        is_free = not soft_state.verts_is_fixed[v[1], i_b]
+    elif qd.static(p >= 8):
+        is_free = not soft_state.verts_is_fixed[v[2], i_b]
+    return is_free
+
+
+@qd.kernel
+def kernel_init_rod_fields(
+    rod_elems_v: qd.types.ndarray(),
+    rod_elems_entity_idx: qd.types.ndarray(),
+    rod_elems_axis_ref: qd.types.ndarray(),
+    rod_stencils_v: qd.types.ndarray(),
+    rod_stencils_e: qd.types.ndarray(),
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    """Rest data of the rod segments and stencils, lumped node masses, and the initial material axes and twists."""
+    n_elems = rod_elems_v.shape[0]
+    n_stencils = rod_stencils_v.shape[0]
+    _B = soft_state.verts_pos.shape[1]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_r in range(n_elems):
+        for k in qd.static(range(2)):
+            soft_info.rod_elems_v[i_r][k] = rod_elems_v[i_r, k]
+        for k in qd.static(range(3)):
+            soft_info.rod_elems_axis_ref[i_r][k] = rod_elems_axis_ref[i_r, k]
+        i_e = rod_elems_entity_idx[i_r]
+        soft_info.rod_elems_entity_idx[i_r] = i_e
+        L = (soft_info.verts_rest[rod_elems_v[i_r, 1]] - soft_info.verts_rest[rod_elems_v[i_r, 0]]).norm()
+        soft_info.rod_elems_L[i_r] = L
+        soft_info.rod_elems_rot_inertia[i_r] = soft_info.entities_rot_inertia[i_e] * L
+        half_mass = 0.5 * soft_info.entities_rho[i_e] * L
+        qd.atomic_add(soft_info.verts_mass[rod_elems_v[i_r, 0]], half_mass)
+        qd.atomic_add(soft_info.verts_mass[rod_elems_v[i_r, 1]], half_mass)
+        if soft_info.entities_collider_type[i_e] == COLLIDER_TYPE.POINT_CLOUD:
+            qd.atomic_add(soft_info.verts_collider_weight[rod_elems_v[i_r, 0]], 0.5 * L)
+            qd.atomic_add(soft_info.verts_collider_weight[rod_elems_v[i_r, 1]], 0.5 * L)
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_s in range(n_stencils):
+        for k in qd.static(range(3)):
+            soft_info.rod_stencils_v[i_s][k] = rod_stencils_v[i_s, k]
+        for k in qd.static(range(2)):
+            soft_info.rod_stencils_e[i_s][k] = rod_stencils_e[i_s, k]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_s in range(n_stencils):
+        v = soft_info.rod_stencils_v[i_s]
+        e = soft_info.rod_stencils_e[i_s]
+        X0 = soft_info.verts_rest[v[0]]
+        X1 = soft_info.verts_rest[v[1]]
+        X2 = soft_info.verts_rest[v[2]]
+        L = 0.5 * ((X1 - X0).norm() + (X2 - X1).norm())
+        soft_info.rod_stencils_L[i_s] = L
+        ka, kb, tw = func_rod_bend_twist_measures(
+            X0, X1, X2, soft_info.rod_elems_axis_ref[e[0]], soft_info.rod_elems_axis_ref[e[1]], L, ROD_TINY
+        )
+        soft_info.rod_stencils_ref[i_s] = qd.Vector([ka, kb, tw], dt=gs.qd_float)
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_r, i_b in qd.ndrange(n_elems, _B):
+        axis = soft_info.rod_elems_axis_ref[i_r]
+        soft_state.rod_elems_axis[i_r, i_b] = axis
+        soft_state.rod_elems_axis_stage_start[i_r, i_b] = axis
+        soft_state.rod_elems_axis_ls_ref[i_r, i_b] = axis
+        soft_state.rod_elems_twist[i_r, i_b] = 0.0
+        soft_state.rod_elems_twist_vel[i_r, i_b] = 0.0
+        for k in qd.static(range(N_HISTORY)):
+            soft_state.rod_elems_twist_prev[k, i_r, i_b] = 0.0
+            soft_state.rod_elems_twist_vel_prev[k, i_r, i_b] = 0.0
+        soft_state.rod_elems_twist_step_start[i_r, i_b] = 0.0
+        soft_state.rod_elems_twist_vel_stage_start[i_r, i_b] = 0.0
+        soft_state.rod_elems_twist_ls_ref[i_r, i_b] = 0.0
+
+
+@qd.func
+def func_rod_tangent(i_r, i_b, field: qd.Tensor, soft_info: MochiSoftInfo):
+    v = soft_info.rod_elems_v[i_r]
+    return func_rod_normalize(field[v[1], i_b] - field[v[0], i_b], ROD_TINY)
+
+
+@qd.kernel
+def kernel_rod_step_start(
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+):
+    """Recenter the twist of every segment to zero (shifting its history), build the stage-start twist, twist rate and
+    material axes (transported from the previous positions to the stage-start ones), and the stage-start strain
+    measures. Runs after the vertex step start."""
+    n_elems = soft_state.rod_elems_H.shape[0]
+    n_stencils = soft_state.rod_stencils_H.shape[0]
+    _B = soft_state.verts_pos.shape[1]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_r, i_b in qd.ndrange(n_elems, _B):
+        theta = soft_state.rod_elems_twist[i_r, i_b]
+        soft_state.rod_elems_twist_prev[1, i_r, i_b] = soft_state.rod_elems_twist_prev[0, i_r, i_b] - theta
+        soft_state.rod_elems_twist_prev[0, i_r, i_b] = 0.0
+        soft_state.rod_elems_twist_vel_prev[1, i_r, i_b] = soft_state.rod_elems_twist_vel_prev[0, i_r, i_b]
+        soft_state.rod_elems_twist_vel_prev[0, i_r, i_b] = soft_state.rod_elems_twist_vel[i_r, i_b]
+        twist_start = gs.qd_float(0.0)
+        vel_start = soft_state.rod_elems_twist_vel[i_r, i_b]
+        if qd.static(mochi_config.integrator == INTEGRATOR.BDF2):  # noqa: SIM102
+            if mochi_state.n_hist[i_b] >= 2:
+                twist_start = BDF2_ALPHA_2 * soft_state.rod_elems_twist_prev[1, i_r, i_b]
+                vel_start = vel_start + BDF2_ALPHA_2 * (soft_state.rod_elems_twist_vel_prev[1, i_r, i_b] - vel_start)
+        soft_state.rod_elems_twist_step_start[i_r, i_b] = twist_start
+        soft_state.rod_elems_twist[i_r, i_b] = twist_start
+        soft_state.rod_elems_twist_vel_stage_start[i_r, i_b] = vel_start
+        # Axes follow the tangents from the previous positions to the stage-start ones, plus the start twist.
+        v_prev = soft_info.rod_elems_v[i_r]
+        t_prev = func_rod_normalize(
+            soft_state.verts_pos_prev[0, v_prev[1], i_b] - soft_state.verts_pos_prev[0, v_prev[0], i_b], ROD_TINY
+        )
+        t_start = func_rod_tangent(i_r, i_b, soft_state.verts_pos_stage_start, soft_info)
+        axis = func_rod_transport_axis(t_prev, t_start, twist_start, soft_state.rod_elems_axis[i_r, i_b], ROD_TINY)
+        soft_state.rod_elems_axis[i_r, i_b] = axis
+        soft_state.rod_elems_axis_stage_start[i_r, i_b] = axis
+        v = soft_info.rod_elems_v[i_r]
+        strain, _q = func_rod_axial_strain(
+            soft_state.verts_pos_stage_start[v[0], i_b],
+            soft_state.verts_pos_stage_start[v[1], i_b],
+            qd.max(soft_info.rod_elems_L[i_r], ROD_TINY),
+        )
+        soft_state.rod_elems_strain_stage_start[i_r, i_b] = strain
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_s, i_b in qd.ndrange(n_stencils, _B):
+        v = soft_info.rod_stencils_v[i_s]
+        e = soft_info.rod_stencils_e[i_s]
+        ka, kb, tw = func_rod_bend_twist_measures(
+            soft_state.verts_pos_stage_start[v[0], i_b],
+            soft_state.verts_pos_stage_start[v[1], i_b],
+            soft_state.verts_pos_stage_start[v[2], i_b],
+            soft_state.rod_elems_axis_stage_start[e[0], i_b],
+            soft_state.rod_elems_axis_stage_start[e[1], i_b],
+            qd.max(soft_info.rod_stencils_L[i_s], ROD_TINY),
+            ROD_TINY,
+        )
+        soft_state.rod_stencils_stage_start[i_s, i_b] = qd.Vector([ka, kb, tw], dt=gs.qd_float)
+
+
+@qd.kernel
+def kernel_rod_assemble(
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    assem_obj: qd.template(),
+    assem_res: qd.template(),
+    assem_dres: qd.template(),
+    skip_ls_done: qd.template(),
+):
+    """Stretching, lumped inertia, gravity and damping of every rod segment (with the twist inertia on its twist
+    degree of freedom), and bending and twisting of every interior stencil."""
+    n_elems = soft_state.rod_elems_H.shape[0]
+    n_stencils = soft_state.rod_stencils_H.shape[0]
+    _B = soft_state.verts_pos.shape[1]
+    EPS = mochi_info.EPS[None]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_r, i_b in qd.ndrange(n_elems, _B):
+        if not func_is_env_active(i_b, mochi_state, skip_ls_done):
+            continue
+        L = soft_info.rod_elems_L[i_r]
+        if L <= 0.0:
+            continue
+        i_e = soft_info.rod_elems_entity_idx[i_r]
+        v = soft_info.rod_elems_v[i_r]
+        h = mochi_state.dt_stage[i_b]
+        f = soft_info.entities_stiffness_damping[i_e] / h
+        x0 = soft_state.verts_pos[v[0], i_b]
+        x1 = soft_state.verts_pos[v[1], i_b]
+        energy, g, T = func_rod_axial(
+            x0,
+            x1,
+            L,
+            soft_info.entities_axial_stiffness[i_e],
+            f,
+            soft_state.rod_elems_strain_stage_start[i_r, i_b],
+            EPS,
+            assem_dres,
+        )
+        # Lumped inertia, mass damping and gravity of the two nodes (half the segment mass each) and twist inertia.
+        half_mass = 0.5 * soft_info.entities_rho[i_e] * L
+        c_inertia = half_mass / (h * h)
+        c_damping = half_mass * soft_info.entities_mass_damping[i_e] / h
+        gravity = mochi_info.gravity[i_b] * (1.0 if soft_info.entities_has_gravity[i_e] else 0.0)
+        res0 = -g
+        res1 = g
+        for k in qd.static(range(2)):
+            i_v = v[k]
+            a = (
+                soft_state.verts_pos[i_v, i_b]
+                - soft_state.verts_pos_stage_start[i_v, i_b]
+                - h * soft_state.verts_vel_stage_start[i_v, i_b]
+            )
+            b = soft_state.verts_pos[i_v, i_b] - soft_state.verts_pos_stage_start[i_v, i_b]
+            node_res = c_inertia * a + c_damping * b - half_mass * gravity
+            if qd.static(k == 0):
+                res0 += node_res
+            else:
+                res1 += node_res
+            if qd.static(assem_obj):
+                energy += 0.5 * (c_inertia * a.norm_sqr() + c_damping * b.norm_sqr()) - half_mass * gravity.dot(
+                    soft_state.verts_pos[i_v, i_b]
+                )
+        I_rot = soft_info.rod_elems_rot_inertia[i_r]
+        c_rot = I_rot / (h * h)
+        c_rot_damping = I_rot * soft_info.entities_mass_damping[i_e] / h
+        a_tw = (
+            soft_state.rod_elems_twist[i_r, i_b]
+            - soft_state.rod_elems_twist_step_start[i_r, i_b]
+            - h * soft_state.rod_elems_twist_vel_stage_start[i_r, i_b]
+        )
+        b_tw = soft_state.rod_elems_twist[i_r, i_b] - soft_state.rod_elems_twist_step_start[i_r, i_b]
+        i_d = func_rod_twist_dof(i_r, soft_info)
+        if qd.static(assem_res):
+            func_add_soft_vec(mochi_state.res, v[0], i_b, res0, soft_info)
+            func_add_soft_vec(mochi_state.res, v[1], i_b, res1, soft_info)
+            qd.atomic_add(mochi_state.res[i_d, i_b], c_rot * a_tw + c_rot_damping * b_tw)
+        if qd.static(assem_obj):
+            energy += 0.5 * (c_rot * a_tw * a_tw + c_rot_damping * b_tw * b_tw)
+            qd.atomic_add(mochi_state.obj[i_b], energy)
+        if qd.static(assem_dres):
+            soft_state.rod_elems_H[i_r, i_b] = T
+            block = T + (c_inertia + c_damping) * qd.Matrix.identity(gs.qd_float, 3)
+            qd.atomic_add(soft_state.verts_H_diag[v[0], i_b], block)
+            qd.atomic_add(soft_state.verts_H_diag[v[1], i_b], block)
+            qd.atomic_add(mochi_state.dofs_H_diag[i_d, i_b], c_rot + c_rot_damping)
+            # The nodal inertia is not part of the segment block: it is applied through the vertex lumped term.
+            soft_state.rod_elems_inertia[i_r, i_b] = c_inertia + c_damping
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_s, i_b in qd.ndrange(n_stencils, _B):
+        if not func_is_env_active(i_b, mochi_state, skip_ls_done):
+            continue
+        L = soft_info.rod_stencils_L[i_s]
+        if L <= 0.0:
+            continue
+        v = soft_info.rod_stencils_v[i_s]
+        e = soft_info.rod_stencils_e[i_s]
+        i_e = soft_info.rod_elems_entity_idx[e[0]]
+        h = mochi_state.dt_stage[i_b]
+        f = soft_info.entities_stiffness_damping[i_e] / h
+        ref = soft_info.rod_stencils_ref[i_s]
+        ss = soft_state.rod_stencils_stage_start[i_s, i_b]
+        energy, res, K, _ka, _kb, _tw = func_rod_bend_twist(
+            soft_state.verts_pos[v[0], i_b],
+            soft_state.verts_pos[v[1], i_b],
+            soft_state.verts_pos[v[2], i_b],
+            soft_state.rod_elems_axis[e[0], i_b],
+            soft_state.rod_elems_axis[e[1], i_b],
+            L,
+            ref[0],
+            ref[1],
+            ref[2],
+            ss[0],
+            ss[1],
+            ss[2],
+            soft_info.entities_membrane_mu[i_e],
+            soft_info.entities_membrane_lambda[i_e],
+            soft_info.entities_torsional_stiffness[i_e],
+            f,
+            ROD_TINY,
+            assem_dres,
+        )
+        dofs = func_rod_stencil_dofs(i_s, soft_info)
+        if qd.static(assem_res):
+            for p in qd.static(range(11)):
+                qd.atomic_add(mochi_state.res[dofs[p], i_b], res[p])
+        if qd.static(assem_obj):
+            qd.atomic_add(mochi_state.obj[i_b], energy)
+        if qd.static(assem_dres):
+            soft_state.rod_stencils_H[i_s, i_b] = K
+            for a in qd.static(range(3)):
+                block = qd.Matrix.zero(gs.qd_float, 3, 3)
+                for r in qd.static(range(3)):
+                    for c in qd.static(range(3)):
+                        block[r, c] = K[4 * a + r, 4 * a + c]
+                qd.atomic_add(soft_state.verts_H_diag[v[a], i_b], block)
+            qd.atomic_add(soft_state.rod_elems_twist_pcg[e[0], i_b], K[3, 3])
+            qd.atomic_add(soft_state.rod_elems_twist_pcg[e[1], i_b], K[7, 7])
+
+
+@qd.kernel
+def kernel_rod_apply_increment(
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    """Trial twist of every segment and its material axis: parallel transport from the reference iterate's tangent
+    to the trial tangent (the vertex increment has been applied), then rotation by the twist increment."""
+    n_elems = soft_state.rod_elems_H.shape[0]
+    _B = soft_state.verts_pos.shape[1]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_r, i_b in qd.ndrange(n_elems, _B):
+        if not func_is_env_active(i_b, mochi_state, True) or soft_info.rod_elems_L[i_r] <= 0.0:
+            continue
+        delta = -mochi_state.ls_alpha[i_b] * mochi_state.dx[func_rod_twist_dof(i_r, soft_info), i_b]
+        soft_state.rod_elems_twist[i_r, i_b] = soft_state.rod_elems_twist_ls_ref[i_r, i_b] + delta
+        t_ref = func_rod_tangent(i_r, i_b, soft_state.verts_pos_ls_ref, soft_info)
+        t_new = func_rod_tangent(i_r, i_b, soft_state.verts_pos, soft_info)
+        soft_state.rod_elems_axis[i_r, i_b] = func_rod_transport_axis(
+            t_ref, t_new, delta, soft_state.rod_elems_axis_ls_ref[i_r, i_b], ROD_TINY
+        )
+
+
+@qd.kernel
+def kernel_rod_store_ls_ref(
+    mochi_state: MochiState,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    only_done: qd.template(),
+):
+    n_elems = soft_state.rod_elems_H.shape[0]
+    _B = soft_state.verts_pos.shape[1]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_r, i_b in qd.ndrange(n_elems, _B):
+        is_ref = mochi_state.is_active[i_b]
+        if qd.static(only_done):
+            is_ref = is_ref and mochi_state.ls_is_done[i_b]
+        if is_ref:
+            soft_state.rod_elems_twist_ls_ref[i_r, i_b] = soft_state.rod_elems_twist[i_r, i_b]
+            soft_state.rod_elems_axis_ls_ref[i_r, i_b] = soft_state.rod_elems_axis[i_r, i_b]
+
+
+@qd.kernel
+def kernel_rod_post_stage(
+    mochi_state: MochiState,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    """Finite-difference twist rate of every segment; a diverged environment returns to its stage start at rest."""
+    n_elems = soft_state.rod_elems_H.shape[0]
+    _B = soft_state.verts_pos.shape[1]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_r, i_b in qd.ndrange(n_elems, _B):
+        if mochi_state.status[i_b] == SOLVE_STATUS.DIVERGED:
+            soft_state.rod_elems_twist[i_r, i_b] = soft_state.rod_elems_twist_step_start[i_r, i_b]
+            soft_state.rod_elems_axis[i_r, i_b] = soft_state.rod_elems_axis_stage_start[i_r, i_b]
+            soft_state.rod_elems_twist_vel[i_r, i_b] = 0.0
+            continue
+        h = mochi_state.dt_stage[i_b]
+        soft_state.rod_elems_twist_vel[i_r, i_b] = (
+            soft_state.rod_elems_twist[i_r, i_b] - soft_state.rod_elems_twist_step_start[i_r, i_b]
+        ) / h
+
+
+@qd.kernel
+def kernel_rod_update_conv_weights(
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    """Convergence weights of the twist degrees of freedom from the rotational inertia: 1 / ((a_ref / r_gyr)^2 sum_e
+    I_e I_e) with the gyration radius sqrt(I_lin / rho_lin) of the entity."""
+    n_elems = soft_state.rod_elems_H.shape[0]
+    n_entities = soft_info.entities_mass.shape[0]
+    _B = soft_state.verts_pos.shape[1]
+    EPS = mochi_info.EPS[None]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_r, i_b in qd.ndrange(n_elems, _B):
+        i_e = soft_info.rod_elems_entity_idx[i_r]
+        w = gs.qd_float(1.0)
+        I_e = soft_info.rod_elems_rot_inertia[i_r]
+        if I_e > 0.0 and soft_info.entities_rot_inertia[i_e] > 0.0:
+            a_ref = qd.max(1.0, mochi_info.gravity[i_b].norm())
+            gyr_sq = soft_info.entities_rot_inertia[i_e] / qd.max(soft_info.entities_rho[i_e], EPS)
+            total = gs.qd_float(0.0)
+            for j_r in range(n_elems):
+                if soft_info.rod_elems_entity_idx[j_r] == i_e:
+                    total += soft_info.rod_elems_rot_inertia[j_r]
+            w = gyr_sq / (a_ref * a_ref * qd.max(total, EPS) * I_e)
+        mochi_state.conv_w[func_rod_twist_dof(i_r, soft_info), i_b] = w
+
+
+# ------------------------------------------------------------------------------------
 # ------------------------------ point-cloud colliders (shells) ----------------------
 # ------------------------------------------------------------------------------------
 
@@ -2195,7 +2753,7 @@ def kernel_pc_collider_eval(
             i_sample = i_q - n_rigid_samples
             e_a = soft_info.samples_entity_idx[i_sample]
             is_enabled = (e_a != e_b) and soft_info.entities_pair_enabled[e_a, e_b]
-            is_shell_a = soft_info.entities_kind[e_a] == SOFT_KIND_SHELL
+            is_shell_a = soft_info.entities_kind[e_a] != SOFT_KIND_SOLID
             tri = soft_info.samples_tri[i_sample]
             bary = soft_info.samples_bary[i_sample]
             x0 = soft_state.verts_pos[tri[0], i_b]
@@ -2234,7 +2792,11 @@ def kernel_pc_collider_eval(
         p_rel = (pos - pos_start) - (x_b - soft_state.verts_pos_stage_start[i_vb, i_b])
         d_start = d - grad.dot(p_rel)
 
-        k = qd.sqrt(k_a * soft_info.entities_penalty_coefficient[e_b]) * w_b / (radius * radius)
+        # Dimensional correction of the point-cloud measure: radius^-2 for a surface (shell), radius^-1 for a curve (rod).
+        length_scale = radius * radius
+        if soft_info.entities_kind[e_b] == SOFT_KIND_ROD:
+            length_scale = radius
+        k = qd.sqrt(k_a * soft_info.entities_penalty_coefficient[e_b]) * w_b / length_scale
         falloff = qd.sqrt(falloff_a * soft_info.entities_friction_falloff_vel[e_b])
         mu = qd.sqrt(mu_a * soft_info.entities_friction[e_b])
         c_visc = qd.sqrt(c_visc_a * soft_info.entities_viscous_friction[e_b])

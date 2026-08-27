@@ -44,6 +44,14 @@ never collides with itself. Consistently wound meshes are required. Light cloth 
 `penalty_coefficient` (1e7 Pa/m) or a larger `explosion_rel_tol` so that the sudden contact residual of an impact is
 not mistaken for a divergence.
 
+Rods (`gs.morphs.Rod` polyline + `gs.materials.Mochi.Rod`) are discrete elastic rods: stretching of the segments,
+bending and twisting at the interior nodes, with one twist angle per segment as an extra unknown and the material
+frames carried along as parallel-transported state (a Kirchhoff rod, no shear). The stiffnesses derive from `E`, `nu`,
+`rho` and the radius (`E A`, `E I`, `G J`, `rho A`, `rho J`) and can be overridden; clamp a rod by fixing its first two
+nodes. Rods collide through samples on their centerline (no radius offset on the colliding side) and act as
+colliders through spheres of the rod radius carried by their nodes (`collider_type="auto"`), so a rigid body resting on
+a rope sits one rod radius above the centerline.
+
 Velocities are recovered by finite differences over the step as in mochi: `get_dofs_velocity()` returns
 `sin(dq)/dt` for revolute joints and the sine-based angular velocity `vee(((R - R_prev)/dt) R^T)` for spherical and
 free joints, which differ from `dq/dt` by a factor `1 - (dq)^2/6`.

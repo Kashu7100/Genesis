@@ -444,6 +444,18 @@ class MochiSoftInfo:
     shell_elems_area: qd.Tensor
     shell_elems_A_inv: qd.Tensor
     shell_elems_B: qd.Tensor
+    # Rod segments: the two vertices, owning entity, reference length, rotational inertia (linear density times length),
+    # reference material axis; and the interior-node stencils (three vertices, the two segments meeting at the node,
+    # the reference Voronoi length and the reference curvature/twist measures).
+    rod_elems_v: qd.Tensor
+    rod_elems_entity_idx: qd.Tensor
+    rod_elems_L: qd.Tensor
+    rod_elems_rot_inertia: qd.Tensor
+    rod_elems_axis_ref: qd.Tensor
+    rod_stencils_v: qd.Tensor
+    rod_stencils_e: qd.Tensor
+    rod_stencils_L: qd.Tensor
+    rod_stencils_ref: qd.Tensor
     # Boundary contact samples: triangle vertices, barycentric coordinates, rest area weight and owning entity.
     samples_tri: qd.Tensor
     samples_bary: qd.Tensor
@@ -464,6 +476,9 @@ class MochiSoftInfo:
     entities_bending_alpha: qd.Tensor
     entities_bending_beta: qd.Tensor
     entities_collider_radius: qd.Tensor
+    entities_axial_stiffness: qd.Tensor
+    entities_torsional_stiffness: qd.Tensor
+    entities_rot_inertia: qd.Tensor
     entities_penalty_coefficient: qd.Tensor
     entities_penalty_smoothing_half_distance: qd.Tensor
     entities_penalty_threshold: qd.Tensor
@@ -488,8 +503,10 @@ class MochiSoftInfo:
     # (layer and entity filters).
     entities_links_pair_enabled: qd.Tensor
     entities_pair_enabled: qd.Tensor
-    # Offset of the first deformable degree of freedom in the Newton system (after the rigid degrees of freedom).
+    # Offset of the first deformable degree of freedom in the Newton system (after the rigid degrees of freedom), and
+    # of the first rod twist degree of freedom (after the vertex degrees of freedom).
     dof_start: qd.Tensor
+    twist_dof_start: qd.Tensor
 
 
 def get_mochi_soft_info(solver):
@@ -500,6 +517,7 @@ def get_mochi_soft_info(solver):
         solver.n_soft_entities_,
     )
     n_sh_ = solver.n_shell_elems_
+    n_re_, n_rs_ = solver.n_rod_elems_, solver.n_rod_stencils_
     return MochiSoftInfo(
         verts_rest=V(dtype=gs.qd_vec3, shape=(n_sv_,)),
         verts_mass=V(dtype=gs.qd_float, shape=(n_sv_,)),
@@ -516,6 +534,15 @@ def get_mochi_soft_info(solver):
         shell_elems_area=V(dtype=gs.qd_float, shape=(n_sh_,)),
         shell_elems_A_inv=V_MAT(n=2, m=2, dtype=gs.qd_float, shape=(n_sh_,)),
         shell_elems_B=V_MAT(n=2, m=2, dtype=gs.qd_float, shape=(n_sh_,)),
+        rod_elems_v=V(dtype=gs.qd_ivec2, shape=(n_re_,)),
+        rod_elems_entity_idx=V(dtype=gs.qd_int, shape=(n_re_,)),
+        rod_elems_L=V(dtype=gs.qd_float, shape=(n_re_,)),
+        rod_elems_rot_inertia=V(dtype=gs.qd_float, shape=(n_re_,)),
+        rod_elems_axis_ref=V(dtype=gs.qd_vec3, shape=(n_re_,)),
+        rod_stencils_v=V(dtype=gs.qd_ivec3, shape=(n_rs_,)),
+        rod_stencils_e=V(dtype=gs.qd_ivec2, shape=(n_rs_,)),
+        rod_stencils_L=V(dtype=gs.qd_float, shape=(n_rs_,)),
+        rod_stencils_ref=V(dtype=gs.qd_vec3, shape=(n_rs_,)),
         samples_tri=V(dtype=gs.qd_ivec3, shape=(n_ss_,)),
         samples_bary=V(dtype=gs.qd_vec3, shape=(n_ss_,)),
         samples_weight=V(dtype=gs.qd_float, shape=(n_ss_,)),
@@ -534,6 +561,9 @@ def get_mochi_soft_info(solver):
         entities_bending_alpha=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_bending_beta=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_collider_radius=V(dtype=gs.qd_float, shape=(n_se_,)),
+        entities_axial_stiffness=V(dtype=gs.qd_float, shape=(n_se_,)),
+        entities_torsional_stiffness=V(dtype=gs.qd_float, shape=(n_se_,)),
+        entities_rot_inertia=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_penalty_coefficient=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_penalty_smoothing_half_distance=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_penalty_threshold=V(dtype=gs.qd_float, shape=(n_se_,)),
@@ -555,6 +585,7 @@ def get_mochi_soft_info(solver):
         entities_links_pair_enabled=V(dtype=gs.qd_bool, shape=(n_se_, solver.n_links_)),
         entities_pair_enabled=V(dtype=gs.qd_bool, shape=(n_se_, n_se_)),
         dof_start=_scalar(gs.qd_int, solver.n_dofs),
+        twist_dof_start=_scalar(gs.qd_int, solver.n_dofs + 3 * solver.n_soft_verts),
     )
 
 
@@ -583,6 +614,26 @@ class MochiSoftState:
     shell_elems_eps_stage_start: qd.Tensor
     shell_elems_s_stage_start: qd.Tensor
     shell_elems_H: qd.Tensor
+    # Rods: material axis of every segment (current, stage start, line search reference), twist angle of the step
+    # (recentered to zero at every step start) with its finite-difference rate and history, stage-start axial strain
+    # and stencil measures, and the Hessian blocks (3x3 axial per segment, 11x11 per stencil over
+    # [x0, theta0, x1, theta1, x2]).
+    rod_elems_axis: qd.Tensor
+    rod_elems_axis_stage_start: qd.Tensor
+    rod_elems_axis_ls_ref: qd.Tensor
+    rod_elems_twist: qd.Tensor
+    rod_elems_twist_vel: qd.Tensor
+    rod_elems_twist_prev: qd.Tensor
+    rod_elems_twist_vel_prev: qd.Tensor
+    rod_elems_twist_step_start: qd.Tensor
+    rod_elems_twist_vel_stage_start: qd.Tensor
+    rod_elems_twist_ls_ref: qd.Tensor
+    rod_elems_strain_stage_start: qd.Tensor
+    rod_elems_H: qd.Tensor
+    rod_elems_inertia: qd.Tensor
+    rod_elems_twist_pcg: qd.Tensor
+    rod_stencils_stage_start: qd.Tensor
+    rod_stencils_H: qd.Tensor
     # Conservative per-step world bounds of every entity.
     entities_step_aabb_min: qd.Tensor
     entities_step_aabb_max: qd.Tensor
@@ -642,6 +693,7 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
     _B = solver._B
     n_sv_, n_el_, n_se_ = solver.n_soft_verts_, solver.n_soft_elems_, solver.n_soft_entities_
     n_sh_ = solver.n_shell_elems_
+    n_re_, n_rs_ = solver.n_rod_elems_, solver.n_rod_stencils_
     return MochiSoftState(
         verts_pos=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
         verts_vel=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
@@ -659,6 +711,22 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         shell_elems_eps_stage_start=V_MAT(n=2, m=2, dtype=gs.qd_float, shape=(n_sh_, _B)),
         shell_elems_s_stage_start=V_MAT(n=2, m=2, dtype=gs.qd_float, shape=(n_sh_, _B)),
         shell_elems_H=V_MAT(n=18, m=18, dtype=gs.qd_float, shape=(n_sh_, _B)),
+        rod_elems_axis=V(dtype=gs.qd_vec3, shape=(n_re_, _B)),
+        rod_elems_axis_stage_start=V(dtype=gs.qd_vec3, shape=(n_re_, _B)),
+        rod_elems_axis_ls_ref=V(dtype=gs.qd_vec3, shape=(n_re_, _B)),
+        rod_elems_twist=V(dtype=gs.qd_float, shape=(n_re_, _B)),
+        rod_elems_twist_vel=V(dtype=gs.qd_float, shape=(n_re_, _B)),
+        rod_elems_twist_prev=V(dtype=gs.qd_float, shape=(N_HISTORY, n_re_, _B)),
+        rod_elems_twist_vel_prev=V(dtype=gs.qd_float, shape=(N_HISTORY, n_re_, _B)),
+        rod_elems_twist_step_start=V(dtype=gs.qd_float, shape=(n_re_, _B)),
+        rod_elems_twist_vel_stage_start=V(dtype=gs.qd_float, shape=(n_re_, _B)),
+        rod_elems_twist_ls_ref=V(dtype=gs.qd_float, shape=(n_re_, _B)),
+        rod_elems_strain_stage_start=V(dtype=gs.qd_float, shape=(n_re_, _B)),
+        rod_elems_H=V(dtype=gs.qd_mat3, shape=(n_re_, _B)),
+        rod_elems_inertia=V(dtype=gs.qd_float, shape=(n_re_, _B)),
+        rod_elems_twist_pcg=V(dtype=gs.qd_float, shape=(n_re_, _B)),
+        rod_stencils_stage_start=V(dtype=gs.qd_vec3, shape=(n_rs_, _B)),
+        rod_stencils_H=V_MAT(n=11, m=11, dtype=gs.qd_float, shape=(n_rs_, _B)),
         entities_step_aabb_min=V(dtype=gs.qd_vec3, shape=(n_se_, _B)),
         entities_step_aabb_max=V(dtype=gs.qd_vec3, shape=(n_se_, _B)),
         n_pairs=V(dtype=gs.qd_int, shape=(_B,)),

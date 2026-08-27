@@ -476,7 +476,10 @@ class Scene(RBC):
                     f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['visual', 'particle', 'recon']."
                 )
 
-        elif isinstance(material, (gs.materials.FEM.Base, gs.materials.Mochi.Elastic, gs.materials.Mochi.Shell)):
+        elif isinstance(
+            material,
+            (gs.materials.FEM.Base, gs.materials.Mochi.Elastic, gs.materials.Mochi.Shell, gs.materials.Mochi.Rod),
+        ):
             if surface.vis_mode is None:
                 surface.vis_mode = "visual"
 

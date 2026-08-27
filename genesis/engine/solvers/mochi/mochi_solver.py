@@ -98,14 +98,24 @@ from .newton import (
 from .rigid_assembly import kernel_assemble_links
 from .soft import (
     ENTITY_PARAMS,
+    SOFT_KIND_ROD,
     SOFT_KIND_SHELL,
     SOFT_KIND_SOLID,
     SoftTetLBVH,
     build_soft_samples,
+    kernel_init_rod_fields,
     kernel_init_shell_fields,
     kernel_init_soft_fields,
     kernel_pc_collider_aabbs,
     kernel_pc_collider_eval,
+    kernel_rod_apply_increment,
+    kernel_rod_assemble,
+    kernel_rod_get_state_render,
+    kernel_rod_init_render,
+    kernel_rod_post_stage,
+    kernel_rod_step_start,
+    kernel_rod_store_ls_ref,
+    kernel_rod_update_conv_weights,
     kernel_shell_assemble,
     kernel_shell_stage_start,
     kernel_soft_apply_increment,
@@ -206,12 +216,17 @@ class MochiSolver(KinematicSolver):
         if isinstance(morph, (gs.morphs.Terrain, gs.morphs.USD, gs.morphs.Drone)):
             gs.raise_exception(f"Morph {type(morph).__name__} is not supported by the MochiSolver.")
 
-        if isinstance(material, (gs.materials.Mochi.Elastic, gs.materials.Mochi.Shell)):
-            if not isinstance(morph, (gs.morphs.Box, gs.morphs.Sphere, gs.morphs.Cylinder, gs.morphs.Mesh)):
+        if isinstance(material, (gs.materials.Mochi.Elastic, gs.materials.Mochi.Shell, gs.materials.Mochi.Rod)):
+            is_rod = isinstance(material, gs.materials.Mochi.Rod)
+            if not is_rod and not isinstance(
+                morph, (gs.morphs.Box, gs.morphs.Sphere, gs.morphs.Cylinder, gs.morphs.Mesh)
+            ):
                 gs.raise_exception(
                     f"Morph {type(morph).__name__} is not supported for deformable Mochi bodies (Box, Sphere, "
                     "Cylinder or Mesh expected)."
                 )
+            if is_rod and not isinstance(morph, gs.morphs.Rod):
+                gs.raise_exception("A `gs.materials.Mochi.Rod` material requires a `gs.morphs.Rod` morph.")
             entity = MochiSoftEntity(
                 scene=self._scene,
                 solver=self,
@@ -296,6 +311,8 @@ class MochiSolver(KinematicSolver):
         self.n_soft_verts_ = max(1, self.n_soft_verts)
         self.n_soft_elems_ = max(1, self.n_soft_elems)
         self.n_shell_elems_ = max(1, self.n_shell_elems)
+        self.n_rod_elems_ = max(1, self.n_rod_elems)
+        self.n_rod_stencils_ = max(1, self.n_rod_stencils)
         self.n_dofs_total_ = max(1, self.n_dofs_total)
 
         if gs.qd_float == qd.f32 and any(
@@ -594,8 +611,20 @@ class MochiSolver(KinematicSolver):
             verts_entity_idx = np.concatenate(
                 [np.full(entity.n_vertices, entity.idx_in_solver, dtype=gs.np_int) for entity in entities]
             )
-            solids = [entity for entity in entities if not entity.is_shell]
+            solids = [entity for entity in entities if not (entity.is_shell or entity.is_rod)]
             shells = [entity for entity in entities if entity.is_shell]
+            rods = [entity for entity in entities if entity.is_rod]
+            rod_elems_v = np.concatenate(
+                [np.zeros((0, 2), dtype=gs.np_int)] + [entity.elems + entity.v_start for entity in rods]
+            ).astype(gs.np_int)
+            rod_elems_entity_idx = np.concatenate(
+                [np.zeros((0,), dtype=gs.np_int)]
+                + [np.full(entity.n_elements, entity.idx_in_solver, dtype=gs.np_int) for entity in rods]
+            )
+            rod_elems_axis_ref = np.concatenate(
+                [np.zeros((0, 3), dtype=gs.np_float)] + [entity.rod_axes_ref for entity in rods]
+            ).astype(gs.np_float)
+            rod_stencils_v, rod_stencils_e = self._rod_stencils(rods)
             elems_v = np.concatenate(
                 [np.zeros((0, 4), dtype=gs.np_int)] + [entity.elems + entity.v_start for entity in solids]
             ).astype(gs.np_int)
@@ -618,9 +647,12 @@ class MochiSolver(KinematicSolver):
             entities_sample_range = np.zeros((len(entities), 2), dtype=gs.np_int)
             n_samples = 0
             for entity in entities:
-                tri, sample_bary, weight = build_soft_samples(
-                    entity.init_positions, entity.surface_triangles, bary, ref_weights
-                )
+                if entity.is_rod:
+                    tri, sample_bary, weight = self._rod_samples(entity)
+                else:
+                    tri, sample_bary, weight = build_soft_samples(
+                        entity.init_positions, entity.surface_triangles, bary, ref_weights
+                    )
                 samples_tri.append(tri + entity.v_start)
                 samples_bary.append(sample_bary)
                 samples_weight.append(weight)
@@ -659,8 +691,11 @@ class MochiSolver(KinematicSolver):
                         *grid["res"],
                         *grid["origin"],
                         *grid["cell"],
-                        float(SOFT_KIND_SHELL if entity.is_shell else SOFT_KIND_SOLID),
+                        float(
+                            SOFT_KIND_ROD if entity.is_rod else SOFT_KIND_SHELL if entity.is_shell else SOFT_KIND_SOLID
+                        ),
                         *self._shell_material_params(entity),
+                        *self._rod_material_params(entity),
                     ]
                     for entity, grid, sdf_start in zip(entities, sdf_grids, sdf_starts)
                 ],
@@ -674,6 +709,11 @@ class MochiSolver(KinematicSolver):
             shell_elems_v = np.zeros((0, 3), dtype=gs.np_int)
             shell_elems_hinge = np.zeros((0, 3), dtype=gs.np_int)
             shell_elems_entity_idx = np.zeros((0,), dtype=gs.np_int)
+            rod_elems_v = np.zeros((0, 2), dtype=gs.np_int)
+            rod_elems_entity_idx = np.zeros((0,), dtype=gs.np_int)
+            rod_elems_axis_ref = np.zeros((0, 3), dtype=gs.np_float)
+            rod_stencils_v = np.zeros((0, 3), dtype=gs.np_int)
+            rod_stencils_e = np.zeros((0, 2), dtype=gs.np_int)
             samples_tri = np.zeros((0, 3), dtype=gs.np_int)
             samples_bary = np.zeros((0, 3), dtype=gs.np_float)
             samples_weight = np.zeros((0,), dtype=gs.np_float)
@@ -751,6 +791,17 @@ class MochiSolver(KinematicSolver):
             kernel_init_shell_fields(
                 shell_elems_v, shell_elems_hinge, shell_elems_entity_idx, self.soft_info, self.rigid_config
             )
+        if self.n_rod_elems > 0:
+            kernel_init_rod_fields(
+                rod_elems_v,
+                rod_elems_entity_idx,
+                rod_elems_axis_ref,
+                rod_stencils_v,
+                rod_stencils_e,
+                self.soft_info,
+                self.soft_state,
+                self.rigid_config,
+            )
 
         # Render geometry of the deformable surfaces.
         n_soft_vverts_ = max(1, self.n_soft_vverts)
@@ -761,6 +812,33 @@ class MochiSolver(KinematicSolver):
                 [vgeom.sim_verts_idx + entity.v_start for entity in entities for vgeom in entity.vgeoms]
             ).astype(gs.np_int)
             kernel_soft_init_render(vert_idx, self._soft_vverts_vert_idx)
+        rods = [entity for entity in entities if entity.is_rod]
+        self._n_rod_vverts = sum(entity.n_vverts for entity in rods)
+        n_rod_vverts_ = max(1, self._n_rod_vverts)
+        self._rod_vverts_vvert = array_class.V(dtype=gs.qd_int, shape=(n_rod_vverts_,))
+        self._rod_vverts_node = array_class.V(dtype=gs.qd_int, shape=(n_rod_vverts_,))
+        self._rod_vverts_elem = array_class.V(dtype=gs.qd_int, shape=(n_rod_vverts_,))
+        self._rod_vverts_offset = array_class.V(dtype=gs.qd_vec2, shape=(n_rod_vverts_,))
+        if self._n_rod_vverts > 0:
+            rod_elem_start = {}
+            n_rod_elems = 0
+            for entity in rods:
+                rod_elem_start[entity.idx_in_solver] = n_rod_elems
+                n_rod_elems += entity.n_elements
+            kernel_rod_init_render(
+                np.concatenate(
+                    [np.arange(entity.vvert_start, entity.vvert_start + entity.n_vverts) for entity in rods]
+                ).astype(gs.np_int),
+                np.concatenate([entity.rod_vverts_node + entity.v_start for entity in rods]).astype(gs.np_int),
+                np.concatenate(
+                    [entity.rod_vverts_elem + rod_elem_start[entity.idx_in_solver] for entity in rods]
+                ).astype(gs.np_int),
+                np.concatenate([entity.rod_vverts_offset for entity in rods]).astype(gs.np_float),
+                self._rod_vverts_vvert,
+                self._rod_vverts_node,
+                self._rod_vverts_elem,
+                self._rod_vverts_offset,
+            )
         self._envs_offset = np.asarray(self._scene.envs_offset, dtype=gs.np_float).reshape((_B, 3))
 
     @staticmethod
@@ -785,16 +863,68 @@ class MochiSolver(KinematicSolver):
         return hinges
 
     @staticmethod
+    def _rod_samples(entity):
+        """Centerline contact samples of a rod: 3-point Gauss-Legendre quadrature of every segment, weighted by the rest
+        segment length, expressed as degenerate triangles (v0, v1, v1) with barycentric coordinates (1 - s, s, 0)."""
+        elems = np.asarray(entity.elems, dtype=gs.np_int)
+        lengths = np.linalg.norm(entity.init_positions[elems[:, 1]] - entity.init_positions[elems[:, 0]], axis=1)
+        points = np.array([0.5 * (1.0 - np.sqrt(0.6)), 0.5, 0.5 * (1.0 + np.sqrt(0.6))])
+        weights = np.array([2.5 / 9.0, 4.0 / 9.0, 2.5 / 9.0])
+        tri = np.repeat(np.stack([elems[:, 0], elems[:, 1], elems[:, 1]], axis=-1), 3, axis=0)
+        bary = np.tile(np.stack([1.0 - points, points, np.zeros(3)], axis=-1), (len(elems), 1))
+        sample_weights = (weights[None, :] * lengths[:, None]).reshape((-1,))
+        return tri.astype(gs.np_int), bary.astype(gs.np_float), sample_weights.astype(gs.np_float)
+
+    @staticmethod
+    def _rod_stencils(rods):
+        """Interior-node stencils of the rods: the three vertices and the two segments meeting at the node."""
+        stencils_v, stencils_e = [], []
+        elem_start = 0
+        for entity in rods:
+            n_nodes = entity.n_vertices
+            n_elems = entity.n_elements
+            nodes = range(n_nodes) if entity.morph.is_closed_loop else range(1, n_nodes - 1)
+            for i_n in nodes:
+                stencils_v.append(
+                    [
+                        (i_n - 1) % n_nodes + entity.v_start,
+                        i_n + entity.v_start,
+                        (i_n + 1) % n_nodes + entity.v_start,
+                    ]
+                )
+                stencils_e.append([(i_n - 1) % n_elems + elem_start, i_n % n_elems + elem_start])
+            elem_start += n_elems
+        return (
+            np.array(stencils_v, dtype=gs.np_int).reshape((-1, 3)),
+            np.array(stencils_e, dtype=gs.np_int).reshape((-1, 2)),
+        )
+
+    @staticmethod
+    def _rod_material_params(entity):
+        """(axial stiffness, torsional stiffness, linear rotational inertia) columns of a rod, zeros otherwise."""
+        if entity.is_rod:
+            params = entity.material.resolve(entity.rod_radius)
+            return (params["axial_stiffness"], params["torsional_stiffness"], params["linear_rotational_inertia"])
+        return (0.0, 0.0, 0.0)
+
+    @staticmethod
     def _solid_material_params(entity):
         """(model, mu, lambda, density) columns: the elastic model of a solid, the areal density of a shell."""
         material = entity.material
+        if entity.is_rod:
+            return (0.0, 0.0, 0.0, material.resolve(entity.rod_radius)["linear_density"])
         if entity.is_shell:
             return (0.0, 0.0, 0.0, material.areal_density)
         return (float(ELASTIC_MODEL_BY_NAME[material.model]), material.mu, material.lam, material.rho)
 
     @staticmethod
     def _shell_material_params(entity):
+        """(membrane mu, membrane lambda, bending alpha, bending beta, collider radius) of a shell; a rod stores its two
+        flexural stiffnesses in the first two columns and its radius in the last."""
         material = entity.material
+        if entity.is_rod:
+            params = material.resolve(entity.rod_radius)
+            return (params["flexural_stiffness"], params["flexural_stiffness"], 0.0, 0.0, entity.rod_radius)
         if entity.is_shell:
             return (
                 material.membrane_mu,
@@ -808,9 +938,9 @@ class MochiSolver(KinematicSolver):
     def _build_soft_sdf_grid(self, entity):
         """Rest-shape signed distance grid of a deformable solid collider (igl over the boundary triangles); shells are
         point-cloud colliders and bodies that do not act as colliders get an empty grid."""
-        if entity.material.collider_type == "none" or entity.is_shell:
+        if entity.material.collider_type == "none" or entity.is_shell or entity.is_rod:
             collider_type = COLLIDER_TYPE.NONE
-            if entity.is_shell and entity.material.collider_type != "none":
+            if (entity.is_shell or entity.is_rod) and entity.material.collider_type != "none":
                 collider_type = COLLIDER_TYPE.POINT_CLOUD
             return {
                 "collider_type": collider_type,
@@ -939,6 +1069,10 @@ class MochiSolver(KinematicSolver):
             )
             if self.n_shell_elems > 0:
                 kernel_shell_stage_start(self.soft_info, self.soft_state, self.rigid_config)
+            if self.n_rod_elems > 0:
+                kernel_rod_step_start(
+                    self.mochi_state, self.soft_info, self.soft_state, self.rigid_config, self.mochi_config
+                )
         self._forward_kinematics()
         kernel_store_stage_start_poses(self.dyn_state, self.mochi_state, self.rigid_config)
         kernel_reset_newton(self.mochi_state, self.rigid_config)
@@ -973,6 +1107,8 @@ class MochiSolver(KinematicSolver):
         )
         if self.has_soft:
             kernel_soft_post_stage(self.mochi_state, self.soft_state, self.rigid_config)
+            if self.n_rod_elems > 0:
+                kernel_rod_post_stage(self.mochi_state, self.soft_state, self.rigid_config)
         self._forward_kinematics()
         self._is_forward_pos_updated = True
         self._is_forward_vel_updated = True
@@ -1159,6 +1295,18 @@ class MochiSolver(KinematicSolver):
                     assem_dres,
                     skip_ls_done,
                 )
+            if self.n_rod_elems > 0:
+                kernel_rod_assemble(
+                    self.mochi_info,
+                    self.mochi_state,
+                    self.soft_info,
+                    self.soft_state,
+                    self.rigid_config,
+                    assem_obj,
+                    assem_res,
+                    assem_dres,
+                    skip_ls_done,
+                )
         if assem_res:
             if self.has_soft:
                 kernel_soft_dirichlet(
@@ -1212,10 +1360,16 @@ class MochiSolver(KinematicSolver):
             kernel_soft_update_conv_weights(
                 self.mochi_info, self.mochi_state, self.soft_info, self.soft_state, self.rigid_config
             )
+            if self.n_rod_elems > 0:
+                kernel_rod_update_conv_weights(
+                    self.mochi_info, self.mochi_state, self.soft_info, self.soft_state, self.rigid_config
+                )
         self._assemble(assem_res=True, assem_dres=True, skip_ls_done=False)
         kernel_store_initial_norms(self.rigid_info, self.mochi_state, self.rigid_config)
         if self.has_soft:
             kernel_soft_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, False)
+            if self.n_rod_elems > 0:
+                kernel_rod_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, False)
         kernel_convergence_check(self.mochi_info, self.mochi_state, self.rigid_config, False, self._errno)
 
         n_linesearch = options.n_linesearch_iterations
@@ -1231,12 +1385,16 @@ class MochiSolver(KinematicSolver):
             kernel_linesearch_begin(self.rigid_info, self.mochi_state, self.rigid_config)
             if self.has_soft:
                 kernel_soft_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, False)
+                if self.n_rod_elems > 0:
+                    kernel_rod_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, False)
             for i_ls in range(max(1, n_linesearch)):
                 kernel_apply_increment(
                     self.dyn_info, self.rigid_info, self.mochi_info, self.mochi_state, self.rigid_config
                 )
                 if self.has_soft:
                     kernel_soft_apply_increment(self.mochi_state, self.soft_info, self.soft_state, self.rigid_config)
+                    if self.n_rod_elems > 0:
+                        kernel_rod_apply_increment(self.mochi_state, self.soft_info, self.soft_state, self.rigid_config)
                 self._forward_kinematics()
                 self._assemble(assem_res=True, assem_dres=False, skip_ls_done=True)
                 kernel_linesearch_decide(
@@ -1249,6 +1407,8 @@ class MochiSolver(KinematicSolver):
                 )
                 if self.has_soft:
                     kernel_soft_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, True)
+                    if self.n_rod_elems > 0:
+                        kernel_rod_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, True)
             kernel_convergence_check(self.mochi_info, self.mochi_state, self.rigid_config, True, self._errno)
 
     def substep_post_coupling(self, f):
@@ -1287,6 +1447,18 @@ class MochiSolver(KinematicSolver):
         kernel_soft_get_state_render(
             self._soft_vverts_render, self._soft_vverts_vert_idx, self._envs_offset, self.soft_state, self.rigid_config
         )
+        if self._n_rod_vverts > 0:
+            kernel_rod_get_state_render(
+                self._soft_vverts_render,
+                self._rod_vverts_vvert,
+                self._rod_vverts_node,
+                self._rod_vverts_elem,
+                self._rod_vverts_offset,
+                self._envs_offset,
+                self.soft_info,
+                self.soft_state,
+                self.rigid_config,
+            )
         return self._soft_vverts_render, None, None
 
     # ------------------------------------------------------------------------------------
@@ -1685,6 +1857,14 @@ class MochiSolver(KinematicSolver):
         return sum(entity.n_elements for entity in self._soft_entities if entity.is_shell)
 
     @property
+    def n_rod_elems(self):
+        return sum(entity.n_elements for entity in self._soft_entities if entity.is_rod)
+
+    @property
+    def n_rod_stencils(self):
+        return sum(entity.n_rod_stencils for entity in self._soft_entities)
+
+    @property
     def n_soft_surfaces(self):
         return sum(entity.n_surfaces for entity in self._soft_entities)
 
@@ -1702,8 +1882,8 @@ class MochiSolver(KinematicSolver):
 
     @property
     def n_dofs_total(self):
-        """Degrees of freedom of the Newton system: rigid, then 3 per deformable vertex."""
-        return self.n_dofs + 3 * self.n_soft_verts
+        """Degrees of freedom of the Newton system: rigid, then 3 per deformable vertex, then one twist per rod segment."""
+        return self.n_dofs + 3 * self.n_soft_verts + self.n_rod_elems
 
     def _soft_field_of_entity(self, entity, field, envs_idx):
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
