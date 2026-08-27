@@ -19,6 +19,7 @@ def main():
     parser.add_argument("-v", "--vis", action="store_true", help="Show visualization GUI")
     parser.add_argument("-g", "--gpu", action="store_true", help="Run on GPU instead of CPU")
     parser.add_argument("-n", "--n_steps", type=int, default=300, help="Number of simulation steps")
+    parser.add_argument("-r", "--record", action="store_true", help="Record video")
     args = parser.parse_args()
 
     gs.init(backend=gs.gpu if args.gpu else gs.cpu, precision="64")
@@ -57,10 +58,19 @@ def main():
         material=gs.materials.Mochi.Rod(E=5e6, nu=0.3, rho=1200.0, mass_damping=1.0),
         surface=gs.surfaces.Default(color=(0.4, 0.8, 0.4)),
     )
+    if args.record:
+        cam = scene.add_camera(
+            res=(640, 360),
+            pos=(2.5, -2.5, 1.5),
+            lookat=(0.0, 0.0, 0.8),
+        )
     scene.build()
 
     rope.set_vertices_fixed([0, n_segments])
     beam.set_vertices_fixed([0, 1])
+
+    if args.record:
+        cam.start_recording(save_to_filename="rods.mp4", fps=30)
 
     for i_step in range(args.n_steps):
         scene.step()
@@ -73,6 +83,11 @@ def main():
                 f"step {i_step:4d}: rope lowest z={rope_z:.4f} beam tip z={beam_z:.4f} "
                 f"dropped rope mean z={loose_z:.4f} newton iterations={int(info['n_iter'][0])}"
             )
+        if args.record:
+            cam.render()
+
+    if args.record:
+        cam.stop_recording()
 
 
 if __name__ == "__main__":

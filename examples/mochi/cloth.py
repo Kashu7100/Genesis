@@ -36,6 +36,7 @@ def main():
     parser.add_argument("-v", "--vis", action="store_true", help="Show visualization GUI")
     parser.add_argument("-g", "--gpu", action="store_true", help="Run on GPU instead of CPU")
     parser.add_argument("-n", "--n_steps", type=int, default=300, help="Number of simulation steps")
+    parser.add_argument("-r", "--record", action="store_true", help="Record video")
     args = parser.parse_args()
 
     gs.init(backend=gs.gpu if args.gpu else gs.cpu, precision="64")
@@ -50,12 +51,12 @@ def main():
     sheet_path = sheet_mesh("/tmp/mochi_cloth_sheet.obj", 12, 0.8)
     box = scene.add_entity(
         gs.morphs.Box(size=(0.3, 0.3, 0.3), pos=(-0.8, 0.0, 0.15), fixed=True),
-        material=gs.materials.Mochi.Rigid(collider_type="box"),
+        material=gs.materials.Mochi.Rigid(),
     )
     drape = scene.add_entity(
         gs.morphs.Mesh(file=sheet_path, pos=(-0.8, 0.0, 0.6)),
         material=gs.materials.Mochi.Shell(
-            E=1e4, nu=0.3, rho=200.0, thickness=1e-3, friction=0.6, stiffness_damping=2e-3, penalty_coefficient=1e7
+            E=2e4, nu=0.3, rho=200.0, thickness=2e-3, friction=0.6, collider_radius=0.02, penalty_coefficient=1e7
         ),
         surface=gs.surfaces.Default(color=(0.9, 0.4, 0.3)),
     )
@@ -70,6 +71,8 @@ def main():
         gs.morphs.Sphere(radius=0.08, pos=(0.8, 0.0, 1.2)),
         material=gs.materials.Mochi.Rigid(rho=300.0),
     )
+    if args.record:
+        cam = scene.add_camera(res=(640, 360), pos=(2.5, -2.5, 1.8), lookat=(0.0, 0.0, 0.5))
     scene.build()
 
     corners = np.flatnonzero(np.abs(net.init_positions[:, :2]).max(axis=1) > 0.4 - 1e-6)
@@ -79,6 +82,8 @@ def main():
     net.set_vertices_fixed(corners)
     corners_rest = net.init_positions[corners]
 
+    if args.record:
+        cam.start_recording(save_to_filename="cloth.mp4", fps=30)
     for i_step in range(args.n_steps):
         # After the ball has settled, drive the corners along a sinusoidal sway; they reach the prescribed positions
         # exactly at the end of each step.
@@ -95,6 +100,10 @@ def main():
                 f"z={float(ball.get_pos()[2]):.4f} "
                 f"box contact={float(box.get_links_net_contact_force()[0, 2]):.2f} N newton iterations={int(info['n_iter'][0])}"
             )
+        if args.record:
+            cam.render()
+
+    cam.stop_recording()
 
 
 if __name__ == "__main__":

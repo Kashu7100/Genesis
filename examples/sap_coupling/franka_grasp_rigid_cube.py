@@ -68,6 +68,7 @@ def main():
 
     # hold
     qpos = franka.inverse_kinematics(link=end_effector, pos=(0.65, 0.0, 0.13), quat=(0, 1, 0, 0))
+    print(qpos)
     franka.control_dofs_position(qpos[motors_dof], motors_dof)
     for i in range(15):
         scene.step()
@@ -79,6 +80,7 @@ def main():
 
     # lift
     qpos = franka.inverse_kinematics(link=end_effector, pos=(0.65, 0.0, 0.3), quat=(0, 1, 0, 0))
+    print(qpos)
     franka.control_dofs_position(qpos[motors_dof], motors_dof)
     for i in range(40):
         franka.control_dofs_force(np.array([-1.0, -1.0]), fingers_dof)

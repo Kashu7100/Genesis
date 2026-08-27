@@ -57,7 +57,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", "--vis", action="store_true", help="Show visualization GUI")
     parser.add_argument("-g", "--gpu", action="store_true", help="Run on GPU instead of CPU")
-    parser.add_argument("-n", "--n_steps", type=int, default=300, help="Number of simulation steps")
+    parser.add_argument("-n", "--n_steps", type=int, default=1000, help="Number of simulation steps")
+    parser.add_argument("-r", "--record", action="store_true", help="Record video")
     args = parser.parse_args()
 
     gs.init(backend=gs.gpu if args.gpu else gs.cpu, precision="64")
@@ -80,6 +81,12 @@ def main():
             material=gs.materials.Mochi.Rigid(),
             surface=gs.surfaces.Default(color=(0.9, 0.5, 0.3)),
         )
+        if args.record:
+            cam = scene.add_camera(
+                res=(640, 360),
+                pos=(1.5, -2.5, 1.5),
+                lookat=(0.2, 0.3, 0.7),
+            )
         scene.build()
 
     equality = linkage.equalities[0]
@@ -90,6 +97,8 @@ def main():
     anchors = np.asarray(equality.eq_data, dtype=np.float64)
     crank_dof = linkage.get_joint("crank_hinge").dofs_idx_local
 
+    if args.record:
+        cam.start_recording(save_to_filename="loop_closure.mp4", fps=30)
     for i_step in range(args.n_steps):
         # Constant torque at the crank turns the mechanism.
         linkage.control_dofs_force(np.array([0.3]), crank_dof)
@@ -106,6 +115,10 @@ def main():
                 f"step {i_step:4d}: crank angle={angle:7.3f} rad, closing joint gap={np.linalg.norm(p_a - p_b):.2e} m, "
                 f"welded pair z={float(welded.links[0].get_pos()[2]):.3f} m"
             )
+        if args.record:
+            cam.render()
+    if args.record:
+        cam.stop_recording()
 
 
 if __name__ == "__main__":
