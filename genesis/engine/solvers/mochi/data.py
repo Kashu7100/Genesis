@@ -8,6 +8,7 @@ last)."""
 import dataclasses
 from enum import IntEnum
 
+import numpy as np
 import quadrants as qd
 
 import genesis as gs
@@ -511,6 +512,10 @@ class MochiSoftInfo:
     rod_stencils_e: qd.Tensor
     rod_stencils_L: qd.Tensor
     rod_stencils_ref: qd.Tensor
+    # Smallest positive normal number of the simulation precision, flooring every rod length, tangent norm and
+    # parallel-transport denominator. Resolved here rather than as a module constant because the value depends on the
+    # precision selected at initialization.
+    rod_tiny: qd.Tensor
     # Boundary contact samples: triangle vertices, barycentric coordinates, rest area weight and owning entity.
     samples_tri: qd.Tensor
     samples_bary: qd.Tensor
@@ -600,6 +605,7 @@ def get_mochi_soft_info(solver):
         rod_stencils_e=V(dtype=gs.qd_ivec2, shape=(n_rs_,)),
         rod_stencils_L=V(dtype=gs.qd_float, shape=(n_rs_,)),
         rod_stencils_ref=V(dtype=gs.qd_vec3, shape=(n_rs_,)),
+        rod_tiny=_scalar(gs.qd_float, float(np.finfo(gs.np_float).tiny)),
         samples_tri=V(dtype=gs.qd_ivec3, shape=(n_ss_,)),
         samples_bary=V(dtype=gs.qd_vec3, shape=(n_ss_,)),
         samples_weight=V(dtype=gs.qd_float, shape=(n_ss_,)),

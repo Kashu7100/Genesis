@@ -19,9 +19,6 @@ import genesis as gs
 
 from .lie import skew
 
-# Guard of degenerate lengths and of the 180-degree singularity of the parallel transport (smallest normal number).
-ROD_TINY = 2.2250738585072014e-308
-
 
 @qd.func
 def func_rod_normalize(v, tiny):

@@ -38,7 +38,6 @@ from .islands import MochiIslandState
 from .lie import skew
 from .newton import func_is_env_active
 from .rod import (
-    ROD_TINY,
     func_rod_axial,
     func_rod_axial_strain,
     func_rod_bend_twist,
@@ -344,17 +343,19 @@ def kernel_soft_step_start(
 @qd.kernel
 def kernel_soft_post_stage(
     mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
 ):
-    """Finite-difference vertex velocities over the stage; a diverged environment is reset to its previous
-    configuration at rest."""
+    """Finite-difference vertex velocities over the stage; a diverged environment falls back to the rest shape at
+    rest. Neither the stage start nor the previous step is a guaranteed-safe deformable state, whereas the rest shape
+    is free of inverted or degenerate elements by construction."""
     n_verts = soft_state.verts_pos.shape[0]
     _B = soft_state.verts_pos.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_v, i_b in qd.ndrange(n_verts, _B):
         if mochi_state.status[i_b] == SOLVE_STATUS.DIVERGED:
-            soft_state.verts_pos[i_v, i_b] = soft_state.verts_pos_prev[0, i_v, i_b]
+            soft_state.verts_pos[i_v, i_b] = soft_info.verts_rest[i_v]
             soft_state.verts_vel[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
             continue
         h = mochi_state.dt_stage[i_b]
@@ -2308,6 +2309,7 @@ def kernel_init_rod_fields(
     n_elems = rod_elems_v.shape[0]
     n_stencils = rod_stencils_v.shape[0]
     _B = soft_state.verts_pos.shape[1]
+    tiny = soft_info.rod_tiny[None]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_r in range(n_elems):
         for k in qd.static(range(2)):
@@ -2341,7 +2343,7 @@ def kernel_init_rod_fields(
         L = 0.5 * ((X1 - X0).norm() + (X2 - X1).norm())
         soft_info.rod_stencils_L[i_s] = L
         ka, kb, tw = func_rod_bend_twist_measures(
-            X0, X1, X2, soft_info.rod_elems_axis_ref[e[0]], soft_info.rod_elems_axis_ref[e[1]], L, ROD_TINY
+            X0, X1, X2, soft_info.rod_elems_axis_ref[e[0]], soft_info.rod_elems_axis_ref[e[1]], L, tiny
         )
         soft_info.rod_stencils_ref[i_s] = qd.Vector([ka, kb, tw], dt=gs.qd_float)
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
@@ -2363,7 +2365,7 @@ def kernel_init_rod_fields(
 @qd.func
 def func_rod_tangent(i_r, i_b, field: qd.Tensor, soft_info: MochiSoftInfo):
     v = soft_info.rod_elems_v[i_r]
-    return func_rod_normalize(field[v[1], i_b] - field[v[0], i_b], ROD_TINY)
+    return func_rod_normalize(field[v[1], i_b] - field[v[0], i_b], soft_info.rod_tiny[None])
 
 
 @qd.kernel
@@ -2380,6 +2382,7 @@ def kernel_rod_step_start(
     n_elems = soft_state.rod_elems_H.shape[0]
     n_stencils = soft_state.rod_stencils_H.shape[0]
     _B = soft_state.verts_pos.shape[1]
+    tiny = soft_info.rod_tiny[None]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_r, i_b in qd.ndrange(n_elems, _B):
         theta = soft_state.rod_elems_twist[i_r, i_b]
@@ -2399,19 +2402,19 @@ def kernel_rod_step_start(
         # Axes follow the tangents from the previous positions to the stage-start ones, plus the start twist.
         v_prev = soft_info.rod_elems_v[i_r]
         t_prev = func_rod_normalize(
-            soft_state.verts_pos_prev[0, v_prev[1], i_b] - soft_state.verts_pos_prev[0, v_prev[0], i_b], ROD_TINY
+            soft_state.verts_pos_prev[0, v_prev[1], i_b] - soft_state.verts_pos_prev[0, v_prev[0], i_b], tiny
         )
         t_start = func_rod_tangent(i_r, i_b, soft_state.verts_pos_stage_start, soft_info)
-        axis = func_rod_transport_axis(t_prev, t_start, twist_start, soft_state.rod_elems_axis[i_r, i_b], ROD_TINY)
+        axis = func_rod_transport_axis(t_prev, t_start, twist_start, soft_state.rod_elems_axis[i_r, i_b], tiny)
         soft_state.rod_elems_axis_stage_start[i_r, i_b] = axis
         # The warm start differs from the stage start where fixed nodes jumped to their prescribed positions.
         t_warm = func_rod_tangent(i_r, i_b, soft_state.verts_pos, soft_info)
-        soft_state.rod_elems_axis[i_r, i_b] = func_rod_transport_axis(t_start, t_warm, 0.0, axis, ROD_TINY)
+        soft_state.rod_elems_axis[i_r, i_b] = func_rod_transport_axis(t_start, t_warm, 0.0, axis, tiny)
         v = soft_info.rod_elems_v[i_r]
         strain, _q = func_rod_axial_strain(
             soft_state.verts_pos_stage_start[v[0], i_b],
             soft_state.verts_pos_stage_start[v[1], i_b],
-            qd.max(soft_info.rod_elems_L[i_r], ROD_TINY),
+            qd.max(soft_info.rod_elems_L[i_r], tiny),
         )
         soft_state.rod_elems_strain_stage_start[i_r, i_b] = strain
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
@@ -2424,8 +2427,8 @@ def kernel_rod_step_start(
             soft_state.verts_pos_stage_start[v[2], i_b],
             soft_state.rod_elems_axis_stage_start[e[0], i_b],
             soft_state.rod_elems_axis_stage_start[e[1], i_b],
-            qd.max(soft_info.rod_stencils_L[i_s], ROD_TINY),
-            ROD_TINY,
+            qd.max(soft_info.rod_stencils_L[i_s], tiny),
+            tiny,
         )
         soft_state.rod_stencils_stage_start[i_s, i_b] = qd.Vector([ka, kb, tw], dt=gs.qd_float)
 
@@ -2553,7 +2556,7 @@ def kernel_rod_assemble(
             soft_info.entities_membrane_lambda[i_e],
             soft_info.entities_torsional_stiffness[i_e],
             f,
-            ROD_TINY,
+            soft_info.rod_tiny[None],
             assem_dres,
         )
         dofs = func_rod_stencil_dofs(i_s, soft_info)
@@ -2594,7 +2597,7 @@ def kernel_rod_apply_increment(
         t_ref = func_rod_tangent(i_r, i_b, soft_state.verts_pos_ls_ref, soft_info)
         t_new = func_rod_tangent(i_r, i_b, soft_state.verts_pos, soft_info)
         soft_state.rod_elems_axis[i_r, i_b] = func_rod_transport_axis(
-            t_ref, t_new, delta, soft_state.rod_elems_axis_ls_ref[i_r, i_b], ROD_TINY
+            t_ref, t_new, delta, soft_state.rod_elems_axis_ls_ref[i_r, i_b], soft_info.rod_tiny[None]
         )
 
 
@@ -2620,17 +2623,20 @@ def kernel_rod_store_ls_ref(
 @qd.kernel
 def kernel_rod_post_stage(
     mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
 ):
-    """Finite-difference twist rate of every segment; a diverged environment returns to its stage start at rest."""
+    """Finite-difference twist rate of every segment; a diverged environment falls back to the rest frame at rest.
+    The material axes must be restored at the same time level as the vertices (kernel_soft_post_stage puts them back
+    at rest), otherwise they stop being orthogonal to the tangents they are transported along."""
     n_elems = soft_state.rod_elems_H.shape[0]
     _B = soft_state.verts_pos.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_r, i_b in qd.ndrange(n_elems, _B):
         if mochi_state.status[i_b] == SOLVE_STATUS.DIVERGED:
-            soft_state.rod_elems_twist[i_r, i_b] = soft_state.rod_elems_twist_step_start[i_r, i_b]
-            soft_state.rod_elems_axis[i_r, i_b] = soft_state.rod_elems_axis_stage_start[i_r, i_b]
+            soft_state.rod_elems_twist[i_r, i_b] = 0.0
+            soft_state.rod_elems_axis[i_r, i_b] = soft_info.rod_elems_axis_ref[i_r]
             soft_state.rod_elems_twist_vel[i_r, i_b] = 0.0
             continue
         h = mochi_state.dt_stage[i_b]
@@ -2939,19 +2945,17 @@ class SoftTetLBVH(LBVH):
     """Bounding-volume hierarchy over the deformed tetrahedra of the deformable colliders, whose queries skip the
     tetrahedra of the entity owning the query sample (a body never collides with itself)."""
 
-    def __init__(
-        self, aabb, tets_entity_idx, queries_entity_idx, max_n_query_result_per_aabb, entities_self_contact=None
-    ):
+    def __init__(self, aabb, tets_entity_idx, queries_entity_idx, entities_self_contact, max_n_query_result_per_aabb):
         super().__init__(aabb, max_n_query_result_per_aabb=max_n_query_result_per_aabb)
         self.tets_entity = qd.field(gs.qd_int, shape=(max(1, len(tets_entity_idx)),))
         self.queries_entity = qd.field(gs.qd_int, shape=(max(1, len(queries_entity_idx)),))
-        n_entities = 1 if entities_self_contact is None else max(1, len(entities_self_contact))
-        self.entities_self_contact = qd.field(gs.qd_int, shape=(n_entities,))
+        # Indexed by entity id in 'filter', so it must span every deformable entity of the solver.
+        self.entities_self_contact = qd.field(gs.qd_int, shape=(max(1, len(entities_self_contact)),))
         if len(tets_entity_idx) > 0:
             self.tets_entity.from_numpy(np.asarray(tets_entity_idx, dtype=gs.np_int))
         if len(queries_entity_idx) > 0:
             self.queries_entity.from_numpy(np.asarray(queries_entity_idx, dtype=gs.np_int))
-        if entities_self_contact is not None and len(entities_self_contact) > 0:
+        if len(entities_self_contact) > 0:
             self.entities_self_contact.from_numpy(np.asarray(entities_self_contact, dtype=gs.np_int))
 
     @qd.func

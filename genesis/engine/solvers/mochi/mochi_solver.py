@@ -785,7 +785,8 @@ class MochiSolver(KinematicSolver):
         self._n_soft_queries = self.n_samples + n_samples
         self._max_sc_hits = max(1, 2 * self._n_soft_queries) if self._has_soft_colliders else 1
         # Self-contact makes every sample overlap the spheres of its own neighborhood before the exclusion test.
-        has_self_contact = any((e.is_shell or e.is_rod) and e.material.self_contact for e in entities)
+        entities_self_contact = [int((e.is_shell or e.is_rod) and e.material.self_contact) for e in entities]
+        has_self_contact = any(entities_self_contact)
         pc_hits_per_query, pc_results_per_point = (16, 32) if has_self_contact else (4, 8)
         self._max_pc_hits = max(1, pc_hits_per_query * self._n_soft_queries) if self._has_pc_colliders else 1
         if self._has_soft_colliders or self._has_pc_colliders:
@@ -798,8 +799,8 @@ class MochiSolver(KinematicSolver):
                 self._pc_aabb,
                 verts_entity_idx,
                 queries_entity_idx,
+                entities_self_contact,
                 max_n_query_result_per_aabb=n_results_per_point,
-                entities_self_contact=[int((e.is_shell or e.is_rod) and e.material.self_contact) for e in entities],
             )
         if self._has_soft_colliders or self._has_pc_colliders:
             self._soft_tet_aabb = AABB(_B, self.n_soft_elems_)
@@ -808,7 +809,11 @@ class MochiSolver(KinematicSolver):
             # are filtered out by the hierarchy.
             n_results_per_tet = max(1, -(-16 * self._n_soft_queries // self.n_soft_elems_))
             self._soft_tet_bvh = SoftTetLBVH(
-                self._soft_tet_aabb, elems_entity_idx, queries_entity_idx, max_n_query_result_per_aabb=n_results_per_tet
+                self._soft_tet_aabb,
+                elems_entity_idx,
+                queries_entity_idx,
+                entities_self_contact,
+                max_n_query_result_per_aabb=n_results_per_tet,
             )
 
         self.soft_info = get_mochi_soft_info(self)

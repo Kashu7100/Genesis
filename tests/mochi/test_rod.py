@@ -4,7 +4,6 @@ import quadrants as qd
 
 import genesis as gs
 from genesis.engine.solvers.mochi.rod import (
-    ROD_TINY,
     func_rod_axial,
     func_rod_bend_twist,
     func_rod_bend_twist_measures,
@@ -28,13 +27,13 @@ def _straight_rod_points(n_segments, length):
 
 
 @qd.kernel
-def _kernel_measures(x: qd.types.ndarray(), a: qd.types.ndarray(), L: float, out: qd.types.ndarray()):
+def _kernel_measures(x: qd.types.ndarray(), a: qd.types.ndarray(), L: float, tiny: float, out: qd.types.ndarray()):
     x0 = qd.Vector([x[0, 0], x[0, 1], x[0, 2]])
     x1 = qd.Vector([x[1, 0], x[1, 1], x[1, 2]])
     x2 = qd.Vector([x[2, 0], x[2, 1], x[2, 2]])
     a0 = qd.Vector([a[0, 0], a[0, 1], a[0, 2]])
     a1 = qd.Vector([a[1, 0], a[1, 1], a[1, 2]])
-    ka, kb, tw = func_rod_bend_twist_measures(x0, x1, x2, a0, a1, L, ROD_TINY)
+    ka, kb, tw = func_rod_bend_twist_measures(x0, x1, x2, a0, a1, L, tiny)
     out[0] = ka
     out[1] = kb
     out[2] = tw
@@ -49,6 +48,7 @@ def _kernel_bend_twist(
     EI1: float,
     EI2: float,
     GJ: float,
+    tiny: float,
     energy: qd.types.ndarray(),
     res: qd.types.ndarray(),
     K: qd.types.ndarray(),
@@ -59,7 +59,7 @@ def _kernel_bend_twist(
     a0 = qd.Vector([a[0, 0], a[0, 1], a[0, 2]])
     a1 = qd.Vector([a[1, 0], a[1, 1], a[1, 2]])
     e, r, Km, _ka, _kb, _tw = func_rod_bend_twist(
-        x0, x1, x2, a0, a1, L, ref[0], ref[1], ref[2], ref[0], ref[1], ref[2], EI1, EI2, GJ, 0.0, ROD_TINY, True
+        x0, x1, x2, a0, a1, L, ref[0], ref[1], ref[2], ref[0], ref[1], ref[2], EI1, EI2, GJ, 0.0, tiny, True
     )
     energy[0] = e
     for p in qd.static(range(11)):
@@ -69,10 +69,12 @@ def _kernel_bend_twist(
 
 
 @qd.kernel
-def _kernel_transport(n0: qd.types.ndarray(), n: qd.types.ndarray(), v: qd.types.ndarray(), out: qd.types.ndarray()):
-    r = func_rod_parallel_transport(
-        qd.Vector([n0[0], n0[1], n0[2]]), qd.Vector([n[0], n[1], n[2]]), ROD_TINY
-    ) @ qd.Vector([v[0], v[1], v[2]])
+def _kernel_transport(
+    n0: qd.types.ndarray(), n: qd.types.ndarray(), v: qd.types.ndarray(), tiny: float, out: qd.types.ndarray()
+):
+    r = func_rod_parallel_transport(qd.Vector([n0[0], n0[1], n0[2]]), qd.Vector([n[0], n[1], n[2]]), tiny) @ qd.Vector(
+        [v[0], v[1], v[2]]
+    )
     for k in qd.static(range(3)):
         out[k] = r[k]
 
@@ -95,20 +97,34 @@ def _unit(v):
 
 def _transport(n0, n, v):
     out = np.zeros(3)
-    _kernel_transport(np.ascontiguousarray(n0), np.ascontiguousarray(n), np.ascontiguousarray(v), out)
+    _kernel_transport(
+        np.ascontiguousarray(n0),
+        np.ascontiguousarray(n),
+        np.ascontiguousarray(v),
+        float(np.finfo(gs.np_float).tiny),
+        out,
+    )
     return out
 
 
 def _measures(x, a, L):
     out = np.zeros(3)
-    _kernel_measures(np.ascontiguousarray(x), np.ascontiguousarray(a), float(L), out)
+    _kernel_measures(np.ascontiguousarray(x), np.ascontiguousarray(a), float(L), float(np.finfo(gs.np_float).tiny), out)
     return out
 
 
 def _bend_twist(x, a, L, ref, params):
     energy, res, K = np.zeros(1), np.zeros(11), np.zeros((11, 11))
     _kernel_bend_twist(
-        np.ascontiguousarray(x), np.ascontiguousarray(a), float(L), np.ascontiguousarray(ref), *params, energy, res, K
+        np.ascontiguousarray(x),
+        np.ascontiguousarray(a),
+        float(L),
+        np.ascontiguousarray(ref),
+        *params,
+        float(np.finfo(gs.np_float).tiny),
+        energy,
+        res,
+        K,
     )
     return energy[0], res, K
 
@@ -215,6 +231,25 @@ def test_rod_free_fall(show_viewer):
     assert_allclose(pos[:, 2].mean() - rest[:, 2].mean(), -g * dt * dt * n_steps * (n_steps + 1) / 2, tol=1e-8)
     assert_allclose(tensor_to_array(rod.get_vertices_velocity())[:, 2], -g * dt * n_steps, tol=1e-6)
     assert_allclose(pos - pos.mean(axis=0), rest - rest.mean(axis=0), tol=1e-5)
+
+
+@pytest.mark.required
+def test_rod_degenerate_segment(show_viewer):
+    n_segments, length = 8, 0.8
+    scene = _mochi_scene(show_viewer, 0.01, n_newton_iterations=8)
+    rod = scene.add_entity(
+        gs.morphs.Rod(points=_straight_rod_points(n_segments, length), radius=0.01, pos=(0.0, 0.0, 1.0)),
+        material=gs.materials.Mochi.Rod(E=1e7, nu=0.3, rho=1000.0),
+    )
+    scene.build()
+    rest = tensor_to_array(rod.get_vertices_position())
+    # Collapsing the root segment onto a point leaves its tangent, its parallel transport and its curvature binormal
+    # defined only through the smallest-normal floor of the rod stencils.
+    rod.set_vertices_target([0, 1], np.stack([rest[0], rest[0]]))
+    for _ in range(10):
+        scene.step()
+    assert np.isfinite(tensor_to_array(rod.get_vertices_position())).all()
+    assert np.isfinite(tensor_to_array(rod.get_vertices_velocity())).all()
 
 
 @pytest.mark.precision("64")
