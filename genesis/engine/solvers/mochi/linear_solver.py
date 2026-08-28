@@ -21,6 +21,13 @@ from .equalities import MochiEqualitiesInfo, MochiEqualitiesState
 from .islands import MochiIslandState
 from .soft import func_soft_matvec, func_soft_precondition
 
+# Divergence factor of the conjugate gradient stopping test, on the norm of the preconditioned residual: an
+# environment is dropped once that norm grows by this much, which also catches a non-finite residual. The stopping
+# test carries no absolute floor: the preconditioned residual is scaled by the inverse of the Hessian diagonal, so a
+# fixed floor would mean a different accuracy for every contact stiffness, and at a stiff default it truncates the
+# solve after a couple of iterations.
+PCG_DIV_REL_TOL = 1e10
+
 
 @qd.func
 def func_add_projected_block(
@@ -271,7 +278,7 @@ def kernel_pcg_init(
     for i_b in range(_B):
         mochi_state.pcg_is_active[i_b] = mochi_state.is_active[i_b] and not island_state.uses_dense[i_b]
         mochi_state.pcg_rTz[i_b] = 0.0
-        mochi_state.pcg_rTr[i_b] = 0.0
+        mochi_state.pcg_zTz[i_b] = 0.0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_d, i_b in qd.ndrange(n_dofs, _B):
         if mochi_state.pcg_is_active[i_b]:
@@ -301,11 +308,13 @@ def kernel_pcg_init(
             z = mochi_state.pcg_z[i_d, i_b]
             mochi_state.pcg_p[i_d, i_b] = z
             qd.atomic_add(mochi_state.pcg_rTz[i_b], r * z)
-            qd.atomic_add(mochi_state.pcg_rTr[i_b], r * r)
+            qd.atomic_add(mochi_state.pcg_zTz[i_b], z * z)
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_b in range(_B):
-        mochi_state.pcg_rTr0[i_b] = mochi_state.pcg_rTr[i_b]
-        if mochi_state.pcg_rTr[i_b] <= 0.0:
+        mochi_state.pcg_zTz0[i_b] = mochi_state.pcg_zTz[i_b]
+        # An environment whose right-hand side vanishes takes no iteration at all; the negated comparison also drops
+        # a non-finite norm.
+        if not (mochi_state.pcg_zTz[i_b] > 0.0):
             mochi_state.pcg_is_active[i_b] = False
 
 
@@ -325,7 +334,6 @@ def kernel_pcg_iter(
 ):
     n_dofs = mochi_state.res.shape[0]
     _B = mochi_state.is_active.shape[0]
-    rel_tol = mochi_info.pcg_rel_tol[None]
 
     func_matvec(
         mochi_state.pcg_p,
@@ -357,28 +365,37 @@ def kernel_pcg_iter(
             if mochi_state.pcg_pTAp[i_b] <= 0.0:
                 mochi_state.pcg_is_active[i_b] = False
             mochi_state.pcg_rTz_new[i_b] = 0.0
-            mochi_state.pcg_rTr[i_b] = 0.0
+            mochi_state.pcg_rTz_cross[i_b] = 0.0
+            mochi_state.pcg_zTz[i_b] = 0.0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_d, i_b in qd.ndrange(n_dofs, _B):
         if mochi_state.pcg_is_active[i_b]:
             alpha = mochi_state.pcg_rTz[i_b] / mochi_state.pcg_pTAp[i_b]
             mochi_state.dx[i_d, i_b] += alpha * mochi_state.pcg_p[i_d, i_b]
-            mochi_state.pcg_r[i_d, i_b] = mochi_state.pcg_r[i_d, i_b] - alpha * mochi_state.pcg_Ap[i_d, i_b]
+            r = mochi_state.pcg_r[i_d, i_b] - alpha * mochi_state.pcg_Ap[i_d, i_b]
+            mochi_state.pcg_r[i_d, i_b] = r
+            # The preconditioned residual of the previous iteration is still in pcg_z; its product with the new
+            # residual is the term that tells the Polak-Ribiere direction from the Fletcher-Reeves one.
+            qd.atomic_add(mochi_state.pcg_rTz_cross[i_b], r * mochi_state.pcg_z[i_d, i_b])
     func_apply_preconditioner(
         mochi_state.pcg_r, mochi_state.pcg_z, mochi_info, mochi_state, soft_info, soft_state, rigid_config, mochi_config
     )
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_d, i_b in qd.ndrange(n_dofs, _B):
         if mochi_state.pcg_is_active[i_b]:
-            r = mochi_state.pcg_r[i_d, i_b]
-            qd.atomic_add(mochi_state.pcg_rTz_new[i_b], r * mochi_state.pcg_z[i_d, i_b])
-            qd.atomic_add(mochi_state.pcg_rTr[i_b], r * r)
+            z = mochi_state.pcg_z[i_d, i_b]
+            qd.atomic_add(mochi_state.pcg_rTz_new[i_b], mochi_state.pcg_r[i_d, i_b] * z)
+            qd.atomic_add(mochi_state.pcg_zTz[i_b], z * z)
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_b in range(_B):
         if mochi_state.pcg_is_active[i_b]:
-            if mochi_state.pcg_rTr[i_b] <= rel_tol * rel_tol * mochi_state.pcg_rTr0[i_b]:
+            rel_tol = mochi_state.pcg_rel_tol[i_b]
+            zTz0 = mochi_state.pcg_zTz0[i_b]
+            zTz = mochi_state.pcg_zTz[i_b]
+            is_converged = not (zTz > zTz0 * rel_tol * rel_tol)
+            if is_converged or zTz > (zTz0 * PCG_DIV_REL_TOL) * PCG_DIV_REL_TOL:
                 mochi_state.pcg_is_active[i_b] = False
-            beta = mochi_state.pcg_rTz_new[i_b] / mochi_state.pcg_rTz[i_b]
+            beta = (mochi_state.pcg_rTz_new[i_b] - mochi_state.pcg_rTz_cross[i_b]) / mochi_state.pcg_rTz[i_b]
             mochi_state.pcg_rTz[i_b] = mochi_state.pcg_rTz_new[i_b]
             mochi_state.pcg_pTAp[i_b] = beta
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))

@@ -303,6 +303,13 @@ def kernel_update_conv_weights(
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_d, i_b in qd.ndrange(n_dofs, _B):
-        a_ref = qd.max(1.0, mochi_info.gravity[i_b].norm())
-        generalized_mass = qd.max(mochi_state.conv_w[i_d, i_b], EPS)
-        mochi_state.conv_w[i_d, i_b] = 1.0 / (a_ref * a_ref * mochi_info.dofs_entity_mass[i_d] * generalized_mass)
+        generalized_mass = mochi_state.conv_w[i_d, i_b]
+        entity_mass = mochi_info.dofs_entity_mass[i_d]
+        # A degree of freedom carrying no inertia at all (massless dummy link) has no acceleration scale to normalize
+        # by: it enters the weighted norm with a unit weight rather than with the enormous weight a floored inertia
+        # would produce, which would make its residual alone decide convergence for the whole entity.
+        w = gs.qd_float(1.0)
+        if generalized_mass > 0.0 and entity_mass > 0.0:
+            a_ref = qd.max(1.0, mochi_info.gravity[i_b].norm())
+            w = 1.0 / (a_ref * a_ref * entity_mass * generalized_mass)
+        mochi_state.conv_w[i_d, i_b] = w

@@ -63,6 +63,7 @@ from .data import (
     COLLIDER_TYPE,
     FRICTION_MODEL,
     INTEGRATOR,
+    LINEAR_TOLERANCE,
     LINESEARCH,
     N_HISTORY,
     MochiInfo,
@@ -104,6 +105,7 @@ from .newton import (
     kernel_reset_newton,
     kernel_residual_norms,
     kernel_store_initial_norms,
+    kernel_update_linear_tolerance,
 )
 from .rigid_assembly import kernel_assemble_links
 from .soft import (
@@ -204,9 +206,9 @@ class MochiSolver(KinematicSolver):
         self.sdf: SDF | None = None
         self._errno = None
         self._is_contacts_recorded = False
-        # Set when the kinematic state is changed from outside the solver; the multistep history is then rebuilt at
-        # the start of the next step.
-        self._is_external_state_dirty = False
+        # Environments whose kinematic state was changed from outside the solver; their multistep history is rebuilt
+        # at the start of the next step. Allocated at build, once the batch size is known.
+        self._external_state_dirty_mask = None
         self._external_state_subscriber = Subscriber(
             frozenset({StateChange.GEOMETRY, StateChange.DYNAMICS}), callback=self._on_external_state_change
         )
@@ -311,6 +313,10 @@ class MochiSolver(KinematicSolver):
         self.n_fixed_verts_ = max(1, self.n_fixed_verts)
 
         super().build()
+        self._external_state_dirty_mask = np.zeros((self._B,), dtype=bool)
+        # Which of the two linear arms have environments to solve; refreshed at every substep by _select_linear_arms.
+        self._has_dense_envs = False
+        self._has_pcg_envs = False
 
         if not self.is_active:
             return
@@ -591,6 +597,11 @@ class MochiSolver(KinematicSolver):
             linesearch_type={"none": LINESEARCH.NONE, "residual_norm": LINESEARCH.RESIDUAL_NORM}.get(
                 options.linesearch_type, LINESEARCH.ARMIJO
             ),
+            linear_tolerance=(
+                LINEAR_TOLERANCE.ADAPTIVE
+                if options.linear_tolerance_strategy == "adaptive"
+                else LINEAR_TOLERANCE.CONSTANT
+            ),
             use_fitted_friction_hessian=options.use_fitted_friction_hessian,
             friction_with_collider_normal=options.friction_with_collider_normal,
             fade_friction=options.fade_friction,
@@ -785,7 +796,8 @@ class MochiSolver(KinematicSolver):
         self._n_soft_queries = self.n_samples + n_samples
         self._max_sc_hits = max(1, 2 * self._n_soft_queries) if self._has_soft_colliders else 1
         # Self-contact makes every sample overlap the spheres of its own neighborhood before the exclusion test.
-        has_self_contact = any((e.is_shell or e.is_rod) and e.material.self_contact for e in entities)
+        entities_self_contact = [int((e.is_shell or e.is_rod) and e.material.self_contact) for e in entities]
+        has_self_contact = any(entities_self_contact)
         pc_hits_per_query, pc_results_per_point = (16, 32) if has_self_contact else (4, 8)
         self._max_pc_hits = max(1, pc_hits_per_query * self._n_soft_queries) if self._has_pc_colliders else 1
         if self._has_soft_colliders or self._has_pc_colliders:
@@ -798,8 +810,8 @@ class MochiSolver(KinematicSolver):
                 self._pc_aabb,
                 verts_entity_idx,
                 queries_entity_idx,
+                entities_self_contact,
                 max_n_query_result_per_aabb=n_results_per_point,
-                entities_self_contact=[int((e.is_shell or e.is_rod) and e.material.self_contact) for e in entities],
             )
         if self._has_soft_colliders or self._has_pc_colliders:
             self._soft_tet_aabb = AABB(_B, self.n_soft_elems_)
@@ -808,7 +820,11 @@ class MochiSolver(KinematicSolver):
             # are filtered out by the hierarchy.
             n_results_per_tet = max(1, -(-16 * self._n_soft_queries // self.n_soft_elems_))
             self._soft_tet_bvh = SoftTetLBVH(
-                self._soft_tet_aabb, elems_entity_idx, queries_entity_idx, max_n_query_result_per_aabb=n_results_per_tet
+                self._soft_tet_aabb,
+                elems_entity_idx,
+                queries_entity_idx,
+                entities_self_contact,
+                max_n_query_result_per_aabb=n_results_per_tet,
             )
 
         self.soft_info = get_mochi_soft_info(self)
@@ -1105,20 +1121,31 @@ class MochiSolver(KinematicSolver):
         kernel_update_geom_aabbs(self.geoms_init_AABB, self.dyn_state, self.rigid_config)
 
     def _on_external_state_change(self, change, envs_idx):
-        self._is_external_state_dirty = True
+        self._mark_external_state_dirty(self._scene._sanitize_envs_idx(envs_idx))
+
+    def _mark_external_state_dirty(self, envs_idx):
+        """Record the environments whose state was set from outside the solver, from an already sanitized index."""
+        self._external_state_dirty_mask[tensor_to_array(envs_idx)] = True
 
     def _sync_external_state(self):
-        # State set from outside the solver invalidates the multistep history and the rotation-derivative correction.
-        if self._is_external_state_dirty:
+        # State set from outside the solver invalidates the multistep history and the rotation-derivative correction
+        # of the environments it touched. Untouched environments keep theirs, so that setting the state of one
+        # environment leaves the trajectories of the others unchanged.
+        if self._external_state_dirty_mask.any():
+            envs_idx = (
+                self._scene._envs_idx
+                if self._external_state_dirty_mask.all()
+                else self._scene._sanitize_envs_idx(np.nonzero(self._external_state_dirty_mask)[0])
+            )
             kernel_reset_history(
-                self._scene._envs_idx,
+                envs_idx,
                 self.dyn_state,
                 self.dyn_info,
                 self.mochi_info,
                 self.mochi_state,
                 self.rigid_config,
             )
-            self._is_external_state_dirty = False
+            self._external_state_dirty_mask[:] = False
 
     def substep_pre_coupling(self, f):
         if not self.is_active:
@@ -1198,14 +1225,15 @@ class MochiSolver(KinematicSolver):
             self.mochi_config.has_dense,
             self.mochi_config.has_equalities,
         )
+        self._select_linear_arms()
         self._newton_solve()
         kernel_post_stage(
             self.dyn_state, self.dyn_info, self.rigid_info, self.mochi_info, self.mochi_state, self.rigid_config
         )
         if self.has_soft:
-            kernel_soft_post_stage(self.mochi_state, self.soft_state, self.rigid_config)
+            kernel_soft_post_stage(self.mochi_state, self.soft_info, self.soft_state, self.rigid_config)
             if self.n_rod_elems > 0:
-                kernel_rod_post_stage(self.mochi_state, self.soft_state, self.rigid_config)
+                kernel_rod_post_stage(self.mochi_state, self.soft_info, self.soft_state, self.rigid_config)
         self._forward_kinematics()
         self._is_forward_pos_updated = True
         self._is_forward_vel_updated = True
@@ -1238,6 +1266,7 @@ class MochiSolver(KinematicSolver):
             self.rigid_config,
             self.mochi_config,
             self._max_samples_per_link,
+            assem_dres,
             skip_ls_done,
             record,
             self._errno,
@@ -1429,37 +1458,50 @@ class MochiSolver(KinematicSolver):
             )
             kernel_residual_norms(self.mochi_state, self.rigid_config, skip_ls_done)
 
+    def _select_linear_arms(self):
+        """Decide, once per substep, which of the two linear arms have work to do. Islands are rebuilt at the start of
+        the substep and the split they induce holds for every Newton iteration, so a single readback spares the dead
+        arm all of its dispatches (and, on the conjugate gradient side, its per-iteration convergence readbacks)."""
+        if self._options.linear_solver == "auto" and self.mochi_config.has_dense:
+            uses_dense = qd_to_numpy(self.island_state.uses_dense)
+            self._has_dense_envs = bool((uses_dense != 0).any())
+            self._has_pcg_envs = bool((uses_dense == 0).any())
+        else:
+            self._has_dense_envs = self.mochi_config.has_dense
+            self._has_pcg_envs = not self.mochi_config.has_dense
+
     def _linear_solve(self):
         # Environments whose largest island fits the dense limit are solved island by island by a direct
         # factorization, the others by the matrix-free conjugate gradient.
-        kernel_pcg_init(
-            self.dyn_state,
-            self.dyn_info,
-            self.mochi_info,
-            self.mochi_state,
-            self.soft_info,
-            self.soft_state,
-            self.island_state,
-            self.rigid_config,
-            self.mochi_config,
-        )
-        for i_iter in range(self._n_pcg_iterations):
-            kernel_pcg_iter(
+        if self._has_pcg_envs:
+            kernel_pcg_init(
                 self.dyn_state,
                 self.dyn_info,
                 self.mochi_info,
                 self.mochi_state,
-                self.contact_state,
                 self.soft_info,
                 self.soft_state,
-                self.eq_info,
-                self.eq_state,
+                self.island_state,
                 self.rigid_config,
                 self.mochi_config,
             )
-            if (i_iter + 1) % PCG_CHECK_PERIOD == 0 and kernel_pcg_any_active(self.mochi_state) == 0:
-                break
-        if self.mochi_config.has_dense:
+            for i_iter in range(self._n_pcg_iterations):
+                kernel_pcg_iter(
+                    self.dyn_state,
+                    self.dyn_info,
+                    self.mochi_info,
+                    self.mochi_state,
+                    self.contact_state,
+                    self.soft_info,
+                    self.soft_state,
+                    self.eq_info,
+                    self.eq_state,
+                    self.rigid_config,
+                    self.mochi_config,
+                )
+                if (i_iter + 1) % PCG_CHECK_PERIOD == 0 and kernel_pcg_any_active(self.mochi_state) == 0:
+                    break
+        if self._has_dense_envs:
             kernel_condense_dense(
                 self.dyn_state,
                 self.dyn_info,
@@ -1513,15 +1555,18 @@ class MochiSolver(KinematicSolver):
             if i_iter > 0:
                 self._assemble(assem_res=True, assem_dres=True, skip_ls_done=False)
                 kernel_convergence_check(self.mochi_info, self.mochi_state, self.rigid_config, False, self._errno)
-            if kernel_any_active(self.mochi_state) == 0:
+            if kernel_any_active(self.mochi_state, False) == 0:
                 break
+            if self._has_pcg_envs:
+                kernel_update_linear_tolerance(self.mochi_info, self.mochi_state, self.rigid_config, self.mochi_config)
             self._linear_solve()
             kernel_linesearch_begin(self.rigid_info, self.mochi_state, self.rigid_config)
             if self.has_soft:
                 kernel_soft_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, False)
                 if self.n_rod_elems > 0:
                     kernel_rod_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, False)
-            for i_ls in range(max(1, n_linesearch)):
+            n_trials = max(1, n_linesearch)
+            for i_ls in range(n_trials):
                 kernel_apply_increment(
                     self.dyn_info, self.rigid_info, self.mochi_info, self.mochi_state, self.rigid_config
                 )
@@ -1537,12 +1582,16 @@ class MochiSolver(KinematicSolver):
                     self.mochi_state,
                     self.rigid_config,
                     self.mochi_config,
-                    i_ls == max(1, n_linesearch) - 1,
+                    i_ls == n_trials - 1,
                 )
                 if self.has_soft:
                     kernel_soft_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, True)
                     if self.n_rod_elems > 0:
                         kernel_rod_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, True)
+                # Every remaining trial would re-evaluate the accepted iterate of every environment, which leaves the
+                # state it writes unchanged; the readback is worth it because a trial costs a full assembly.
+                if i_ls + 1 < n_trials and kernel_any_active(self.mochi_state, True) == 0:
+                    break
             kernel_convergence_check(self.mochi_info, self.mochi_state, self.rigid_config, True, self._errno)
 
     def substep_post_coupling(self, f):
@@ -1678,7 +1727,7 @@ class MochiSolver(KinematicSolver):
                 self.soft_state,
                 self.rigid_config,
             )
-        self._is_external_state_dirty = False
+        self._external_state_dirty_mask[tensor_to_array(envs_idx)] = False
         self._is_contacts_recorded = False
 
     # ------------------------------------------------------------------------------------
@@ -2073,19 +2122,19 @@ class MochiSolver(KinematicSolver):
     def set_soft_vertices_position(self, entity, pos, envs_idx=None):
         envs_idx, pos = self._soft_values_of_entity(entity, pos, envs_idx)
         kernel_soft_set_vertices_positions(envs_idx, entity.v_start, pos, self.soft_state, self.rigid_config)
-        self._is_external_state_dirty = True
+        self._mark_external_state_dirty(envs_idx)
         self._is_contacts_recorded = False
 
     def set_soft_vertices_velocity(self, entity, vel, envs_idx=None):
         envs_idx, vel = self._soft_values_of_entity(entity, vel, envs_idx)
         kernel_soft_set_vertices_velocities(envs_idx, entity.v_start, vel, self.soft_state, self.rigid_config)
-        self._is_external_state_dirty = True
+        self._mark_external_state_dirty(envs_idx)
 
     def set_soft_vertices_fixed(self, entity, verts_idx, is_fixed, envs_idx=None):
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
         verts_idx = np.asarray(verts_idx, dtype=gs.np_int) + entity.v_start
         kernel_soft_set_vertices_fixed(envs_idx, verts_idx, int(bool(is_fixed)), self.soft_state, self.rigid_config)
-        self._is_external_state_dirty = True
+        self._mark_external_state_dirty(envs_idx)
 
     def set_soft_vertices_target(self, entity, verts_idx, pos, envs_idx=None):
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
