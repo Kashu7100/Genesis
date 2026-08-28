@@ -870,13 +870,15 @@ def kernel_soft_contact_eval(
                 func_add_soft_vec(mochi_state.res, tri[i], i_b, -(w * bary[i]) * force, soft_info)
         qd.atomic_add(soft_state.acc_f[i_p, i_b], w * force)
         qd.atomic_add(soft_state.acc_q[i_p, i_b], w * r_b.cross(force))
-        qd.atomic_add(soft_state.acc_D[i_p, i_b], D)
-        qd.atomic_add(soft_state.acc_SD[i_p, i_b], S_b @ D)
-        qd.atomic_add(soft_state.acc_SDS[i_p, i_b], S_b @ D @ S_b)
         qd.atomic_add(soft_state.acc_obj[i_p, i_b], w * energy)
         qd.atomic_add(soft_state.n_hits[i_p, i_b], 1)
 
+        # The three per-pair Hessian sums are read by kernel_soft_pairs_to_blocks under the same flag, and they carry
+        # most of the atomic traffic of this kernel: the line search re-evaluates contact for the residual alone.
         if qd.static(assem_dres):
+            qd.atomic_add(soft_state.acc_D[i_p, i_b], D)
+            qd.atomic_add(soft_state.acc_SD[i_p, i_b], S_b @ D)
+            qd.atomic_add(soft_state.acc_SDS[i_p, i_b], S_b @ D @ S_b)
             for i in qd.static(range(3)):
                 qd.atomic_add(soft_state.verts_H_diag[tri[i], i_b], (bary[i] * bary[i]) * D)
         if qd.static(assem_dres or record):

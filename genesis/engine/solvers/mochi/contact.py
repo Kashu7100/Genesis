@@ -360,6 +360,7 @@ def kernel_contact_eval(
     rigid_config: qd.template(),
     mochi_config: qd.template(),
     max_samples_per_link: int,
+    assem_dres: qd.template(),
     skip_ls_done: qd.template(),
     record: qd.template(),
     errno: qd.Tensor,
@@ -458,16 +459,19 @@ def kernel_contact_eval(
         w = mochi_info.samples.weight[i_s]
         R_g = gu.qd_quat_to_R(quat_g, EPS)
         force = R_g @ force_geom
-        D = -w * (R_g @ dforce_geom @ R_g.transpose())
         r_b = pos - dyn_state.links.pos[i_lb, i_b]
-        S_b = skew(r_b)
         qd.atomic_add(contact_state.acc_f[i_p, i_b], w * force)
         qd.atomic_add(contact_state.acc_q[i_p, i_b], w * r_b.cross(force))
-        qd.atomic_add(contact_state.acc_D[i_p, i_b], D)
-        qd.atomic_add(contact_state.acc_SD[i_p, i_b], S_b @ D)
-        qd.atomic_add(contact_state.acc_SDS[i_p, i_b], S_b @ D @ S_b)
         qd.atomic_add(contact_state.acc_obj[i_p, i_b], w * energy)
         qd.atomic_add(contact_state.n_hits[i_p, i_b], 1)
+        # The three Hessian sums are read by kernel_pairs_to_blocks under the same flag, and they carry most of the
+        # atomic traffic of this kernel: the line search re-evaluates contact for the residual alone.
+        if qd.static(assem_dres):
+            D = -w * (R_g @ dforce_geom @ R_g.transpose())
+            S_b = skew(r_b)
+            qd.atomic_add(contact_state.acc_D[i_p, i_b], D)
+            qd.atomic_add(contact_state.acc_SD[i_p, i_b], S_b @ D)
+            qd.atomic_add(contact_state.acc_SDS[i_p, i_b], S_b @ D @ S_b)
 
         if qd.static(record):
             qd.atomic_add(dyn_state.links.contact_force[i_la, i_b], w * force)

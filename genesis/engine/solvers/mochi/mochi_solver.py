@@ -313,6 +313,10 @@ class MochiSolver(KinematicSolver):
         self.n_fixed_verts_ = max(1, self.n_fixed_verts)
 
         super().build()
+        self._external_state_dirty_mask = np.zeros((self._B,), dtype=bool)
+        # Which of the two linear arms have environments to solve; refreshed at every substep by _select_linear_arms.
+        self._has_dense_envs = False
+        self._has_pcg_envs = False
 
         if not self.is_active:
             return
@@ -1221,14 +1225,15 @@ class MochiSolver(KinematicSolver):
             self.mochi_config.has_dense,
             self.mochi_config.has_equalities,
         )
+        self._select_linear_arms()
         self._newton_solve()
         kernel_post_stage(
             self.dyn_state, self.dyn_info, self.rigid_info, self.mochi_info, self.mochi_state, self.rigid_config
         )
         if self.has_soft:
-            kernel_soft_post_stage(self.mochi_state, self.soft_state, self.rigid_config)
+            kernel_soft_post_stage(self.mochi_state, self.soft_info, self.soft_state, self.rigid_config)
             if self.n_rod_elems > 0:
-                kernel_rod_post_stage(self.mochi_state, self.soft_state, self.rigid_config)
+                kernel_rod_post_stage(self.mochi_state, self.soft_info, self.soft_state, self.rigid_config)
         self._forward_kinematics()
         self._is_forward_pos_updated = True
         self._is_forward_vel_updated = True
@@ -1261,6 +1266,7 @@ class MochiSolver(KinematicSolver):
             self.rigid_config,
             self.mochi_config,
             self._max_samples_per_link,
+            assem_dres,
             skip_ls_done,
             record,
             self._errno,
@@ -1452,37 +1458,50 @@ class MochiSolver(KinematicSolver):
             )
             kernel_residual_norms(self.mochi_state, self.rigid_config, skip_ls_done)
 
+    def _select_linear_arms(self):
+        """Decide, once per substep, which of the two linear arms have work to do. Islands are rebuilt at the start of
+        the substep and the split they induce holds for every Newton iteration, so a single readback spares the dead
+        arm all of its dispatches (and, on the conjugate gradient side, its per-iteration convergence readbacks)."""
+        if self._options.linear_solver == "auto" and self.mochi_config.has_dense:
+            uses_dense = qd_to_numpy(self.island_state.uses_dense)
+            self._has_dense_envs = bool((uses_dense != 0).any())
+            self._has_pcg_envs = bool((uses_dense == 0).any())
+        else:
+            self._has_dense_envs = self.mochi_config.has_dense
+            self._has_pcg_envs = not self.mochi_config.has_dense
+
     def _linear_solve(self):
         # Environments whose largest island fits the dense limit are solved island by island by a direct
         # factorization, the others by the matrix-free conjugate gradient.
-        kernel_pcg_init(
-            self.dyn_state,
-            self.dyn_info,
-            self.mochi_info,
-            self.mochi_state,
-            self.soft_info,
-            self.soft_state,
-            self.island_state,
-            self.rigid_config,
-            self.mochi_config,
-        )
-        for i_iter in range(self._n_pcg_iterations):
-            kernel_pcg_iter(
+        if self._has_pcg_envs:
+            kernel_pcg_init(
                 self.dyn_state,
                 self.dyn_info,
                 self.mochi_info,
                 self.mochi_state,
-                self.contact_state,
                 self.soft_info,
                 self.soft_state,
-                self.eq_info,
-                self.eq_state,
+                self.island_state,
                 self.rigid_config,
                 self.mochi_config,
             )
-            if (i_iter + 1) % PCG_CHECK_PERIOD == 0 and kernel_pcg_any_active(self.mochi_state) == 0:
-                break
-        if self.mochi_config.has_dense:
+            for i_iter in range(self._n_pcg_iterations):
+                kernel_pcg_iter(
+                    self.dyn_state,
+                    self.dyn_info,
+                    self.mochi_info,
+                    self.mochi_state,
+                    self.contact_state,
+                    self.soft_info,
+                    self.soft_state,
+                    self.eq_info,
+                    self.eq_state,
+                    self.rigid_config,
+                    self.mochi_config,
+                )
+                if (i_iter + 1) % PCG_CHECK_PERIOD == 0 and kernel_pcg_any_active(self.mochi_state) == 0:
+                    break
+        if self._has_dense_envs:
             kernel_condense_dense(
                 self.dyn_state,
                 self.dyn_info,
@@ -1536,15 +1555,18 @@ class MochiSolver(KinematicSolver):
             if i_iter > 0:
                 self._assemble(assem_res=True, assem_dres=True, skip_ls_done=False)
                 kernel_convergence_check(self.mochi_info, self.mochi_state, self.rigid_config, False, self._errno)
-            if kernel_any_active(self.mochi_state) == 0:
+            if kernel_any_active(self.mochi_state, False) == 0:
                 break
+            if self._has_pcg_envs:
+                kernel_update_linear_tolerance(self.mochi_info, self.mochi_state, self.rigid_config, self.mochi_config)
             self._linear_solve()
             kernel_linesearch_begin(self.rigid_info, self.mochi_state, self.rigid_config)
             if self.has_soft:
                 kernel_soft_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, False)
                 if self.n_rod_elems > 0:
                     kernel_rod_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, False)
-            for i_ls in range(max(1, n_linesearch)):
+            n_trials = max(1, n_linesearch)
+            for i_ls in range(n_trials):
                 kernel_apply_increment(
                     self.dyn_info, self.rigid_info, self.mochi_info, self.mochi_state, self.rigid_config
                 )
@@ -1560,12 +1582,16 @@ class MochiSolver(KinematicSolver):
                     self.mochi_state,
                     self.rigid_config,
                     self.mochi_config,
-                    i_ls == max(1, n_linesearch) - 1,
+                    i_ls == n_trials - 1,
                 )
                 if self.has_soft:
                     kernel_soft_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, True)
                     if self.n_rod_elems > 0:
                         kernel_rod_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, True)
+                # Every remaining trial would re-evaluate the accepted iterate of every environment, which leaves the
+                # state it writes unchanged; the readback is worth it because a trial costs a full assembly.
+                if i_ls + 1 < n_trials and kernel_any_active(self.mochi_state, True) == 0:
+                    break
             kernel_convergence_check(self.mochi_info, self.mochi_state, self.rigid_config, True, self._errno)
 
     def substep_post_coupling(self, f):
