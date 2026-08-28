@@ -38,7 +38,11 @@ def main():
             size=(0.04, 0.04, 0.04),
             pos=(0.65, 0.0, 0.02),
         ),
-        material=gs.materials.Mochi.Rigid(friction=1.0, viscous_friction=1.0),
+        # material=gs.materials.Mochi.Rigid(friction=1.0, viscous_friction=1.0),
+        material=gs.materials.Mochi.Elastic(
+            E=2e4, nu=0.4, rho=800.0, stiffness_damping=1e-3, friction=1.0, viscous_friction=1.0
+        ),
+        surface=gs.surfaces.Default(color=(0.3, 0.7, 0.9)),
     )
     if args.record:
         cam = scene.add_camera(
