@@ -63,6 +63,7 @@ from .data import (
     COLLIDER_TYPE,
     FRICTION_MODEL,
     INTEGRATOR,
+    LINEAR_TOLERANCE,
     LINESEARCH,
     N_HISTORY,
     MochiInfo,
@@ -104,6 +105,7 @@ from .newton import (
     kernel_reset_newton,
     kernel_residual_norms,
     kernel_store_initial_norms,
+    kernel_update_linear_tolerance,
 )
 from .rigid_assembly import kernel_assemble_links
 from .soft import (
@@ -204,9 +206,9 @@ class MochiSolver(KinematicSolver):
         self.sdf: SDF | None = None
         self._errno = None
         self._is_contacts_recorded = False
-        # Set when the kinematic state is changed from outside the solver; the multistep history is then rebuilt at
-        # the start of the next step.
-        self._is_external_state_dirty = False
+        # Environments whose kinematic state was changed from outside the solver; their multistep history is rebuilt
+        # at the start of the next step. Allocated at build, once the batch size is known.
+        self._external_state_dirty_mask = None
         self._external_state_subscriber = Subscriber(
             frozenset({StateChange.GEOMETRY, StateChange.DYNAMICS}), callback=self._on_external_state_change
         )
@@ -590,6 +592,11 @@ class MochiSolver(KinematicSolver):
             friction_model=FRICTION_MODEL.CINF if options.friction_model == "cinf" else FRICTION_MODEL.C1,
             linesearch_type={"none": LINESEARCH.NONE, "residual_norm": LINESEARCH.RESIDUAL_NORM}.get(
                 options.linesearch_type, LINESEARCH.ARMIJO
+            ),
+            linear_tolerance=(
+                LINEAR_TOLERANCE.ADAPTIVE
+                if options.linear_tolerance_strategy == "adaptive"
+                else LINEAR_TOLERANCE.CONSTANT
             ),
             use_fitted_friction_hessian=options.use_fitted_friction_hessian,
             friction_with_collider_normal=options.friction_with_collider_normal,
@@ -1110,20 +1117,31 @@ class MochiSolver(KinematicSolver):
         kernel_update_geom_aabbs(self.geoms_init_AABB, self.dyn_state, self.rigid_config)
 
     def _on_external_state_change(self, change, envs_idx):
-        self._is_external_state_dirty = True
+        self._mark_external_state_dirty(self._scene._sanitize_envs_idx(envs_idx))
+
+    def _mark_external_state_dirty(self, envs_idx):
+        """Record the environments whose state was set from outside the solver, from an already sanitized index."""
+        self._external_state_dirty_mask[tensor_to_array(envs_idx)] = True
 
     def _sync_external_state(self):
-        # State set from outside the solver invalidates the multistep history and the rotation-derivative correction.
-        if self._is_external_state_dirty:
+        # State set from outside the solver invalidates the multistep history and the rotation-derivative correction
+        # of the environments it touched. Untouched environments keep theirs, so that setting the state of one
+        # environment leaves the trajectories of the others unchanged.
+        if self._external_state_dirty_mask.any():
+            envs_idx = (
+                self._scene._envs_idx
+                if self._external_state_dirty_mask.all()
+                else self._scene._sanitize_envs_idx(np.nonzero(self._external_state_dirty_mask)[0])
+            )
             kernel_reset_history(
-                self._scene._envs_idx,
+                envs_idx,
                 self.dyn_state,
                 self.dyn_info,
                 self.mochi_info,
                 self.mochi_state,
                 self.rigid_config,
             )
-            self._is_external_state_dirty = False
+            self._external_state_dirty_mask[:] = False
 
     def substep_pre_coupling(self, f):
         if not self.is_active:
@@ -1683,7 +1701,7 @@ class MochiSolver(KinematicSolver):
                 self.soft_state,
                 self.rigid_config,
             )
-        self._is_external_state_dirty = False
+        self._external_state_dirty_mask[tensor_to_array(envs_idx)] = False
         self._is_contacts_recorded = False
 
     # ------------------------------------------------------------------------------------
@@ -2078,19 +2096,19 @@ class MochiSolver(KinematicSolver):
     def set_soft_vertices_position(self, entity, pos, envs_idx=None):
         envs_idx, pos = self._soft_values_of_entity(entity, pos, envs_idx)
         kernel_soft_set_vertices_positions(envs_idx, entity.v_start, pos, self.soft_state, self.rigid_config)
-        self._is_external_state_dirty = True
+        self._mark_external_state_dirty(envs_idx)
         self._is_contacts_recorded = False
 
     def set_soft_vertices_velocity(self, entity, vel, envs_idx=None):
         envs_idx, vel = self._soft_values_of_entity(entity, vel, envs_idx)
         kernel_soft_set_vertices_velocities(envs_idx, entity.v_start, vel, self.soft_state, self.rigid_config)
-        self._is_external_state_dirty = True
+        self._mark_external_state_dirty(envs_idx)
 
     def set_soft_vertices_fixed(self, entity, verts_idx, is_fixed, envs_idx=None):
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
         verts_idx = np.asarray(verts_idx, dtype=gs.np_int) + entity.v_start
         kernel_soft_set_vertices_fixed(envs_idx, verts_idx, int(bool(is_fixed)), self.soft_state, self.rigid_config)
-        self._is_external_state_dirty = True
+        self._mark_external_state_dirty(envs_idx)
 
     def set_soft_vertices_target(self, entity, verts_idx, pos, envs_idx=None):
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)

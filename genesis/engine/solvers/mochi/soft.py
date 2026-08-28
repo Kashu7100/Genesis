@@ -381,12 +381,14 @@ def kernel_soft_update_conv_weights(
     mass, so that a unit weighted residual norm means a unit acceleration error."""
     n_verts = soft_state.verts_pos.shape[0]
     _B = soft_state.verts_pos.shape[1]
-    EPS = mochi_info.EPS[None]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_v, i_b in qd.ndrange(n_verts, _B):
-        a_ref = qd.max(1.0, mochi_info.gravity[i_b].norm())
-        mass_entity = soft_info.entities_mass[soft_info.verts_entity_idx[i_v]]
-        w = 1.0 / (a_ref * a_ref * qd.max(mass_entity * soft_info.verts_mass[i_v], EPS))
+        # A massless vertex has no acceleration scale to normalize by; see kernel_update_conv_weights.
+        mass = soft_info.entities_mass[soft_info.verts_entity_idx[i_v]] * soft_info.verts_mass[i_v]
+        w = gs.qd_float(1.0)
+        if mass > 0.0:
+            a_ref = qd.max(1.0, mochi_info.gravity[i_b].norm())
+            w = 1.0 / (a_ref * a_ref * mass)
         for k in qd.static(range(3)):
             mochi_state.conv_w[func_soft_dof(i_v, k, soft_info), i_b] = w
 

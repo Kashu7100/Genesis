@@ -40,6 +40,11 @@ class LINESEARCH(IntEnum):
     ARMIJO = 2
 
 
+class LINEAR_TOLERANCE(IntEnum):
+    CONSTANT = 0
+    ADAPTIVE = 1
+
+
 class SOLVE_STATUS(IntEnum):
     RUNNING = 0
     CONVERGED = 1
@@ -59,6 +64,7 @@ class MochiStaticConfig(metaclass=AutoInitMeta):
     use_newton_euler_inertia: bool
     friction_model: int
     linesearch_type: int
+    linear_tolerance: int
     use_fitted_friction_hessian: bool
     friction_with_collider_normal: bool
     fade_friction: bool
@@ -285,7 +291,11 @@ class MochiState:
     ls_slope: qd.Tensor
     obj: qd.Tensor
     obj_ref: qd.Tensor
-    # Preconditioned conjugate gradient scratch.
+    # Residual norm of the previous Newton iterate, driving the adaptive linear tolerance.
+    res_norm_prev: qd.Tensor
+    # Preconditioned conjugate gradient scratch. The stopping criterion monitors the preconditioned residual
+    # z = M^-1 r, whose squared norm starts at pcg_zTz0; pcg_rTz_cross holds r_new . z_old for the Polak-Ribiere beta.
+    pcg_rel_tol: qd.Tensor
     pcg_diag: qd.Tensor
     pcg_r: qd.Tensor
     pcg_z: qd.Tensor
@@ -293,9 +303,10 @@ class MochiState:
     pcg_Ap: qd.Tensor
     pcg_rTz: qd.Tensor
     pcg_rTz_new: qd.Tensor
+    pcg_rTz_cross: qd.Tensor
     pcg_pTAp: qd.Tensor
-    pcg_rTr: qd.Tensor
-    pcg_rTr0: qd.Tensor
+    pcg_zTz: qd.Tensor
+    pcg_zTz0: qd.Tensor
     pcg_is_active: qd.Tensor
 
 
@@ -348,6 +359,8 @@ def get_mochi_state(solver, max_pairs, has_dense):
         ls_slope=V(dtype=gs.qd_float, shape=(_B,)),
         obj=V(dtype=gs.qd_float, shape=(_B,)),
         obj_ref=V(dtype=gs.qd_float, shape=(_B,)),
+        res_norm_prev=V(dtype=gs.qd_float, shape=(_B,)),
+        pcg_rel_tol=V(dtype=gs.qd_float, shape=(_B,)),
         pcg_diag=V(dtype=gs.qd_float, shape=(n_dofs_, _B)),
         pcg_r=V(dtype=gs.qd_float, shape=(n_dofs_, _B)),
         pcg_z=V(dtype=gs.qd_float, shape=(n_dofs_, _B)),
@@ -355,9 +368,10 @@ def get_mochi_state(solver, max_pairs, has_dense):
         pcg_Ap=V(dtype=gs.qd_float, shape=(n_dofs_, _B)),
         pcg_rTz=V(dtype=gs.qd_float, shape=(_B,)),
         pcg_rTz_new=V(dtype=gs.qd_float, shape=(_B,)),
+        pcg_rTz_cross=V(dtype=gs.qd_float, shape=(_B,)),
         pcg_pTAp=V(dtype=gs.qd_float, shape=(_B,)),
-        pcg_rTr=V(dtype=gs.qd_float, shape=(_B,)),
-        pcg_rTr0=V(dtype=gs.qd_float, shape=(_B,)),
+        pcg_zTz=V(dtype=gs.qd_float, shape=(_B,)),
+        pcg_zTz0=V(dtype=gs.qd_float, shape=(_B,)),
         pcg_is_active=V(dtype=gs.qd_bool, shape=(_B,)),
     )
 

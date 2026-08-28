@@ -3,7 +3,13 @@ import quadrants as qd
 
 import genesis as gs
 from genesis.engine.solvers.mochi.contact_utils import collision_response
-from genesis.engine.solvers.mochi.data import FRICTION_MODEL, INTEGRATOR, LINESEARCH, MochiStaticConfig
+from genesis.engine.solvers.mochi.data import (
+    FRICTION_MODEL,
+    INTEGRATOR,
+    LINEAR_TOLERANCE,
+    LINESEARCH,
+    MochiStaticConfig,
+)
 
 
 def make_static_config(**overrides):
@@ -14,6 +20,7 @@ def make_static_config(**overrides):
         "use_newton_euler_inertia": False,
         "friction_model": FRICTION_MODEL.C1,
         "linesearch_type": LINESEARCH.RESIDUAL_NORM,
+        "linear_tolerance": LINEAR_TOLERANCE.CONSTANT,
         "use_fitted_friction_hessian": True,
         "friction_with_collider_normal": True,
         "fade_friction": True,

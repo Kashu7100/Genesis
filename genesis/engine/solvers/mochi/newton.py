@@ -9,7 +9,16 @@ import genesis as gs
 import genesis.utils.geom as gu
 from genesis.utils import array_class
 
-from .data import LINESEARCH, SOLVE_STATUS, MochiInfo, MochiState
+from .data import LINEAR_TOLERANCE, LINESEARCH, SOLVE_STATUS, MochiInfo, MochiState
+
+# Forcing term of the adaptive linear tolerance ('choice 2' of Eisenstat and Walker): the tolerance of the next linear
+# solve is EW_GAMMA * (res / res_prev) ** EW_ALPHA, capped at EW_MAX_ETA (also the tolerance of the first iteration,
+# where no ratio exists yet) and floored at EW_MIN_ETA_EPS times the machine epsilon so it stays above the noise
+# floor. The cap is much tighter than the textbook 0.9 because an assembly costs more than a linear solve here.
+EW_GAMMA = 0.9
+EW_ALPHA = 1.618033988749895
+EW_MAX_ETA = 0.01
+EW_MIN_ETA_EPS = 100.0
 
 
 @qd.func
@@ -244,9 +253,35 @@ def kernel_convergence_check(
 
 
 @qd.kernel
-def kernel_any_active(mochi_state: MochiState) -> qd.i32:
+def kernel_update_linear_tolerance(
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+):
+    """Relative tolerance the linear solve of the coming Newton step must reach in every running environment."""
+    _B = mochi_state.is_active.shape[0]
+    EPS = mochi_info.EPS[None]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
+    for i_b in range(_B):
+        if not mochi_state.is_active[i_b]:
+            continue
+        if qd.static(mochi_config.linear_tolerance == LINEAR_TOLERANCE.ADAPTIVE):
+            res_norm = qd.sqrt(mochi_state.res_norm_sq[i_b])
+            eta = gs.qd_float(EW_MAX_ETA)
+            if mochi_state.n_iter[i_b] > 0:
+                eta = EW_GAMMA * qd.pow(res_norm / mochi_state.res_norm_prev[i_b], EW_ALPHA)
+                eta = qd.min(qd.max(eta, EW_MIN_ETA_EPS * EPS), EW_MAX_ETA)
+            mochi_state.pcg_rel_tol[i_b] = eta
+            mochi_state.res_norm_prev[i_b] = res_norm
+        else:
+            mochi_state.pcg_rel_tol[i_b] = mochi_info.pcg_rel_tol[None]
+
+
+@qd.kernel
+def kernel_any_active(mochi_state: MochiState, skip_ls_done: qd.template()) -> qd.i32:
     n_active = 0
     for i_b in range(mochi_state.is_active.shape[0]):
-        if mochi_state.is_active[i_b]:
+        if func_is_env_active(i_b, mochi_state, skip_ls_done):
             n_active += 1
     return n_active
