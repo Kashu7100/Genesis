@@ -363,6 +363,17 @@ class MochiState:
     # every environment index in order, and the batch size: the identity environment list of the step functions
     all_envs: qd.Tensor
     n_envs_all: qd.Tensor
+    # control of the graph step kernel: kind of the current round and the environment-list gates of its phases
+    graph_is_first: qd.Tensor
+    graph_round_is_s: qd.Tensor
+    graph_round_is_l: qd.Tensor
+    graph_round_is_last_trial: qd.Tensor
+    graph_any: qd.Tensor
+    gate_ls: qd.Tensor
+    gate_newton: qd.Tensor
+    gate_first: qd.Tensor
+    gate_post_ls: qd.Tensor
+    gate_pcg: qd.Tensor
     res_norm_sq: qd.Tensor
     res_w_sq: qd.Tensor
     res_norm0: qd.Tensor
@@ -433,6 +444,16 @@ def get_mochi_state(solver, max_pairs, has_dense):
         n_pcg_iter=V(dtype=gs.qd_int, shape=(_B,)),
         all_envs=V(dtype=gs.qd_int, shape=(_B,)),
         n_envs_all=_scalar(gs.qd_int, _B),
+        graph_is_first=_scalar(gs.qd_int, 0),
+        graph_round_is_s=_scalar(gs.qd_int, 0),
+        graph_round_is_l=_scalar(gs.qd_int, 0),
+        graph_round_is_last_trial=_scalar(gs.qd_int, 0),
+        graph_any=_scalar(gs.qd_int, 0),
+        gate_ls=_scalar(gs.qd_int, 0),
+        gate_newton=_scalar(gs.qd_int, 0),
+        gate_first=_scalar(gs.qd_int, 0),
+        gate_post_ls=_scalar(gs.qd_int, 0),
+        gate_pcg=_scalar(gs.qd_int, 0),
         res_norm_sq=V(dtype=gs.qd_float, shape=(_B,)),
         res_w_sq=V(dtype=gs.qd_float, shape=(_B,)),
         res_norm0=V(dtype=gs.qd_float, shape=(_B,)),

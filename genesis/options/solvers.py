@@ -1052,10 +1052,17 @@ class MochiOptions(Options):
         Whether individual contact points can be read back through `entity.get_contacts()`; their buffers are
         allocated at the first readback. Defaults to True.
     step_kernel : str, optional
-        How a step is executed: "monolith" runs the whole step of every environment in one kernel (environments in
-        parallel, one launch per step, no host round trips), "pipeline" runs each stage as its own kernel with the host
-        driving the Newton and conjugate gradient loops (parallel over items), "auto" picks the monolith on the CPU
-        and, on the GPU, for rigid scenes of at most 64 degrees of freedom. Defaults to "auto".
+        How a step is executed: "monolith" runs the whole step of every environment in one kernel (one thread per
+        environment, one launch per step, no host round trips), "graph" runs the step as one graph-launched kernel
+        whose Newton, line-search and conjugate-gradient loops run on the device with the stages parallel over items
+        and environments (one launch per step; on GPUs without device-side graph conditionals the runtime reads one
+        flag back per loop round), "pipeline" runs each stage as its own kernel with the host driving the loops.
+        "auto" picks the monolith on the CPU and, on the GPU, for rigid scenes of at most 64 degrees of freedom, the
+        graph otherwise. Defaults to "auto".
+    graph_pcg_unroll : int, optional
+        Conjugate-gradient iterations per round of the graph step kernel's inner loop (each round costs one flag
+        readback on GPUs without device-side graph conditionals; each iteration is compiled once per unrolled
+        slot). Defaults to 4.
     joint_limit_stiffness : float, optional
         Stiffness in N/m (N*m/rad) of the penalty holding revolute and prismatic joints inside their range. Joint
         limits are soft: the violation at rest is the limit torque divided by this stiffness. Higher values reduce the
@@ -1107,7 +1114,8 @@ class MochiOptions(Options):
     max_point_cloud_hits_per_query: PositiveInt | None = None
     broadphase_margin: NonNegativeFloat = 0.01
     record_contacts: StrictBool = True
-    step_kernel: Literal["auto", "monolith", "pipeline"] = "auto"
+    step_kernel: Literal["auto", "monolith", "pipeline", "graph"] = "auto"
+    graph_pcg_unroll: PositiveInt = 4
     joint_limit_stiffness: PositiveFloat = 1e4
     joint_limit_damping: NonNegativeFloat = 0.0
     batch_links_info: StrictBool = False

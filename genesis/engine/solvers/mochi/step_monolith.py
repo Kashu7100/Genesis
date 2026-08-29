@@ -120,8 +120,11 @@ def func_update_kinematics_env(
 
 
 @qd.func
-def func_assemble_env(
-    i_b,
+def func_assemble(
+    i_b_env,
+    per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
@@ -145,13 +148,13 @@ def func_assemble_env(
     skip_ls_done,
     errno: qd.Tensor,
 ):
-    """Residual and/or Hessian of one environment at its current iterate (contact re-detected)."""
+    """Residual and/or Hessian of the environments of the list at their current iterate (contact re-detected)."""
     assem_obj = qd.static(mochi_config.linesearch_type == LINESEARCH.ARMIJO)
     func_zero_assembly(
-        i_b,
-        True,
-        mochi_state.all_envs,
-        mochi_state.n_envs_all,
+        i_b_env,
+        per_env,
+        envs,
+        n_envs,
         dyn_state,
         mochi_state,
         contact_state,
@@ -165,10 +168,10 @@ def func_assemble_env(
     )
     if qd.static(mochi_config.has_soft):
         func_soft_zero_assembly(
-            i_b,
-            True,
-            mochi_state.all_envs,
-            mochi_state.n_envs_all,
+            i_b_env,
+            per_env,
+            envs,
+            n_envs,
             mochi_state,
             soft_state,
             rigid_config,
@@ -177,10 +180,10 @@ def func_assemble_env(
             False,
         )
     func_contact_eval(
-        i_b,
-        True,
-        mochi_state.all_envs,
-        mochi_state.n_envs_all,
+        i_b_env,
+        per_env,
+        envs,
+        n_envs,
         dyn_state,
         dyn_info,
         sdf_info,
@@ -197,10 +200,10 @@ def func_assemble_env(
     )
     if qd.static(mochi_config.has_soft):
         func_soft_contact_eval(
-            i_b,
-            True,
-            mochi_state.all_envs,
-            mochi_state.n_envs_all,
+            i_b_env,
+            per_env,
+            envs,
+            n_envs,
             dyn_state,
             dyn_info,
             sdf_info,
@@ -220,10 +223,10 @@ def func_assemble_env(
         )
         if qd.static(mochi_config.has_pc_colliders):
             func_pc_hash_build(
-                i_b,
-                True,
-                mochi_state.all_envs,
-                mochi_state.n_envs_all,
+                i_b_env,
+                per_env,
+                envs,
+                n_envs,
                 mochi_state,
                 soft_info,
                 soft_state,
@@ -231,10 +234,10 @@ def func_assemble_env(
                 skip_ls_done,
             )
             func_pc_collider_eval(
-                i_b,
-                True,
-                mochi_state.all_envs,
-                mochi_state.n_envs_all,
+                i_b_env,
+                per_env,
+                envs,
+                n_envs,
                 dyn_state,
                 dyn_info,
                 mochi_info,
@@ -253,10 +256,10 @@ def func_assemble_env(
             )
         if qd.static(mochi_config.has_soft_colliders):
             func_tet_hash_build(
-                i_b,
-                True,
-                mochi_state.all_envs,
-                mochi_state.n_envs_all,
+                i_b_env,
+                per_env,
+                envs,
+                n_envs,
                 mochi_state,
                 soft_info,
                 soft_state,
@@ -265,10 +268,10 @@ def func_assemble_env(
                 errno,
             )
             func_soft_collider_eval(
-                i_b,
-                True,
-                mochi_state.all_envs,
-                mochi_state.n_envs_all,
+                i_b_env,
+                per_env,
+                envs,
+                n_envs,
                 dyn_state,
                 dyn_info,
                 mochi_info,
@@ -286,10 +289,10 @@ def func_assemble_env(
                 errno,
             )
     func_pairs_to_blocks(
-        i_b,
-        True,
-        mochi_state.all_envs,
-        mochi_state.n_envs_all,
+        i_b_env,
+        per_env,
+        envs,
+        n_envs,
         dyn_state,
         dyn_info,
         mochi_info,
@@ -302,10 +305,10 @@ def func_assemble_env(
         skip_ls_done,
     )
     func_assemble_links(
-        i_b,
-        True,
-        mochi_state.all_envs,
-        mochi_state.n_envs_all,
+        i_b_env,
+        per_env,
+        envs,
+        n_envs,
         dyn_state,
         dyn_info,
         mochi_info,
@@ -318,10 +321,10 @@ def func_assemble_env(
         skip_ls_done,
     )
     func_assemble_joints(
-        i_b,
-        True,
-        mochi_state.all_envs,
-        mochi_state.n_envs_all,
+        i_b_env,
+        per_env,
+        envs,
+        n_envs,
         dyn_state,
         dyn_info,
         rigid_info,
@@ -335,10 +338,10 @@ def func_assemble_env(
     )
     if qd.static(mochi_config.has_equalities):
         func_assemble_equalities(
-            i_b,
-            True,
-            mochi_state.all_envs,
-            mochi_state.n_envs_all,
+            i_b_env,
+            per_env,
+            envs,
+            n_envs,
             dyn_state,
             dyn_info,
             rigid_info,
@@ -354,10 +357,10 @@ def func_assemble_env(
         )
     if qd.static(mochi_config.has_soft):
         func_soft_pairs_to_blocks(
-            i_b,
-            True,
-            mochi_state.all_envs,
-            mochi_state.n_envs_all,
+            i_b_env,
+            per_env,
+            envs,
+            n_envs,
             dyn_state,
             mochi_info,
             mochi_state,
@@ -369,10 +372,10 @@ def func_assemble_env(
             skip_ls_done,
         )
         func_soft_assemble_elements(
-            i_b,
-            True,
-            mochi_state.all_envs,
-            mochi_state.n_envs_all,
+            i_b_env,
+            per_env,
+            envs,
+            n_envs,
             mochi_info,
             mochi_state,
             soft_info,
@@ -385,10 +388,10 @@ def func_assemble_env(
         )
         if qd.static(has_shell):
             func_shell_assemble(
-                i_b,
-                True,
-                mochi_state.all_envs,
-                mochi_state.n_envs_all,
+                i_b_env,
+                per_env,
+                envs,
+                n_envs,
                 mochi_info,
                 mochi_state,
                 soft_info,
@@ -401,10 +404,10 @@ def func_assemble_env(
             )
         if qd.static(has_rod):
             func_rod_assemble(
-                i_b,
-                True,
-                mochi_state.all_envs,
-                mochi_state.n_envs_all,
+                i_b_env,
+                per_env,
+                envs,
+                n_envs,
                 mochi_info,
                 mochi_state,
                 soft_info,
@@ -418,10 +421,10 @@ def func_assemble_env(
     if qd.static(assem_res):
         if qd.static(mochi_config.has_soft):
             func_soft_dirichlet(
-                i_b,
-                True,
-                mochi_state.all_envs,
-                mochi_state.n_envs_all,
+                i_b_env,
+                per_env,
+                envs,
+                n_envs,
                 mochi_state,
                 soft_info,
                 soft_state,
@@ -429,10 +432,10 @@ def func_assemble_env(
                 skip_ls_done,
             )
         func_project_links_residual(
-            i_b,
-            True,
-            mochi_state.all_envs,
-            mochi_state.n_envs_all,
+            i_b_env,
+            per_env,
+            envs,
+            n_envs,
             dyn_state,
             dyn_info,
             mochi_info,
@@ -441,10 +444,10 @@ def func_assemble_env(
             skip_ls_done,
         )
         func_residual_norms(
-            i_b,
-            True,
-            mochi_state.all_envs,
-            mochi_state.n_envs_all,
+            i_b_env,
+            per_env,
+            envs,
+            n_envs,
             mochi_state,
             island_state,
             rigid_config,
@@ -827,8 +830,11 @@ def kernel_step_monolith(
                             rigid_config,
                         )
                 func_update_kinematics_env(i_b, geoms_init_AABB, dyn_state, dyn_info, rigid_info, rigid_config, False)
-            func_assemble_env(
+            func_assemble(
                 i_b,
+                True,
+                mochi_state.all_envs,
+                mochi_state.n_envs_all,
                 dyn_state,
                 dyn_info,
                 rigid_info,

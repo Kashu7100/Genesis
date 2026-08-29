@@ -161,6 +161,7 @@ from .soft import (
     kernel_tet_hash_build,
 )
 from .soft_materials import ELASTIC_MODEL_BY_NAME
+from .step_graph import kernel_step_graph
 from .step_monolith import kernel_step_monolith
 
 if TYPE_CHECKING:
@@ -352,7 +353,12 @@ class MochiSolver(KinematicSolver):
         )
         self._init_mochi()
         self._init_soft()
-        self._use_monolith = self._resolve_step_kernel()
+        self._step_kernel = self._resolve_step_kernel()
+        self._use_monolith = self._step_kernel == "monolith"
+        # loop counters of the graph step kernel (the same physical arrays every launch)
+        self._newton_counter = qd.ndarray(qd.i32, shape=())
+        self._round_counter = qd.ndarray(qd.i32, shape=())
+        self._pcg_counter = qd.ndarray(qd.i32, shape=())
         # The contact points recorded for readback are allocated at the first readback (see `_record_contacts`).
         self.hit_readback = get_mochi_hit_readback(self, 1, 1, 1, 1)
         self._is_hit_readback_allocated = False
@@ -1357,20 +1363,65 @@ class MochiSolver(KinematicSolver):
             self._external_state_dirty_mask[:] = False
 
     def _resolve_step_kernel(self):
-        """Whether the step runs as one per-environment kernel (no host round trips) or as the multi-kernel
-        pipeline: always the monolith on the CPU; on the GPU one thread per environment only pays off for small rigid
-        environments."""
+        """How a step runs: "monolith" (one kernel, one thread per environment; the CPU, and small rigid scenes on
+        the GPU), "graph" (one graph-launched kernel whose loops run on the device, parallel over items and
+        environments; deformable and large scenes on the GPU) or "pipeline" (one kernel per stage, the host driving the
+        loops)."""
         step_kernel = self._options.step_kernel
-        if step_kernel == "monolith":
-            return True
-        if step_kernel == "pipeline":
-            return False
-        return gs.backend == gs.cpu or (self.n_dofs_total <= 64 and not self.has_soft)
+        if step_kernel != "auto":
+            return step_kernel
+        if gs.backend == gs.cpu:
+            return "monolith"
+        if self.n_dofs_total <= 64 and not self.has_soft:
+            return "monolith"
+        return "graph"
 
     def substep_pre_coupling(self, f):
         if not self.is_active:
             return
         self._sync_external_state()
+        if self._step_kernel == "graph":
+            options = self._options
+            n_linesearch = (
+                0 if self.mochi_config.linesearch_type == LINESEARCH.NONE else options.n_linesearch_iterations
+            )
+            pcg_unroll = options.graph_pcg_unroll
+            kernel_step_graph(
+                self._newton_counter,
+                self._round_counter,
+                self._pcg_counter,
+                self.dyn_state,
+                self.dyn_info,
+                self.rigid_info,
+                self.sdf._sdf_info,
+                self.geoms_init_AABB,
+                self.mochi_info,
+                self.mochi_state,
+                self.contact_state,
+                self.hit_readback,
+                self.island_state,
+                self.eq_info,
+                self.eq_state,
+                self.soft_info,
+                self.soft_state,
+                self.rigid_config,
+                self.mochi_config,
+                self.n_shell_elems > 0,
+                self.n_rod_elems > 0,
+                pcg_unroll,
+                max(1, n_linesearch),
+                self._dense_max_dofs,
+                len(self._entities),
+                options.n_newton_iterations,
+                self._n_pcg_iterations,
+                -(-self._n_pcg_iterations // pcg_unroll),
+                self._max_samples_per_soft_entity,
+                self._errno,
+            )
+            self._is_forward_pos_updated = True
+            self._is_forward_vel_updated = True
+            self._is_contacts_recorded = False
+            return
         if self._use_monolith:
             options = self._options
             n_linesearch = (
