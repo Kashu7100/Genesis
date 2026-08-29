@@ -13,7 +13,6 @@ import torch
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.engine.bvh import AABB
 from genesis.engine.entities.mochi_entity import MochiEntity, MochiSoftEntity
 from genesis.engine.states.solvers import MochiSolverState
 from genesis.options.solvers import MochiOptions
@@ -115,13 +114,12 @@ from .soft import (
     SOFT_KIND_ROD,
     SOFT_KIND_SHELL,
     SOFT_KIND_SOLID,
-    SoftTetLBVH,
     build_soft_samples,
     kernel_init_rod_fields,
     kernel_init_shell_fields,
     kernel_init_soft_fields,
-    kernel_pc_collider_aabbs,
     kernel_pc_collider_eval,
+    kernel_pc_hash_build,
     kernel_rod_apply_increment,
     kernel_rod_assemble,
     kernel_rod_get_state_render,
@@ -135,9 +133,7 @@ from .soft import (
     kernel_soft_apply_increment,
     kernel_soft_assemble_elements,
     kernel_soft_broadphase,
-    kernel_soft_collider_aabbs,
     kernel_soft_collider_eval,
-    kernel_soft_collider_query,
     kernel_soft_condense_dense,
     kernel_soft_conservative_bounds,
     kernel_soft_contact_eval,
@@ -161,6 +157,7 @@ from .soft import (
     kernel_soft_store_ls_ref,
     kernel_soft_update_conv_weights,
     kernel_soft_zero_assembly,
+    kernel_tet_hash_build,
 )
 from .soft_materials import ELASTIC_MODEL_BY_NAME
 from .step_monolith import kernel_step_monolith
@@ -190,6 +187,10 @@ _AUTO_COLLIDER_TYPE_BY_GEOM_TYPE = {
     gs.GEOM_TYPE.SPHERE: COLLIDER_TYPE.SPHERE,
     gs.GEOM_TYPE.BOX: COLLIDER_TYPE.BOX,
 }
+
+
+def _next_power_of_two(n):
+    return 1 << max(0, int(n) - 1).bit_length()
 
 
 class MochiSolver(KinematicSolver):
@@ -612,6 +613,7 @@ class MochiSolver(KinematicSolver):
         if self._n_pcg_iterations is None:
             self._n_pcg_iterations = min(max(1, self.n_dofs_total), 1000)
 
+        self._resolve_soft_collider_flags()
         self.mochi_config = MochiStaticConfig(
             backend=gs.backend,
             para_level=self.sim._para_level,
@@ -638,6 +640,8 @@ class MochiSolver(KinematicSolver):
             record_contacts=options.record_contacts,
             batch_links_info=self._options.batch_links_info,
             has_soft=self.has_soft,
+            has_pc_colliders=self._has_pc_colliders,
+            has_soft_colliders=self._has_soft_colliders,
             has_equalities=len(self._equalities) > 0,
         )
         self.mochi_info = get_mochi_info(self)
@@ -822,51 +826,25 @@ class MochiSolver(KinematicSolver):
         self._n_soft_sdf_voxels = len(sdf_values)
         self.n_soft_sdf_voxels_ = max(1, len(sdf_values))
 
-        # Deformable colliders: every rigid and deformable sample point is located in the deformed tetrahedra through
-        # a bounding-volume hierarchy rebuilt at every assembly.
-        # A deformable collider only matters when something can query it: rigid samples, another deformable entity, or
-        # its own samples under self-contact.
-        has_self_contact = any((e.is_shell or e.is_rod) and e.material.self_contact for e in entities)
-        has_queries = self.n_samples > 0 or len(entities) > 1
-        self._has_soft_colliders = has_queries and any(
-            grid["collider_type"] == COLLIDER_TYPE.GRID for grid in (sdf_grids if self.has_soft else ())
-        )
-        self._has_pc_colliders = (has_queries or has_self_contact) and any(
-            grid["collider_type"] == COLLIDER_TYPE.POINT_CLOUD for grid in (sdf_grids if self.has_soft else ())
-        )
+        # Deformable colliders: every rigid and deformable sample point is located in the collider spheres / deformed
+        # tetrahedra through a spatial hash rebuilt at every assembly (the flags are resolved in `_init_mochi`).
         self._n_soft_queries = self.n_samples + n_samples
         self._max_sc_hits = max(1, 2 * self._n_soft_queries) if self._has_soft_colliders else 1
         # Self-contact makes every sample overlap the spheres of its own neighborhood before the exclusion test.
-        entities_self_contact = [int((e.is_shell or e.is_rod) and e.material.self_contact) for e in entities]
-        has_self_contact = any(entities_self_contact)
-        pc_hits_per_query, pc_results_per_point = (16, 32) if has_self_contact else (4, 8)
+        has_self_contact = any((e.is_shell or e.is_rod) and e.material.self_contact for e in entities)
+        pc_hits_per_query = 16 if has_self_contact else 4
         self._max_pc_hits = max(1, pc_hits_per_query * self._n_soft_queries) if self._has_pc_colliders else 1
-        if self._has_soft_colliders or self._has_pc_colliders:
-            self._soft_query_aabb = AABB(_B, max(1, self._n_soft_queries))
-            queries_entity_idx = np.concatenate([np.full(self.n_samples, -1, dtype=gs.np_int), samples_entity_idx])
-        if self._has_pc_colliders:
-            self._pc_aabb = AABB(_B, self.n_soft_verts_)
-            n_results_per_point = max(1, -(-pc_results_per_point * self._n_soft_queries // self.n_soft_verts_))
-            self._pc_bvh = SoftTetLBVH(
-                self._pc_aabb,
-                verts_entity_idx,
-                queries_entity_idx,
-                entities_self_contact,
-                max_n_query_result_per_aabb=n_results_per_point,
-            )
-        if self._has_soft_colliders or self._has_pc_colliders:
-            self._soft_tet_aabb = AABB(_B, self.n_soft_elems_)
-        if self._has_soft_colliders:
-            # A sample point overlaps the bounds of many tetrahedra before the inclusion test; those of its own entity
-            # are filtered out by the hierarchy.
-            n_results_per_tet = max(1, -(-16 * self._n_soft_queries // self.n_soft_elems_))
-            self._soft_tet_bvh = SoftTetLBVH(
-                self._soft_tet_aabb,
-                elems_entity_idx,
-                queries_entity_idx,
-                entities_self_contact,
-                max_n_query_result_per_aabb=n_results_per_tet,
-            )
+        bins_per_item = options.spatial_hash_bins_per_item
+        self.n_pc_bins_ = _next_power_of_two(bins_per_item * self.n_soft_verts) if self._has_pc_colliders else 1
+        self.n_tet_bins_ = _next_power_of_two(bins_per_item * self.n_soft_elems) if self._has_soft_colliders else 1
+        # The hash cell of the spheres is the largest contact range of a point-cloud collider (radius plus penalty
+        # threshold, as mochi's): a sample within the range of a sphere is then at most one cell away from its center.
+        pc_bands = [
+            (e.rod_radius if e.is_rod else e.material.collider_radius) + e.material.penalty_threshold
+            for e in entities
+            if self._soft_collider_kind(e) == COLLIDER_TYPE.POINT_CLOUD
+        ]
+        self._pc_hash_cell = max(pc_bands) if pc_bands else 1.0
 
         band = self._rod_band_layout()
         self.n_band_rows_ = max(1, len(band["rows_dof"]))
@@ -1209,6 +1187,28 @@ class MochiSolver(KinematicSolver):
             "cell": tuple(float(c) for c in cell),
         }
 
+    @staticmethod
+    def _soft_collider_kind(entity):
+        """Collider of a deformable entity: none, the spheres of its vertices (shells and rods) or the signed distance
+        field of its rest shape sampled in its deformed tetrahedra (solids)."""
+        if entity.material.collider_type == "none":
+            return COLLIDER_TYPE.NONE
+        if entity.is_shell or entity.is_rod:
+            return COLLIDER_TYPE.POINT_CLOUD
+        return COLLIDER_TYPE.GRID
+
+    def _resolve_soft_collider_flags(self):
+        """Whether the scene has deformable colliders that something can query: rigid samples, another deformable
+        entity, or the entity's own samples under self-contact."""
+        entities = self._soft_entities
+        kinds = [self._soft_collider_kind(entity) for entity in entities]
+        has_self_contact = any((e.is_shell or e.is_rod) and e.material.self_contact for e in entities)
+        has_queries = self.n_samples > 0 or len(entities) > 1
+        self._has_soft_colliders = has_queries and any(kind == COLLIDER_TYPE.GRID for kind in kinds)
+        self._has_pc_colliders = (has_queries or has_self_contact) and any(
+            kind == COLLIDER_TYPE.POINT_CLOUD for kind in kinds
+        )
+
     def _compute_soft_pair_enabled(self):
         """Deformable entity pair contact filter from the contact layers (an entity never collides with itself)."""
         enabled = np.ones((self.n_soft_entities_, self.n_soft_entities_), dtype=bool)
@@ -1313,20 +1313,14 @@ class MochiSolver(KinematicSolver):
 
     def _resolve_step_kernel(self):
         """Whether the step runs as one per-environment kernel (no host round trips) or as the multi-kernel
-        pipeline. The bounding-volume hierarchies of the deformable colliders are built by host-driven kernels, so
-        scenes that need them keep the pipeline; on the GPU one thread per environment only pays off for small
+        pipeline: always the monolith on the CPU; on the GPU one thread per environment only pays off for small rigid
         environments."""
-        needs_pipeline = self._has_soft_colliders or self._has_pc_colliders
         step_kernel = self._options.step_kernel
         if step_kernel == "monolith":
-            if needs_pipeline:
-                gs.raise_exception(
-                    "The monolith step kernel does not support deformable colliders (point-cloud or SDF)."
-                )
             return True
         if step_kernel == "pipeline":
             return False
-        return not needs_pipeline and (gs.backend == gs.cpu or (self.n_dofs_total <= 64 and not self.has_soft))
+        return gs.backend == gs.cpu or (self.n_dofs_total <= 64 and not self.has_soft)
 
     def substep_pre_coupling(self, f):
         if not self.is_active:
@@ -1504,28 +1498,9 @@ class MochiSolver(KinematicSolver):
                 record,
                 self._errno,
             )
-            if self._has_soft_colliders or self._has_pc_colliders:
-                kernel_soft_collider_aabbs(
-                    self.dyn_state,
-                    self.mochi_info,
-                    self.mochi_state,
-                    self.soft_info,
-                    self.soft_state,
-                    self._soft_tet_aabb.aabbs,
-                    self._soft_query_aabb.aabbs,
-                    self.n_samples,
-                    self.rigid_config,
-                )
             if self._has_pc_colliders:
-                kernel_pc_collider_aabbs(
-                    self.mochi_state, self.soft_info, self.soft_state, self._pc_aabb.aabbs, self.rigid_config
-                )
-                self._pc_bvh.build()
-                if kernel_soft_collider_query(self._pc_bvh, self._soft_query_aabb.aabbs):
-                    gs.raise_exception("Exceeding the capacity of the point-cloud collider queries.")
+                kernel_pc_hash_build(self.mochi_state, self.soft_info, self.soft_state, self.rigid_config, skip_ls_done)
                 kernel_pc_collider_eval(
-                    self._pc_bvh.query_result,
-                    self._pc_bvh.query_result_count,
                     self.dyn_state,
                     self.dyn_info,
                     self.mochi_info,
@@ -1534,7 +1509,6 @@ class MochiSolver(KinematicSolver):
                     self.soft_state,
                     self.rigid_config,
                     self.mochi_config,
-                    self.n_samples,
                     assem_obj,
                     assem_res,
                     assem_dres,
@@ -1543,12 +1517,10 @@ class MochiSolver(KinematicSolver):
                     self._errno,
                 )
             if self._has_soft_colliders:
-                self._soft_tet_bvh.build()
-                if kernel_soft_collider_query(self._soft_tet_bvh, self._soft_query_aabb.aabbs):
-                    gs.raise_exception("Exceeding the capacity of the deformable collider queries.")
+                kernel_tet_hash_build(
+                    self.mochi_state, self.soft_info, self.soft_state, self.rigid_config, skip_ls_done
+                )
                 kernel_soft_collider_eval(
-                    self._soft_tet_bvh.query_result,
-                    self._soft_tet_bvh.query_result_count,
                     self.dyn_state,
                     self.dyn_info,
                     self.mochi_info,
@@ -1557,7 +1529,6 @@ class MochiSolver(KinematicSolver):
                     self.soft_state,
                     self.rigid_config,
                     self.mochi_config,
-                    self.n_samples,
                     assem_obj,
                     assem_res,
                     assem_dres,
@@ -2380,7 +2351,7 @@ class MochiSolver(KinematicSolver):
 
     @property
     def n_soft_elems(self):
-        return sum(entity.n_elements for entity in self._soft_entities if not entity.is_shell)
+        return sum(entity.n_elements for entity in self._soft_entities if not (entity.is_shell or entity.is_rod))
 
     @property
     def n_shell_elems(self):

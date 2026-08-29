@@ -81,6 +81,8 @@ class MochiStaticConfig(metaclass=AutoInitMeta):
     batch_links_info: bool
     has_soft: bool
     has_equalities: bool
+    has_pc_colliders: bool
+    has_soft_colliders: bool
 
 
 # =========================================== build-time info ===========================================
@@ -681,6 +683,10 @@ class MochiSoftInfo:
     # of the first rod twist degree of freedom (after the vertex degrees of freedom).
     dof_start: qd.Tensor
     twist_dof_start: qd.Tensor
+    n_rigid_queries: qd.Tensor
+    n_queries: qd.Tensor
+    pc_hash_cell: qd.Tensor
+    tet_hash_cell_min: qd.Tensor
 
 
 def get_mochi_soft_info(solver):
@@ -777,6 +783,10 @@ def get_mochi_soft_info(solver):
         entities_pair_enabled=V(dtype=gs.qd_bool, shape=(n_se_, n_se_)),
         dof_start=_scalar(gs.qd_int, solver.n_dofs),
         twist_dof_start=_scalar(gs.qd_int, solver.n_dofs + 3 * solver.n_soft_verts),
+        n_rigid_queries=_scalar(gs.qd_int, solver.n_samples),
+        n_queries=_scalar(gs.qd_int, solver._n_soft_queries),
+        pc_hash_cell=_scalar(gs.qd_float, solver._pc_hash_cell),
+        tet_hash_cell_min=_scalar(gs.qd_float, 0.0),
     )
 
 
@@ -887,6 +897,12 @@ class MochiSoftState:
     pc_hit_pos: qd.Tensor
     pc_hit_normal: qd.Tensor
     pc_hit_distance: qd.Tensor
+    # spatial hashes of the deformable colliders (heads of the per-bin chains, -1 empty; next item of a chain)
+    pc_hash_heads: qd.Tensor
+    pc_hash_next: qd.Tensor
+    tet_hash_heads: qd.Tensor
+    tet_hash_next: qd.Tensor
+    tet_hash_cell: qd.Tensor
 
 
 def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max_pc_hits):
@@ -977,4 +993,9 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         pc_hit_pos=V(dtype=gs.qd_vec3, shape=(max_pc_hits, _B)),
         pc_hit_normal=V(dtype=gs.qd_vec3, shape=(max_pc_hits, _B)),
         pc_hit_distance=V(dtype=gs.qd_float, shape=(max_pc_hits, _B)),
+        pc_hash_heads=V(dtype=gs.qd_int, shape=(solver.n_pc_bins_, _B)),
+        pc_hash_next=V(dtype=gs.qd_int, shape=(n_sv_, _B)),
+        tet_hash_heads=V(dtype=gs.qd_int, shape=(solver.n_tet_bins_, _B)),
+        tet_hash_next=V(dtype=gs.qd_int, shape=(n_el_, _B)),
+        tet_hash_cell=V(dtype=gs.qd_float, shape=(_B,)),
     )

@@ -7,8 +7,7 @@ The multi-kernel pipeline of `MochiSolver` launches every stage of the step as i
 the Newton, line-search and conjugate gradient loops; at one environment each launch costs more than the work it
 carries. This kernel runs the whole step for one environment as one serial program (the same per-item functions as the
 pipeline, in their per-environment form), environments in parallel: no host round trips, one launch per step. It is
-used when the scene has no deformable collider that needs the bounding-volume hierarchies (built by host-driven
-kernels), and on the GPU when the environments are small enough to be worth one thread each.
+used on the CPU, and on the GPU when the environments are small enough to be worth one thread each.
 """
 
 import quadrants as qd
@@ -61,6 +60,8 @@ from .newton import (
 )
 from .rigid_assembly import func_assemble_links
 from .soft import (
+    func_pc_collider_eval,
+    func_pc_hash_build,
     func_rod_apply_increment,
     func_rod_assemble,
     func_rod_post_stage,
@@ -72,6 +73,7 @@ from .soft import (
     func_soft_apply_increment,
     func_soft_assemble_elements,
     func_soft_broadphase,
+    func_soft_collider_eval,
     func_soft_condense_dense,
     func_soft_conservative_bounds,
     func_soft_contact_eval,
@@ -82,6 +84,7 @@ from .soft import (
     func_soft_store_ls_ref,
     func_soft_update_conv_weights,
     func_soft_zero_assembly,
+    func_tet_hash_build,
 )
 
 
@@ -193,6 +196,46 @@ def func_assemble_env(
             False,
             errno,
         )
+        if qd.static(mochi_config.has_pc_colliders):
+            func_pc_hash_build(i_b, True, mochi_state, soft_info, soft_state, rigid_config, skip_ls_done)
+            func_pc_collider_eval(
+                i_b,
+                True,
+                dyn_state,
+                dyn_info,
+                mochi_info,
+                mochi_state,
+                soft_info,
+                soft_state,
+                rigid_config,
+                mochi_config,
+                assem_obj,
+                assem_res,
+                assem_dres,
+                skip_ls_done,
+                False,
+                errno,
+            )
+        if qd.static(mochi_config.has_soft_colliders):
+            func_tet_hash_build(i_b, True, mochi_state, soft_info, soft_state, rigid_config, skip_ls_done)
+            func_soft_collider_eval(
+                i_b,
+                True,
+                dyn_state,
+                dyn_info,
+                mochi_info,
+                mochi_state,
+                soft_info,
+                soft_state,
+                rigid_config,
+                mochi_config,
+                assem_obj,
+                assem_res,
+                assem_dres,
+                skip_ls_done,
+                False,
+                errno,
+            )
     func_pairs_to_blocks(
         i_b,
         True,

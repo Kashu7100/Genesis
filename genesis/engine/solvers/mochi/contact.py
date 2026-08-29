@@ -369,11 +369,7 @@ def func_broadphase_pairs(
             continue
         # A plane is a half-space: its mesh bounds say nothing about the penetration side, so it is never culled.
         if mochi_info.geoms.collider_type[i_gb] != COLLIDER_TYPE.PLANE:
-            band = (
-                contact_state.links_step_pad[i_lb, i_b]
-                + mochi_info.geoms.penalty_threshold[i_gb]
-                + 2.0 * mochi_info.geoms.penalty_smoothing_half_distance[i_gb]
-            )
+            band = contact_state.links_step_pad[i_lb, i_b] + mochi_info.geoms.penalty_threshold[i_gb]
             geom_min = dyn_state.geoms.aabb_min[i_gb, i_b] - band
             geom_max = dyn_state.geoms.aabb_max[i_gb, i_b] + band
             if (contact_state.links_step_aabb_max[i_la, i_b] < geom_min).any():
@@ -451,7 +447,8 @@ def func_contact_eval_sample(
     pos = gu.qd_transform_by_trans_quat(mochi_info.samples.pos[i_s], pos_a, quat_a)
     thr = mochi_info.geoms.penalty_threshold[i_gb]
     h = mochi_info.geoms.penalty_smoothing_half_distance[i_gb]
-    band = thr + 2.0 * h
+    # Contact range: the penalty and its derivatives vanish beyond the threshold (mochi's detection range).
+    band = thr
     if is_hit and mochi_info.geoms.collider_type[i_gb] != COLLIDER_TYPE.PLANE:
         if (pos < dyn_state.geoms.aabb_min[i_gb, i_b] - band).any():
             is_hit = False
@@ -591,7 +588,7 @@ def func_contact_eval(
         quat_a = dyn_state.links.quat[i_la, i_b]
         pos_g = dyn_state.geoms.pos[i_gb, i_b]
         quat_g = dyn_state.geoms.quat[i_gb, i_b]
-        band = mochi_info.geoms.penalty_threshold[i_gb] + 2.0 * mochi_info.geoms.penalty_smoothing_half_distance[i_gb]
+        band = mochi_info.geoms.penalty_threshold[i_gb]
         i_node = mochi_info.links.tree_start[i_la]
         i_node_end = mochi_info.links.tree_end[i_la]
         while i_node < i_node_end:

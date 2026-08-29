@@ -34,6 +34,8 @@ def make_static_config(**overrides):
         "batch_links_info": False,
         "has_soft": False,
         "has_equalities": False,
+        "has_pc_colliders": False,
+        "has_soft_colliders": False,
     }
     config.update(overrides)
     return MochiStaticConfig(**config)

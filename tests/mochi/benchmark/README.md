@@ -121,3 +121,48 @@ Where the remaining time goes (CPU fp64, one environment):
   broadphase (which would also let the t-shirt run as one kernel) are the next steps if it needs to be faster.
 - rigid/articulated/equalities: one kernel launch (15-25 us) plus 30-140 us of serial work (forward kinematics, contact
   sampling over the culled sample tree, dense Cholesky, line search); mochi's 9-36 us is the same work in C++.
+
+## Plan 2: batched deformables on the GPU, memory per environment (2026-08-29)
+
+Three Genesis-only scenes model batched reinforcement learning with deformables (a Franka arm pressing a 31x31 cloth
+with self-contact, a Franka gripper closing on a 4263-tetrahedron cube, the arm pressing a 64-node rope); `sweep.py`
+runs a scene over batch sizes and every run records the solver's memory per environment (`memory_report()`), the
+process' device memory, the conjugate-gradient iteration counts of both engines and the usage of the bounded contact
+lists.
+
+### Baseline before Plan 2 (`10b72f6f`, GPU fp32, host-driven pipeline with bounding-volume hierarchies)
+
+| scene | B=1 ms/step | B=64 ms/step (us/env-step) | B=256 ms/step (us/env-step) | MiB/env | fits on 10 GB |
+|---|---|---|---|---|---|
+| cloth_arm | 30.0 | 257 (4010) | out of memory | 84.5 | 64 |
+| soft_gripper | 44.4 | 294 (4590) | 1347 (5260) | 17.8 | 256 |
+| rope_arm | 5.6 | 9.8 (154) | 18.2 (71) | 20.4 | 256 |
+
+### After the spatial hash (Phase H): deformable colliders located by an in-kernel hash
+
+Both deformable collider kinds (collider spheres of shells and rods, deformed tetrahedra of solids) are found through
+a per-environment spatial hash rebuilt at every assembly, as in mochi (items inserted once in the bin of their cell, a
+query walks the 27 cells around its own; with a cell no smaller than the contact range the candidate set is a superset
+of the exact one and `tests/mochi/test_spatial_hash.py` checks that the hits equal a brute-force evaluation). No host
+synchronization remains in an assembly, so every scene now runs as one kernel per step on the CPU, and the contact
+range follows mochi's (`radius + penalty threshold`; the former `threshold + 2 x smoothing` band only added zero-force
+hits: 30k of the 33k hits of the flat cloth+arm scene).
+
+| scene | CPU fp64 ms/step (before -> after) | GPU B=1 ms/step | GPU B=64 ms/step (us/env-step) | GPU B=256 ms/step (us/env-step) | MiB/env |
+|---|---|---|---|---|---|
+| cloth_arm | 105 -> 8.9 (at rest) | 30.0 -> 14.6 | 257 -> 40.3 (630) | out of memory | 83.8 |
+| soft_gripper | 130 -> 145 (see below) | 44.4 -> 32.1 | 294 -> 102 (1590) | 1347 -> 358 (1400) | 16.9 |
+| rope_arm | 10.0 -> 2.8 | 5.6 -> 3.1 | 9.8 -> 4.8 (75) | 18.2 -> 7.8 (30) | 20.2 |
+| soft_duck | 88.7 -> 86.8 | 21.7 -> 20.8 | 60.1 (940) | 177 (690) | 3.98 |
+| cloth_tshirt | 240 -> 148 | 32.9 -> 25.1 | 81.5 (1270) | out of memory | 86.7 |
+
+The GPU still runs the multi-kernel pipeline for deformables (the one-kernel graph step is Phase I); the gain is the
+removal of the per-assembly hierarchy rebuilds (a host sync per tree layer) and of the flat shared query buffer. The
+gripper on the CPU got slower because a coarse hash cell (the largest tetrahedron) made the cube's own samples walk
+thousands of its own tetrahedra before the entity filter; the follow-up skips queries that cannot hit anything and
+tests the entity filter before the dedupe. Memory per environment is unchanged: the hit buffers dominate (cloth+arm
+84 MiB of which 33.7 MiB point-cloud hit records sized `16 x queries` and 45 MiB contact-readback records) - Phase G.
+
+Conjugate-gradient iterations per step, mochi / Genesis (fp64, single thread): duck 92 / 101, t-shirt 78 / 86, helix
+17.5 / ~120 - the tetrahedron and shell counts match (same block-Jacobi preconditioner and adaptive tolerance), the
+rod's exact banded solve should bring the helix to mochi's count (Phase K).

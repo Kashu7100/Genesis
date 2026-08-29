@@ -68,9 +68,11 @@ def main():
             and r["n_envs"] == 1
             and not r.get("options")
         ]
-        m = f"{mochi[-1]['ms_per_step_best']:.3f}" if mochi else "-"
+        # the reference engine's time is the best over its runs (its iteration counts come from the latest run)
+        mochi_ms = min(r["ms_per_step_best"] for r in mochi) if mochi else None
+        m = f"{mochi_ms:.3f}" if mochi else "-"
         g = f"{gen_cpu[-1]['ms_per_step_best']:.3f}" if gen_cpu else "-"
-        ratio = f"{gen_cpu[-1]['ms_per_step_best'] / mochi[-1]['ms_per_step_best']:.1f}x" if mochi and gen_cpu else "-"
+        ratio = f"{gen_cpu[-1]['ms_per_step_best'] / mochi_ms:.1f}x" if mochi and gen_cpu else "-"
         # the launch count comes from the most recent profiled run of the configuration
         profiled = [r for r in gen_cpu if "launches_per_step" in r]
         launches = f"{profiled[-1]['launches_per_step']:.0f}" if profiled else "-"
