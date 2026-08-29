@@ -63,8 +63,10 @@ def func_add_projected_block(
         i_a = dyn_info.links.parent_idx[I_a]
 
 
-@qd.kernel
-def kernel_condense_dense(
+@qd.func
+def func_condense_dense(
+    i_b_env,
+    per_env: qd.template(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
@@ -84,17 +86,20 @@ def kernel_condense_dense(
     _B = mochi_state.is_active.shape[0]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_b, i_d, j_d in qd.ndrange(_B, n_dofs, n_dofs):
+    for i_b_, i_d, j_d in qd.ndrange(_B, n_dofs, n_dofs) if qd.static(not per_env) else qd.ndrange(1, n_dofs, n_dofs):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if mochi_state.is_active[i_b] and island_state.uses_dense[i_b]:
             mochi_state.H_dense[i_b, i_d, j_d] = 0.0
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_b in qd.ndrange(n_dofs, _B):
+    for i_d, i_b_ in qd.ndrange(n_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if mochi_state.is_active[i_b] and island_state.uses_dense[i_b]:
             mochi_state.H_dense[i_b, i_d, i_d] = mochi_state.dofs_H_diag[i_d, i_b]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b in qd.ndrange(n_links, _B):
+    for i_l, i_b_ in qd.ndrange(n_links, _B) if qd.static(not per_env) else qd.ndrange(n_links, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or not mochi_info.links.is_dynamic[i_l]:
             continue
         func_add_projected_block(
@@ -102,7 +107,8 @@ def kernel_condense_dense(
         )
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_p, i_b in qd.ndrange(max_pairs, _B):
+    for i_p, i_b_ in qd.ndrange(max_pairs, _B) if qd.static(not per_env) else qd.ndrange(max_pairs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or i_p >= contact_state.n_pairs[i_b]:
             continue
         if contact_state.n_hits[i_p, i_b] == 0:
@@ -118,7 +124,8 @@ def kernel_condense_dense(
     if qd.static(has_equalities):
         n_eq = eq_info.eq_type.shape[0]
         qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-        for i_eq, i_b in qd.ndrange(n_eq, _B):
+        for i_eq, i_b_ in qd.ndrange(n_eq, _B) if qd.static(not per_env) else qd.ndrange(n_eq, 1):
+            i_b = i_b_ if qd.static(not per_env) else i_b_env
             if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]):
                 continue
             if eq_info.eq_type[i_eq] == gs.EQUALITY_TYPE.JOINT:
@@ -149,8 +156,39 @@ def kernel_condense_dense(
                     )
 
 
+@qd.kernel
+def kernel_condense_dense(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    island_state: MochiIslandState,
+    eq_info: MochiEqualitiesInfo,
+    eq_state: MochiEqualitiesState,
+    rigid_config: qd.template(),
+    has_equalities: qd.template(),
+):
+    func_condense_dense(
+        0,
+        False,
+        dyn_state,
+        dyn_info,
+        mochi_info,
+        mochi_state,
+        contact_state,
+        island_state,
+        eq_info,
+        eq_state,
+        rigid_config,
+        has_equalities,
+    )
+
+
 @qd.func
 def func_matvec(
+    i_b_env,
+    per_env: qd.template(),
     src: qd.Tensor,
     dst: qd.Tensor,
     dyn_state: array_class.DynState,
@@ -172,12 +210,14 @@ def func_matvec(
     _B = mochi_state.is_active.shape[0]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_b in qd.ndrange(n_dofs, _B):
+    for i_d, i_b_ in qd.ndrange(n_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if mochi_state.pcg_is_active[i_b]:
             dst[i_d, i_b] = mochi_state.dofs_H_diag[i_d, i_b] * src[i_d, i_b]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b in qd.ndrange(n_links, _B):
+    for i_l, i_b_ in qd.ndrange(n_links, _B) if qd.static(not per_env) else qd.ndrange(n_links, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if mochi_state.pcg_is_active[i_b] and mochi_info.links.is_dynamic[i_l]:
             v = func_jacobian_times_dofs(i_l, i_b, src, dyn_state, dyn_info, rigid_config)
             func_jacobian_transpose_add(
@@ -185,7 +225,8 @@ def func_matvec(
             )
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_p, i_b in qd.ndrange(max_pairs, _B):
+    for i_p, i_b_ in qd.ndrange(max_pairs, _B) if qd.static(not per_env) else qd.ndrange(max_pairs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not mochi_state.pcg_is_active[i_b] or i_p >= contact_state.n_pairs[i_b]:
             continue
         if contact_state.n_hits[i_p, i_b] == 0:
@@ -204,7 +245,8 @@ def func_matvec(
         n_eq = eq_info.eq_type.shape[0]
         _B_eq = mochi_state.is_active.shape[0]
         qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-        for i_eq, i_b in qd.ndrange(n_eq, _B_eq):
+        for i_eq, i_b_ in qd.ndrange(n_eq, _B_eq) if qd.static(not per_env) else qd.ndrange(n_eq, 1):
+            i_b = i_b_ if qd.static(not per_env) else i_b_env
             if not mochi_state.pcg_is_active[i_b]:
                 continue
             if eq_info.eq_type[i_eq] == gs.EQUALITY_TYPE.JOINT:
@@ -231,11 +273,25 @@ def func_matvec(
                     )
 
     if qd.static(mochi_config.has_soft):
-        func_soft_matvec(src, dst, dyn_state, dyn_info, mochi_info, mochi_state, soft_info, soft_state, rigid_config)
+        func_soft_matvec(
+            i_b_env,
+            per_env,
+            src,
+            dst,
+            dyn_state,
+            dyn_info,
+            mochi_info,
+            mochi_state,
+            soft_info,
+            soft_state,
+            rigid_config,
+        )
 
 
 @qd.func
 def func_apply_preconditioner(
+    i_b_env,
+    per_env: qd.template(),
     r: qd.Tensor,
     z: qd.Tensor,
     mochi_info: MochiInfo,
@@ -250,15 +306,18 @@ def func_apply_preconditioner(
     _B = mochi_state.is_active.shape[0]
     EPS = mochi_info.EPS[None]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_b in qd.ndrange(n_dofs, _B):
+    for i_d, i_b_ in qd.ndrange(n_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if mochi_state.pcg_is_active[i_b]:
             z[i_d, i_b] = r[i_d, i_b] / qd.max(mochi_state.pcg_diag[i_d, i_b], EPS)
     if qd.static(mochi_config.has_soft):
-        func_soft_precondition(r, z, mochi_state, soft_info, soft_state, rigid_config, EPS)
+        func_soft_precondition(i_b_env, per_env, r, z, mochi_state, soft_info, soft_state, rigid_config, EPS)
 
 
-@qd.kernel
-def kernel_pcg_init(
+@qd.func
+def func_pcg_init(
+    i_b_env,
+    per_env: qd.template(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
@@ -276,22 +335,24 @@ def kernel_pcg_init(
     _B = mochi_state.is_active.shape[0]
 
     if qd.static(mochi_config.has_soft):
-        func_soft_hit_counts_max(soft_state, rigid_config)
+        func_soft_hit_counts_max(i_b_env, per_env, soft_state, rigid_config)
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         mochi_state.pcg_is_active[i_b] = mochi_state.is_active[i_b] and not island_state.uses_dense[i_b]
         mochi_state.pcg_rTz[i_b] = 0.0
         mochi_state.pcg_zTz[i_b] = 0.0
     if qd.static(mochi_config.has_soft):
-        func_rod_band_factor(mochi_state, soft_info, soft_state, rigid_config, mochi_info.EPS[None])
+        func_rod_band_factor(i_b_env, per_env, mochi_state, soft_info, soft_state, rigid_config, mochi_info.EPS[None])
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_b in qd.ndrange(n_dofs, _B):
+    for i_d, i_b_ in qd.ndrange(n_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if mochi_state.pcg_is_active[i_b]:
             mochi_state.dx[i_d, i_b] = 0.0
             mochi_state.pcg_r[i_d, i_b] = mochi_state.res[i_d, i_b]
             mochi_state.pcg_diag[i_d, i_b] = mochi_state.dofs_H_diag[i_d, i_b]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b in qd.ndrange(n_links, _B):
+    for i_l, i_b_ in qd.ndrange(n_links, _B) if qd.static(not per_env) else qd.ndrange(n_links, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not mochi_state.pcg_is_active[i_b] or not mochi_info.links.is_dynamic[i_l]:
             continue
         H = mochi_state.H_diag[i_l, i_b]
@@ -304,10 +365,20 @@ def kernel_pcg_init(
                 qd.atomic_add(mochi_state.pcg_diag[i_d, i_b], column.dot(H @ column))
             i_a = dyn_info.links.parent_idx[I_a]
     func_apply_preconditioner(
-        mochi_state.pcg_r, mochi_state.pcg_z, mochi_info, mochi_state, soft_info, soft_state, rigid_config, mochi_config
+        i_b_env,
+        per_env,
+        mochi_state.pcg_r,
+        mochi_state.pcg_z,
+        mochi_info,
+        mochi_state,
+        soft_info,
+        soft_state,
+        rigid_config,
+        mochi_config,
     )
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_b in qd.ndrange(n_dofs, _B):
+    for i_d, i_b_ in qd.ndrange(n_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if mochi_state.pcg_is_active[i_b]:
             r = mochi_state.pcg_r[i_d, i_b]
             z = mochi_state.pcg_z[i_d, i_b]
@@ -315,7 +386,7 @@ def kernel_pcg_init(
             qd.atomic_add(mochi_state.pcg_rTz[i_b], r * z)
             qd.atomic_add(mochi_state.pcg_zTz[i_b], z * z)
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         mochi_state.pcg_zTz0[i_b] = mochi_state.pcg_zTz[i_b]
         # An environment whose right-hand side vanishes takes no iteration at all; the negated comparison also drops
         # a non-finite norm.
@@ -324,7 +395,36 @@ def kernel_pcg_init(
 
 
 @qd.kernel
-def kernel_pcg_iter(
+def kernel_pcg_init(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    island_state: MochiIslandState,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+):
+    func_pcg_init(
+        0,
+        False,
+        dyn_state,
+        dyn_info,
+        mochi_info,
+        mochi_state,
+        soft_info,
+        soft_state,
+        island_state,
+        rigid_config,
+        mochi_config,
+    )
+
+
+@qd.func
+def func_pcg_iter(
+    i_b_env,
+    per_env: qd.template(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
@@ -342,6 +442,8 @@ def kernel_pcg_iter(
     abs_tol = mochi_info.pcg_abs_tol[None]
 
     func_matvec(
+        i_b_env,
+        per_env,
         mochi_state.pcg_p,
         mochi_state.pcg_Ap,
         dyn_state,
@@ -358,15 +460,16 @@ def kernel_pcg_iter(
     )
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         mochi_state.pcg_pTAp[i_b] = 0.0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_b in qd.ndrange(n_dofs, _B):
+    for i_d, i_b_ in qd.ndrange(n_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if mochi_state.pcg_is_active[i_b]:
             qd.atomic_add(mochi_state.pcg_pTAp[i_b], mochi_state.pcg_p[i_d, i_b] * mochi_state.pcg_Ap[i_d, i_b])
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         if mochi_state.pcg_is_active[i_b]:
             if mochi_state.pcg_pTAp[i_b] <= 0.0:
                 mochi_state.pcg_is_active[i_b] = False
@@ -374,7 +477,8 @@ def kernel_pcg_iter(
             mochi_state.pcg_rTz_cross[i_b] = 0.0
             mochi_state.pcg_zTz[i_b] = 0.0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_b in qd.ndrange(n_dofs, _B):
+    for i_d, i_b_ in qd.ndrange(n_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if mochi_state.pcg_is_active[i_b]:
             alpha = mochi_state.pcg_rTz[i_b] / mochi_state.pcg_pTAp[i_b]
             mochi_state.dx[i_d, i_b] += alpha * mochi_state.pcg_p[i_d, i_b]
@@ -384,16 +488,26 @@ def kernel_pcg_iter(
             # residual is the term that tells the Polak-Ribiere direction from the Fletcher-Reeves one.
             qd.atomic_add(mochi_state.pcg_rTz_cross[i_b], r * mochi_state.pcg_z[i_d, i_b])
     func_apply_preconditioner(
-        mochi_state.pcg_r, mochi_state.pcg_z, mochi_info, mochi_state, soft_info, soft_state, rigid_config, mochi_config
+        i_b_env,
+        per_env,
+        mochi_state.pcg_r,
+        mochi_state.pcg_z,
+        mochi_info,
+        mochi_state,
+        soft_info,
+        soft_state,
+        rigid_config,
+        mochi_config,
     )
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_b in qd.ndrange(n_dofs, _B):
+    for i_d, i_b_ in qd.ndrange(n_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if mochi_state.pcg_is_active[i_b]:
             z = mochi_state.pcg_z[i_d, i_b]
             qd.atomic_add(mochi_state.pcg_rTz_new[i_b], mochi_state.pcg_r[i_d, i_b] * z)
             qd.atomic_add(mochi_state.pcg_zTz[i_b], z * z)
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         if mochi_state.pcg_is_active[i_b]:
             rel_tol = mochi_state.pcg_rel_tol[i_b]
             zTz0 = mochi_state.pcg_zTz0[i_b]
@@ -405,11 +519,43 @@ def kernel_pcg_iter(
             mochi_state.pcg_rTz[i_b] = mochi_state.pcg_rTz_new[i_b]
             mochi_state.pcg_pTAp[i_b] = beta
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_b in qd.ndrange(n_dofs, _B):
+    for i_d, i_b_ in qd.ndrange(n_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if mochi_state.pcg_is_active[i_b]:
             mochi_state.pcg_p[i_d, i_b] = (
                 mochi_state.pcg_z[i_d, i_b] + mochi_state.pcg_pTAp[i_b] * mochi_state.pcg_p[i_d, i_b]
             )
+
+
+@qd.kernel
+def kernel_pcg_iter(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    eq_info: MochiEqualitiesInfo,
+    eq_state: MochiEqualitiesState,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+):
+    func_pcg_iter(
+        0,
+        False,
+        dyn_state,
+        dyn_info,
+        mochi_info,
+        mochi_state,
+        contact_state,
+        soft_info,
+        soft_state,
+        eq_info,
+        eq_state,
+        rigid_config,
+        mochi_config,
+    )
 
 
 @qd.kernel

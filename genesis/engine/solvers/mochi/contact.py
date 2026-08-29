@@ -173,6 +173,70 @@ def kernel_set_links_pair_enabled(
         mochi_info.links_pair_enabled[i_la, i_lb] = links_pair_enabled[i_la, i_lb]
 
 
+@qd.func
+def func_zero_assembly(
+    i_b_env,
+    per_env: qd.template(),
+    dyn_state: array_class.DynState,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    rigid_config: qd.template(),
+    assem_obj: qd.template(),
+    assem_res: qd.template(),
+    assem_dres,
+    skip_ls_done,
+    record: qd.template(),
+):
+    n_dofs = mochi_state.res.shape[0]
+    n_links = mochi_state.H_diag.shape[0]
+    max_pairs = contact_state.pair_link_a.shape[0]
+    max_hits = contact_state.hit_sample.shape[0]
+    _B = mochi_state.is_active.shape[0]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
+        if func_is_env_active(i_b, mochi_state, skip_ls_done):
+            if qd.static(assem_obj):
+                mochi_state.obj[i_b] = 0.0
+            if qd.static(record):
+                contact_state.n_hits_total[i_b] = 0
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_d, i_b_ in qd.ndrange(n_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
+        if func_is_env_active(i_b, mochi_state, skip_ls_done):
+            if qd.static(assem_res):
+                mochi_state.res[i_d, i_b] = 0.0
+            if assem_dres:
+                mochi_state.dofs_H_diag[i_d, i_b] = 0.0
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_l, i_b_ in qd.ndrange(n_links, _B) if qd.static(not per_env) else qd.ndrange(n_links, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
+        if func_is_env_active(i_b, mochi_state, skip_ls_done):
+            if qd.static(assem_res):
+                mochi_state.links_res[i_l, i_b] = qd.Vector.zero(gs.qd_float, 6)
+            if assem_dres:
+                mochi_state.H_diag[i_l, i_b] = qd.Matrix.zero(gs.qd_float, 6, 6)
+            if qd.static(record):
+                dyn_state.links.contact_force[i_l, i_b] = qd.Vector.zero(gs.qd_float, 3)
+    if qd.static(record):
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_h, i_b_ in qd.ndrange(max_hits, _B) if qd.static(not per_env) else qd.ndrange(max_hits, 1):
+            i_b = i_b_ if qd.static(not per_env) else i_b_env
+            contact_state.hit_geom_a[i_h, i_b] = -1
+            contact_state.hit_geom_b[i_h, i_b] = -1
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_p, i_b_ in qd.ndrange(max_pairs, _B) if qd.static(not per_env) else qd.ndrange(max_pairs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
+        if func_is_env_active(i_b, mochi_state, skip_ls_done) and i_p < contact_state.n_pairs[i_b]:
+            contact_state.acc_f[i_p, i_b] = qd.Vector.zero(gs.qd_float, 3)
+            contact_state.acc_q[i_p, i_b] = qd.Vector.zero(gs.qd_float, 3)
+            contact_state.acc_D[i_p, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
+            contact_state.acc_SD[i_p, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
+            contact_state.acc_SDS[i_p, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
+            contact_state.acc_obj[i_p, i_b] = 0.0
+            contact_state.n_hits[i_p, i_b] = 0
+
+
 @qd.kernel
 def kernel_zero_assembly(
     dyn_state: array_class.DynState,
@@ -185,54 +249,25 @@ def kernel_zero_assembly(
     skip_ls_done: qd.template(),
     record: qd.template(),
 ):
-    n_dofs = mochi_state.res.shape[0]
-    n_links = mochi_state.H_diag.shape[0]
-    max_pairs = contact_state.pair_link_a.shape[0]
-    max_hits = contact_state.hit_sample.shape[0]
-    _B = mochi_state.is_active.shape[0]
-
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
-        if func_is_env_active(i_b, mochi_state, skip_ls_done):
-            if qd.static(assem_obj):
-                mochi_state.obj[i_b] = 0.0
-            if qd.static(record):
-                contact_state.n_hits_total[i_b] = 0
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_b in qd.ndrange(n_dofs, _B):
-        if func_is_env_active(i_b, mochi_state, skip_ls_done):
-            if qd.static(assem_res):
-                mochi_state.res[i_d, i_b] = 0.0
-            if qd.static(assem_dres):
-                mochi_state.dofs_H_diag[i_d, i_b] = 0.0
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b in qd.ndrange(n_links, _B):
-        if func_is_env_active(i_b, mochi_state, skip_ls_done):
-            if qd.static(assem_res):
-                mochi_state.links_res[i_l, i_b] = qd.Vector.zero(gs.qd_float, 6)
-            if qd.static(assem_dres):
-                mochi_state.H_diag[i_l, i_b] = qd.Matrix.zero(gs.qd_float, 6, 6)
-            if qd.static(record):
-                dyn_state.links.contact_force[i_l, i_b] = qd.Vector.zero(gs.qd_float, 3)
-    if qd.static(record):
-        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-        for i_h, i_b in qd.ndrange(max_hits, _B):
-            contact_state.hit_geom_a[i_h, i_b] = -1
-            contact_state.hit_geom_b[i_h, i_b] = -1
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_p, i_b in qd.ndrange(max_pairs, _B):
-        if func_is_env_active(i_b, mochi_state, skip_ls_done) and i_p < contact_state.n_pairs[i_b]:
-            contact_state.acc_f[i_p, i_b] = qd.Vector.zero(gs.qd_float, 3)
-            contact_state.acc_q[i_p, i_b] = qd.Vector.zero(gs.qd_float, 3)
-            contact_state.acc_D[i_p, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
-            contact_state.acc_SD[i_p, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
-            contact_state.acc_SDS[i_p, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
-            contact_state.acc_obj[i_p, i_b] = 0.0
-            contact_state.n_hits[i_p, i_b] = 0
+    func_zero_assembly(
+        0,
+        False,
+        dyn_state,
+        mochi_state,
+        contact_state,
+        rigid_config,
+        assem_obj,
+        assem_res,
+        assem_dres,
+        skip_ls_done,
+        record,
+    )
 
 
-@qd.kernel
-def kernel_conservative_bounds(
+@qd.func
+def func_conservative_bounds(
+    i_b_env,
+    per_env: qd.template(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
@@ -248,7 +283,8 @@ def kernel_conservative_bounds(
     margin = mochi_info.broadphase_margin[None]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b in qd.ndrange(n_links, _B):
+    for i_l, i_b_ in qd.ndrange(n_links, _B) if qd.static(not per_env) else qd.ndrange(n_links, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         aabb_min = mochi_info.links.samples_aabb_min[i_l]
         aabb_max = mochi_info.links.samples_aabb_max[i_l]
         pad = margin
@@ -279,7 +315,21 @@ def kernel_conservative_bounds(
 
 
 @qd.kernel
-def kernel_broadphase_pairs(
+def kernel_conservative_bounds(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    rigid_config: qd.template(),
+):
+    func_conservative_bounds(0, False, dyn_state, dyn_info, mochi_info, mochi_state, contact_state, rigid_config)
+
+
+@qd.func
+def func_broadphase_pairs(
+    i_b_env,
+    per_env: qd.template(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
@@ -296,11 +346,14 @@ def kernel_broadphase_pairs(
     max_pairs = contact_state.pair_link_a.shape[0]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         contact_state.n_pairs[i_b] = 0
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_la, i_gb, i_b in qd.ndrange(n_links, n_geoms, _B):
+    for i_la, i_gb, i_b_ in (
+        qd.ndrange(n_links, n_geoms, _B) if qd.static(not per_env) else qd.ndrange(n_links, n_geoms, 1)
+    ):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not mochi_state.is_active[i_b]:
             continue
         if mochi_info.links.sample_end[i_la] <= mochi_info.links.sample_start[i_la]:
@@ -336,8 +389,21 @@ def kernel_broadphase_pairs(
             qd.atomic_or(errno[i_b], array_class.ErrorCode.OVERFLOW_MOCHI_CONTACT_PAIRS)
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         contact_state.n_pairs[i_b] = qd.min(contact_state.n_pairs[i_b], max_pairs)
+
+
+@qd.kernel
+def kernel_broadphase_pairs(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    rigid_config: qd.template(),
+    errno: qd.Tensor,
+):
+    func_broadphase_pairs(0, False, dyn_state, dyn_info, mochi_info, mochi_state, contact_state, rigid_config, errno)
 
 
 @qd.func
@@ -365,7 +431,7 @@ def func_contact_eval_sample(
     contact_state: MochiContactState,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
-    assem_dres: qd.template(),
+    assem_dres,
     record: qd.template(),
     errno: qd.Tensor,
 ):
@@ -461,7 +527,7 @@ def func_contact_eval_sample(
         qd.atomic_add(contact_state.n_hits[i_p, i_b], 1)
         # The three Hessian sums are read by kernel_pairs_to_blocks under the same flag, and they carry most of the
         # atomic traffic of this kernel: the line search re-evaluates contact for the residual alone.
-        if qd.static(assem_dres):
+        if assem_dres:
             D = -w * (R_g @ dforce_geom @ R_g.transpose())
             S_b = skew(r_b)
             qd.atomic_add(contact_state.acc_D[i_p, i_b], D)
@@ -487,8 +553,10 @@ def func_contact_eval_sample(
                 qd.atomic_or(errno[i_b], array_class.ErrorCode.OVERFLOW_MOCHI_CONTACTS)
 
 
-@qd.kernel
-def kernel_contact_eval(
+@qd.func
+def func_contact_eval(
+    i_b_env,
+    per_env: qd.template(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     sdf_info: array_class.SDFInfo,
@@ -497,8 +565,8 @@ def kernel_contact_eval(
     contact_state: MochiContactState,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres,
+    skip_ls_done,
     record: qd.template(),
     errno: qd.Tensor,
 ):
@@ -510,7 +578,8 @@ def kernel_contact_eval(
     _B = mochi_state.is_active.shape[0]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_p, i_b in qd.ndrange(max_pairs, _B):
+    for i_p, i_b_ in qd.ndrange(max_pairs, _B) if qd.static(not per_env) else qd.ndrange(max_pairs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
         if i_p >= contact_state.n_pairs[i_b]:
@@ -566,7 +635,42 @@ def kernel_contact_eval(
 
 
 @qd.kernel
-def kernel_pairs_to_blocks(
+def kernel_contact_eval(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    sdf_info: array_class.SDFInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+    assem_dres: qd.template(),
+    skip_ls_done: qd.template(),
+    record: qd.template(),
+    errno: qd.Tensor,
+):
+    func_contact_eval(
+        0,
+        False,
+        dyn_state,
+        dyn_info,
+        sdf_info,
+        mochi_info,
+        mochi_state,
+        contact_state,
+        rigid_config,
+        mochi_config,
+        assem_dres,
+        skip_ls_done,
+        record,
+        errno,
+    )
+
+
+@qd.func
+def func_pairs_to_blocks(
+    i_b_env,
+    per_env: qd.template(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
@@ -575,8 +679,8 @@ def kernel_pairs_to_blocks(
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres,
+    skip_ls_done,
 ):
     """Expand the per-pair sums into the residual and the 6x6 Hessian blocks of the two links.
 
@@ -587,7 +691,8 @@ def kernel_pairs_to_blocks(
     _B = mochi_state.is_active.shape[0]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_p, i_b in qd.ndrange(max_pairs, _B):
+    for i_p, i_b_ in qd.ndrange(max_pairs, _B) if qd.static(not per_env) else qd.ndrange(max_pairs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
         if i_p >= contact_state.n_pairs[i_b] or contact_state.n_hits[i_p, i_b] == 0:
@@ -615,7 +720,7 @@ def kernel_pairs_to_blocks(
                     qd.atomic_add(mochi_state.links_res[i_lb, i_b][k], F[k])
                     qd.atomic_add(mochi_state.links_res[i_lb, i_b][3 + k], Q[k])
 
-        if qd.static(assem_dres):
+        if assem_dres:
             Dbar = contact_state.acc_D[i_p, i_b]
             Sh = contact_state.acc_SD[i_p, i_b]
             Sh2 = contact_state.acc_SDS[i_p, i_b]
@@ -645,6 +750,35 @@ def kernel_pairs_to_blocks(
                     H_off[3 + k, l] = AB_rt[k, l]
                     H_off[3 + k, 3 + l] = AB_rr[k, l]
                 mochi_state.H_off[i_p, i_b] = H_off
+
+
+@qd.kernel
+def kernel_pairs_to_blocks(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    rigid_config: qd.template(),
+    assem_obj: qd.template(),
+    assem_res: qd.template(),
+    assem_dres: qd.template(),
+    skip_ls_done: qd.template(),
+):
+    func_pairs_to_blocks(
+        0,
+        False,
+        dyn_state,
+        dyn_info,
+        mochi_info,
+        mochi_state,
+        contact_state,
+        rigid_config,
+        assem_obj,
+        assem_res,
+        assem_dres,
+        skip_ls_done,
+    )
 
 
 # ------------------------------------------------------------------------------------

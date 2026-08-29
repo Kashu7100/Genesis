@@ -163,6 +163,7 @@ from .soft import (
     kernel_soft_zero_assembly,
 )
 from .soft_materials import ELASTIC_MODEL_BY_NAME
+from .step_monolith import kernel_step_monolith
 
 if TYPE_CHECKING:
     from genesis.engine.scene import Scene
@@ -349,6 +350,7 @@ class MochiSolver(KinematicSolver):
         )
         self._init_mochi()
         self._init_soft()
+        self._use_monolith = self._resolve_step_kernel()
         # Unified contact readback over every kind of recorded contact point.
         max_records = self._max_hits
         if self.has_soft:
@@ -822,10 +824,14 @@ class MochiSolver(KinematicSolver):
 
         # Deformable colliders: every rigid and deformable sample point is located in the deformed tetrahedra through
         # a bounding-volume hierarchy rebuilt at every assembly.
-        self._has_soft_colliders = any(
+        # A deformable collider only matters when something can query it: rigid samples, another deformable entity, or
+        # its own samples under self-contact.
+        has_self_contact = any((e.is_shell or e.is_rod) and e.material.self_contact for e in entities)
+        has_queries = self.n_samples > 0 or len(entities) > 1
+        self._has_soft_colliders = has_queries and any(
             grid["collider_type"] == COLLIDER_TYPE.GRID for grid in (sdf_grids if self.has_soft else ())
         )
-        self._has_pc_colliders = any(
+        self._has_pc_colliders = (has_queries or has_self_contact) and any(
             grid["collider_type"] == COLLIDER_TYPE.POINT_CLOUD for grid in (sdf_grids if self.has_soft else ())
         )
         self._n_soft_queries = self.n_samples + n_samples
@@ -1305,10 +1311,62 @@ class MochiSolver(KinematicSolver):
             )
             self._external_state_dirty_mask[:] = False
 
+    def _resolve_step_kernel(self):
+        """Whether the step runs as one per-environment kernel (no host round trips) or as the multi-kernel
+        pipeline. The bounding-volume hierarchies of the deformable colliders are built by host-driven kernels, so
+        scenes that need them keep the pipeline; on the GPU one thread per environment only pays off for small
+        environments."""
+        needs_pipeline = self._has_soft_colliders or self._has_pc_colliders
+        step_kernel = self._options.step_kernel
+        if step_kernel == "monolith":
+            if needs_pipeline:
+                gs.raise_exception(
+                    "The monolith step kernel does not support deformable colliders (point-cloud or SDF)."
+                )
+            return True
+        if step_kernel == "pipeline":
+            return False
+        return not needs_pipeline and (gs.backend == gs.cpu or (self.n_dofs_total <= 64 and not self.has_soft))
+
     def substep_pre_coupling(self, f):
         if not self.is_active:
             return
         self._sync_external_state()
+        if self._use_monolith:
+            options = self._options
+            n_linesearch = (
+                0 if self.mochi_config.linesearch_type == LINESEARCH.NONE else options.n_linesearch_iterations
+            )
+            kernel_step_monolith(
+                self.dyn_state,
+                self.dyn_info,
+                self.rigid_info,
+                self.sdf._sdf_info,
+                self.geoms_init_AABB,
+                self.mochi_info,
+                self.mochi_state,
+                self.contact_state,
+                self.island_state,
+                self.eq_info,
+                self.eq_state,
+                self.soft_info,
+                self.soft_state,
+                self.rigid_config,
+                self.mochi_config,
+                self.n_shell_elems > 0,
+                self.n_rod_elems > 0,
+                max(1, n_linesearch),
+                self._dense_max_dofs,
+                len(self._entities),
+                options.n_newton_iterations,
+                self._n_pcg_iterations,
+                self._max_samples_per_soft_entity,
+                self._errno,
+            )
+            self._is_forward_pos_updated = True
+            self._is_forward_vel_updated = True
+            self._is_contacts_recorded = False
+            return
 
         kernel_step_start(
             self.dyn_state,

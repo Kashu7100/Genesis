@@ -291,8 +291,10 @@ def func_shape_gradients(Dm_inv):
 # ------------------------------------------------------------------------------------
 
 
-@qd.kernel
-def kernel_soft_step_start(
+@qd.func
+def func_soft_step_start(
+    i_b_env,
+    per_env: qd.template(),
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
@@ -307,7 +309,8 @@ def kernel_soft_step_start(
     _B = soft_state.verts_pos.shape[1]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_v, i_b in qd.ndrange(n_verts, _B):
+    for i_v, i_b_ in qd.ndrange(n_verts, _B) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         soft_state.verts_pos_prev[1, i_v, i_b] = soft_state.verts_pos_prev[0, i_v, i_b]
         soft_state.verts_vel_prev[1, i_v, i_b] = soft_state.verts_vel_prev[0, i_v, i_b]
         soft_state.verts_pos_prev[0, i_v, i_b] = soft_state.verts_pos[i_v, i_b]
@@ -330,7 +333,8 @@ def kernel_soft_step_start(
         soft_state.verts_pos[i_v, i_b] = pos
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_el, i_b in qd.ndrange(n_elems, _B):
+    for i_el, i_b_ in qd.ndrange(n_elems, _B) if qd.static(not per_env) else qd.ndrange(n_elems, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         v = soft_info.elems_v[i_el]
         soft_state.elems_F_stage_start[i_el, i_b] = func_deformation_gradient(
             soft_state.verts_pos_stage_start[v[0], i_b],
@@ -342,7 +346,20 @@ def kernel_soft_step_start(
 
 
 @qd.kernel
-def kernel_soft_post_stage(
+def kernel_soft_step_start(
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+):
+    func_soft_step_start(0, False, mochi_state, soft_info, soft_state, rigid_config, mochi_config)
+
+
+@qd.func
+def func_soft_post_stage(
+    i_b_env,
+    per_env: qd.template(),
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
@@ -354,7 +371,8 @@ def kernel_soft_post_stage(
     n_verts = soft_state.verts_pos.shape[0]
     _B = soft_state.verts_pos.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_v, i_b in qd.ndrange(n_verts, _B):
+    for i_v, i_b_ in qd.ndrange(n_verts, _B) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if mochi_state.status[i_b] == SOLVE_STATUS.DIVERGED:
             soft_state.verts_pos[i_v, i_b] = soft_info.verts_rest[i_v]
             soft_state.verts_vel[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
@@ -365,13 +383,25 @@ def kernel_soft_post_stage(
         ) / h
 
 
+@qd.kernel
+def kernel_soft_post_stage(
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    func_soft_post_stage(0, False, mochi_state, soft_info, soft_state, rigid_config)
+
+
 # ------------------------------------------------------------------------------------
 # --------------------------------------- Newton -------------------------------------
 # ------------------------------------------------------------------------------------
 
 
-@qd.kernel
-def kernel_soft_update_conv_weights(
+@qd.func
+def func_soft_update_conv_weights(
+    i_b_env,
+    per_env: qd.template(),
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
@@ -383,7 +413,8 @@ def kernel_soft_update_conv_weights(
     n_verts = soft_state.verts_pos.shape[0]
     _B = soft_state.verts_pos.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_v, i_b in qd.ndrange(n_verts, _B):
+    for i_v, i_b_ in qd.ndrange(n_verts, _B) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         # A massless vertex has no acceleration scale to normalize by; see kernel_update_conv_weights.
         mass = soft_info.entities_mass[soft_info.verts_entity_idx[i_v]] * soft_info.verts_mass[i_v]
         w = gs.qd_float(1.0)
@@ -395,27 +426,53 @@ def kernel_soft_update_conv_weights(
 
 
 @qd.kernel
-def kernel_soft_store_ls_ref(
+def kernel_soft_update_conv_weights(
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    func_soft_update_conv_weights(0, False, mochi_info, mochi_state, soft_info, soft_state, rigid_config)
+
+
+@qd.func
+def func_soft_store_ls_ref(
+    i_b_env,
+    per_env: qd.template(),
     mochi_state: MochiState,
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
-    only_done: qd.template(),
+    only_done,
 ):
     """Take the current vertex positions as the line search reference of the active environments (of those that just
     accepted an iterate when only_done)."""
     n_verts = soft_state.verts_pos.shape[0]
     _B = soft_state.verts_pos.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_v, i_b in qd.ndrange(n_verts, _B):
+    for i_v, i_b_ in qd.ndrange(n_verts, _B) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         is_ref = mochi_state.is_active[i_b]
-        if qd.static(only_done):
+        if only_done:
             is_ref = is_ref and mochi_state.ls_is_done[i_b]
         if is_ref:
             soft_state.verts_pos_ls_ref[i_v, i_b] = soft_state.verts_pos[i_v, i_b]
 
 
 @qd.kernel
-def kernel_soft_apply_increment(
+def kernel_soft_store_ls_ref(
+    mochi_state: MochiState,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    only_done: qd.template(),
+):
+    func_soft_store_ls_ref(0, False, mochi_state, soft_state, rigid_config, only_done)
+
+
+@qd.func
+def func_soft_apply_increment(
+    i_b_env,
+    per_env: qd.template(),
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
@@ -425,7 +482,8 @@ def kernel_soft_apply_increment(
     n_verts = soft_state.verts_pos.shape[0]
     _B = soft_state.verts_pos.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_v, i_b in qd.ndrange(n_verts, _B):
+    for i_v, i_b_ in qd.ndrange(n_verts, _B) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, True):
             continue
         if soft_state.verts_is_fixed[i_v, i_b]:
@@ -434,18 +492,30 @@ def kernel_soft_apply_increment(
         soft_state.verts_pos[i_v, i_b] = soft_state.verts_pos_ls_ref[i_v, i_b] - mochi_state.ls_alpha[i_b] * dx
 
 
+@qd.kernel
+def kernel_soft_apply_increment(
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    func_soft_apply_increment(0, False, mochi_state, soft_info, soft_state, rigid_config)
+
+
 # ------------------------------------------------------------------------------------
 # -------------------------------------- assembly ------------------------------------
 # ------------------------------------------------------------------------------------
 
 
-@qd.kernel
-def kernel_soft_zero_assembly(
+@qd.func
+def func_soft_zero_assembly(
+    i_b_env,
+    per_env: qd.template(),
     mochi_state: MochiState,
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres,
+    skip_ls_done,
     record: qd.template(),
 ):
     n_verts = soft_state.verts_pos.shape[0]
@@ -453,33 +523,37 @@ def kernel_soft_zero_assembly(
     _B = soft_state.verts_pos.shape[1]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         if func_is_env_active(i_b, mochi_state, skip_ls_done):
             soft_state.n_soft_hits[i_b] = 0
             soft_state.n_sc_hits[i_b] = 0
             soft_state.n_pc_hits[i_b] = 0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_v, i_b in qd.ndrange(n_verts, _B):
+    for i_v, i_b_ in qd.ndrange(n_verts, _B) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if func_is_env_active(i_b, mochi_state, skip_ls_done):
-            if qd.static(assem_dres):
+            if assem_dres:
                 soft_state.verts_H_diag[i_v, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
             if qd.static(record):
                 soft_state.verts_contact_force[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
-    if qd.static(assem_dres):
+    if assem_dres:
         n_csr = soft_state.csr_values.shape[0]
         qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-        for j, i_b in qd.ndrange(n_csr, _B):
+        for j, i_b_ in qd.ndrange(n_csr, _B) if qd.static(not per_env) else qd.ndrange(n_csr, 1):
+            i_b = i_b_ if qd.static(not per_env) else i_b_env
             if func_is_env_active(i_b, mochi_state, skip_ls_done):
                 soft_state.csr_values[j, i_b] = 0.0
         # The rod blocks kept for the banded preconditioner are overwritten by the assembly kernels (padding elements
         # keep their zero allocation); only the accumulated twist diagonal needs zeroing.
         n_rod_elems = soft_state.rod_elems_H.shape[0]
         qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-        for i_r, i_b in qd.ndrange(n_rod_elems, _B):
+        for i_r, i_b_ in qd.ndrange(n_rod_elems, _B) if qd.static(not per_env) else qd.ndrange(n_rod_elems, 1):
+            i_b = i_b_ if qd.static(not per_env) else i_b_env
             if func_is_env_active(i_b, mochi_state, skip_ls_done):
                 soft_state.rod_elems_twist_pcg[i_r, i_b] = 0.0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_p, i_b in qd.ndrange(max_pairs, _B):
+    for i_p, i_b_ in qd.ndrange(max_pairs, _B) if qd.static(not per_env) else qd.ndrange(max_pairs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if func_is_env_active(i_b, mochi_state, skip_ls_done) and i_p < soft_state.n_pairs[i_b]:
             soft_state.acc_f[i_p, i_b] = qd.Vector.zero(gs.qd_float, 3)
             soft_state.acc_q[i_p, i_b] = qd.Vector.zero(gs.qd_float, 3)
@@ -491,7 +565,21 @@ def kernel_soft_zero_assembly(
 
 
 @qd.kernel
-def kernel_soft_assemble_elements(
+def kernel_soft_zero_assembly(
+    mochi_state: MochiState,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    assem_dres: qd.template(),
+    skip_ls_done: qd.template(),
+    record: qd.template(),
+):
+    func_soft_zero_assembly(0, False, mochi_state, soft_state, rigid_config, assem_dres, skip_ls_done, record)
+
+
+@qd.func
+def func_soft_assemble_elements(
+    i_b_env,
+    per_env: qd.template(),
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
@@ -499,8 +587,8 @@ def kernel_soft_assemble_elements(
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres,
+    skip_ls_done,
 ):
     """Inertia, gravity, mass damping, elastic stress and stiffness damping of every tetrahedron of the running
     environments: residual into the vertex degrees of freedom, 12x12 tangent block per element (positive-semidefinite
@@ -510,7 +598,8 @@ def kernel_soft_assemble_elements(
     EPS = mochi_info.EPS[None]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_el, i_b in qd.ndrange(n_elems, _B):
+    for i_el, i_b_ in qd.ndrange(n_elems, _B) if qd.static(not per_env) else qd.ndrange(n_elems, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
         vol = soft_info.elems_vol[i_el]
@@ -597,7 +686,7 @@ def kernel_soft_assemble_elements(
         if qd.static(assem_obj):
             qd.atomic_add(mochi_state.obj[i_b], energy)
 
-        if qd.static(assem_dres):
+        if assem_dres:
             C = func_elastic_tangent(model, F, mu, lam, EPS, True)
             K = qd.Matrix.zero(gs.qd_float, 12, 12)
             for f in qd.static(range(4)):
@@ -628,6 +717,54 @@ def kernel_soft_assemble_elements(
 
 
 @qd.kernel
+def kernel_soft_assemble_elements(
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    assem_obj: qd.template(),
+    assem_res: qd.template(),
+    assem_dres: qd.template(),
+    skip_ls_done: qd.template(),
+):
+    func_soft_assemble_elements(
+        0,
+        False,
+        mochi_info,
+        mochi_state,
+        soft_info,
+        soft_state,
+        rigid_config,
+        assem_obj,
+        assem_res,
+        assem_dres,
+        skip_ls_done,
+    )
+
+
+@qd.func
+def func_soft_dirichlet(
+    i_b_env,
+    per_env: qd.template(),
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    skip_ls_done,
+):
+    """Zero the residual of the fixed vertices (their rows of the Newton system are identities)."""
+    n_verts = soft_state.verts_pos.shape[0]
+    _B = soft_state.verts_pos.shape[1]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_v, i_b_ in qd.ndrange(n_verts, _B) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
+        if func_is_env_active(i_b, mochi_state, skip_ls_done) and soft_state.verts_is_fixed[i_v, i_b]:
+            for k in qd.static(range(3)):
+                mochi_state.res[func_soft_dof(i_v, k, soft_info), i_b] = 0.0
+
+
+@qd.kernel
 def kernel_soft_dirichlet(
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
@@ -635,14 +772,7 @@ def kernel_soft_dirichlet(
     rigid_config: qd.template(),
     skip_ls_done: qd.template(),
 ):
-    """Zero the residual of the fixed vertices (their rows of the Newton system are identities)."""
-    n_verts = soft_state.verts_pos.shape[0]
-    _B = soft_state.verts_pos.shape[1]
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_v, i_b in qd.ndrange(n_verts, _B):
-        if func_is_env_active(i_b, mochi_state, skip_ls_done) and soft_state.verts_is_fixed[i_v, i_b]:
-            for k in qd.static(range(3)):
-                mochi_state.res[func_soft_dof(i_v, k, soft_info), i_b] = 0.0
+    func_soft_dirichlet(0, False, mochi_state, soft_info, soft_state, rigid_config, skip_ls_done)
 
 
 # ------------------------------------------------------------------------------------
@@ -650,8 +780,10 @@ def kernel_soft_dirichlet(
 # ------------------------------------------------------------------------------------
 
 
-@qd.kernel
-def kernel_soft_conservative_bounds(
+@qd.func
+def func_soft_conservative_bounds(
+    i_b_env,
+    per_env: qd.template(),
     mochi_info: MochiInfo,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
@@ -666,11 +798,13 @@ def kernel_soft_conservative_bounds(
     margin = mochi_info.broadphase_margin[None]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_e, i_b in qd.ndrange(n_entities, _B):
+    for i_e, i_b_ in qd.ndrange(n_entities, _B) if qd.static(not per_env) else qd.ndrange(n_entities, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         soft_state.entities_step_aabb_min[i_e, i_b] = qd.Vector([gs.qd_float(1e30)] * 3, dt=gs.qd_float)
         soft_state.entities_step_aabb_max[i_e, i_b] = qd.Vector([gs.qd_float(-1e30)] * 3, dt=gs.qd_float)
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_v, i_b in qd.ndrange(n_verts, _B):
+    for i_v, i_b_ in qd.ndrange(n_verts, _B) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         i_e = soft_info.verts_entity_idx[i_v]
         speed = soft_state.verts_vel_stage_start[i_v, i_b].norm()
         speed = CONSERVATIVE_SPEED_SCALE * speed + CONSERVATIVE_MAX_ACCEL * dt
@@ -684,7 +818,19 @@ def kernel_soft_conservative_bounds(
 
 
 @qd.kernel
-def kernel_soft_broadphase(
+def kernel_soft_conservative_bounds(
+    mochi_info: MochiInfo,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    func_soft_conservative_bounds(0, False, mochi_info, soft_info, soft_state, rigid_config)
+
+
+@qd.func
+def func_soft_broadphase(
+    i_b_env,
+    per_env: qd.template(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
@@ -702,11 +848,14 @@ def kernel_soft_broadphase(
     max_pairs = soft_state.pair_entity_a.shape[0]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         soft_state.n_pairs[i_b] = 0
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_e, i_gb, i_b in qd.ndrange(n_entities, n_geoms, _B):
+    for i_e, i_gb, i_b_ in (
+        qd.ndrange(n_entities, n_geoms, _B) if qd.static(not per_env) else qd.ndrange(n_entities, n_geoms, 1)
+    ):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not mochi_state.is_active[i_b]:
             continue
         if soft_info.entities_sample_end[i_e] <= soft_info.entities_sample_start[i_e]:
@@ -737,12 +886,41 @@ def kernel_soft_broadphase(
             qd.atomic_or(errno[i_b], array_class.ErrorCode.OVERFLOW_MOCHI_CONTACT_PAIRS)
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         soft_state.n_pairs[i_b] = qd.min(soft_state.n_pairs[i_b], max_pairs)
 
 
 @qd.kernel
-def kernel_soft_contact_eval(
+def kernel_soft_broadphase(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    errno: qd.Tensor,
+):
+    func_soft_broadphase(
+        0,
+        False,
+        dyn_state,
+        dyn_info,
+        mochi_info,
+        mochi_state,
+        contact_state,
+        soft_info,
+        soft_state,
+        rigid_config,
+        errno,
+    )
+
+
+@qd.func
+def func_soft_contact_eval(
+    i_b_env,
+    per_env: qd.template(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     sdf_info: array_class.SDFInfo,
@@ -754,8 +932,8 @@ def kernel_soft_contact_eval(
     mochi_config: qd.template(),
     max_samples_per_entity: int,
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres,
+    skip_ls_done,
     record: qd.template(),
     errno: qd.Tensor,
 ):
@@ -768,7 +946,12 @@ def kernel_soft_contact_eval(
     EPS = mochi_info.EPS[None]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_p, i_s_, i_b in qd.ndrange(max_pairs, max_samples_per_entity, _B):
+    for i_p, i_s_, i_b_ in (
+        qd.ndrange(max_pairs, max_samples_per_entity, _B)
+        if qd.static(not per_env)
+        else qd.ndrange(max_pairs, max_samples_per_entity, 1)
+    ):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
         if i_p >= soft_state.n_pairs[i_b]:
@@ -868,13 +1051,13 @@ def kernel_soft_contact_eval(
 
         # The three per-pair Hessian sums are read by kernel_soft_pairs_to_blocks under the same flag, and they carry
         # most of the atomic traffic of this kernel: the line search re-evaluates contact for the residual alone.
-        if qd.static(assem_dres):
+        if assem_dres:
             qd.atomic_add(soft_state.acc_D[i_p, i_b], D)
             qd.atomic_add(soft_state.acc_SD[i_p, i_b], S_b @ D)
             qd.atomic_add(soft_state.acc_SDS[i_p, i_b], S_b @ D @ S_b)
             for i in qd.static(range(3)):
                 qd.atomic_add(soft_state.verts_H_diag[tri[i], i_b], (bary[i] * bary[i]) * D)
-        if qd.static(assem_dres or record):
+        if assem_dres or record:
             i_h = qd.atomic_add(soft_state.n_soft_hits[i_b], 1)
             if i_h < max_hits:
                 soft_state.hit_sample[i_h, i_b] = i_s
@@ -895,7 +1078,48 @@ def kernel_soft_contact_eval(
 
 
 @qd.kernel
-def kernel_soft_pairs_to_blocks(
+def kernel_soft_contact_eval(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    sdf_info: array_class.SDFInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+    max_samples_per_entity: int,
+    assem_res: qd.template(),
+    assem_dres: qd.template(),
+    skip_ls_done: qd.template(),
+    record: qd.template(),
+    errno: qd.Tensor,
+):
+    func_soft_contact_eval(
+        0,
+        False,
+        dyn_state,
+        dyn_info,
+        sdf_info,
+        mochi_info,
+        mochi_state,
+        soft_info,
+        soft_state,
+        rigid_config,
+        mochi_config,
+        max_samples_per_entity,
+        assem_res,
+        assem_dres,
+        skip_ls_done,
+        record,
+        errno,
+    )
+
+
+@qd.func
+def func_soft_pairs_to_blocks(
+    i_b_env,
+    per_env: qd.template(),
     dyn_state: array_class.DynState,
     mochi_info: MochiInfo,
     mochi_state: MochiState,
@@ -903,15 +1127,16 @@ def kernel_soft_pairs_to_blocks(
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres,
+    skip_ls_done,
 ):
     """Rigid side of the deformable-rigid pairs: residual and 6x6 block of the collider link (its point Jacobian is
     -[I, -[r_b]x], see the rigid kernel_pairs_to_blocks)."""
     max_pairs = soft_state.pair_entity_a.shape[0]
     _B = soft_state.verts_pos.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_p, i_b in qd.ndrange(max_pairs, _B):
+    for i_p, i_b_ in qd.ndrange(max_pairs, _B) if qd.static(not per_env) else qd.ndrange(max_pairs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
         if i_p >= soft_state.n_pairs[i_b] or soft_state.n_hits[i_p, i_b] == 0:
@@ -927,7 +1152,7 @@ def kernel_soft_pairs_to_blocks(
             for k in qd.static(range(3)):
                 qd.atomic_add(mochi_state.links_res[i_lb, i_b][k], F[k])
                 qd.atomic_add(mochi_state.links_res[i_lb, i_b][3 + k], Q[k])
-        if qd.static(assem_dres):
+        if assem_dres:
             Dbar = soft_state.acc_D[i_p, i_b]
             Sh = soft_state.acc_SD[i_p, i_b]
             Sh2 = soft_state.acc_SDS[i_p, i_b]
@@ -938,6 +1163,33 @@ def kernel_soft_pairs_to_blocks(
                     qd.atomic_add(mochi_state.H_diag[i_lb, i_b][k, 3 + l], ShT[k, l])
                     qd.atomic_add(mochi_state.H_diag[i_lb, i_b][3 + k, l], Sh[k, l])
                     qd.atomic_add(mochi_state.H_diag[i_lb, i_b][3 + k, 3 + l], -Sh2[k, l])
+
+
+@qd.kernel
+def kernel_soft_pairs_to_blocks(
+    dyn_state: array_class.DynState,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    assem_obj: qd.template(),
+    assem_res: qd.template(),
+    assem_dres: qd.template(),
+    skip_ls_done: qd.template(),
+):
+    func_soft_pairs_to_blocks(
+        0,
+        False,
+        dyn_state,
+        mochi_info,
+        mochi_state,
+        soft_state,
+        rigid_config,
+        assem_obj,
+        assem_res,
+        assem_dres,
+        skip_ls_done,
+    )
 
 
 # ------------------------------------------------------------------------------------
@@ -988,7 +1240,12 @@ def func_soft_point_force_add(
 
 
 @qd.func
-def func_soft_hit_counts_max(soft_state: MochiSoftState, rigid_config: qd.template()):
+def func_soft_hit_counts_max(
+    i_b_env,
+    per_env: qd.template(),
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
     """Largest per-environment hit counts of the current assembly, the runtime bounds of the loops over the compact hit
     lists (their capacities are many times larger than what a step records)."""
     _B = soft_state.verts_pos.shape[1]
@@ -996,7 +1253,7 @@ def func_soft_hit_counts_max(soft_state: MochiSoftState, rigid_config: qd.templa
     soft_state.n_sc_hits_max[None] = 0
     soft_state.n_pc_hits_max[None] = 0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         qd.atomic_max(soft_state.n_soft_hits_max[None], soft_state.n_soft_hits[i_b])
         qd.atomic_max(soft_state.n_sc_hits_max[None], soft_state.n_sc_hits[i_b])
         qd.atomic_max(soft_state.n_pc_hits_max[None], soft_state.n_pc_hits[i_b])
@@ -1004,6 +1261,8 @@ def func_soft_hit_counts_max(soft_state: MochiSoftState, rigid_config: qd.templa
 
 @qd.func
 def func_soft_matvec(
+    i_b_env,
+    per_env: qd.template(),
     src: qd.Tensor,
     dst: qd.Tensor,
     dyn_state: array_class.DynState,
@@ -1023,7 +1282,8 @@ def func_soft_matvec(
     dof_start = soft_info.dof_start[None]
     twist_dof_start = soft_info.twist_dof_start[None]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b in qd.ndrange(n_soft_dofs, _B):
+    for i_l, i_b_ in qd.ndrange(n_soft_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_soft_dofs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not mochi_state.pcg_is_active[i_b]:
             continue
         i_d = dof_start + i_l
@@ -1039,7 +1299,12 @@ def func_soft_matvec(
         dst[i_d, i_b] += acc
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_h, i_b in qd.ndrange(soft_state.n_soft_hits_max[None], _B):
+    for i_h, i_b_ in (
+        qd.ndrange(soft_state.n_soft_hits_max[None], _B)
+        if qd.static(not per_env)
+        else qd.ndrange(soft_state.n_soft_hits_max[None], 1)
+    ):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not mochi_state.pcg_is_active[i_b] or i_h >= soft_state.n_soft_hits[i_b]:
             continue
         i_s = soft_state.hit_sample[i_h, i_b]
@@ -1068,7 +1333,12 @@ def func_soft_matvec(
             func_soft_point_force_add(i_lb, i_b, r_b, -(D @ g_soft), dst, dyn_state, dyn_info, rigid_config)
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_h, i_b in qd.ndrange(soft_state.n_sc_hits_max[None], _B):
+    for i_h, i_b_ in (
+        qd.ndrange(soft_state.n_sc_hits_max[None], _B)
+        if qd.static(not per_env)
+        else qd.ndrange(soft_state.n_sc_hits_max[None], 1)
+    ):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not mochi_state.pcg_is_active[i_b] or i_h >= soft_state.n_sc_hits[i_b]:
             continue
         D = soft_state.sc_hit_D[i_h, i_b]
@@ -1104,7 +1374,12 @@ def func_soft_matvec(
                 func_add_soft_vec(dst, v_b[j], i_b, -bary_b[j] * g, soft_info)
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_h, i_b in qd.ndrange(soft_state.n_pc_hits_max[None], _B):
+    for i_h, i_b_ in (
+        qd.ndrange(soft_state.n_pc_hits_max[None], _B)
+        if qd.static(not per_env)
+        else qd.ndrange(soft_state.n_pc_hits_max[None], 1)
+    ):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not mochi_state.pcg_is_active[i_b] or i_h >= soft_state.n_pc_hits[i_b]:
             continue
         D = soft_state.pc_hit_D[i_h, i_b]
@@ -1135,7 +1410,8 @@ def func_soft_matvec(
             func_add_soft_vec(dst, i_vb, i_b, -g, soft_info)
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_v, i_b in qd.ndrange(n_verts, _B):
+    for i_v, i_b_ in qd.ndrange(n_verts, _B) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if mochi_state.pcg_is_active[i_b] and soft_state.verts_is_fixed[i_v, i_b]:
             for k in qd.static(range(3)):
                 i_d = func_soft_dof(i_v, k, soft_info)
@@ -1144,6 +1420,8 @@ def func_soft_matvec(
 
 @qd.func
 def func_soft_precondition(
+    i_b_env,
+    per_env: qd.template(),
     r: qd.Tensor,
     z: qd.Tensor,
     mochi_state: MochiState,
@@ -1157,7 +1435,8 @@ def func_soft_precondition(
     _B = soft_state.verts_pos.shape[1]
     n_rod_elems = soft_state.rod_elems_H.shape[0]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_r, i_b in qd.ndrange(n_rod_elems, _B):
+    for i_r, i_b_ in qd.ndrange(n_rod_elems, _B) if qd.static(not per_env) else qd.ndrange(n_rod_elems, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not mochi_state.pcg_is_active[i_b] or soft_info.rod_elems_L[i_r] <= 0.0:
             continue
         i_d = func_rod_twist_dof(i_r, soft_info)
@@ -1166,7 +1445,8 @@ def func_soft_precondition(
         diag = mochi_state.dofs_H_diag[i_d, i_b] + soft_state.rod_elems_twist_pcg[i_r, i_b]
         z[i_d, i_b] = r[i_d, i_b] / qd.max(diag, eps)
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_v, i_b in qd.ndrange(n_verts, _B):
+    for i_v, i_b_ in qd.ndrange(n_verts, _B) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not mochi_state.pcg_is_active[i_b] or soft_info.dofs_band_row[func_soft_dof(i_v, 0, soft_info)] >= 0:
             continue
         r_v = func_read_soft_vec(r, i_v, i_b, soft_info)
@@ -1182,11 +1462,13 @@ def func_soft_precondition(
         i_d = func_soft_dof(i_v, 0, soft_info)
         for k in qd.static(range(3)):
             z[i_d + k, i_b] = z_v[k]
-    func_rod_band_solve(r, z, mochi_state, soft_info, soft_state, rigid_config)
+    func_rod_band_solve(i_b_env, per_env, r, z, mochi_state, soft_info, soft_state, rigid_config)
 
 
-@qd.kernel
-def kernel_soft_condense_dense(
+@qd.func
+def func_soft_condense_dense(
+    i_b_env,
+    per_env: qd.template(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     mochi_state: MochiState,
@@ -1201,18 +1483,24 @@ def kernel_soft_condense_dense(
     n_dofs = mochi_state.res.shape[0]
     _B = soft_state.verts_pos.shape[1]
 
-    func_soft_hit_counts_max(soft_state, rigid_config)
+    func_soft_hit_counts_max(i_b_env, per_env, soft_state, rigid_config)
     n_soft_dofs = soft_info.csr_start.shape[0] - 1
     dof_start = soft_info.dof_start[None]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b in qd.ndrange(n_soft_dofs, _B):
+    for i_l, i_b_ in qd.ndrange(n_soft_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_soft_dofs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]):
             continue
         for j in range(soft_info.csr_start[i_l], soft_info.csr_start[i_l + 1]):
             mochi_state.H_dense[i_b, dof_start + i_l, dof_start + soft_info.csr_col[j]] += soft_state.csr_values[j, i_b]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_h, i_b in qd.ndrange(soft_state.n_soft_hits_max[None], _B):
+    for i_h, i_b_ in (
+        qd.ndrange(soft_state.n_soft_hits_max[None], _B)
+        if qd.static(not per_env)
+        else qd.ndrange(soft_state.n_soft_hits_max[None], 1)
+    ):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or i_h >= soft_state.n_soft_hits[i_b]:
             continue
         i_s = soft_state.hit_sample[i_h, i_b]
@@ -1243,7 +1531,12 @@ def kernel_soft_condense_dense(
                 i_a = dyn_info.links.parent_idx[I_a]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_h, i_b in qd.ndrange(soft_state.n_sc_hits_max[None], _B):
+    for i_h, i_b_ in (
+        qd.ndrange(soft_state.n_sc_hits_max[None], _B)
+        if qd.static(not per_env)
+        else qd.ndrange(soft_state.n_sc_hits_max[None], 1)
+    ):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or i_h >= soft_state.n_sc_hits[i_b]:
             continue
         D = soft_state.sc_hit_D[i_h, i_b]
@@ -1291,7 +1584,12 @@ def kernel_soft_condense_dense(
                     i_anc = dyn_info.links.parent_idx[I_anc]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_h, i_b in qd.ndrange(soft_state.n_pc_hits_max[None], _B):
+    for i_h, i_b_ in (
+        qd.ndrange(soft_state.n_pc_hits_max[None], _B)
+        if qd.static(not per_env)
+        else qd.ndrange(soft_state.n_pc_hits_max[None], 1)
+    ):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or i_h >= soft_state.n_pc_hits[i_b]:
             continue
         D = soft_state.pc_hit_D[i_h, i_b]
@@ -1331,7 +1629,8 @@ def kernel_soft_condense_dense(
                     i_anc = dyn_info.links.parent_idx[I_anc]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_v, i_b in qd.ndrange(n_verts, _B):
+    for i_v, i_b_ in qd.ndrange(n_verts, _B) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or not soft_state.verts_is_fixed[i_v, i_b]:
             continue
         for k in qd.static(range(3)):
@@ -1340,6 +1639,21 @@ def kernel_soft_condense_dense(
                 mochi_state.H_dense[i_b, i_d, j_d] = 0.0
                 mochi_state.H_dense[i_b, j_d, i_d] = 0.0
             mochi_state.H_dense[i_b, i_d, i_d] = 1.0
+
+
+@qd.kernel
+def kernel_soft_condense_dense(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    island_state: MochiIslandState,
+    rigid_config: qd.template(),
+):
+    func_soft_condense_dense(
+        0, False, dyn_state, dyn_info, mochi_state, soft_info, soft_state, island_state, rigid_config
+    )
 
 
 # ------------------------------------------------------------------------------------
@@ -1881,7 +2195,7 @@ def kernel_soft_collider_eval(
                     func_add_soft_vec(mochi_state.res, tri[i], i_b, -(bary[i]) * wf, soft_info)
             for j in qd.static(range(4)):
                 func_add_soft_vec(mochi_state.res, v[j], i_b, bary_b[j] * wf, soft_info)
-        if qd.static(assem_dres):
+        if assem_dres:
             if kind_a == 0:
                 if is_dynamic_a:
                     S_a = skew(r_a)
@@ -1901,7 +2215,7 @@ def kernel_soft_collider_eval(
                     qd.atomic_add(soft_state.verts_H_diag[tri[i], i_b], (bary[i] * bary[i]) * D)
             for j in qd.static(range(4)):
                 qd.atomic_add(soft_state.verts_H_diag[v[j], i_b], (bary_b[j] * bary_b[j]) * D)
-        if qd.static(assem_dres or record):
+        if assem_dres or record:
             i_h = qd.atomic_add(soft_state.n_sc_hits[i_b], 1)
             if i_h < max_hits:
                 soft_state.sc_hit_kind_a[i_h, i_b] = kind_a
@@ -2025,8 +2339,10 @@ def kernel_init_shell_fields(
                 qd.atomic_add(soft_info.verts_collider_weight[i_v], area / 3.0)
 
 
-@qd.kernel
-def kernel_shell_stage_start(
+@qd.func
+def func_shell_stage_start(
+    i_b_env,
+    per_env: qd.template(),
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
@@ -2035,7 +2351,8 @@ def kernel_shell_stage_start(
     n_tris = soft_info.shell_elems_v.shape[0]
     _B = soft_state.verts_pos.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_t, i_b in qd.ndrange(n_tris, _B):
+    for i_t, i_b_ in qd.ndrange(n_tris, _B) if qd.static(not per_env) else qd.ndrange(n_tris, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         x = func_shell_gather(i_t, i_b, soft_state.verts_pos_stage_start, soft_info)
         X = func_shell_gather_rest(i_t, soft_info)
         eps_m, s = func_shell_strains(
@@ -2051,7 +2368,18 @@ def kernel_shell_stage_start(
 
 
 @qd.kernel
-def kernel_shell_assemble(
+def kernel_shell_stage_start(
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    func_shell_stage_start(0, False, soft_info, soft_state, rigid_config)
+
+
+@qd.func
+def func_shell_assemble(
+    i_b_env,
+    per_env: qd.template(),
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
@@ -2059,8 +2387,8 @@ def kernel_shell_assemble(
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres,
+    skip_ls_done,
 ):
     """Membrane, bending, inertia (consistent mass), gravity and damping of every shell triangle of the running
     environments: residual into the vertex degrees of freedom, 18x18 tangent block per triangle and its diagonal
@@ -2069,7 +2397,8 @@ def kernel_shell_assemble(
     _B = soft_state.verts_pos.shape[1]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_t, i_b in qd.ndrange(n_tris, _B):
+    for i_t, i_b_ in qd.ndrange(n_tris, _B) if qd.static(not per_env) else qd.ndrange(n_tris, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
         i_e = soft_info.shell_elems_entity_idx[i_t]
@@ -2119,7 +2448,7 @@ def kernel_shell_assemble(
                 b_g = soft_state.verts_pos[i_g, i_b] - soft_state.verts_pos_stage_start[i_g, i_b]
                 for k in qd.static(range(3)):
                     res[3 * f + k] += m_fg * (c_inertia * a_g[k] + c_damping * b_g[k])
-                    if qd.static(assem_dres):
+                    if assem_dres:
                         K[3 * f + k, 3 * g + k] += m_fg * (c_inertia + c_damping)
                 if qd.static(assem_obj):
                     a_f = (
@@ -2149,7 +2478,7 @@ def kernel_shell_assemble(
                     )
         if qd.static(assem_obj):
             qd.atomic_add(mochi_state.obj[i_b], energy)
-        if qd.static(assem_dres):
+        if assem_dres:
             for a in qd.static(range(6)):
                 for c in qd.static(range(6)):
                     if nodes[a] >= 0 and nodes[c] >= 0:
@@ -2166,6 +2495,33 @@ def kernel_shell_assemble(
                         for c in qd.static(range(3)):
                             block[r, c] = K[3 * a + r, 3 * a + c]
                     qd.atomic_add(soft_state.verts_H_diag[nodes[a], i_b], block)
+
+
+@qd.kernel
+def kernel_shell_assemble(
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    assem_obj: qd.template(),
+    assem_res: qd.template(),
+    assem_dres: qd.template(),
+    skip_ls_done: qd.template(),
+):
+    func_shell_assemble(
+        0,
+        False,
+        mochi_info,
+        mochi_state,
+        soft_info,
+        soft_state,
+        rigid_config,
+        assem_obj,
+        assem_res,
+        assem_dres,
+        skip_ls_done,
+    )
 
 
 # ------------------------------------------------------------------------------------
@@ -2280,8 +2636,10 @@ def func_rod_tangent(i_r, i_b, field: qd.Tensor, soft_info: MochiSoftInfo):
     return func_rod_normalize(field[v[1], i_b] - field[v[0], i_b], soft_info.rod_tiny[None])
 
 
-@qd.kernel
-def kernel_rod_step_start(
+@qd.func
+def func_rod_step_start(
+    i_b_env,
+    per_env: qd.template(),
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
@@ -2296,7 +2654,8 @@ def kernel_rod_step_start(
     _B = soft_state.verts_pos.shape[1]
     tiny = soft_info.rod_tiny[None]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_r, i_b in qd.ndrange(n_elems, _B):
+    for i_r, i_b_ in qd.ndrange(n_elems, _B) if qd.static(not per_env) else qd.ndrange(n_elems, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         theta = soft_state.rod_elems_twist[i_r, i_b]
         soft_state.rod_elems_twist_prev[1, i_r, i_b] = soft_state.rod_elems_twist_prev[0, i_r, i_b] - theta
         soft_state.rod_elems_twist_prev[0, i_r, i_b] = 0.0
@@ -2330,7 +2689,8 @@ def kernel_rod_step_start(
         )
         soft_state.rod_elems_strain_stage_start[i_r, i_b] = strain
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_s, i_b in qd.ndrange(n_stencils, _B):
+    for i_s, i_b_ in qd.ndrange(n_stencils, _B) if qd.static(not per_env) else qd.ndrange(n_stencils, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         v = soft_info.rod_stencils_v[i_s]
         e = soft_info.rod_stencils_e[i_s]
         ka, kb, tw = func_rod_bend_twist_measures(
@@ -2346,7 +2706,20 @@ def kernel_rod_step_start(
 
 
 @qd.kernel
-def kernel_rod_assemble(
+def kernel_rod_step_start(
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+):
+    func_rod_step_start(0, False, mochi_state, soft_info, soft_state, rigid_config, mochi_config)
+
+
+@qd.func
+def func_rod_assemble(
+    i_b_env,
+    per_env: qd.template(),
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
@@ -2354,8 +2727,8 @@ def kernel_rod_assemble(
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres,
+    skip_ls_done,
 ):
     """Stretching, lumped inertia, gravity and damping of every rod segment (with the twist inertia on its twist
     degree of freedom), and bending and twisting of every interior stencil."""
@@ -2365,7 +2738,8 @@ def kernel_rod_assemble(
     EPS = mochi_info.EPS[None]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_r, i_b in qd.ndrange(n_elems, _B):
+    for i_r, i_b_ in qd.ndrange(n_elems, _B) if qd.static(not per_env) else qd.ndrange(n_elems, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
         L = soft_info.rod_elems_L[i_r]
@@ -2428,7 +2802,7 @@ def kernel_rod_assemble(
         if qd.static(assem_obj):
             energy += 0.5 * (c_rot * a_tw * a_tw + c_rot_damping * b_tw * b_tw)
             qd.atomic_add(mochi_state.obj[i_b], energy)
-        if qd.static(assem_dres):
+        if assem_dres:
             soft_state.rod_elems_H[i_r, i_b] = T
             block = T + (c_inertia + c_damping) * qd.Matrix.identity(gs.qd_float, 3)
             qd.atomic_add(soft_state.verts_H_diag[v[0], i_b], block)
@@ -2450,7 +2824,8 @@ def kernel_rod_assemble(
                     qd.atomic_add(soft_state.csr_values[soft_info.rod_elems_csr[i_r, 6 * (3 + r) + c], i_b], -T[r, c])
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_s, i_b in qd.ndrange(n_stencils, _B):
+    for i_s, i_b_ in qd.ndrange(n_stencils, _B) if qd.static(not per_env) else qd.ndrange(n_stencils, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
         L = soft_info.rod_stencils_L[i_s]
@@ -2489,7 +2864,7 @@ def kernel_rod_assemble(
                 qd.atomic_add(mochi_state.res[dofs[p], i_b], res[p])
         if qd.static(assem_obj):
             qd.atomic_add(mochi_state.obj[i_b], energy)
-        if qd.static(assem_dres):
+        if assem_dres:
             soft_state.rod_stencils_H[i_s, i_b] = K
             for p in qd.static(range(11)):
                 for q in qd.static(range(11)):
@@ -2505,7 +2880,36 @@ def kernel_rod_assemble(
 
 
 @qd.kernel
-def kernel_rod_apply_increment(
+def kernel_rod_assemble(
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    assem_obj: qd.template(),
+    assem_res: qd.template(),
+    assem_dres: qd.template(),
+    skip_ls_done: qd.template(),
+):
+    func_rod_assemble(
+        0,
+        False,
+        mochi_info,
+        mochi_state,
+        soft_info,
+        soft_state,
+        rigid_config,
+        assem_obj,
+        assem_res,
+        assem_dres,
+        skip_ls_done,
+    )
+
+
+@qd.func
+def func_rod_apply_increment(
+    i_b_env,
+    per_env: qd.template(),
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
@@ -2516,7 +2920,8 @@ def kernel_rod_apply_increment(
     n_elems = soft_state.rod_elems_H.shape[0]
     _B = soft_state.verts_pos.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_r, i_b in qd.ndrange(n_elems, _B):
+    for i_r, i_b_ in qd.ndrange(n_elems, _B) if qd.static(not per_env) else qd.ndrange(n_elems, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, True) or soft_info.rod_elems_L[i_r] <= 0.0:
             continue
         delta = -mochi_state.ls_alpha[i_b] * mochi_state.dx[func_rod_twist_dof(i_r, soft_info), i_b]
@@ -2529,18 +2934,31 @@ def kernel_rod_apply_increment(
 
 
 @qd.kernel
-def kernel_rod_store_ls_ref(
+def kernel_rod_apply_increment(
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    func_rod_apply_increment(0, False, mochi_state, soft_info, soft_state, rigid_config)
+
+
+@qd.func
+def func_rod_store_ls_ref(
+    i_b_env,
+    per_env: qd.template(),
     mochi_state: MochiState,
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
-    only_done: qd.template(),
+    only_done,
 ):
     n_elems = soft_state.rod_elems_H.shape[0]
     _B = soft_state.verts_pos.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_r, i_b in qd.ndrange(n_elems, _B):
+    for i_r, i_b_ in qd.ndrange(n_elems, _B) if qd.static(not per_env) else qd.ndrange(n_elems, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         is_ref = mochi_state.is_active[i_b]
-        if qd.static(only_done):
+        if only_done:
             is_ref = is_ref and mochi_state.ls_is_done[i_b]
         if is_ref:
             soft_state.rod_elems_twist_ls_ref[i_r, i_b] = soft_state.rod_elems_twist[i_r, i_b]
@@ -2548,7 +2966,19 @@ def kernel_rod_store_ls_ref(
 
 
 @qd.kernel
-def kernel_rod_post_stage(
+def kernel_rod_store_ls_ref(
+    mochi_state: MochiState,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    only_done: qd.template(),
+):
+    func_rod_store_ls_ref(0, False, mochi_state, soft_state, rigid_config, only_done)
+
+
+@qd.func
+def func_rod_post_stage(
+    i_b_env,
+    per_env: qd.template(),
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
@@ -2560,7 +2990,8 @@ def kernel_rod_post_stage(
     n_elems = soft_state.rod_elems_H.shape[0]
     _B = soft_state.verts_pos.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_r, i_b in qd.ndrange(n_elems, _B):
+    for i_r, i_b_ in qd.ndrange(n_elems, _B) if qd.static(not per_env) else qd.ndrange(n_elems, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if mochi_state.status[i_b] == SOLVE_STATUS.DIVERGED:
             soft_state.rod_elems_twist[i_r, i_b] = 0.0
             soft_state.rod_elems_axis[i_r, i_b] = soft_info.rod_elems_axis_ref[i_r]
@@ -2573,7 +3004,19 @@ def kernel_rod_post_stage(
 
 
 @qd.kernel
-def kernel_rod_update_conv_weights(
+def kernel_rod_post_stage(
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    func_rod_post_stage(0, False, mochi_state, soft_info, soft_state, rigid_config)
+
+
+@qd.func
+def func_rod_update_conv_weights(
+    i_b_env,
+    per_env: qd.template(),
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
@@ -2587,7 +3030,8 @@ def kernel_rod_update_conv_weights(
     _B = soft_state.verts_pos.shape[1]
     EPS = mochi_info.EPS[None]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_r, i_b in qd.ndrange(n_elems, _B):
+    for i_r, i_b_ in qd.ndrange(n_elems, _B) if qd.static(not per_env) else qd.ndrange(n_elems, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         i_e = soft_info.rod_elems_entity_idx[i_r]
         w = gs.qd_float(1.0)
         I_e = soft_info.rod_elems_rot_inertia[i_r]
@@ -2600,6 +3044,17 @@ def kernel_rod_update_conv_weights(
                     total += soft_info.rod_elems_rot_inertia[j_r]
             w = gyr_sq / (a_ref * a_ref * qd.max(total, EPS) * I_e)
         mochi_state.conv_w[func_rod_twist_dof(i_r, soft_info), i_b] = w
+
+
+@qd.kernel
+def kernel_rod_update_conv_weights(
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    func_rod_update_conv_weights(0, False, mochi_info, mochi_state, soft_info, soft_state, rigid_config)
 
 
 # ------------------------------------------------------------------------------------
@@ -2822,7 +3277,7 @@ def kernel_pc_collider_eval(
                 for i in qd.static(range(3)):
                     func_add_soft_vec(mochi_state.res, tri[i], i_b, -(bary[i]) * wf, soft_info)
             func_add_soft_vec(mochi_state.res, i_vb, i_b, wf, soft_info)
-        if qd.static(assem_dres):
+        if assem_dres:
             if kind_a == 0:
                 if is_dynamic_a:
                     S_a = skew(r_a)
@@ -2841,7 +3296,7 @@ def kernel_pc_collider_eval(
                 for i in qd.static(range(3)):
                     qd.atomic_add(soft_state.verts_H_diag[tri[i], i_b], (bary[i] * bary[i]) * D)
             qd.atomic_add(soft_state.verts_H_diag[i_vb, i_b], D)
-        if qd.static(assem_dres or record):
+        if assem_dres or record:
             i_h = qd.atomic_add(soft_state.n_pc_hits[i_b], 1)
             if i_h < max_hits:
                 soft_state.pc_hit_kind_a[i_h, i_b] = kind_a

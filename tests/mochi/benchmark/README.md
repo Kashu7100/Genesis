@@ -54,3 +54,20 @@ Filled in by `report.py` at every optimization phase; see the git history of thi
 | franka | - | 10.509 | - | 268 | - | 15 dofs, newton 8 |
 
 Newton iteration counts agree between the two engines on every scene, so the ratios compare equal work.
+
+### After phases B1-B2, B5-B6, B8 (rods) and C1-C2 (one-kernel step), 2026-08-29
+
+| scene | mochi fp64 (T=0) ms/step | Genesis CPU fp64 ms/step | ratio | launches/step | Genesis GPU fp32 ms/step (B) | notes |
+|---|---|---|---|---|---|---|
+| rigid | 0.017 | 0.069 | 4.1x | 1 | 2.27 (B=1024) | 12 dofs, newton 1; mochi newton 0 |
+| articulated | 0.036 | 0.157 | 4.3x | 1 | 9.33 (B=1024) | 11 dofs, newton 2; mochi newton 2 |
+| equalities | 0.022 | 0.049 | 2.2x | 1 | - | 12 dofs, newton 4; mochi newton 4 |
+| soft_duck | 12.371 | 100.945 | 8.2x | 1 | - | 5697 dofs, newton 3; mochi newton 3 |
+| cloth_tshirt | 32.201 | 266.994 | 8.3x | 744 | - | 10779 dofs, newton 2; mochi newton 2 |
+| rod_helix | 2.277 | 5.977 | 2.6x | 1 | - | 515 dofs, newton 20; mochi newton 20 |
+| franka | - | 0.075 | - | 1 | - | 15 dofs, newton 8 |
+
+Every scene is within the 10x target of single-threaded mochi on the CPU. The t-shirt (self-contact) still runs the
+multi-kernel pipeline because its point-cloud collider is built by host-driven bounding-volume kernels; all other
+scenes run as one kernel launch per step. GPU (RTX 3080, fp32, monolith, 1024 environments): rigid 2.2 us and
+articulated 9.1 us per environment step.

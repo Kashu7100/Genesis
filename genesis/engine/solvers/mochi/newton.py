@@ -22,20 +22,25 @@ EW_MIN_ETA_EPS = 100.0
 
 
 @qd.func
-def func_is_env_active(i_b, mochi_state: MochiState, skip_ls_done: qd.template()):
+def func_is_env_active(i_b, mochi_state: MochiState, skip_ls_done):
     """Whether the Newton solve of an environment is still running, optionally excluding the environments whose line
     search has already accepted an iterate."""
     is_active = mochi_state.is_active[i_b]
-    if qd.static(skip_ls_done):
+    if skip_ls_done:
         is_active = is_active and not mochi_state.ls_is_done[i_b]
     return is_active
 
 
-@qd.kernel
-def kernel_reset_newton(mochi_state: MochiState, rigid_config: qd.template()):
+@qd.func
+def func_reset_newton(
+    i_b_env,
+    per_env: qd.template(),
+    mochi_state: MochiState,
+    rigid_config: qd.template(),
+):
     _B = mochi_state.is_active.shape[0]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         mochi_state.is_active[i_b] = True
         mochi_state.status[i_b] = SOLVE_STATUS.RUNNING
         mochi_state.n_iter[i_b] = 0
@@ -46,11 +51,18 @@ def kernel_reset_newton(mochi_state: MochiState, rigid_config: qd.template()):
 
 
 @qd.kernel
-def kernel_residual_norms(
+def kernel_reset_newton(mochi_state: MochiState, rigid_config: qd.template()):
+    func_reset_newton(0, False, mochi_state, rigid_config)
+
+
+@qd.func
+def func_residual_norms(
+    i_b_env,
+    per_env: qd.template(),
     mochi_state: MochiState,
     island_state: MochiIslandState,
     rigid_config: qd.template(),
-    skip_ls_done: qd.template(),
+    skip_ls_done,
 ):
     """Plain and convergence-weighted squared norms of the residual of every running environment, the weighted one
     also per entity."""
@@ -58,16 +70,18 @@ def kernel_residual_norms(
     n_nodes = island_state.nodes_res_w_sq.shape[0]
     _B = mochi_state.res.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         if func_is_env_active(i_b, mochi_state, skip_ls_done):
             mochi_state.res_norm_sq[i_b] = 0.0
             mochi_state.res_w_sq[i_b] = 0.0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_n, i_b in qd.ndrange(n_nodes, _B):
+    for i_n, i_b_ in qd.ndrange(n_nodes, _B) if qd.static(not per_env) else qd.ndrange(n_nodes, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if func_is_env_active(i_b, mochi_state, skip_ls_done):
             island_state.nodes_res_w_sq[i_n, i_b] = 0.0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_b in qd.ndrange(n_dofs, _B):
+    for i_d, i_b_ in qd.ndrange(n_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if func_is_env_active(i_b, mochi_state, skip_ls_done):
             r = mochi_state.res[i_d, i_b]
             r_w_sq = mochi_state.conv_w[i_d, i_b] * r * r
@@ -77,7 +91,19 @@ def kernel_residual_norms(
 
 
 @qd.kernel
-def kernel_store_initial_norms(
+def kernel_residual_norms(
+    mochi_state: MochiState,
+    island_state: MochiIslandState,
+    rigid_config: qd.template(),
+    skip_ls_done: qd.template(),
+):
+    func_residual_norms(0, False, mochi_state, island_state, rigid_config, skip_ls_done)
+
+
+@qd.func
+def func_store_initial_norms(
+    i_b_env,
+    per_env: qd.template(),
     rigid_info: array_class.RigidInfo,
     mochi_state: MochiState,
     island_state: MochiIslandState,
@@ -89,21 +115,35 @@ def kernel_store_initial_norms(
     n_nodes = island_state.nodes_res_w_sq.shape[0]
     _B = mochi_state.is_active.shape[0]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         mochi_state.res_norm0[i_b] = qd.sqrt(mochi_state.res_norm_sq[i_b])
         mochi_state.res_norm0_w[i_b] = qd.sqrt(mochi_state.res_w_sq[i_b])
         mochi_state.ls_ref_norm_sq[i_b] = mochi_state.res_norm_sq[i_b]
         mochi_state.obj_ref[i_b] = mochi_state.obj[i_b]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_n, i_b in qd.ndrange(n_nodes, _B):
+    for i_n, i_b_ in qd.ndrange(n_nodes, _B) if qd.static(not per_env) else qd.ndrange(n_nodes, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         island_state.nodes_res_norm0_w[i_n, i_b] = qd.sqrt(island_state.nodes_res_w_sq[i_n, i_b])
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_q, i_b in qd.ndrange(n_qs, _B):
+    for i_q, i_b_ in qd.ndrange(n_qs, _B) if qd.static(not per_env) else qd.ndrange(n_qs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         mochi_state.qpos_ls_ref[i_q, i_b] = rigid_info.qpos[i_q, i_b]
 
 
 @qd.kernel
-def kernel_linesearch_begin(
+def kernel_store_initial_norms(
+    rigid_info: array_class.RigidInfo,
+    mochi_state: MochiState,
+    island_state: MochiIslandState,
+    rigid_config: qd.template(),
+):
+    func_store_initial_norms(0, False, rigid_info, mochi_state, island_state, rigid_config)
+
+
+@qd.func
+def func_linesearch_begin(
+    i_b_env,
+    per_env: qd.template(),
     rigid_info: array_class.RigidInfo,
     mochi_state: MochiState,
     rigid_config: qd.template(),
@@ -114,7 +154,7 @@ def kernel_linesearch_begin(
     n_dofs = mochi_state.res.shape[0]
     _B = mochi_state.is_active.shape[0]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         if mochi_state.is_active[i_b]:
             mochi_state.ls_alpha[i_b] = 1.0
             mochi_state.ls_is_done[i_b] = False
@@ -122,18 +162,31 @@ def kernel_linesearch_begin(
             mochi_state.obj_ref[i_b] = mochi_state.obj[i_b]
             mochi_state.ls_slope[i_b] = 0.0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_q, i_b in qd.ndrange(n_qs, _B):
+    for i_q, i_b_ in qd.ndrange(n_qs, _B) if qd.static(not per_env) else qd.ndrange(n_qs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if mochi_state.is_active[i_b]:
             mochi_state.qpos_ls_ref[i_q, i_b] = rigid_info.qpos[i_q, i_b]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_b in qd.ndrange(n_dofs, _B):
+    for i_d, i_b_ in qd.ndrange(n_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if mochi_state.is_active[i_b]:
             # The step taken is -dx, so the slope of the objective along it is -res . dx.
             qd.atomic_add(mochi_state.ls_slope[i_b], -mochi_state.res[i_d, i_b] * mochi_state.dx[i_d, i_b])
 
 
 @qd.kernel
-def kernel_apply_increment(
+def kernel_linesearch_begin(
+    rigid_info: array_class.RigidInfo,
+    mochi_state: MochiState,
+    rigid_config: qd.template(),
+):
+    func_linesearch_begin(0, False, rigid_info, mochi_state, rigid_config)
+
+
+@qd.func
+def func_apply_increment(
+    i_b_env,
+    per_env: qd.template(),
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
     mochi_info: MochiInfo,
@@ -147,7 +200,8 @@ def kernel_apply_increment(
     _B = mochi_state.is_active.shape[0]
     EPS = mochi_info.EPS[None]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_j, i_b in qd.ndrange(n_joints, _B):
+    for i_j, i_b_ in qd.ndrange(n_joints, _B) if qd.static(not per_env) else qd.ndrange(n_joints, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, True):
             continue
         I_j = [i_j, i_b] if qd.static(rigid_config.batch_joints_info) else i_j
@@ -194,20 +248,33 @@ def kernel_apply_increment(
 
 
 @qd.kernel
-def kernel_linesearch_decide(
+def kernel_apply_increment(
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    rigid_config: qd.template(),
+):
+    func_apply_increment(0, False, dyn_info, rigid_info, mochi_info, mochi_state, rigid_config)
+
+
+@qd.func
+def func_linesearch_decide(
+    i_b_env,
+    per_env: qd.template(),
     rigid_info: array_class.RigidInfo,
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
-    is_last: qd.template(),
+    is_last,
 ):
     """Accept the trial iterate of every searching environment when it improves on the reference (or on the last
     trial regardless, so that the solve always progresses), else halve the step."""
     n_qs = rigid_info.qpos.shape[0]
     _B = mochi_state.is_active.shape[0]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         if not func_is_env_active(i_b, mochi_state, True):
             continue
         is_improved = True
@@ -218,25 +285,40 @@ def kernel_linesearch_decide(
                 mochi_state.obj_ref[i_b]
                 + mochi_info.linesearch_wolfe1[None] * mochi_state.ls_alpha[i_b] * mochi_state.ls_slope[i_b]
             )
-        if is_improved or qd.static(is_last):
+        if is_improved or is_last:
             mochi_state.ls_is_done[i_b] = True
             mochi_state.ls_ref_norm_sq[i_b] = mochi_state.res_norm_sq[i_b]
             mochi_state.obj_ref[i_b] = mochi_state.obj[i_b]
         else:
             mochi_state.ls_alpha[i_b] = mochi_state.ls_alpha[i_b] * mochi_info.linesearch_alpha[None]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_q, i_b in qd.ndrange(n_qs, _B):
+    for i_q, i_b_ in qd.ndrange(n_qs, _B) if qd.static(not per_env) else qd.ndrange(n_qs, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if mochi_state.is_active[i_b] and mochi_state.ls_is_done[i_b]:
             mochi_state.qpos_ls_ref[i_q, i_b] = rigid_info.qpos[i_q, i_b]
 
 
 @qd.kernel
-def kernel_convergence_check(
+def kernel_linesearch_decide(
+    rigid_info: array_class.RigidInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+    is_last: qd.template(),
+):
+    func_linesearch_decide(0, False, rigid_info, mochi_info, mochi_state, rigid_config, mochi_config, is_last)
+
+
+@qd.func
+def func_convergence_check(
+    i_b_env,
+    per_env: qd.template(),
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     island_state: MochiIslandState,
     rigid_config: qd.template(),
-    increment_iter: qd.template(),
+    increment_iter,
     errno: qd.Tensor,
 ):
     """Classify every running environment from the residual of its accepted iterate: converged when every entity's
@@ -250,10 +332,10 @@ def kernel_convergence_check(
     div_rel_tol = mochi_info.explosion_rel_tol[None]
     max_iter = mochi_info.n_newton_iterations[None]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         if not mochi_state.is_active[i_b]:
             continue
-        if qd.static(increment_iter):
+        if increment_iter:
             mochi_state.n_iter[i_b] = mochi_state.n_iter[i_b] + 1
         res_norm = qd.sqrt(mochi_state.res_norm_sq[i_b])
         res_norm_w = qd.sqrt(mochi_state.res_w_sq[i_b])
@@ -280,7 +362,21 @@ def kernel_convergence_check(
 
 
 @qd.kernel
-def kernel_update_linear_tolerance(
+def kernel_convergence_check(
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    island_state: MochiIslandState,
+    rigid_config: qd.template(),
+    increment_iter: qd.template(),
+    errno: qd.Tensor,
+):
+    func_convergence_check(0, False, mochi_info, mochi_state, island_state, rigid_config, increment_iter, errno)
+
+
+@qd.func
+def func_update_linear_tolerance(
+    i_b_env,
+    per_env: qd.template(),
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     rigid_config: qd.template(),
@@ -290,7 +386,7 @@ def kernel_update_linear_tolerance(
     _B = mochi_state.is_active.shape[0]
     EPS = mochi_info.EPS[None]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         if not mochi_state.is_active[i_b]:
             continue
         if qd.static(mochi_config.linear_tolerance == LINEAR_TOLERANCE.ADAPTIVE):
@@ -303,6 +399,16 @@ def kernel_update_linear_tolerance(
             mochi_state.res_norm_prev[i_b] = res_norm
         else:
             mochi_state.pcg_rel_tol[i_b] = mochi_info.pcg_rel_tol[None]
+
+
+@qd.kernel
+def kernel_update_linear_tolerance(
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+):
+    func_update_linear_tolerance(0, False, mochi_info, mochi_state, rigid_config, mochi_config)
 
 
 @qd.kernel

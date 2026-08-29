@@ -23,8 +23,10 @@ from .lie import (
 from .newton import func_is_env_active
 
 
-@qd.kernel
-def kernel_assemble_links(
+@qd.func
+def func_assemble_links(
+    i_b_env,
+    per_env: qd.template(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
@@ -33,8 +35,8 @@ def kernel_assemble_links(
     mochi_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres,
+    skip_ls_done,
 ):
     """Add the inertia, gravity and damping of every moving link to the objective and to the link-space residual and
     diagonal Hessian blocks.
@@ -50,7 +52,8 @@ def kernel_assemble_links(
     I3 = qd.Matrix.identity(gs.qd_float, 3)
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b in qd.ndrange(n_links, _B):
+    for i_l, i_b_ in qd.ndrange(n_links, _B) if qd.static(not per_env) else qd.ndrange(n_links, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not mochi_info.links.is_dynamic[i_l] or not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
         I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
@@ -134,7 +137,7 @@ def kernel_assemble_links(
             for k in qd.static(range(3)):
                 mochi_state.links_res[i_l, i_b][k] += g_t[k]
                 mochi_state.links_res[i_l, i_b][3 + k] += g_r_link[k]
-        if qd.static(assem_dres):
+        if assem_dres:
             H_tr = -H_t @ S_c
             H_rr = -S_c @ H_t @ S_c + H_r
             for k, l in qd.static(qd.ndrange(3, 3)):
@@ -142,3 +145,32 @@ def kernel_assemble_links(
                 mochi_state.H_diag[i_l, i_b][k, 3 + l] += H_tr[k, l]
                 mochi_state.H_diag[i_l, i_b][3 + k, l] += H_tr[l, k]
                 mochi_state.H_diag[i_l, i_b][3 + k, 3 + l] += H_rr[k, l]
+
+
+@qd.kernel
+def kernel_assemble_links(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+    assem_obj: qd.template(),
+    assem_res: qd.template(),
+    assem_dres: qd.template(),
+    skip_ls_done: qd.template(),
+):
+    func_assemble_links(
+        0,
+        False,
+        dyn_state,
+        dyn_info,
+        mochi_info,
+        mochi_state,
+        rigid_config,
+        mochi_config,
+        assem_obj,
+        assem_res,
+        assem_dres,
+        skip_ls_done,
+    )

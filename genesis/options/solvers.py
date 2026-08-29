@@ -1035,6 +1035,12 @@ class MochiOptions(Options):
         Absolute padding of the per-step conservative bounding boxes in meters. Defaults to 0.01.
     record_contacts : bool, optional
         Whether individual contact points are stored for readback through `entity.get_contacts()`. Defaults to True.
+    step_kernel : str, optional
+        How a step is executed: "monolith" runs the whole step of every environment in one kernel (environments in
+        parallel, one launch per step, no host round trips), "pipeline" runs each stage as its own kernel with the host
+        driving the Newton and conjugate gradient loops (parallel over items, needed by the deformable colliders),
+        "auto" picks the monolith whenever the scene has no deformable collider, on the CPU always and on the GPU for
+        rigid scenes of at most 64 degrees of freedom. Defaults to "auto".
     joint_limit_stiffness : float, optional
         Stiffness in N/m (N*m/rad) of the penalty holding revolute and prismatic joints inside their range. Joint
         limits are soft: the violation at rest is the limit torque divided by this stiffness. Higher values reduce the
@@ -1082,6 +1088,7 @@ class MochiOptions(Options):
     max_contact_pairs_per_env: PositiveInt | None = None
     broadphase_margin: NonNegativeFloat = 0.01
     record_contacts: StrictBool = True
+    step_kernel: Literal["auto", "monolith", "pipeline"] = "auto"
     joint_limit_stiffness: PositiveFloat = 1e4
     joint_limit_damping: NonNegativeFloat = 0.0
     batch_links_info: StrictBool = False
