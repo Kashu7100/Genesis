@@ -89,6 +89,7 @@ from .integration import (
     kernel_store_stage_start_poses,
 )
 from .islands import get_mochi_island_state, kernel_build_islands, kernel_cholesky_solve_islands
+from .kinematics import kernel_update_kinematics
 from .linear_solver import (
     kernel_condense_dense,
     kernel_pcg_any_active,
@@ -108,6 +109,7 @@ from .newton import (
     kernel_update_linear_tolerance,
 )
 from .rigid_assembly import kernel_assemble_links
+from .sample_tree import build_sample_tree
 from .soft import (
     ENTITY_PARAMS,
     SOFT_KIND_ROD,
@@ -161,6 +163,7 @@ from .soft import (
     kernel_soft_zero_assembly,
 )
 from .soft_materials import ELASTIC_MODEL_BY_NAME
+from .step_monolith import kernel_step_monolith
 
 if TYPE_CHECKING:
     from genesis.engine.scene import Scene
@@ -347,6 +350,7 @@ class MochiSolver(KinematicSolver):
         )
         self._init_mochi()
         self._init_soft()
+        self._use_monolith = self._resolve_step_kernel()
         # Unified contact readback over every kind of recorded contact point.
         max_records = self._max_hits
         if self.has_soft:
@@ -555,8 +559,28 @@ class MochiSolver(KinematicSolver):
             samples_weight = np.zeros((0,), dtype=gs.np_float)
             samples_link_idx = np.zeros((0,), dtype=gs.np_int)
             samples_geom_idx = np.zeros((0,), dtype=gs.np_int)
+        # Bounding-sphere hierarchy of every link's samples; the samples of a link are permuted so that the samples of
+        # a leaf are contiguous.
+        tree_arrays = [[] for _ in range(6)]
+        links_tree_start = np.zeros(self.n_links, dtype=gs.np_int)
+        links_tree_end = np.zeros(self.n_links, dtype=gs.np_int)
+        n_tree_nodes = 0
+        for link in links:
+            start, end = links_sample_start[link.idx], links_sample_end[link.idx]
+            links_tree_start[link.idx] = n_tree_nodes
+            if end > start:
+                order, centers, radii, first, count, escape, is_leaf = build_sample_tree(samples_pos[start:end])
+                for arrays in (samples_pos, samples_normal, samples_weight, samples_link_idx, samples_geom_idx):
+                    arrays[start:end] = arrays[start:end][order]
+                for values, chunk in zip(
+                    tree_arrays, (centers, radii, first + start, count, escape + n_tree_nodes, is_leaf)
+                ):
+                    values.append(chunk)
+                n_tree_nodes += len(radii)
+            links_tree_end[link.idx] = n_tree_nodes
         self._n_samples = n_samples
         self.n_samples_ = max(1, n_samples)
+        self.n_tree_nodes_ = max(1, n_tree_nodes)
         self._max_samples_per_link = int(max(1, (links_sample_end - links_sample_start).max(initial=0)))
 
         n_collider_geoms = int((geoms_collider_type != COLLIDER_TYPE.NONE).sum())
@@ -646,6 +670,19 @@ class MochiSolver(KinematicSolver):
             self.mochi_info,
             self.rigid_config,
         )
+        if self.n_links > 0:
+            self.mochi_info.links.tree_start.from_numpy(links_tree_start)
+            self.mochi_info.links.tree_end.from_numpy(links_tree_end)
+        if n_tree_nodes > 0:
+            tree_center, tree_radius, tree_first, tree_count, tree_escape, tree_is_leaf = (
+                np.concatenate(values) for values in tree_arrays
+            )
+            self.mochi_info.samples.tree_center.from_numpy(tree_center)
+            self.mochi_info.samples.tree_radius.from_numpy(tree_radius)
+            self.mochi_info.samples.tree_first.from_numpy(tree_first)
+            self.mochi_info.samples.tree_count.from_numpy(tree_count)
+            self.mochi_info.samples.tree_escape.from_numpy(tree_escape)
+            self.mochi_info.samples.tree_is_leaf.from_numpy(tree_is_leaf)
 
     def _init_soft(self):
         """Rest data, contact samples and material parameters of the deformable bodies."""
@@ -787,10 +824,14 @@ class MochiSolver(KinematicSolver):
 
         # Deformable colliders: every rigid and deformable sample point is located in the deformed tetrahedra through
         # a bounding-volume hierarchy rebuilt at every assembly.
-        self._has_soft_colliders = any(
+        # A deformable collider only matters when something can query it: rigid samples, another deformable entity, or
+        # its own samples under self-contact.
+        has_self_contact = any((e.is_shell or e.is_rod) and e.material.self_contact for e in entities)
+        has_queries = self.n_samples > 0 or len(entities) > 1
+        self._has_soft_colliders = has_queries and any(
             grid["collider_type"] == COLLIDER_TYPE.GRID for grid in (sdf_grids if self.has_soft else ())
         )
-        self._has_pc_colliders = any(
+        self._has_pc_colliders = (has_queries or has_self_contact) and any(
             grid["collider_type"] == COLLIDER_TYPE.POINT_CLOUD for grid in (sdf_grids if self.has_soft else ())
         )
         self._n_soft_queries = self.n_samples + n_samples
@@ -827,10 +868,36 @@ class MochiSolver(KinematicSolver):
                 max_n_query_result_per_aabb=n_results_per_tet,
             )
 
+        band = self._rod_band_layout()
+        self.n_band_rows_ = max(1, len(band["rows_dof"]))
+        csr = self._soft_csr_layout(
+            elems_v, shell_elems_v, shell_elems_hinge, rod_elems_v, rod_stencils_v, rod_stencils_e
+        )
+        self.n_soft_dofs_ = max(1, len(csr["start"]) - 1)
+        self.n_csr_ = max(1, len(csr["col"]))
         self.soft_info = get_mochi_soft_info(self)
         self.soft_state = get_mochi_soft_state(
             self, self._max_soft_pairs, self._max_soft_hits, self._max_sc_hits, self._max_pc_hits
         )
+        self.soft_info.dofs_band_row.from_numpy(band["dofs_row"])
+        if len(csr["col"]) > 0:
+            self.soft_info.csr_start.from_numpy(csr["start"])
+            self.soft_info.csr_col.from_numpy(csr["col"])
+            for name in ("elems", "shell", "rod_elems", "rod_stencils"):
+                if len(csr[name]) > 0:
+                    getattr(self.soft_info, f"{name}_csr").from_numpy(csr[name])
+        if len(band["rows_dof"]) > 0:
+            self.soft_info.band_rows_dof.from_numpy(band["rows_dof"])
+        if self.n_soft_entities > 0:
+            for name in (
+                "band_start",
+                "band_n",
+                "rod_elem_start",
+                "rod_elem_end",
+                "rod_stencil_start",
+                "rod_stencil_end",
+            ):
+                getattr(self.soft_info, f"entities_{name}").from_numpy(band[name])
         kernel_init_soft_fields(
             verts_rest,
             verts_entity_idx,
@@ -935,6 +1002,91 @@ class MochiSolver(KinematicSolver):
         bary = np.tile(np.stack([1.0 - points, points, np.zeros(3)], axis=-1), (len(elems), 1))
         sample_weights = (weights[None, :] * lengths[:, None]).reshape((-1,))
         return tri.astype(gs.np_int), bary.astype(gs.np_float), sample_weights.astype(gs.np_float)
+
+    def _soft_csr_layout(self, elems_v, shell_elems_v, shell_elems_hinge, rod_elems_v, rod_stencils_v, rod_stencils_e):
+        """Scalar CSR sparsity of the deformable Hessian (local dofs: 3 i_v + k for the vertices, then one twist dof
+        per rod segment) and, for every element kind, the CSR index of each entry of the element block."""
+        n_dofs = 3 * self.n_soft_verts + self.n_rod_elems
+
+        def vertex_dofs(verts):
+            return (3 * verts[..., None] + np.arange(3)).reshape(len(verts), 3 * verts.shape[1])
+
+        def element_dofs():
+            yield "elems", vertex_dofs(elems_v.astype(np.int64))
+            nodes = np.concatenate([shell_elems_v, shell_elems_hinge], axis=1).astype(np.int64)
+            dofs = vertex_dofs(nodes)
+            dofs[np.repeat(nodes < 0, 3, axis=1)] = -1
+            yield "shell", dofs
+            yield "rod_elems", vertex_dofs(rod_elems_v.astype(np.int64))
+            v, e = rod_stencils_v.astype(np.int64), rod_stencils_e.astype(np.int64)
+            dofs = np.empty((len(v), 11), dtype=np.int64)
+            for a in range(3):
+                dofs[:, 4 * a : 4 * a + 3] = 3 * v[:, a : a + 1] + np.arange(3)
+            dofs[:, 3] = 3 * self.n_soft_verts + e[:, 0]
+            dofs[:, 7] = 3 * self.n_soft_verts + e[:, 1]
+            yield "rod_stencils", dofs
+
+        keys = [np.arange(n_dofs, dtype=np.int64) * (n_dofs + 1)]
+        blocks = {}
+        for name, dofs in element_dofs():
+            rows = np.repeat(dofs[:, :, None], dofs.shape[1], axis=2)
+            cols = np.repeat(dofs[:, None, :], dofs.shape[1], axis=1)
+            valid = (rows >= 0) & (cols >= 0)
+            block_keys = np.where(valid, rows * n_dofs + cols, -1)
+            blocks[name] = (block_keys, valid)
+            keys.append(block_keys[valid])
+        unique_keys = np.unique(np.concatenate(keys))
+        csr = {
+            "start": np.searchsorted(unique_keys // n_dofs, np.arange(n_dofs + 1)).astype(gs.np_int),
+            "col": (unique_keys % n_dofs).astype(gs.np_int),
+        }
+        for name, (block_keys, valid) in blocks.items():
+            index = np.searchsorted(unique_keys, np.where(valid, block_keys, 0))
+            n_block = block_keys.shape[1] * block_keys.shape[2]
+            csr[name] = np.where(valid, index, -1).reshape(len(block_keys), n_block).astype(gs.np_int)
+        return csr
+
+    def _rod_band_layout(self):
+        """Node-interleaved ordering [x_0, theta_0, x_1, theta_1, ..., x_(n-1)] of every open rod's degrees of freedom
+        (band rows), the inverse map for all degrees of freedom, and the rod element / stencil ranges per entity."""
+        n_entities = self.n_soft_entities
+        dofs_row = np.full(self.n_dofs_total_, -1, dtype=gs.np_int)
+        rows_dof = []
+        band = {
+            name: np.zeros(max(1, n_entities), dtype=gs.np_int)
+            for name in (
+                "band_start",
+                "band_n",
+                "rod_elem_start",
+                "rod_elem_end",
+                "rod_stencil_start",
+                "rod_stencil_end",
+            )
+        }
+        elem_offset, stencil_offset = 0, 0
+        for entity in self._soft_entities:
+            if not entity.is_rod:
+                continue
+            i_e = entity.idx_in_solver
+            n_nodes, n_elems = entity.n_vertices, entity.n_elements
+            n_stencils = n_nodes if entity.morph.is_closed_loop else n_nodes - 2
+            band["rod_elem_start"][i_e], band["rod_elem_end"][i_e] = elem_offset, elem_offset + n_elems
+            band["rod_stencil_start"][i_e], band["rod_stencil_end"][i_e] = stencil_offset, stencil_offset + n_stencils
+            if not entity.morph.is_closed_loop:
+                band["band_start"][i_e] = len(rows_dof)
+                for i_n in range(n_nodes):
+                    for k in range(3):
+                        rows_dof.append(self.n_dofs + 3 * (entity.v_start + i_n) + k)
+                    if i_n < n_elems:
+                        rows_dof.append(self.n_dofs + 3 * self.n_soft_verts + elem_offset + i_n)
+                band["band_n"][i_e] = len(rows_dof) - band["band_start"][i_e]
+            elem_offset += n_elems
+            stencil_offset += n_stencils
+        rows_dof = np.array(rows_dof, dtype=gs.np_int)
+        dofs_row[rows_dof] = np.arange(len(rows_dof), dtype=gs.np_int)
+        band["rows_dof"] = rows_dof
+        band["dofs_row"] = dofs_row
+        return band
 
     @staticmethod
     def _rod_stencils(rods):
@@ -1111,14 +1263,26 @@ class MochiSolver(KinematicSolver):
     # ------------------------------------ stepping --------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def _forward_kinematics(self):
-        kernel_forward_kinematics(
-            self._scene._envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
-        )
-        kernel_update_geoms(
-            self._scene._envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, False
-        )
-        kernel_update_geom_aabbs(self.geoms_init_AABB, self.dyn_state, self.rigid_config)
+    def _forward_kinematics(self, with_velocity=True):
+        """Link and geom poses (and bounds) of the current joint coordinates; the joint-space velocities only when the
+        kinematic state is final (the Newton iterates never read them)."""
+        if with_velocity:
+            kernel_forward_kinematics(
+                self._scene._envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
+            )
+            kernel_update_geoms(
+                self._scene._envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, False
+            )
+            kernel_update_geom_aabbs(self.geoms_init_AABB, self.dyn_state, self.rigid_config)
+        else:
+            kernel_update_kinematics(
+                self._scene._envs_idx,
+                self.geoms_init_AABB,
+                self.dyn_state,
+                self.dyn_info,
+                self.rigid_info,
+                self.rigid_config,
+            )
 
     def _on_external_state_change(self, change, envs_idx):
         self._mark_external_state_dirty(self._scene._sanitize_envs_idx(envs_idx))
@@ -1147,10 +1311,62 @@ class MochiSolver(KinematicSolver):
             )
             self._external_state_dirty_mask[:] = False
 
+    def _resolve_step_kernel(self):
+        """Whether the step runs as one per-environment kernel (no host round trips) or as the multi-kernel
+        pipeline. The bounding-volume hierarchies of the deformable colliders are built by host-driven kernels, so
+        scenes that need them keep the pipeline; on the GPU one thread per environment only pays off for small
+        environments."""
+        needs_pipeline = self._has_soft_colliders or self._has_pc_colliders
+        step_kernel = self._options.step_kernel
+        if step_kernel == "monolith":
+            if needs_pipeline:
+                gs.raise_exception(
+                    "The monolith step kernel does not support deformable colliders (point-cloud or SDF)."
+                )
+            return True
+        if step_kernel == "pipeline":
+            return False
+        return not needs_pipeline and (gs.backend == gs.cpu or (self.n_dofs_total <= 64 and not self.has_soft))
+
     def substep_pre_coupling(self, f):
         if not self.is_active:
             return
         self._sync_external_state()
+        if self._use_monolith:
+            options = self._options
+            n_linesearch = (
+                0 if self.mochi_config.linesearch_type == LINESEARCH.NONE else options.n_linesearch_iterations
+            )
+            kernel_step_monolith(
+                self.dyn_state,
+                self.dyn_info,
+                self.rigid_info,
+                self.sdf._sdf_info,
+                self.geoms_init_AABB,
+                self.mochi_info,
+                self.mochi_state,
+                self.contact_state,
+                self.island_state,
+                self.eq_info,
+                self.eq_state,
+                self.soft_info,
+                self.soft_state,
+                self.rigid_config,
+                self.mochi_config,
+                self.n_shell_elems > 0,
+                self.n_rod_elems > 0,
+                max(1, n_linesearch),
+                self._dense_max_dofs,
+                len(self._entities),
+                options.n_newton_iterations,
+                self._n_pcg_iterations,
+                self._max_samples_per_soft_entity,
+                self._errno,
+            )
+            self._is_forward_pos_updated = True
+            self._is_forward_vel_updated = True
+            self._is_contacts_recorded = False
+            return
 
         kernel_step_start(
             self.dyn_state,
@@ -1171,7 +1387,7 @@ class MochiSolver(KinematicSolver):
                 kernel_rod_step_start(
                     self.mochi_state, self.soft_info, self.soft_state, self.rigid_config, self.mochi_config
                 )
-        self._forward_kinematics()
+        self._forward_kinematics(with_velocity=False)
         kernel_store_stage_start_poses(self.dyn_state, self.mochi_state, self.rigid_config)
         if self.mochi_config.has_equalities:
             kernel_equalities_stage_start(
@@ -1265,7 +1481,6 @@ class MochiSolver(KinematicSolver):
             self.contact_state,
             self.rigid_config,
             self.mochi_config,
-            self._max_samples_per_link,
             assem_dres,
             skip_ls_done,
             record,
@@ -1456,7 +1671,7 @@ class MochiSolver(KinematicSolver):
             kernel_project_links_residual(
                 self.dyn_state, self.dyn_info, self.mochi_info, self.mochi_state, self.rigid_config, skip_ls_done
             )
-            kernel_residual_norms(self.mochi_state, self.rigid_config, skip_ls_done)
+            kernel_residual_norms(self.mochi_state, self.island_state, self.rigid_config, skip_ls_done)
 
     def _select_linear_arms(self):
         """Decide, once per substep, which of the two linear arms have work to do. Islands are rebuilt at the start of
@@ -1541,12 +1756,14 @@ class MochiSolver(KinematicSolver):
                     self.mochi_info, self.mochi_state, self.soft_info, self.soft_state, self.rigid_config
                 )
         self._assemble(assem_res=True, assem_dres=True, skip_ls_done=False)
-        kernel_store_initial_norms(self.rigid_info, self.mochi_state, self.rigid_config)
+        kernel_store_initial_norms(self.rigid_info, self.mochi_state, self.island_state, self.rigid_config)
         if self.has_soft:
             kernel_soft_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, False)
             if self.n_rod_elems > 0:
                 kernel_rod_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, False)
-        kernel_convergence_check(self.mochi_info, self.mochi_state, self.rigid_config, False, self._errno)
+        kernel_convergence_check(
+            self.mochi_info, self.mochi_state, self.island_state, self.rigid_config, False, self._errno
+        )
 
         n_linesearch = options.n_linesearch_iterations
         if self.mochi_config.linesearch_type == LINESEARCH.NONE:
@@ -1554,7 +1771,9 @@ class MochiSolver(KinematicSolver):
         for i_iter in range(options.n_newton_iterations):
             if i_iter > 0:
                 self._assemble(assem_res=True, assem_dres=True, skip_ls_done=False)
-                kernel_convergence_check(self.mochi_info, self.mochi_state, self.rigid_config, False, self._errno)
+                kernel_convergence_check(
+                    self.mochi_info, self.mochi_state, self.island_state, self.rigid_config, False, self._errno
+                )
             if kernel_any_active(self.mochi_state, False) == 0:
                 break
             if self._has_pcg_envs:
@@ -1574,7 +1793,7 @@ class MochiSolver(KinematicSolver):
                     kernel_soft_apply_increment(self.mochi_state, self.soft_info, self.soft_state, self.rigid_config)
                     if self.n_rod_elems > 0:
                         kernel_rod_apply_increment(self.mochi_state, self.soft_info, self.soft_state, self.rigid_config)
-                self._forward_kinematics()
+                self._forward_kinematics(with_velocity=False)
                 self._assemble(assem_res=True, assem_dres=False, skip_ls_done=True)
                 kernel_linesearch_decide(
                     self.rigid_info,
@@ -1592,7 +1811,9 @@ class MochiSolver(KinematicSolver):
                 # state it writes unchanged; the readback is worth it because a trial costs a full assembly.
                 if i_ls + 1 < n_trials and kernel_any_active(self.mochi_state, True) == 0:
                     break
-            kernel_convergence_check(self.mochi_info, self.mochi_state, self.rigid_config, True, self._errno)
+            kernel_convergence_check(
+                self.mochi_info, self.mochi_state, self.island_state, self.rigid_config, True, self._errno
+            )
 
     def substep_post_coupling(self, f):
         pass

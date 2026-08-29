@@ -131,8 +131,10 @@ def func_joint_coupling(
     return c, deriv, i_d1, i_d2
 
 
-@qd.kernel
-def kernel_equalities_stage_start(
+@qd.func
+def func_equalities_stage_start(
+    i_b_env,
+    per_env: qd.template(),
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
     mochi_info: MochiInfo,
@@ -146,7 +148,8 @@ def kernel_equalities_stage_start(
     _B = mochi_state.is_active.shape[0]
     EPS = mochi_info.EPS[None]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_eq, i_b in qd.ndrange(n_eq, _B):
+    for i_eq, i_b_ in qd.ndrange(n_eq, _B) if qd.static(not per_env) else qd.ndrange(n_eq, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         c = qd.Vector.zero(gs.qd_float, 6)
         eq_type = eq_info.eq_type[i_eq]
         if eq_type == gs.EQUALITY_TYPE.JOINT:
@@ -169,7 +172,24 @@ def kernel_equalities_stage_start(
 
 
 @qd.kernel
-def kernel_assemble_equalities(
+def kernel_equalities_stage_start(
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    eq_info: MochiEqualitiesInfo,
+    eq_state: MochiEqualitiesState,
+    rigid_config: qd.template(),
+):
+    func_equalities_stage_start(
+        0, False, dyn_info, rigid_info, mochi_info, mochi_state, eq_info, eq_state, rigid_config
+    )
+
+
+@qd.func
+def func_assemble_equalities(
+    i_b_env,
+    per_env: qd.template(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
@@ -180,8 +200,8 @@ def kernel_assemble_equalities(
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres,
+    skip_ls_done,
 ):
     """Penalty of every equality constraint: residual on the links (connect, weld: through the point Jacobians
     J = [I, -[rho]x] of the anchors and the identity on the rotation error) or on the joint coordinates (joint
@@ -193,7 +213,8 @@ def kernel_assemble_equalities(
     d = mochi_info.equality_damping[None]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_eq, i_b in qd.ndrange(n_eq, _B):
+    for i_eq, i_b_ in qd.ndrange(n_eq, _B) if qd.static(not per_env) else qd.ndrange(n_eq, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
         h = mochi_state.dt_stage[i_b]
@@ -214,7 +235,7 @@ def kernel_assemble_equalities(
                 qd.atomic_add(mochi_state.res[i_d1, i_b], g)
                 if i_d2 >= 0:
                     qd.atomic_add(mochi_state.res[i_d2, i_b], g * deriv)
-            if qd.static(assem_dres):
+            if assem_dres:
                 qd.atomic_add(mochi_state.dofs_H_diag[i_d1, i_b], K)
                 eq_state.joint_h12[i_eq, i_b] = 0.0
                 if i_d2 >= 0:
@@ -253,7 +274,7 @@ def kernel_assemble_equalities(
                 for kk in qd.static(range(3)):
                     qd.atomic_add(mochi_state.links_res[i_lb, i_b][kk], -g_t[kk])
                     qd.atomic_add(mochi_state.links_res[i_lb, i_b][3 + kk], -torque_b[kk])
-        if qd.static(assem_dres):
+        if assem_dres:
             S_a = skew(rho_a)
             S_b = skew(rho_b)
             I3 = qd.Matrix.identity(gs.qd_float, 3)
@@ -281,3 +302,36 @@ def kernel_assemble_equalities(
                     H_off[3 + kk, ll] = -K * S_a[kk, ll]
                     H_off[3 + kk, 3 + ll] = K * SaSb[kk, ll] - K_r * I3[kk, ll]
             eq_state.H_off[i_eq, i_b] = H_off
+
+
+@qd.kernel
+def kernel_assemble_equalities(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    eq_info: MochiEqualitiesInfo,
+    eq_state: MochiEqualitiesState,
+    rigid_config: qd.template(),
+    assem_obj: qd.template(),
+    assem_res: qd.template(),
+    assem_dres: qd.template(),
+    skip_ls_done: qd.template(),
+):
+    func_assemble_equalities(
+        0,
+        False,
+        dyn_state,
+        dyn_info,
+        rigid_info,
+        mochi_info,
+        mochi_state,
+        eq_info,
+        eq_state,
+        rigid_config,
+        assem_obj,
+        assem_res,
+        assem_dres,
+        skip_ls_done,
+    )

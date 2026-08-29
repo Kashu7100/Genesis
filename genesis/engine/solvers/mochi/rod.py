@@ -95,7 +95,7 @@ def func_rod_axial_strain(x0, x1, L):
 
 
 @qd.func
-def func_rod_axial(x0, x1, L, EA, f, strain_ss, eps, assem_dres: qd.template()):
+def func_rod_axial(x0, x1, L, EA, f, strain_ss, eps, assem_dres):
     """Stretching of a segment of reference length L: energy, force on the two nodes as the residual pair
     (res on node 0 = -g, on node 1 = +g) and the symmetric 3x3 tangent T (node blocks +T, -T; -T, +T). f is the
     stiffness damping factor beta / h and strain_ss the stage-start strain."""
@@ -107,7 +107,7 @@ def func_rod_axial(x0, x1, L, EA, f, strain_ss, eps, assem_dres: qd.template()):
     energy = 0.5 * stress * strain_eff * L
     g = stress * q
     T = qd.Matrix.zero(gs.qd_float, 3, 3)
-    if qd.static(assem_dres):
+    if assem_dres:
         geometric = stress / L
         geometric = max(geometric, eps)
         T = (EA_eff / L) * q.outer_product(q) + geometric * qd.Matrix.identity(gs.qd_float, 3)
@@ -157,7 +157,7 @@ def func_rod_bend_twist(
     GJ,
     f,
     tiny,
-    assem_dres: qd.template(),
+    assem_dres,
 ):
     """Bending and twisting energy at the central node, the residual over the 11 stencil coordinates
     [x0, theta0, x1, theta1, x2] and its Gauss-Newton tangent. f is the stiffness damping factor beta / h; the *_ss are
@@ -280,6 +280,6 @@ def func_rod_bend_twist(
     w_t = GJ_eff / L
     res = (w_a * ka_eff) * Dka + (w_b * kb_eff) * Dkb + (w_t * tw_eff) * Dtw
     K = qd.Matrix.zero(gs.qd_float, 11, 11)
-    if qd.static(assem_dres):
+    if assem_dres:
         K = w_a * Dka.outer_product(Dka) + w_b * Dkb.outer_product(Dkb) + w_t * Dtw.outer_product(Dtw)
     return energy, res, K, ka, kb, tw

@@ -16,6 +16,10 @@ from genesis.utils.sdf import (
 
 from .data import COLLIDER_TYPE, MochiGeomsInfo
 
+# Bound of the gradient norm of a trilinear interpolant of a signed distance field: each partial derivative is an
+# interpolant of unit-bounded finite differences, so the gradient norm is at most sqrt(3).
+GRID_LIPSCHITZ = 1.7320508075688772
+
 
 @qd.func
 def query_collider(
@@ -80,3 +84,35 @@ def query_collider(
             is_valid = False
 
     return is_valid, sd, grad
+
+
+@qd.func
+def query_collider_lower_bound(
+    i_g,
+    center_geom,
+    radius,
+    geoms_info: array_class.GeomsInfo,
+    mochi_geoms_info: MochiGeomsInfo,
+    sdf_info: array_class.SDFInfo,
+    mochi_config: qd.template(),
+):
+    """Lower bound of the signed distance to the collider over a sphere (geom frame), used to prune whole nodes of a
+    sample hierarchy at once: the analytic colliders are exact distance fields (1-Lipschitz), the grid field is the
+    trilinear interpolant of one. A sphere entirely outside a grid holds no contact (nothing is evaluated outside the
+    grid, whose padding exceeds the penalty band); a sphere straddling the grid boundary is kept."""
+    lower = -gs.qd_float(1e30)
+    if mochi_geoms_info.collider_type[i_g] == COLLIDER_TYPE.GRID:
+        if qd.static(mochi_config.has_grid_colliders):
+            pos_sdf = gu.qd_transform_by_T(center_geom, sdf_info.geoms_info.T_mesh_to_sdf[i_g])
+            res = sdf_info.geoms_info.sdf_res[i_g]
+            radius_sdf = radius / sdf_info.geoms_info.sdf_cell_size[i_g]
+            if (pos_sdf + radius_sdf <= 0).any() or (pos_sdf - radius_sdf >= res - 1).any():
+                lower = gs.qd_float(1e30)
+            elif not sdf_func_is_outside_sdf_grid(i_g, pos_sdf, sdf_info):
+                lower = sdf_func_true_sdf(i_g, pos_sdf, sdf_info) - GRID_LIPSCHITZ * radius
+        else:
+            lower = gs.qd_float(1e30)
+    else:
+        _is_valid, sd, _grad = query_collider(i_g, center_geom, geoms_info, mochi_geoms_info, sdf_info, mochi_config)
+        lower = sd - radius
+    return lower

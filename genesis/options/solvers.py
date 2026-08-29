@@ -74,8 +74,6 @@ class BaseCouplerOptions(Options):
     Base class for all coupler options.
     """
 
-    pass
-
 
 class LegacyCouplerOptions(BaseCouplerOptions):
     """
@@ -987,14 +985,19 @@ class MochiOptions(Options):
     pcg_rel_tol : float, optional
         Relative tolerance of the conjugate gradient solve. Ignored under the "adaptive" tolerance strategy.
         Defaults to 1e-5.
+    pcg_abs_tol : float, optional
+        Absolute floor of the conjugate gradient stopping test, on the norm of the preconditioned residual (the
+        residual scaled by the inverse of the Hessian diagonal, i.e. a displacement). A solve stops as soon as that
+        norm drops below the floor, whatever the relative tolerance asks for; mochi's default. Set to 0 to disable.
+        Defaults to 1e-9.
     linear_tolerance_strategy : str, optional
         How tightly each Newton step solves its linear system: "constant" always solves to `pcg_rel_tol`, so the
         accuracy of a substep is set by `pcg_rel_tol` and `n_newton_iterations` alone; "adaptive" starts each substep
         at a loose tolerance and tightens it as the nonlinear residual drops, spending far fewer conjugate gradient
         iterations per Newton step but leaving more truncation error in the step it takes, which can cost an extra
-        Newton iteration on scenes that would otherwise converge in one. Prefer "adaptive" when the conjugate
-        gradient dominates the substep and a relative accuracy of order 1e-5 is enough, "constant" when accuracy per
-        substep matters more than the cost of reaching it. Defaults to "constant".
+        Newton iteration on scenes that would otherwise converge in one. Prefer "adaptive" (mochi's default policy)
+        when the conjugate gradient dominates the substep and a relative accuracy of order 1e-5 is enough, "constant"
+        when accuracy per substep matters more than the cost of reaching it. Defaults to "adaptive".
     friction_model : str, optional
         Regularization of the Coulomb friction force around zero sliding velocity: "c1" has compact support (exact
         Coulomb beyond `friction_falloff_vel`), "cinf" is smooth everywhere (never exactly Coulomb, better
@@ -1032,6 +1035,12 @@ class MochiOptions(Options):
         Absolute padding of the per-step conservative bounding boxes in meters. Defaults to 0.01.
     record_contacts : bool, optional
         Whether individual contact points are stored for readback through `entity.get_contacts()`. Defaults to True.
+    step_kernel : str, optional
+        How a step is executed: "monolith" runs the whole step of every environment in one kernel (environments in
+        parallel, one launch per step, no host round trips), "pipeline" runs each stage as its own kernel with the host
+        driving the Newton and conjugate gradient loops (parallel over items, needed by the deformable colliders),
+        "auto" picks the monolith whenever the scene has no deformable collider, on the CPU always and on the GPU for
+        rigid scenes of at most 64 degrees of freedom. Defaults to "auto".
     joint_limit_stiffness : float, optional
         Stiffness in N/m (N*m/rad) of the penalty holding revolute and prismatic joints inside their range. Joint
         limits are soft: the violation at rest is the limit torque divided by this stiffness. Higher values reduce the
@@ -1065,7 +1074,8 @@ class MochiOptions(Options):
     dense_matrix_max_dofs: PositiveInt = 256
     n_pcg_iterations: PositiveInt | None = None
     pcg_rel_tol: PositiveFloat = 1e-5
-    linear_tolerance_strategy: Literal["constant", "adaptive"] = "constant"
+    pcg_abs_tol: NonNegativeFloat = 1e-9
+    linear_tolerance_strategy: Literal["constant", "adaptive"] = "adaptive"
     friction_model: Literal["c1", "cinf"] = "c1"
     use_fitted_friction_hessian: StrictBool = True
     friction_with_collider_normal: StrictBool = True
@@ -1078,6 +1088,7 @@ class MochiOptions(Options):
     max_contact_pairs_per_env: PositiveInt | None = None
     broadphase_margin: NonNegativeFloat = 0.01
     record_contacts: StrictBool = True
+    step_kernel: Literal["auto", "monolith", "pipeline"] = "auto"
     joint_limit_stiffness: PositiveFloat = 1e4
     joint_limit_damping: NonNegativeFloat = 0.0
     batch_links_info: StrictBool = False

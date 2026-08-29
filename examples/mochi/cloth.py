@@ -103,7 +103,8 @@ def main():
         if args.record:
             cam.render()
 
-    cam.stop_recording()
+    if args.record:
+        cam.stop_recording()
 
 
 if __name__ == "__main__":

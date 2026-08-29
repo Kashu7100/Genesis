@@ -303,7 +303,7 @@ def func_shell_elastic(
     s_ss,
     eps,
     project: qd.template(),
-    assem_dres: qd.template(),
+    assem_dres,
 ):
     """Membrane and bending energy of a stencil, the residual on its 18 coordinates and the 18x18 tangent (membrane:
     material term plus the metric-projected geometric term; bending: material term only)."""
@@ -338,7 +338,7 @@ def func_shell_elastic(
         Ga[6 + i, 2] = 2.0 * e1[i]
     for p in qd.static(range(9)):
         res[p] += area * func_colon(func_sym2(Ga[p, 0], Ga[p, 1], Ga[p, 2]), dpsi_da)
-    if qd.static(assem_dres):
+    if assem_dres:
         S_proj = dpsi_da
         if qd.static(project):
             S_proj = func_project_psd_metric(dpsi_da, A_inv, eps)
@@ -363,7 +363,7 @@ def func_shell_elastic(
     Gb = func_fold_missing(func_shell_bending_gradients(v, n, n_hat, n_avg, eps), is_missing)
     for p in qd.static(range(18)):
         res[p] += area * func_colon(func_sym2(Gb[p, 0], Gb[p, 1], Gb[p, 2]), dpsi_db)
-    if qd.static(assem_dres):
+    if assem_dres:
         for p in qd.static(range(18)):
             Gp = func_sym2(Gb[p, 0], Gb[p, 1], Gb[p, 2])
             for q in qd.static(range(p, 18)):

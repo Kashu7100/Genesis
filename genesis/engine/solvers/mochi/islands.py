@@ -13,52 +13,17 @@ import genesis as gs
 from genesis.utils import array_class
 from genesis.utils.array_class import V
 
-from .data import COLLIDER_TYPE, MochiContactState, MochiInfo, MochiSoftInfo, MochiSoftState, MochiState
+from .data import (
+    COLLIDER_TYPE,
+    MochiContactState,
+    MochiInfo,
+    MochiIslandState,
+    MochiSoftInfo,
+    MochiSoftState,
+    MochiState,
+    get_mochi_island_state,
+)
 from .equalities import MochiEqualitiesInfo
-
-
-@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
-class MochiIslandState:
-    # Island nodes are the rigid entities (all links of an articulation move together) followed by the deformable
-    # entities. Build-time maps from links and degrees of freedom to nodes (-1 for links without dofs).
-    links_node: qd.Tensor
-    dofs_node: qd.Tensor
-    # Per-environment union-find forest over the nodes, compact island index of every node and island count.
-    nodes_parent: qd.Tensor
-    nodes_island: qd.Tensor
-    n_islands: qd.Tensor
-    # Degrees of freedom grouped by island: dofs of island k are island_dofs[island_start[k]:island_start[k + 1]].
-    island_start: qd.Tensor
-    island_n_dofs: qd.Tensor
-    island_dofs: qd.Tensor
-    dofs_island: qd.Tensor
-    island_max_dofs: qd.Tensor
-    # Whether the environment is solved by the island-wise direct solver (largest island within the dense limit).
-    uses_dense: qd.Tensor
-
-
-def get_mochi_island_state(solver, links_node, dofs_node):
-    _B = solver._B
-    n_nodes_ = max(1, len(solver._entities) + len(solver._soft_entities))
-    n_dofs_ = solver.n_dofs_total_
-    state = MochiIslandState(
-        links_node=V(dtype=gs.qd_int, shape=(solver.n_links_,)),
-        dofs_node=V(dtype=gs.qd_int, shape=(n_dofs_,)),
-        nodes_parent=V(dtype=gs.qd_int, shape=(n_nodes_, _B)),
-        nodes_island=V(dtype=gs.qd_int, shape=(n_nodes_, _B)),
-        n_islands=V(dtype=gs.qd_int, shape=(_B,)),
-        island_start=V(dtype=gs.qd_int, shape=(n_nodes_ + 1, _B)),
-        island_n_dofs=V(dtype=gs.qd_int, shape=(n_nodes_, _B)),
-        island_dofs=V(dtype=gs.qd_int, shape=(n_dofs_, _B)),
-        dofs_island=V(dtype=gs.qd_int, shape=(n_dofs_, _B)),
-        island_max_dofs=V(dtype=gs.qd_int, shape=(_B,)),
-        uses_dense=V(dtype=gs.qd_bool, shape=(_B,)),
-    )
-    if len(links_node) > 0:
-        state.links_node.from_numpy(np.asarray(links_node, dtype=gs.np_int))
-    if len(dofs_node) > 0:
-        state.dofs_node.from_numpy(np.asarray(dofs_node, dtype=gs.np_int))
-    return state
 
 
 @qd.func
@@ -88,8 +53,10 @@ def func_aabbs_overlap(min_a, max_a, min_b, max_b):
     return not ((max_a < min_b).any() or (min_a > max_b).any())
 
 
-@qd.kernel
-def kernel_build_islands(
+@qd.func
+def func_build_islands(
+    i_b_env,
+    per_env: qd.template(),
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
     mochi_state: MochiState,
@@ -116,11 +83,12 @@ def kernel_build_islands(
     max_pairs = contact_state.pair_link_a.shape[0]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_n, i_b in qd.ndrange(n_nodes, _B):
+    for i_n, i_b_ in qd.ndrange(n_nodes, _B) if qd.static(not per_env) else qd.ndrange(n_nodes, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         island_state.nodes_parent[i_n, i_b] = i_n
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
+    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         if not mochi_state.is_active[i_b]:
             continue
         for i_p in range(qd.min(contact_state.n_pairs[i_b], max_pairs)):
@@ -218,7 +186,46 @@ def kernel_build_islands(
 
 
 @qd.kernel
-def kernel_cholesky_solve_islands(
+def kernel_build_islands(
+    dyn_info: array_class.DynInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    island_state: MochiIslandState,
+    eq_info: MochiEqualitiesInfo,
+    dense_max_dofs: int,
+    n_rigid_entities: int,
+    rigid_config: qd.template(),
+    has_soft: qd.template(),
+    has_dense: qd.template(),
+    has_equalities: qd.template(),
+):
+    func_build_islands(
+        0,
+        False,
+        dyn_info,
+        mochi_info,
+        mochi_state,
+        contact_state,
+        soft_info,
+        soft_state,
+        island_state,
+        eq_info,
+        dense_max_dofs,
+        n_rigid_entities,
+        rigid_config,
+        has_soft,
+        has_dense,
+        has_equalities,
+    )
+
+
+@qd.func
+def func_cholesky_solve_islands(
+    i_b_env,
+    per_env: qd.template(),
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     island_state: MochiIslandState,
@@ -232,7 +239,8 @@ def kernel_cholesky_solve_islands(
     EPS = mochi_info.EPS[None]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_isl, i_b in qd.ndrange(n_nodes, _B):
+    for i_isl, i_b_ in qd.ndrange(n_nodes, _B) if qd.static(not per_env) else qd.ndrange(n_nodes, 1):
+        i_b = i_b_ if qd.static(not per_env) else i_b_env
         if not mochi_state.is_active[i_b] or not island_state.uses_dense[i_b]:
             continue
         if i_isl >= island_state.n_islands[i_b]:
@@ -272,3 +280,13 @@ def kernel_cholesky_solve_islands(
                 k_d = island_state.island_dofs[s0 + k_, i_b]
                 s = s - mochi_state.H_dense[i_b, k_d, i_d] * mochi_state.dx[k_d, i_b]
             mochi_state.dx[i_d, i_b] = s / mochi_state.H_dense[i_b, i_d, i_d]
+
+
+@qd.kernel
+def kernel_cholesky_solve_islands(
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    island_state: MochiIslandState,
+    rigid_config: qd.template(),
+):
+    func_cholesky_solve_islands(0, False, mochi_info, mochi_state, island_state, rigid_config)

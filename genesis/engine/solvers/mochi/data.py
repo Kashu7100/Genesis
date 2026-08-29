@@ -54,6 +54,9 @@ class SOLVE_STATUS(IntEnum):
 
 # Number of previous steps kept for multistep integration (BDF2 needs two).
 N_HISTORY = 2
+# Half bandwidth of a rod's Hessian in the node-interleaved ordering [x_0, theta_0, x_1, theta_1, ...]: a bending
+# stencil couples three consecutive nodes and the two segments between them, i.e. rows at most 10 apart.
+ROD_BAND = 10
 
 
 @qd.data_oriented
@@ -100,6 +103,9 @@ class MochiLinksInfo:
     sample_end: qd.Tensor
     samples_aabb_min: qd.Tensor
     samples_aabb_max: qd.Tensor
+    # Node range of the link's contact-sample hierarchy (depth-first order, see sample_tree.py).
+    tree_start: qd.Tensor
+    tree_end: qd.Tensor
 
 
 def get_mochi_links_info(solver):
@@ -113,6 +119,8 @@ def get_mochi_links_info(solver):
         damping=V(dtype=gs.qd_float, shape=(n_links_,)),
         layer=V(dtype=gs.qd_int, shape=(n_links_,)),
         sample_start=V(dtype=gs.qd_int, shape=(n_links_,)),
+        tree_start=V(dtype=gs.qd_int, shape=(n_links_,)),
+        tree_end=V(dtype=gs.qd_int, shape=(n_links_,)),
         sample_end=V(dtype=gs.qd_int, shape=(n_links_,)),
         samples_aabb_min=V(dtype=gs.qd_vec3, shape=(n_links_,)),
         samples_aabb_max=V(dtype=gs.qd_vec3, shape=(n_links_,)),
@@ -156,16 +164,32 @@ class MochiSamplesInfo:
     weight: qd.Tensor
     link_idx: qd.Tensor
     geom_idx: qd.Tensor
+    # Bounding-sphere hierarchy of every link's samples (link frame), nodes in depth-first order: center and radius,
+    # the contiguous sample range a node bounds, the depth-first index of the next node outside its subtree, and
+    # whether it is a leaf (see sample_tree.py).
+    tree_center: qd.Tensor
+    tree_radius: qd.Tensor
+    tree_first: qd.Tensor
+    tree_count: qd.Tensor
+    tree_escape: qd.Tensor
+    tree_is_leaf: qd.Tensor
 
 
 def get_mochi_samples_info(solver):
     n_samples_ = solver.n_samples_
+    n_nodes_ = solver.n_tree_nodes_
     return MochiSamplesInfo(
         pos=V(dtype=gs.qd_vec3, shape=(n_samples_,)),
         normal=V(dtype=gs.qd_vec3, shape=(n_samples_,)),
         weight=V(dtype=gs.qd_float, shape=(n_samples_,)),
         link_idx=V(dtype=gs.qd_int, shape=(n_samples_,)),
         geom_idx=V(dtype=gs.qd_int, shape=(n_samples_,)),
+        tree_center=V(dtype=gs.qd_vec3, shape=(n_nodes_,)),
+        tree_radius=V(dtype=gs.qd_float, shape=(n_nodes_,)),
+        tree_first=V(dtype=gs.qd_int, shape=(n_nodes_,)),
+        tree_count=V(dtype=gs.qd_int, shape=(n_nodes_,)),
+        tree_escape=V(dtype=gs.qd_int, shape=(n_nodes_,)),
+        tree_is_leaf=V(dtype=gs.qd_int, shape=(n_nodes_,)),
     )
 
 
@@ -193,6 +217,7 @@ class MochiInfo:
     linesearch_alpha: qd.Tensor
     linesearch_wolfe1: qd.Tensor
     pcg_rel_tol: qd.Tensor
+    pcg_abs_tol: qd.Tensor
     n_newton_iterations: qd.Tensor
     EPS: qd.Tensor
 
@@ -219,6 +244,7 @@ def get_mochi_info(solver):
         linesearch_alpha=_scalar(gs.qd_float, options.linesearch_alpha),
         linesearch_wolfe1=_scalar(gs.qd_float, options.linesearch_wolfe1),
         pcg_rel_tol=_scalar(gs.qd_float, options.pcg_rel_tol),
+        pcg_abs_tol=_scalar(gs.qd_float, options.pcg_abs_tol),
         n_newton_iterations=_scalar(gs.qd_int, options.n_newton_iterations),
         EPS=_scalar(gs.qd_float, gs.EPS),
     )
@@ -228,6 +254,56 @@ def _scalar(dtype, value):
     data = V(dtype=dtype, shape=())
     data.fill(value)
     return data
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class MochiIslandState:
+    # Island nodes are the rigid entities (all links of an articulation move together) followed by the deformable
+    # entities. Build-time maps from links and degrees of freedom to nodes (-1 for links without dofs).
+    links_node: qd.Tensor
+    dofs_node: qd.Tensor
+    # Per-environment union-find forest over the nodes, compact island index of every node and island count.
+    nodes_parent: qd.Tensor
+    nodes_island: qd.Tensor
+    n_islands: qd.Tensor
+    # Degrees of freedom grouped by island: dofs of island k are island_dofs[island_start[k]:island_start[k + 1]].
+    island_start: qd.Tensor
+    island_n_dofs: qd.Tensor
+    island_dofs: qd.Tensor
+    dofs_island: qd.Tensor
+    island_max_dofs: qd.Tensor
+    # Whether the environment is solved by the island-wise direct solver (largest island within the dense limit).
+    uses_dense: qd.Tensor
+    # Weighted squared residual norm of every node (entity) at the current and the initial Newton iterate; an
+    # environment converges when every one of its entities does, as in mochi.
+    nodes_res_w_sq: qd.Tensor
+    nodes_res_norm0_w: qd.Tensor
+
+
+def get_mochi_island_state(solver, links_node, dofs_node):
+    _B = solver._B
+    n_nodes_ = max(1, len(solver._entities) + len(solver._soft_entities))
+    n_dofs_ = solver.n_dofs_total_
+    state = MochiIslandState(
+        links_node=V(dtype=gs.qd_int, shape=(solver.n_links_,)),
+        dofs_node=V(dtype=gs.qd_int, shape=(n_dofs_,)),
+        nodes_parent=V(dtype=gs.qd_int, shape=(n_nodes_, _B)),
+        nodes_island=V(dtype=gs.qd_int, shape=(n_nodes_, _B)),
+        n_islands=V(dtype=gs.qd_int, shape=(_B,)),
+        island_start=V(dtype=gs.qd_int, shape=(n_nodes_ + 1, _B)),
+        island_n_dofs=V(dtype=gs.qd_int, shape=(n_nodes_, _B)),
+        island_dofs=V(dtype=gs.qd_int, shape=(n_dofs_, _B)),
+        dofs_island=V(dtype=gs.qd_int, shape=(n_dofs_, _B)),
+        island_max_dofs=V(dtype=gs.qd_int, shape=(_B,)),
+        uses_dense=V(dtype=gs.qd_bool, shape=(_B,)),
+        nodes_res_w_sq=V(dtype=gs.qd_float, shape=(n_nodes_, _B)),
+        nodes_res_norm0_w=V(dtype=gs.qd_float, shape=(n_nodes_, _B)),
+    )
+    if len(links_node) > 0:
+        state.links_node.from_numpy(np.asarray(links_node, dtype=gs.np_int))
+    if len(dofs_node) > 0:
+        state.dofs_node.from_numpy(np.asarray(dofs_node, dtype=gs.np_int))
+    return state
 
 
 # =========================================== runtime state ===========================================
@@ -530,6 +606,26 @@ class MochiSoftInfo:
     # parallel-transport denominator. Resolved here rather than as a module constant because the value depends on the
     # precision selected at initialization.
     rod_tiny: qd.Tensor
+    # Banded ordering of the open rods for the exact per-rod preconditioner: band row of every degree of freedom (-1
+    # outside the rods), degree of freedom of every band row, and per deformable entity the row range plus the rod
+    # element and stencil ranges (all zero-length for anything but an open rod).
+    # Sparsity of the deformable Hessian over the deformable degrees of freedom (vertex dofs 3 i_v + k, then the rod
+    # twist dofs), as a scalar CSR: row starts, columns, and the CSR index of every entry of every element block so the
+    # assembly kernels scatter straight into the values (-1 for the entries of a missing shell hinge vertex).
+    csr_start: qd.Tensor
+    csr_col: qd.Tensor
+    elems_csr: qd.Tensor
+    shell_csr: qd.Tensor
+    rod_elems_csr: qd.Tensor
+    rod_stencils_csr: qd.Tensor
+    dofs_band_row: qd.Tensor
+    band_rows_dof: qd.Tensor
+    entities_band_start: qd.Tensor
+    entities_band_n: qd.Tensor
+    entities_rod_elem_start: qd.Tensor
+    entities_rod_elem_end: qd.Tensor
+    entities_rod_stencil_start: qd.Tensor
+    entities_rod_stencil_end: qd.Tensor
     # Boundary contact samples: triangle vertices, barycentric coordinates, rest area weight and owning entity.
     samples_tri: qd.Tensor
     samples_bary: qd.Tensor
@@ -620,6 +716,20 @@ def get_mochi_soft_info(solver):
         rod_stencils_L=V(dtype=gs.qd_float, shape=(n_rs_,)),
         rod_stencils_ref=V(dtype=gs.qd_vec3, shape=(n_rs_,)),
         rod_tiny=_scalar(gs.qd_float, float(np.finfo(gs.np_float).tiny)),
+        csr_start=V(dtype=gs.qd_int, shape=(solver.n_soft_dofs_ + 1,)),
+        csr_col=V(dtype=gs.qd_int, shape=(solver.n_csr_,)),
+        elems_csr=V(dtype=gs.qd_int, shape=(n_el_, 144)),
+        shell_csr=V(dtype=gs.qd_int, shape=(solver.n_shell_elems_, 324)),
+        rod_elems_csr=V(dtype=gs.qd_int, shape=(n_re_, 36)),
+        rod_stencils_csr=V(dtype=gs.qd_int, shape=(n_rs_, 121)),
+        dofs_band_row=V(dtype=gs.qd_int, shape=(solver.n_dofs_total_,)),
+        band_rows_dof=V(dtype=gs.qd_int, shape=(solver.n_band_rows_,)),
+        entities_band_start=V(dtype=gs.qd_int, shape=(n_se_,)),
+        entities_band_n=V(dtype=gs.qd_int, shape=(n_se_,)),
+        entities_rod_elem_start=V(dtype=gs.qd_int, shape=(n_se_,)),
+        entities_rod_elem_end=V(dtype=gs.qd_int, shape=(n_se_,)),
+        entities_rod_stencil_start=V(dtype=gs.qd_int, shape=(n_se_,)),
+        entities_rod_stencil_end=V(dtype=gs.qd_int, shape=(n_se_,)),
         samples_tri=V(dtype=gs.qd_ivec3, shape=(n_ss_,)),
         samples_bary=V(dtype=gs.qd_vec3, shape=(n_ss_,)),
         samples_weight=V(dtype=gs.qd_float, shape=(n_ss_,)),
@@ -689,12 +799,12 @@ class MochiSoftState:
     verts_contact_force: qd.Tensor
     # Stage-start deformation gradient (stiffness damping) and the 12x12 Hessian block of every tetrahedron.
     elems_F_stage_start: qd.Tensor
-    elems_H: qd.Tensor
+    # Values of the deformable Hessian CSR (see MochiSoftInfo.csr_start), assembled once per Newton iteration.
+    csr_values: qd.Tensor
     # Shell triangles: stage-start membrane and bending strains (stiffness damping) and the 18x18 Hessian block of
     # the six-vertex stencil.
     shell_elems_eps_stage_start: qd.Tensor
     shell_elems_s_stage_start: qd.Tensor
-    shell_elems_H: qd.Tensor
     # Rods: material axis of every segment (current, stage start, line search reference), twist angle of the step
     # (recentered to zero at every step start) with its finite-difference rate and history, stage-start axial strain
     # and stencil measures, and the Hessian blocks (3x3 axial per segment, 11x11 per stencil over
@@ -715,6 +825,9 @@ class MochiSoftState:
     rod_elems_twist_pcg: qd.Tensor
     rod_stencils_stage_start: qd.Tensor
     rod_stencils_H: qd.Tensor
+    # Lower Cholesky factor of every open rod's own Hessian block in band storage: rod_band[row, d] holds the entry
+    # (row, row - d) of the node-interleaved ordering.
+    rod_band: qd.Tensor
     # Conservative per-step world bounds of every entity.
     entities_step_aabb_min: qd.Tensor
     entities_step_aabb_max: qd.Tensor
@@ -733,6 +846,7 @@ class MochiSoftState:
     # Active contact samples of the current iterate: sample, collider link (-1 if static), lever arm about the collider
     # link origin, and the per-sample matrix D = -w df/dp, from which the vertex and coupling blocks are formed.
     n_soft_hits: qd.Tensor
+    n_soft_hits_max: qd.Tensor
     hit_sample: qd.Tensor
     hit_link_b: qd.Tensor
     hit_geom_b: qd.Tensor
@@ -746,6 +860,7 @@ class MochiSoftState:
     # the link origin, kind 1 = deformable sample), collider tetrahedron with the barycentric coordinates of the point,
     # per-sample matrix D = -w df/dp, force on the colliding side and readback data.
     n_sc_hits: qd.Tensor
+    n_sc_hits_max: qd.Tensor
     sc_hit_kind_a: qd.Tensor
     sc_hit_sample_a: qd.Tensor
     sc_hit_link_a: qd.Tensor
@@ -759,6 +874,7 @@ class MochiSoftState:
     sc_hit_distance: qd.Tensor
     # Active samples against the point-cloud colliders of the shells: colliding side as above, collider vertex.
     n_pc_hits: qd.Tensor
+    n_pc_hits_max: qd.Tensor
     pc_hit_kind_a: qd.Tensor
     pc_hit_sample_a: qd.Tensor
     pc_hit_link_a: qd.Tensor
@@ -790,10 +906,9 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         verts_H_diag=V(dtype=gs.qd_mat3, shape=(n_sv_, _B)),
         verts_contact_force=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
         elems_F_stage_start=V(dtype=gs.qd_mat3, shape=(n_el_, _B)),
-        elems_H=V_MAT(n=12, m=12, dtype=gs.qd_float, shape=(n_el_, _B)),
+        csr_values=V(dtype=gs.qd_float, shape=(solver.n_csr_, _B)),
         shell_elems_eps_stage_start=V_MAT(n=2, m=2, dtype=gs.qd_float, shape=(n_sh_, _B)),
         shell_elems_s_stage_start=V_MAT(n=2, m=2, dtype=gs.qd_float, shape=(n_sh_, _B)),
-        shell_elems_H=V_MAT(n=18, m=18, dtype=gs.qd_float, shape=(n_sh_, _B)),
         rod_elems_axis=V(dtype=gs.qd_vec3, shape=(n_re_, _B)),
         rod_elems_axis_stage_start=V(dtype=gs.qd_vec3, shape=(n_re_, _B)),
         rod_elems_axis_ls_ref=V(dtype=gs.qd_vec3, shape=(n_re_, _B)),
@@ -810,6 +925,7 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         rod_elems_twist_pcg=V(dtype=gs.qd_float, shape=(n_re_, _B)),
         rod_stencils_stage_start=V(dtype=gs.qd_vec3, shape=(n_rs_, _B)),
         rod_stencils_H=V_MAT(n=11, m=11, dtype=gs.qd_float, shape=(n_rs_, _B)),
+        rod_band=V(dtype=gs.qd_float, shape=(solver.n_band_rows_, ROD_BAND + 1, _B)),
         entities_step_aabb_min=V(dtype=gs.qd_vec3, shape=(n_se_, _B)),
         entities_step_aabb_max=V(dtype=gs.qd_vec3, shape=(n_se_, _B)),
         n_pairs=V(dtype=gs.qd_int, shape=(_B,)),
@@ -824,6 +940,7 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         acc_obj=V(dtype=gs.qd_float, shape=(max_soft_pairs, _B)),
         n_hits=V(dtype=gs.qd_int, shape=(max_soft_pairs, _B)),
         n_soft_hits=V(dtype=gs.qd_int, shape=(_B,)),
+        n_soft_hits_max=_scalar(gs.qd_int, 0),
         hit_sample=V(dtype=gs.qd_int, shape=(max_soft_hits, _B)),
         hit_link_b=V(dtype=gs.qd_int, shape=(max_soft_hits, _B)),
         hit_geom_b=V(dtype=gs.qd_int, shape=(max_soft_hits, _B)),
@@ -834,6 +951,7 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         hit_normal=V(dtype=gs.qd_vec3, shape=(max_soft_hits, _B)),
         hit_distance=V(dtype=gs.qd_float, shape=(max_soft_hits, _B)),
         n_sc_hits=V(dtype=gs.qd_int, shape=(_B,)),
+        n_sc_hits_max=_scalar(gs.qd_int, 0),
         sc_hit_kind_a=V(dtype=gs.qd_int, shape=(max_sc_hits, _B)),
         sc_hit_sample_a=V(dtype=gs.qd_int, shape=(max_sc_hits, _B)),
         sc_hit_link_a=V(dtype=gs.qd_int, shape=(max_sc_hits, _B)),
@@ -846,6 +964,7 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         sc_hit_normal=V(dtype=gs.qd_vec3, shape=(max_sc_hits, _B)),
         sc_hit_distance=V(dtype=gs.qd_float, shape=(max_sc_hits, _B)),
         n_pc_hits=V(dtype=gs.qd_int, shape=(_B,)),
+        n_pc_hits_max=_scalar(gs.qd_int, 0),
         pc_hit_kind_a=V(dtype=gs.qd_int, shape=(max_pc_hits, _B)),
         pc_hit_sample_a=V(dtype=gs.qd_int, shape=(max_pc_hits, _B)),
         pc_hit_link_a=V(dtype=gs.qd_int, shape=(max_pc_hits, _B)),

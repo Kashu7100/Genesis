@@ -54,6 +54,21 @@ def func_cofactor(F):
 
 
 @qd.func
+def func_max_eigenvalue_sym3(G):
+    """Largest eigenvalue of a symmetric 3x3 matrix (trigonometric closed form)."""
+    q = G.trace() / 3.0
+    p1 = G[0, 1] ** 2 + G[0, 2] ** 2 + G[1, 2] ** 2
+    p2 = (G[0, 0] - q) ** 2 + (G[1, 1] - q) ** 2 + (G[2, 2] - q) ** 2 + 2.0 * p1
+    lam_max = q
+    if p2 > 0.0:
+        p = qd.sqrt(p2 / 6.0)
+        B = (G - q * qd.Matrix.identity(gs.qd_float, 3)) / p
+        r = qd.math.clamp(0.5 * B.determinant(), -1.0, 1.0)
+        lam_max = q + 2.0 * p * qd.cos(qd.acos(r) / 3.0)
+    return lam_max
+
+
+@qd.func
 def func_rotation_variant_svd(F):
     """SVD F = U diag(sigma) V^T with det(U) >= 0 and det(V) >= 0, so that sigma[2] < 0 exactly when F is inverted."""
     U, S, V = qd.svd(F)
@@ -134,33 +149,82 @@ def func_smith_nh_stress(F, mu, lam):
 
 
 @qd.func
-def func_smith_nh_tangent(F, mu, lam, eps, project: qd.template()):
-    mu_hat, lam_hat, alpha = func_smith_params(mu, lam)
-    U, sigma, V = func_rotation_variant_svd(F)
-    Ic = sigma.norm_sqr()
-    J = sigma[0] * sigma[1] * sigma[2]
+def func_smith_nh_direct_tangent(F, mu_hat, lam_hat, alpha, Ic, J):
+    """Exact tangent d2Psi/dF2 of the Smith neo-Hookean energy (row-major 9x9):
+    c3 f f^T + lam_hat cof cof^T + lam_hat (J - alpha) d2J/dF2 + c2 I with c2 = mu_hat (1 - 1/(Ic+1)) and
+    c3 = 2 mu_hat/(Ic+1)^2; d2J/dF2 pairs the columns a != b of F through the skew matrix of the third column."""
     Ic1 = Ic + 1.0
-    coeff0 = mu_hat * (1.0 - 1.0 / Ic1)
-    coeff1 = lam_hat * (J - alpha)
-    A = qd.Matrix.zero(gs.qd_float, 3, 3)
-    for i in qd.static(range(3)):
-        j, k = qd.static(_MODE_PAIRS[i])
-        A[i, i] = (
-            (2.0 * mu_hat * sigma[i] ** 2 - mu_hat * Ic1) / (Ic1 * Ic1)
-            + lam_hat * sigma[j] ** 2 * sigma[k] ** 2
-            + mu_hat
-        )
-    for i in qd.static(range(3)):
-        j, k = qd.static(_MODE_PAIRS[i])
-        # The off-diagonal (j, k) couples the modes other than i through sigma_i.
-        A[j, k] = (2.0 * J - alpha) * lam_hat * sigma[i] + 2.0 * mu_hat * sigma[j] * sigma[k] / (Ic1 * Ic1)
-        A[k, j] = A[j, k]
-    twist = qd.Vector.zero(gs.qd_float, 3)
-    flip = qd.Vector.zero(gs.qd_float, 3)
-    for n in qd.static(range(3)):
-        twist[n] = coeff1 * sigma[n] + coeff0
-        flip[n] = -coeff1 * sigma[n] + coeff0
-    return func_tangent_from_eigensystem(U, V, A, twist, flip, eps, project)
+    c2 = mu_hat * (1.0 - 1.0 / Ic1)
+    c3 = 2.0 * mu_hat / (Ic1 * Ic1)
+    f = func_flatten(F)
+    cof = func_flatten(func_cofactor(F))
+    C = qd.Matrix.zero(gs.qd_float, 9, 9)
+    for p in qd.static(range(9)):
+        for q in qd.static(range(9)):
+            C[p, q] = c3 * f[p] * f[q] + lam_hat * cof[p] * cof[q]
+        C[p, p] += c2
+    coeff = lam_hat * (J - alpha)
+    for a in qd.static(range(3)):
+        for b in qd.static(range(3)):
+            if qd.static(a != b):
+                c = qd.static(3 - a - b)
+                # -eps_abc: the derivative of column a's cofactor with respect to column b.
+                sign = qd.static(-1.0 if (a, b) in ((0, 1), (1, 2), (2, 0)) else 1.0)
+                v0, v1, v2 = F[0, c], F[1, c], F[2, c]
+                C[3 * 0 + a, 3 * 1 + b] += coeff * sign * (-v2)
+                C[3 * 0 + a, 3 * 2 + b] += coeff * sign * v1
+                C[3 * 1 + a, 3 * 0 + b] += coeff * sign * v2
+                C[3 * 1 + a, 3 * 2 + b] += coeff * sign * (-v0)
+                C[3 * 2 + a, 3 * 0 + b] += coeff * sign * (-v1)
+                C[3 * 2 + a, 3 * 1 + b] += coeff * sign * v0
+    return C
+
+
+@qd.func
+def func_smith_nh_tangent(F, mu, lam, eps, project: qd.template()):
+    """Newton tangent of the Smith neo-Hookean energy. Only the twist and flip modes can make it indefinite, with
+    eigenvalues +-lam_hat (J - alpha) sigma_i + mu_hat_k, mu_hat_k = mu_hat (1 - 1/(Ic+1)); when J >= 0 and
+    lam_hat^2 (J - alpha)^2 max_i sigma_i^2 <= mu_hat_k^2 the exact tangent is positive semidefinite and is returned
+    directly, without any decomposition, as in mochi's PSD oracle (max_i sigma_i^2 is the largest eigenvalue of F^T F).
+    The eigensystem path projects the remaining elements."""
+    mu_hat, lam_hat, alpha = func_smith_params(mu, lam)
+    Ic = F.norm_sqr()
+    J = F.determinant()
+    C = qd.Matrix.zero(gs.qd_float, 9, 9)
+    use_direct = True
+    if qd.static(project):
+        mu_hat_k = mu_hat * (1.0 - 1.0 / (Ic + 1.0))
+        max_sigma_sq = func_max_eigenvalue_sym3(F.transpose() @ F)
+        use_direct = (lam_hat * (J - alpha)) ** 2 * max_sigma_sq <= mu_hat_k * mu_hat_k and J >= 0.0
+    if use_direct:
+        C = func_smith_nh_direct_tangent(F, mu_hat, lam_hat, alpha, Ic, J)
+    else:
+        U, sigma, V = func_rotation_variant_svd(F)
+        Ic = sigma.norm_sqr()
+        J = sigma[0] * sigma[1] * sigma[2]
+        Ic1 = Ic + 1.0
+        coeff0 = mu_hat * (1.0 - 1.0 / Ic1)
+        coeff1 = lam_hat * (J - alpha)
+        A = qd.Matrix.zero(gs.qd_float, 3, 3)
+        for i in qd.static(range(3)):
+            j, k = qd.static(_MODE_PAIRS[i])
+            A[i, i] = (
+                (2.0 * mu_hat * sigma[i] ** 2 - mu_hat * Ic1) / (Ic1 * Ic1)
+                + lam_hat * sigma[j] ** 2 * sigma[k] ** 2
+                + mu_hat
+            )
+        for i in qd.static(range(3)):
+            j, k = qd.static(_MODE_PAIRS[i])
+            # The off-diagonal (j, k) couples the modes other than i through sigma_i.
+            A[j, k] = (2.0 * J - alpha) * lam_hat * sigma[i] + 2.0 * mu_hat * sigma[j] * sigma[k] / (Ic1 * Ic1)
+            A[k, j] = A[j, k]
+        twist = qd.Vector.zero(gs.qd_float, 3)
+        flip = qd.Vector.zero(gs.qd_float, 3)
+        for n in qd.static(range(3)):
+            twist[n] = coeff1 * sigma[n] + coeff0
+            flip[n] = -coeff1 * sigma[n] + coeff0
+        C = func_tangent_from_eigensystem(U, V, A, twist, flip, eps, project)
+    return C
 
 
 # ------------------------------------------------------------------------------------
