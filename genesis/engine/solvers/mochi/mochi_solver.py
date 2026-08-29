@@ -108,6 +108,7 @@ from .newton import (
     kernel_update_linear_tolerance,
 )
 from .rigid_assembly import kernel_assemble_links
+from .sample_tree import build_sample_tree
 from .soft import (
     ENTITY_PARAMS,
     SOFT_KIND_ROD,
@@ -555,8 +556,28 @@ class MochiSolver(KinematicSolver):
             samples_weight = np.zeros((0,), dtype=gs.np_float)
             samples_link_idx = np.zeros((0,), dtype=gs.np_int)
             samples_geom_idx = np.zeros((0,), dtype=gs.np_int)
+        # Bounding-sphere hierarchy of every link's samples; the samples of a link are permuted so that the samples of
+        # a leaf are contiguous.
+        tree_arrays = [[] for _ in range(6)]
+        links_tree_start = np.zeros(self.n_links, dtype=gs.np_int)
+        links_tree_end = np.zeros(self.n_links, dtype=gs.np_int)
+        n_tree_nodes = 0
+        for link in links:
+            start, end = links_sample_start[link.idx], links_sample_end[link.idx]
+            links_tree_start[link.idx] = n_tree_nodes
+            if end > start:
+                order, centers, radii, first, count, escape, is_leaf = build_sample_tree(samples_pos[start:end])
+                for arrays in (samples_pos, samples_normal, samples_weight, samples_link_idx, samples_geom_idx):
+                    arrays[start:end] = arrays[start:end][order]
+                for values, chunk in zip(
+                    tree_arrays, (centers, radii, first + start, count, escape + n_tree_nodes, is_leaf)
+                ):
+                    values.append(chunk)
+                n_tree_nodes += len(radii)
+            links_tree_end[link.idx] = n_tree_nodes
         self._n_samples = n_samples
         self.n_samples_ = max(1, n_samples)
+        self.n_tree_nodes_ = max(1, n_tree_nodes)
         self._max_samples_per_link = int(max(1, (links_sample_end - links_sample_start).max(initial=0)))
 
         n_collider_geoms = int((geoms_collider_type != COLLIDER_TYPE.NONE).sum())
@@ -646,6 +667,19 @@ class MochiSolver(KinematicSolver):
             self.mochi_info,
             self.rigid_config,
         )
+        if self.n_links > 0:
+            self.mochi_info.links.tree_start.from_numpy(links_tree_start)
+            self.mochi_info.links.tree_end.from_numpy(links_tree_end)
+        if n_tree_nodes > 0:
+            tree_center, tree_radius, tree_first, tree_count, tree_escape, tree_is_leaf = (
+                np.concatenate(values) for values in tree_arrays
+            )
+            self.mochi_info.samples.tree_center.from_numpy(tree_center)
+            self.mochi_info.samples.tree_radius.from_numpy(tree_radius)
+            self.mochi_info.samples.tree_first.from_numpy(tree_first)
+            self.mochi_info.samples.tree_count.from_numpy(tree_count)
+            self.mochi_info.samples.tree_escape.from_numpy(tree_escape)
+            self.mochi_info.samples.tree_is_leaf.from_numpy(tree_is_leaf)
 
     def _init_soft(self):
         """Rest data, contact samples and material parameters of the deformable bodies."""
@@ -1265,7 +1299,6 @@ class MochiSolver(KinematicSolver):
             self.contact_state,
             self.rigid_config,
             self.mochi_config,
-            self._max_samples_per_link,
             assem_dres,
             skip_ls_done,
             record,

@@ -11,7 +11,7 @@ import genesis as gs
 import genesis.utils.geom as gu
 from genesis.utils import array_class
 
-from .colliders import query_collider
+from .colliders import query_collider, query_collider_lower_bound
 from .contact_utils import collision_response
 from .data import (
     COLLIDER_TYPE,
@@ -349,8 +349,14 @@ def func_pair_param(value_a, value_b, is_static_b: qd.template()):
     return value
 
 
-@qd.kernel
-def kernel_contact_eval(
+@qd.func
+def func_contact_eval_sample(
+    i_p,
+    i_s,
+    i_b,
+    i_la,
+    i_lb,
+    i_gb,
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     sdf_info: array_class.SDFInfo,
@@ -359,59 +365,48 @@ def kernel_contact_eval(
     contact_state: MochiContactState,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
-    max_samples_per_link: int,
     assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
     record: qd.template(),
     errno: qd.Tensor,
 ):
-    """Evaluate every sample of every candidate pair against its collider at the current iterate and accumulate the
-    per-pair force, torque and Hessian sums. Contact is re-detected here at every call, so the set of active samples
-    follows the Newton iterates."""
-    max_pairs = contact_state.pair_link_a.shape[0]
-    _B = mochi_state.is_active.shape[0]
+    """Evaluate one sample of a candidate pair against its collider at the current iterate and accumulate the pair's
+    force, torque and Hessian sums."""
     max_hits = contact_state.hit_sample.shape[0]
     EPS = mochi_info.EPS[None]
+    i_ga = mochi_info.samples.geom_idx[i_s]
+    contype_a = dyn_info.geoms.contype[i_ga]
+    conaffinity_a = dyn_info.geoms.conaffinity[i_ga]
+    contype_b = dyn_info.geoms.contype[i_gb]
+    conaffinity_b = dyn_info.geoms.conaffinity[i_gb]
+    is_hit = (contype_a & conaffinity_b) != 0 or (contype_b & conaffinity_a) != 0
 
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_p, i_s_, i_b in qd.ndrange(max_pairs, max_samples_per_link, _B):
-        if not func_is_env_active(i_b, mochi_state, skip_ls_done):
-            continue
-        if i_p >= contact_state.n_pairs[i_b]:
-            continue
-        i_la = contact_state.pair_link_a[i_p, i_b]
-        i_s = mochi_info.links.sample_start[i_la] + i_s_
-        if i_s >= mochi_info.links.sample_end[i_la]:
-            continue
-        i_lb = contact_state.pair_link_b[i_p, i_b]
-        i_gb = contact_state.pair_geom_b[i_p, i_b]
-        i_ga = mochi_info.samples.geom_idx[i_s]
-        contype_a = dyn_info.geoms.contype[i_ga]
-        conaffinity_a = dyn_info.geoms.conaffinity[i_ga]
-        contype_b = dyn_info.geoms.contype[i_gb]
-        conaffinity_b = dyn_info.geoms.conaffinity[i_gb]
-        if (contype_a & conaffinity_b) == 0 and (contype_b & conaffinity_a) == 0:
-            continue
+    pos_a = dyn_state.links.pos[i_la, i_b]
+    quat_a = dyn_state.links.quat[i_la, i_b]
+    pos = gu.qd_transform_by_trans_quat(mochi_info.samples.pos[i_s], pos_a, quat_a)
+    thr = mochi_info.geoms.penalty_threshold[i_gb]
+    h = mochi_info.geoms.penalty_smoothing_half_distance[i_gb]
+    band = thr + 2.0 * h
+    if is_hit and mochi_info.geoms.collider_type[i_gb] != COLLIDER_TYPE.PLANE:
+        if (pos < dyn_state.geoms.aabb_min[i_gb, i_b] - band).any():
+            is_hit = False
+        if (pos > dyn_state.geoms.aabb_max[i_gb, i_b] + band).any():
+            is_hit = False
 
-        pos_a = dyn_state.links.pos[i_la, i_b]
-        quat_a = dyn_state.links.quat[i_la, i_b]
-        pos = gu.qd_transform_by_trans_quat(mochi_info.samples.pos[i_s], pos_a, quat_a)
-        thr = mochi_info.geoms.penalty_threshold[i_gb]
-        h = mochi_info.geoms.penalty_smoothing_half_distance[i_gb]
-        band = thr + 2.0 * h
-        if mochi_info.geoms.collider_type[i_gb] != COLLIDER_TYPE.PLANE:
-            if (pos < dyn_state.geoms.aabb_min[i_gb, i_b] - band).any():
-                continue
-            if (pos > dyn_state.geoms.aabb_max[i_gb, i_b] + band).any():
-                continue
-
-        pos_g = dyn_state.geoms.pos[i_gb, i_b]
-        quat_g = dyn_state.geoms.quat[i_gb, i_b]
-        pos_geom = gu.qd_inv_transform_by_trans_quat(pos, pos_g, quat_g)
-        is_valid, d, grad = query_collider(i_gb, pos_geom, dyn_info.geoms, mochi_info.geoms, sdf_info, mochi_config)
+    pos_g = dyn_state.geoms.pos[i_gb, i_b]
+    quat_g = dyn_state.geoms.quat[i_gb, i_b]
+    pos_geom = gu.qd_inv_transform_by_trans_quat(pos, pos_g, quat_g)
+    d = gs.qd_float(0.0)
+    grad = qd.Vector([1.0, 0.0, 0.0], dt=gs.qd_float)
+    if is_hit:
+        is_valid, d_query, grad_query = query_collider(
+            i_gb, pos_geom, dyn_info.geoms, mochi_info.geoms, sdf_info, mochi_config
+        )
+        d = d_query
+        grad = grad_query
         if not is_valid or d > band:
-            continue
+            is_hit = False
 
+    if is_hit:
         # Colliding normal and stage displacement of the sample, in the collider frame.
         normal_world = gu.qd_transform_by_quat(mochi_info.samples.normal[i_s], quat_a)
         normal_geom = gu.qd_inv_transform_by_quat(normal_world, quat_g)
@@ -490,6 +485,84 @@ def kernel_contact_eval(
                 contact_state.hit_weight[i_h, i_b] = w
             else:
                 qd.atomic_or(errno[i_b], array_class.ErrorCode.OVERFLOW_MOCHI_CONTACTS)
+
+
+@qd.kernel
+def kernel_contact_eval(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    sdf_info: array_class.SDFInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+    assem_dres: qd.template(),
+    skip_ls_done: qd.template(),
+    record: qd.template(),
+    errno: qd.Tensor,
+):
+    """Evaluate the samples of every candidate pair that can lie within the penalty band of the collider at the
+    current iterate, and accumulate the per-pair force, torque and Hessian sums. Contact is re-detected here at every
+    call, so the set of active samples follows the Newton iterates; the sample hierarchy of the colliding link is
+    traversed depth-first and a node whose distance lower bound exceeds the band is skipped with all its samples."""
+    max_pairs = contact_state.pair_link_a.shape[0]
+    _B = mochi_state.is_active.shape[0]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_p, i_b in qd.ndrange(max_pairs, _B):
+        if not func_is_env_active(i_b, mochi_state, skip_ls_done):
+            continue
+        if i_p >= contact_state.n_pairs[i_b]:
+            continue
+        i_la = contact_state.pair_link_a[i_p, i_b]
+        i_lb = contact_state.pair_link_b[i_p, i_b]
+        i_gb = contact_state.pair_geom_b[i_p, i_b]
+        pos_a = dyn_state.links.pos[i_la, i_b]
+        quat_a = dyn_state.links.quat[i_la, i_b]
+        pos_g = dyn_state.geoms.pos[i_gb, i_b]
+        quat_g = dyn_state.geoms.quat[i_gb, i_b]
+        band = mochi_info.geoms.penalty_threshold[i_gb] + 2.0 * mochi_info.geoms.penalty_smoothing_half_distance[i_gb]
+        i_node = mochi_info.links.tree_start[i_la]
+        i_node_end = mochi_info.links.tree_end[i_la]
+        while i_node < i_node_end:
+            center = gu.qd_transform_by_trans_quat(mochi_info.samples.tree_center[i_node], pos_a, quat_a)
+            center_geom = gu.qd_inv_transform_by_trans_quat(center, pos_g, quat_g)
+            lower = query_collider_lower_bound(
+                i_gb,
+                center_geom,
+                mochi_info.samples.tree_radius[i_node],
+                dyn_info.geoms,
+                mochi_info.geoms,
+                sdf_info,
+                mochi_config,
+            )
+            if lower > band:
+                i_node = mochi_info.samples.tree_escape[i_node]
+            else:
+                if mochi_info.samples.tree_is_leaf[i_node] != 0:
+                    i_s_start = mochi_info.samples.tree_first[i_node]
+                    for i_s in range(i_s_start, i_s_start + mochi_info.samples.tree_count[i_node]):
+                        func_contact_eval_sample(
+                            i_p,
+                            i_s,
+                            i_b,
+                            i_la,
+                            i_lb,
+                            i_gb,
+                            dyn_state,
+                            dyn_info,
+                            sdf_info,
+                            mochi_info,
+                            mochi_state,
+                            contact_state,
+                            rigid_config,
+                            mochi_config,
+                            assem_dres,
+                            record,
+                            errno,
+                        )
+                i_node = i_node + 1
 
 
 @qd.kernel

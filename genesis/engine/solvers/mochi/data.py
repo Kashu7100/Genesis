@@ -100,6 +100,9 @@ class MochiLinksInfo:
     sample_end: qd.Tensor
     samples_aabb_min: qd.Tensor
     samples_aabb_max: qd.Tensor
+    # Node range of the link's contact-sample hierarchy (depth-first order, see sample_tree.py).
+    tree_start: qd.Tensor
+    tree_end: qd.Tensor
 
 
 def get_mochi_links_info(solver):
@@ -113,6 +116,8 @@ def get_mochi_links_info(solver):
         damping=V(dtype=gs.qd_float, shape=(n_links_,)),
         layer=V(dtype=gs.qd_int, shape=(n_links_,)),
         sample_start=V(dtype=gs.qd_int, shape=(n_links_,)),
+        tree_start=V(dtype=gs.qd_int, shape=(n_links_,)),
+        tree_end=V(dtype=gs.qd_int, shape=(n_links_,)),
         sample_end=V(dtype=gs.qd_int, shape=(n_links_,)),
         samples_aabb_min=V(dtype=gs.qd_vec3, shape=(n_links_,)),
         samples_aabb_max=V(dtype=gs.qd_vec3, shape=(n_links_,)),
@@ -156,16 +161,32 @@ class MochiSamplesInfo:
     weight: qd.Tensor
     link_idx: qd.Tensor
     geom_idx: qd.Tensor
+    # Bounding-sphere hierarchy of every link's samples (link frame), nodes in depth-first order: center and radius,
+    # the contiguous sample range a node bounds, the depth-first index of the next node outside its subtree, and
+    # whether it is a leaf (see sample_tree.py).
+    tree_center: qd.Tensor
+    tree_radius: qd.Tensor
+    tree_first: qd.Tensor
+    tree_count: qd.Tensor
+    tree_escape: qd.Tensor
+    tree_is_leaf: qd.Tensor
 
 
 def get_mochi_samples_info(solver):
     n_samples_ = solver.n_samples_
+    n_nodes_ = solver.n_tree_nodes_
     return MochiSamplesInfo(
         pos=V(dtype=gs.qd_vec3, shape=(n_samples_,)),
         normal=V(dtype=gs.qd_vec3, shape=(n_samples_,)),
         weight=V(dtype=gs.qd_float, shape=(n_samples_,)),
         link_idx=V(dtype=gs.qd_int, shape=(n_samples_,)),
         geom_idx=V(dtype=gs.qd_int, shape=(n_samples_,)),
+        tree_center=V(dtype=gs.qd_vec3, shape=(n_nodes_,)),
+        tree_radius=V(dtype=gs.qd_float, shape=(n_nodes_,)),
+        tree_first=V(dtype=gs.qd_int, shape=(n_nodes_,)),
+        tree_count=V(dtype=gs.qd_int, shape=(n_nodes_,)),
+        tree_escape=V(dtype=gs.qd_int, shape=(n_nodes_,)),
+        tree_is_leaf=V(dtype=gs.qd_int, shape=(n_nodes_,)),
     )
 
 
