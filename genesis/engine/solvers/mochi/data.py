@@ -887,7 +887,8 @@ class MochiSoftState:
     pc_hit_r_a: qd.Tensor
     pc_hit_vert_b: qd.Tensor
     pc_hit_D: qd.Tensor
-    # spatial hashes of the deformable colliders (heads of the per-bin chains, -1 empty; next item of a chain)
+    # spatial hashes of the deformable colliders: heads of the per-bin chains (-1 empty) and the next entry of a
+    # chain; an item has one entry (8 x item + k) per cell its bounds overlap, k encoding the cell offset
     pc_hash_heads: qd.Tensor
     pc_hash_next: qd.Tensor
     tet_hash_heads: qd.Tensor
@@ -970,8 +971,8 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         pc_hit_vert_b=V(dtype=gs.qd_int, shape=(max_pc_hits, _B)),
         pc_hit_D=V(dtype=gs.qd_mat3, shape=(max_pc_hits, _B)),
         pc_hash_heads=V(dtype=gs.qd_int, shape=(solver.n_pc_bins_, _B)),
-        pc_hash_next=V(dtype=gs.qd_int, shape=(n_sv_, _B)),
+        pc_hash_next=V(dtype=gs.qd_int, shape=(8 * n_sv_, _B)),
         tet_hash_heads=V(dtype=gs.qd_int, shape=(solver.n_tet_bins_, _B)),
-        tet_hash_next=V(dtype=gs.qd_int, shape=(n_el_, _B)),
+        tet_hash_next=V(dtype=gs.qd_int, shape=(8 * n_el_, _B)),
         tet_hash_cell=V(dtype=gs.qd_float, shape=(_B,)),
     )

@@ -846,16 +846,18 @@ class MochiSolver(KinematicSolver):
             else 1
         )
         bins_per_item = options.spatial_hash_bins_per_item
-        self.n_pc_bins_ = _next_power_of_two(bins_per_item * self.n_soft_verts) if self._has_pc_colliders else 1
-        self.n_tet_bins_ = _next_power_of_two(bins_per_item * self.n_soft_elems) if self._has_soft_colliders else 1
-        # The hash cell of the spheres is the largest contact range of a point-cloud collider (radius plus penalty
-        # threshold, as mochi's): a sample within the range of a sphere is then at most one cell away from its center.
+        # every item occupies up to eight entries (the cells its bounds overlap)
+        self.n_pc_bins_ = _next_power_of_two(bins_per_item * 8 * self.n_soft_verts) if self._has_pc_colliders else 1
+        self.n_tet_bins_ = _next_power_of_two(bins_per_item * 8 * self.n_soft_elems) if self._has_soft_colliders else 1
+        # The hash cell of the spheres is the largest diameter of the contact range of a point-cloud collider (radius
+        # plus penalty threshold, as mochi's, with a rounding margin): the range of a sphere then overlaps at most two
+        # cells per axis, and a sample within it lies in one of them.
         pc_bands = [
             (e.rod_radius if e.is_rod else e.material.collider_radius) + e.material.penalty_threshold
             for e in entities
             if self._soft_collider_kind(e) == COLLIDER_TYPE.POINT_CLOUD
         ]
-        self._pc_hash_cell = max(pc_bands) if pc_bands else 1.0
+        self._pc_hash_cell = 2.0 * max(pc_bands) * (1.0 + 1e-3) if pc_bands else 1.0
 
         band = self._rod_band_layout()
         self.n_band_rows_ = max(1, len(band["rows_dof"]))
