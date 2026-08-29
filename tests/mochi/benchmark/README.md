@@ -71,3 +71,33 @@ Every scene is within the 10x target of single-threaded mochi on the CPU. The t-
 multi-kernel pipeline because its point-cloud collider is built by host-driven bounding-volume kernels; all other
 scenes run as one kernel launch per step. GPU (RTX 3080, fp32, monolith, 1024 environments): rigid 2.2 us and
 articulated 9.1 us per environment step.
+
+### After B8 (neo-Hookean PSD oracle) and C3 (one kernel per step on every scene without self-contact), 2026-08-29, `5f628355`
+
+| scene | mochi fp64 (T=0) ms/step | Genesis CPU fp64 ms/step | ratio | launches/step | Genesis GPU fp32 ms/step (B) | notes |
+|---|---|---|---|---|---|---|
+| rigid | 0.017 | 0.066 | 4.0x | 1 | 1.29 (B=1), 1.48 (B=64), 2.27 (B=1024) | 12 dofs, newton 1; mochi newton 0 |
+| articulated | 0.036 | 0.164 | 4.5x | 1 | 4.76 (B=1), 9.33 (B=1024) | 11 dofs, newton 2; mochi newton 2 |
+| equalities | 0.022 | 0.049 | 2.2x | 1 | - | 12 dofs, newton 4; mochi newton 4 |
+| soft_duck | 12.371 | 88.701 | 7.2x | 1 | 21.68 (B=1), 29.08 (B=8) | 5697 dofs, newton 3; mochi newton 3 |
+| cloth_tshirt | 32.201 | 239.807 | 7.4x | 744 | 32.55 (B=1) | 10779 dofs, newton 2; mochi newton 2 |
+| rod_helix | 2.277 | 5.988 | 2.6x | 1 | 157.83 (B=1), 228.95 (B=64) | 515 dofs, newton 20; mochi newton 20 |
+| franka | - | 0.075 | - | 1 | - | 15 dofs, newton 8 |
+
+CPU fp32 (`--precision 32`) reproduces the fp64 trajectories on every scene (same probes) at the same speed: the CPU
+kernels are scalar, so the precision only matters on the GPU. The GPU column is fp32 with the automatic kernel choice
+(one kernel per step for the rigid/articulated scenes, the multi-kernel pipeline for the deformables); the helix with
+the one-kernel step on the GPU is slower (310 ms at B=1), because one GPU thread per environment runs its 515 dofs
+through 20 Newton iterations.
+
+Where the remaining time goes (CPU fp64, one environment):
+
+- duck: 107 PCG iterations x 0.365 ms (scalar CSR matvec over 5697 dofs) + 3.7 full assemblies x 9.0 ms (1.05 us per
+  tetrahedron incl. the PSD-projected tangent); mochi's element kernels are fp32 8-wide SIMD, which is the constant
+  factor that remains.
+- t-shirt: PCG 60% (86 iterations x 2.3 ms: shell CSR plus the self-contact hits in the matvec), point-cloud broadphase
+  15% (one bounding-volume-hierarchy query per assembly), point-cloud collider evaluation 13%, shell assembly 7%.
+  Reusing the broadphase candidates across the line-search trials or an in-kernel spatial hash for the self-contact
+  broadphase (which would also let the t-shirt run as one kernel) are the next steps if it needs to be faster.
+- rigid/articulated/equalities: one kernel launch (15-25 us) plus 30-140 us of serial work (forward kinematics, contact
+  sampling over the culled sample tree, dense Cholesky, line search); mochi's 9-36 us is the same work in C++.
