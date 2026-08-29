@@ -23,8 +23,9 @@ def main():
     parser.add_argument("--threads", type=int, default=0, help="mochi thread setting used as the reference")
     args = parser.parse_args()
 
+    # the most recent result of each configuration wins
     runs = []
-    for path in sorted(glob.glob(os.path.join(args.results, "*.json"))):
+    for path in sorted(glob.glob(os.path.join(args.results, "*.json")), key=os.path.getmtime):
         with open(path) as fp:
             runs.append(json.load(fp))
     print(
@@ -66,7 +67,9 @@ def main():
         m = f"{mochi[-1]['ms_per_step_best']:.3f}" if mochi else "-"
         g = f"{gen_cpu[-1]['ms_per_step_best']:.3f}" if gen_cpu else "-"
         ratio = f"{gen_cpu[-1]['ms_per_step_best'] / mochi[-1]['ms_per_step_best']:.1f}x" if mochi and gen_cpu else "-"
-        launches = f"{gen_cpu[-1]['launches_per_step']:.0f}" if gen_cpu and "launches_per_step" in gen_cpu[-1] else "-"
+        # the launch count comes from the most recent profiled run of the configuration
+        profiled = [r for r in gen_cpu if "launches_per_step" in r]
+        launches = f"{profiled[-1]['launches_per_step']:.0f}" if profiled else "-"
         gpu = ", ".join(f"{r['ms_per_step_best']:.2f} (B={r['n_envs']})" for r in gen_gpu) or "-"
         notes = []
         if gen_cpu:
