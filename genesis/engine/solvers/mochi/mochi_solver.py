@@ -858,6 +858,20 @@ class MochiSolver(KinematicSolver):
             if self._soft_collider_kind(e) == COLLIDER_TYPE.POINT_CLOUD
         ]
         self._pc_hash_cell = 2.0 * max(pc_bands) * (1.0 + 1e-3) if pc_bands else 1.0
+        # The hash cell of the tetrahedra is twice the median rest extent of the collider tetrahedra, so a typical
+        # tetrahedron overlaps at most two cells per axis; the larger ones (a few in the rest mesh, more when the body
+        # stretches) go to an overflow list that every query scans.
+        kinds_by_entity = [self._soft_collider_kind(entity) for entity in entities]
+        self._tet_hash_cell = 1.0
+        n_big = 0
+        if self._has_soft_colliders and len(elems_v) > 0:
+            is_collider_tet = np.array([kinds_by_entity[i] == COLLIDER_TYPE.GRID for i in elems_entity_idx], dtype=bool)
+            if is_collider_tet.any():
+                rest = verts_rest[elems_v[is_collider_tet]]
+                extents = (rest.max(axis=1) - rest.min(axis=1)).max(axis=1)
+                self._tet_hash_cell = float(2.0 * np.median(extents))
+                n_big = int((extents > self._tet_hash_cell).sum())
+        self.n_tet_hash_big_ = max(16, 2 * n_big + 8)
 
         band = self._rod_band_layout()
         self.n_band_rows_ = max(1, len(band["rows_dof"]))
@@ -1556,7 +1570,7 @@ class MochiSolver(KinematicSolver):
                 )
             if self._has_soft_colliders:
                 kernel_tet_hash_build(
-                    self.mochi_state, self.soft_info, self.soft_state, self.rigid_config, skip_ls_done
+                    self.mochi_state, self.soft_info, self.soft_state, self.rigid_config, skip_ls_done, self._errno
                 )
                 kernel_soft_collider_eval(
                     self.dyn_state,
@@ -1842,7 +1856,8 @@ class MochiSolver(KinematicSolver):
             gs.raise_exception(
                 "Exceeding the capacity of a contact list: increase MochiSolver's option 'max_soft_hits_per_sample', "
                 "'max_deformable_collider_hits_per_query' or 'max_point_cloud_hits_per_query' (see "
-                "`get_contact_capacity_usage()`)."
+                "`get_contact_capacity_usage()`); or too many tetrahedra grew past the hash cell of the deformable "
+                "colliders (a solid stretched to several times its rest size)."
             )
         if errno & array_class.ErrorCode.MOCHI_DIVERGED:
             gs.raise_exception(

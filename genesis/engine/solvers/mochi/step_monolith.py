@@ -262,6 +262,7 @@ def func_assemble_env(
                 soft_state,
                 rigid_config,
                 skip_ls_done,
+                errno,
             )
             func_soft_collider_eval(
                 i_b,

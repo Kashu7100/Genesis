@@ -2210,29 +2210,21 @@ def func_tet_hash_build(
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
     skip_ls_done,
+    errno: qd.Tensor,
 ):
-    """Insert the deformed tetrahedra of the collider entities in the hash; the cell of an environment is the largest
-    extent of its collider tetrahedra (with a rounding margin), so a tetrahedron overlaps at most two cells per axis."""
+    """Insert the deformed tetrahedra of the collider entities in the hash (cell: twice the median rest extent, so a
+    typical tetrahedron overlaps at most two cells per axis); the tetrahedra larger than the cell go to the overflow list
+    every query scans."""
     n_bins = soft_state.tet_hash_heads.shape[0]
     n_elems = soft_info.elems_v.shape[0]
-    # An environment without collider tetrahedra keeps a finite reciprocal; a minimum cell can be imposed.
-    cell_min = qd.max(gs.qd_float(1e-6), soft_info.tet_hash_cell_min[None])
+    n_big_max = soft_state.tet_hash_big.shape[0]
+    cell = qd.max(soft_info.tet_hash_cell[None], soft_info.tet_hash_cell_min[None])
+    inv_cell = 1.0 / cell
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_slot in range(n_envs[None]) if qd.static(not per_env) else range(1):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if func_is_env_active(i_b, mochi_state, skip_ls_done):
-            soft_state.tet_hash_cell[i_b] = cell_min
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_el, i_slot in qd.ndrange(n_elems, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_elems, 1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if (
-            func_is_env_active(i_b, mochi_state, skip_ls_done)
-            and soft_info.entities_collider_type[soft_info.elems_entity_idx[i_el]] == COLLIDER_TYPE.GRID
-        ):
-            aabb_min, aabb_max = func_tet_aabb(i_el, i_b, soft_info, soft_state)
-            extent = aabb_max - aabb_min
-            largest = qd.max(qd.max(extent[0], extent[1]), extent[2]) * (1.0 + 1e-3)
-            qd.atomic_max(soft_state.tet_hash_cell[i_b], largest)
+            soft_state.n_tet_hash_big[i_b] = 0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_bin, i_slot in qd.ndrange(n_bins, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_bins, 1):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
@@ -2246,12 +2238,19 @@ def func_tet_hash_build(
             and soft_info.entities_collider_type[soft_info.elems_entity_idx[i_el]] == COLLIDER_TYPE.GRID
         ):
             aabb_min, aabb_max = func_tet_aabb(i_el, i_b, soft_info, soft_state)
-            inv_cell = 1.0 / soft_state.tet_hash_cell[i_b]
-            cell_lo = func_hash_cell(aabb_min, inv_cell)
-            cell_hi = func_hash_cell(aabb_max, inv_cell)
-            func_hash_insert(
-                soft_state.tet_hash_heads, soft_state.tet_hash_next, i_el, cell_lo, cell_hi, n_bins - 1, i_b
-            )
+            extent = aabb_max - aabb_min
+            if qd.max(qd.max(extent[0], extent[1]), extent[2]) <= cell:
+                cell_lo = func_hash_cell(aabb_min, inv_cell)
+                cell_hi = func_hash_cell(aabb_max, inv_cell)
+                func_hash_insert(
+                    soft_state.tet_hash_heads, soft_state.tet_hash_next, i_el, cell_lo, cell_hi, n_bins - 1, i_b
+                )
+            else:
+                i_big = qd.atomic_add(soft_state.n_tet_hash_big[i_b], 1)
+                if i_big < n_big_max:
+                    soft_state.tet_hash_big[i_big, i_b] = i_el
+                else:
+                    qd.atomic_or(errno[i_b], array_class.ErrorCode.OVERFLOW_MOCHI_CONTACTS)
 
 
 @qd.func
@@ -2370,15 +2369,24 @@ def func_soft_collider_eval(
         kind_a, i_la, e_a, i_sample, pos, pos_start, normal_a0, w, k_a, falloff_a, mu_a, c_visc_a, c_ndamp_a = (
             func_query_point(i_q, i_b, dyn_state, mochi_info, mochi_state, soft_info, soft_state, EPS)
         )
-        inv_cell = 1.0 / soft_state.tet_hash_cell[i_b]
+        inv_cell = 1.0 / qd.max(soft_info.tet_hash_cell[None], soft_info.tet_hash_cell_min[None])
         cell_q = func_hash_cell(pos, inv_cell)
         entry = soft_state.tet_hash_heads[func_hash_bin(cell_q, n_bins - 1), i_b]
-        for _ in range(8 * n_elems):
-            if entry < 0:
+        # the chain of the cell, then the tetrahedra too large for the hash
+        n_big = qd.min(soft_state.n_tet_hash_big[i_b], soft_state.tet_hash_big.shape[0])
+        i_big = 0
+        for _ in range(8 * n_elems + n_big):
+            i_el_cur = -1
+            k_cell = -1
+            if entry >= 0:
+                i_el_cur = entry // 8
+                k_cell = entry % 8
+                entry = soft_state.tet_hash_next[entry, i_b]
+            elif i_big < n_big:
+                i_el_cur = soft_state.tet_hash_big[i_big, i_b]
+                i_big += 1
+            if i_el_cur < 0:
                 break
-            i_el_cur = entry // 8
-            k_cell = entry % 8
-            entry = soft_state.tet_hash_next[entry, i_b]
             e_b = soft_info.elems_entity_idx[i_el_cur]
             if soft_info.entities_collider_type[e_b] == COLLIDER_TYPE.NONE:
                 continue
@@ -2398,9 +2406,10 @@ def func_soft_collider_eval(
                 pos_j = soft_state.verts_pos[v_cur[j], i_b]
                 aabb_min = qd.min(aabb_min, pos_j)
                 aabb_max = qd.max(aabb_max, pos_j)
-            entry_cell = func_hash_cell(aabb_min, inv_cell) + func_cell_offset(k_cell)
-            if (entry_cell != cell_q).any():
-                continue
+            if k_cell >= 0:
+                entry_cell = func_hash_cell(aabb_min, inv_cell) + func_cell_offset(k_cell)
+                if (entry_cell != cell_q).any():
+                    continue
             if (pos < aabb_min).any() or (pos > aabb_max).any():
                 continue
             normal_a = normal_a0
@@ -2583,6 +2592,7 @@ def kernel_tet_hash_build(
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
     skip_ls_done: qd.template(),
+    errno: qd.Tensor,
 ):
     func_tet_hash_build(
         0,
@@ -2594,6 +2604,7 @@ def kernel_tet_hash_build(
         soft_state,
         rigid_config,
         skip_ls_done,
+        errno,
     )
 
 

@@ -166,3 +166,24 @@ tests the entity filter before the dedupe. Memory per environment is unchanged: 
 Conjugate-gradient iterations per step, mochi / Genesis (fp64, single thread): duck 92 / 101, t-shirt 78 / 86, helix
 17.5 / ~120 - the tetrahedron and shell counts match (same block-Jacobi preconditioner and adaptive tolerance), the
 rod's exact banded solve should bring the helix to mochi's count (Phase K).
+
+### Memory diet (Phase G) and the bounds hash (H2, H3)
+
+Contact points are recorded for readback only on demand (`get_contacts` counts, allocates and gathers; the readback
+fields of the hit lists live in a struct allocated at the first readback), the hit lists keep the solver-side fields
+only and their capacities follow three options (`max_soft_hits_per_sample`, `max_deformable_collider_hits_per_query`,
+`max_point_cloud_hits_per_query`). The hash then inserts every item in the (at most eight) cells its bounds overlap and a
+sample walks its own cell only; the tetrahedron cell is twice the median rest extent, the few larger tetrahedra live in
+an overflow list every sample scans.
+
+| scene | MiB/env before | MiB/env after | GPU fp32 B=256 ms/step (us/env-step) | GPU fp32 B=1024 ms/step (us/env-step) |
+|---|---|---|---|---|
+| cloth_arm | 84.5 | 6.3 | 120 (468) | 548 -> 382 (373) |
+| soft_gripper | 17.8 | 4.8 | 1347 -> 257-282 (1000-1100) | out of memory -> 970 (947) |
+| rope_arm | 20.4 | 2.2 | 8.2 (32) | 16.6 (16) |
+| soft_duck | 3.98 | 2.30 | 176 (689) | 648 (633) |
+| cloth_tshirt | 86.7 | 16.3 | 266 (1040) | out of memory (16.7 GB) |
+
+With these, 1024 environments of every RL scene fit on the 10 GB card, and 4096 of each on 80 GB by projection (the
+t-shirt at 4096 needs ~67 GB; the symmetric Hessian storage planned in Phase K/G7 halves its largest remaining array).
+The deformables still run the multi-kernel pipeline on the GPU at this point; the graph step kernel is next.

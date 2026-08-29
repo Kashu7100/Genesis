@@ -688,6 +688,7 @@ class MochiSoftInfo:
     n_rigid_queries: qd.Tensor
     n_queries: qd.Tensor
     pc_hash_cell: qd.Tensor
+    tet_hash_cell: qd.Tensor
     tet_hash_cell_min: qd.Tensor
 
 
@@ -790,6 +791,7 @@ def get_mochi_soft_info(solver):
         n_rigid_queries=_scalar(gs.qd_int, solver.n_samples),
         n_queries=_scalar(gs.qd_int, solver._n_soft_queries),
         pc_hash_cell=_scalar(gs.qd_float, solver._pc_hash_cell),
+        tet_hash_cell=_scalar(gs.qd_float, solver._tet_hash_cell),
         tet_hash_cell_min=_scalar(gs.qd_float, 0.0),
     )
 
@@ -893,7 +895,9 @@ class MochiSoftState:
     pc_hash_next: qd.Tensor
     tet_hash_heads: qd.Tensor
     tet_hash_next: qd.Tensor
-    tet_hash_cell: qd.Tensor
+    # tetrahedra larger than the hash cell, scanned by every query
+    tet_hash_big: qd.Tensor
+    n_tet_hash_big: qd.Tensor
 
 
 def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max_pc_hits):
@@ -974,5 +978,6 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         pc_hash_next=V(dtype=gs.qd_int, shape=(8 * n_sv_, _B)),
         tet_hash_heads=V(dtype=gs.qd_int, shape=(solver.n_tet_bins_, _B)),
         tet_hash_next=V(dtype=gs.qd_int, shape=(8 * n_el_, _B)),
-        tet_hash_cell=V(dtype=gs.qd_float, shape=(_B,)),
+        tet_hash_big=V(dtype=gs.qd_int, shape=(solver.n_tet_hash_big_, _B)),
+        n_tet_hash_big=V(dtype=gs.qd_int, shape=(_B,)),
     )
