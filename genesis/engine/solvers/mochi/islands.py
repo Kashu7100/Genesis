@@ -57,6 +57,8 @@ def func_aabbs_overlap(min_a, max_a, min_b, max_b):
 def func_build_islands(
     i_b_env,
     per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
     mochi_state: MochiState,
@@ -83,12 +85,13 @@ def func_build_islands(
     max_pairs = contact_state.pair_link_a.shape[0]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_n, i_b_ in qd.ndrange(n_nodes, _B) if qd.static(not per_env) else qd.ndrange(n_nodes, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_n, i_slot in qd.ndrange(n_nodes, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_nodes, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         island_state.nodes_parent[i_n, i_b] = i_n
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
+    for i_slot in range(n_envs[None]) if qd.static(not per_env) else range(1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not mochi_state.is_active[i_b]:
             continue
         for i_p in range(qd.min(contact_state.n_pairs[i_b], max_pairs)):
@@ -205,6 +208,8 @@ def kernel_build_islands(
     func_build_islands(
         0,
         False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
         dyn_info,
         mochi_info,
         mochi_state,
@@ -226,6 +231,8 @@ def kernel_build_islands(
 def func_cholesky_solve_islands(
     i_b_env,
     per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     island_state: MochiIslandState,
@@ -239,8 +246,8 @@ def func_cholesky_solve_islands(
     EPS = mochi_info.EPS[None]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_isl, i_b_ in qd.ndrange(n_nodes, _B) if qd.static(not per_env) else qd.ndrange(n_nodes, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_isl, i_slot in qd.ndrange(n_nodes, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_nodes, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not mochi_state.is_active[i_b] or not island_state.uses_dense[i_b]:
             continue
         if i_isl >= island_state.n_islands[i_b]:
@@ -289,4 +296,13 @@ def kernel_cholesky_solve_islands(
     island_state: MochiIslandState,
     rigid_config: qd.template(),
 ):
-    func_cholesky_solve_islands(0, False, mochi_info, mochi_state, island_state, rigid_config)
+    func_cholesky_solve_islands(
+        0,
+        False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
+        mochi_info,
+        mochi_state,
+        island_state,
+        rigid_config,
+    )

@@ -121,6 +121,8 @@ def func_joint_dof_displacement(
 def func_project_links_residual(
     i_b_env,
     per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
@@ -132,8 +134,8 @@ def func_project_links_residual(
     n_links = dyn_state.links.pos.shape[0]
     _B = dyn_state.links.pos.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b_ in qd.ndrange(n_links, _B) if qd.static(not per_env) else qd.ndrange(n_links, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_l, i_slot in qd.ndrange(n_links, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_links, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not mochi_info.links.is_dynamic[i_l] or not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
         func_jacobian_transpose_add(
@@ -150,13 +152,26 @@ def kernel_project_links_residual(
     rigid_config: qd.template(),
     skip_ls_done: qd.template(),
 ):
-    func_project_links_residual(0, False, dyn_state, dyn_info, mochi_info, mochi_state, rigid_config, skip_ls_done)
+    func_project_links_residual(
+        0,
+        False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
+        dyn_state,
+        dyn_info,
+        mochi_info,
+        mochi_state,
+        rigid_config,
+        skip_ls_done,
+    )
 
 
 @qd.func
 def func_assemble_joints(
     i_b_env,
     per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
@@ -178,8 +193,8 @@ def func_assemble_joints(
     limit_damping = mochi_info.joint_limit_damping[None]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_j, i_b_ in qd.ndrange(n_joints, _B) if qd.static(not per_env) else qd.ndrange(n_joints, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_j, i_slot in qd.ndrange(n_joints, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_joints, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
         I_j = [i_j, i_b] if qd.static(rigid_config.batch_joints_info) else i_j
@@ -297,6 +312,8 @@ def kernel_assemble_joints(
     func_assemble_joints(
         0,
         False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
         dyn_state,
         dyn_info,
         rigid_info,
@@ -314,6 +331,8 @@ def kernel_assemble_joints(
 def func_update_conv_weights(
     i_b_env,
     per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
@@ -329,13 +348,13 @@ def func_update_conv_weights(
     EPS = mochi_info.EPS[None]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_b_ in qd.ndrange(n_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         mochi_state.conv_w[i_d, i_b] = 0.0
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b_ in qd.ndrange(n_links, _B) if qd.static(not per_env) else qd.ndrange(n_links, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_l, i_slot in qd.ndrange(n_links, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_links, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not mochi_info.links.is_dynamic[i_l]:
             continue
         I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
@@ -353,8 +372,8 @@ def func_update_conv_weights(
             i_a = dyn_info.links.parent_idx[I_a]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_b_ in qd.ndrange(n_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         generalized_mass = mochi_state.conv_w[i_d, i_b]
         entity_mass = mochi_info.dofs_entity_mass[i_d]
         # A degree of freedom carrying no inertia at all (massless dummy link) has no acceleration scale to normalize
@@ -375,4 +394,14 @@ def kernel_update_conv_weights(
     mochi_state: MochiState,
     rigid_config: qd.template(),
 ):
-    func_update_conv_weights(0, False, dyn_state, dyn_info, mochi_info, mochi_state, rigid_config)
+    func_update_conv_weights(
+        0,
+        False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
+        dyn_state,
+        dyn_info,
+        mochi_info,
+        mochi_state,
+        rigid_config,
+    )

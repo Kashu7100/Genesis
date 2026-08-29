@@ -360,6 +360,9 @@ class MochiState:
     status: qd.Tensor
     n_iter: qd.Tensor
     n_pcg_iter: qd.Tensor
+    # every environment index in order, and the batch size: the identity environment list of the step functions
+    all_envs: qd.Tensor
+    n_envs_all: qd.Tensor
     res_norm_sq: qd.Tensor
     res_w_sq: qd.Tensor
     res_norm0: qd.Tensor
@@ -428,6 +431,8 @@ def get_mochi_state(solver, max_pairs, has_dense):
         status=V(dtype=gs.qd_int, shape=(_B,)),
         n_iter=V(dtype=gs.qd_int, shape=(_B,)),
         n_pcg_iter=V(dtype=gs.qd_int, shape=(_B,)),
+        all_envs=V(dtype=gs.qd_int, shape=(_B,)),
+        n_envs_all=_scalar(gs.qd_int, _B),
         res_norm_sq=V(dtype=gs.qd_float, shape=(_B,)),
         res_w_sq=V(dtype=gs.qd_float, shape=(_B,)),
         res_norm0=V(dtype=gs.qd_float, shape=(_B,)),

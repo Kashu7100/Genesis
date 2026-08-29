@@ -645,6 +645,7 @@ class MochiSolver(KinematicSolver):
         )
         self.mochi_info = get_mochi_info(self)
         self.mochi_state = get_mochi_state(self, self._max_pairs, has_dense)
+        self.mochi_state.all_envs.from_numpy(np.arange(self._B, dtype=gs.np_int))
         self.contact_state = get_mochi_contact_state(self, self._max_pairs)
         self.eq_info = get_mochi_equalities_info(self, self._equalities)
         self.eq_state = get_mochi_equalities_state(self, len(self._equalities))
@@ -1405,7 +1406,7 @@ class MochiSolver(KinematicSolver):
                 self.mochi_state, self.soft_info, self.soft_state, self.rigid_config, self.mochi_config
             )
             if self.n_shell_elems > 0:
-                kernel_shell_stage_start(self.soft_info, self.soft_state, self.rigid_config)
+                kernel_shell_stage_start(self.mochi_state, self.soft_info, self.soft_state, self.rigid_config)
             if self.n_rod_elems > 0:
                 kernel_rod_step_start(
                     self.mochi_state, self.soft_info, self.soft_state, self.rigid_config, self.mochi_config
@@ -1436,7 +1437,9 @@ class MochiSolver(KinematicSolver):
             self._errno,
         )
         if self.has_soft:
-            kernel_soft_conservative_bounds(self.mochi_info, self.soft_info, self.soft_state, self.rigid_config)
+            kernel_soft_conservative_bounds(
+                self.mochi_state, self.mochi_info, self.soft_info, self.soft_state, self.rigid_config
+            )
             kernel_soft_broadphase(
                 self.dyn_state,
                 self.dyn_info,

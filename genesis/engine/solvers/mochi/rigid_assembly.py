@@ -27,6 +27,8 @@ from .newton import func_is_env_active
 def func_assemble_links(
     i_b_env,
     per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
@@ -52,8 +54,8 @@ def func_assemble_links(
     I3 = qd.Matrix.identity(gs.qd_float, 3)
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b_ in qd.ndrange(n_links, _B) if qd.static(not per_env) else qd.ndrange(n_links, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_l, i_slot in qd.ndrange(n_links, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_links, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not mochi_info.links.is_dynamic[i_l] or not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
         I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
@@ -163,6 +165,8 @@ def kernel_assemble_links(
     func_assemble_links(
         0,
         False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
         dyn_state,
         dyn_info,
         mochi_info,

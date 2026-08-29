@@ -50,6 +50,8 @@ def func_quat_extrapolate(quat_1, quat_2, alpha, eps):
 def func_step_start(
     i_b_env,
     per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
@@ -68,7 +70,8 @@ def func_step_start(
     EPS = mochi_info.EPS[None]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
+    for i_slot in range(n_envs[None]) if qd.static(not per_env) else range(1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         mochi_state.n_hist[i_b] = qd.min(mochi_state.n_hist[i_b] + 1, N_HISTORY)
         beta = gs.qd_float(1.0)
         if qd.static(mochi_config.integrator == INTEGRATOR.BDF2):  # noqa: SIM102
@@ -77,20 +80,20 @@ def func_step_start(
         mochi_state.dt_stage[i_b] = beta * mochi_info.dt[None]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_q, i_b_ in qd.ndrange(n_qs, _B) if qd.static(not per_env) else qd.ndrange(n_qs, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_q, i_slot in qd.ndrange(n_qs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_qs, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         mochi_state.qpos_prev[1, i_q, i_b] = mochi_state.qpos_prev[0, i_q, i_b]
         mochi_state.qpos_prev[0, i_q, i_b] = rigid_info.qpos[i_q, i_b]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_b_ in qd.ndrange(n_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         mochi_state.dofs_vel_prev[1, i_d, i_b] = mochi_state.dofs_vel_prev[0, i_d, i_b]
         mochi_state.dofs_vel_prev[0, i_d, i_b] = dyn_state.dofs.vel[i_d, i_b]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b_ in qd.ndrange(n_links, _B) if qd.static(not per_env) else qd.ndrange(n_links, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_l, i_slot in qd.ndrange(n_links, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_links, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         mochi_state.links_vel_prev[1, i_l, i_b] = mochi_state.links_vel_prev[0, i_l, i_b]
         mochi_state.links_ang_prev[1, i_l, i_b] = mochi_state.links_ang_prev[0, i_l, i_b]
         mochi_state.links_vsym_prev[1, i_l, i_b] = mochi_state.links_vsym_prev[0, i_l, i_b]
@@ -101,8 +104,8 @@ def func_step_start(
     # Step-start generalized coordinates, joint by joint: linear extrapolation of the coordinates of scalar joints
     # and of free-joint translations, geodesic extrapolation of the quaternions.
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_j, i_b_ in qd.ndrange(n_joints, _B) if qd.static(not per_env) else qd.ndrange(n_joints, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_j, i_slot in qd.ndrange(n_joints, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_joints, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         I_j = [i_j, i_b] if qd.static(rigid_config.batch_joints_info) else i_j
         joint_type = dyn_info.joints.type[I_j]
         q_start = dyn_info.joints.q_start[I_j]
@@ -125,15 +128,15 @@ def func_step_start(
                 mochi_state.qpos_step_start[q_start + rot_offset + k, i_b] = quat_0[k]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_q, i_b_ in qd.ndrange(n_qs, _B) if qd.static(not per_env) else qd.ndrange(n_qs, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_q, i_slot in qd.ndrange(n_qs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_qs, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         # Single-stage schemes: the stage starts at the step start, which is also the warm start of the solve.
         mochi_state.qpos_stage_start[i_q, i_b] = mochi_state.qpos_step_start[i_q, i_b]
         rigid_info.qpos[i_q, i_b] = mochi_state.qpos_step_start[i_q, i_b]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_b_ in qd.ndrange(n_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         v1 = mochi_state.dofs_vel_prev[0, i_d, i_b]
         value = v1
         if qd.static(mochi_config.integrator == INTEGRATOR.BDF2):  # noqa: SIM102
@@ -142,8 +145,8 @@ def func_step_start(
         mochi_state.dofs_vel_stage_start[i_d, i_b] = value
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b_ in qd.ndrange(n_links, _B) if qd.static(not per_env) else qd.ndrange(n_links, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_l, i_slot in qd.ndrange(n_links, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_links, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         vel_1 = mochi_state.links_vel_prev[0, i_l, i_b]
         ang_1 = mochi_state.links_ang_prev[0, i_l, i_b]
         vsym_1 = mochi_state.links_vsym_prev[0, i_l, i_b]
@@ -170,13 +173,27 @@ def kernel_step_start(
     rigid_config: qd.template(),
     mochi_config: qd.template(),
 ):
-    func_step_start(0, False, dyn_state, dyn_info, rigid_info, mochi_info, mochi_state, rigid_config, mochi_config)
+    func_step_start(
+        0,
+        False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
+        dyn_state,
+        dyn_info,
+        rigid_info,
+        mochi_info,
+        mochi_state,
+        rigid_config,
+        mochi_config,
+    )
 
 
 @qd.func
 def func_store_stage_start_poses(
     i_b_env,
     per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     mochi_state: MochiState,
     rigid_config: qd.template(),
@@ -187,13 +204,13 @@ def func_store_stage_start_poses(
     n_geoms = dyn_state.geoms.pos.shape[0]
     _B = dyn_state.links.pos.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b_ in qd.ndrange(n_links, _B) if qd.static(not per_env) else qd.ndrange(n_links, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_l, i_slot in qd.ndrange(n_links, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_links, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         mochi_state.links_pos_stage_start[i_l, i_b] = dyn_state.links.pos[i_l, i_b]
         mochi_state.links_quat_stage_start[i_l, i_b] = dyn_state.links.quat[i_l, i_b]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_g, i_b_ in qd.ndrange(n_geoms, _B) if qd.static(not per_env) else qd.ndrange(n_geoms, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_g, i_slot in qd.ndrange(n_geoms, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_geoms, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         mochi_state.geoms_pos_stage_start[i_g, i_b] = dyn_state.geoms.pos[i_g, i_b]
         mochi_state.geoms_quat_stage_start[i_g, i_b] = dyn_state.geoms.quat[i_g, i_b]
 
@@ -204,13 +221,23 @@ def kernel_store_stage_start_poses(
     mochi_state: MochiState,
     rigid_config: qd.template(),
 ):
-    func_store_stage_start_poses(0, False, dyn_state, mochi_state, rigid_config)
+    func_store_stage_start_poses(
+        0,
+        False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
+        dyn_state,
+        mochi_state,
+        rigid_config,
+    )
 
 
 @qd.func
 def func_post_stage(
     i_b_env,
     per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
@@ -228,8 +255,8 @@ def func_post_stage(
     EPS = mochi_info.EPS[None]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_j, i_b_ in qd.ndrange(n_joints, _B) if qd.static(not per_env) else qd.ndrange(n_joints, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_j, i_slot in qd.ndrange(n_joints, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_joints, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         I_j = [i_j, i_b] if qd.static(rigid_config.batch_joints_info) else i_j
         joint_type = dyn_info.joints.type[I_j]
         if joint_type == gs.JOINT_TYPE.FIXED:
@@ -273,8 +300,8 @@ def func_post_stage(
                 dyn_state.dofs.vel[dof_start + i_q_, i_b] = dq / h
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b_ in qd.ndrange(n_links, _B) if qd.static(not per_env) else qd.ndrange(n_links, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_l, i_slot in qd.ndrange(n_links, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_links, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not mochi_info.links.is_dynamic[i_l]:
             continue
         if mochi_state.status[i_b] == SOLVE_STATUS.DIVERGED:
@@ -308,7 +335,18 @@ def kernel_post_stage(
     mochi_state: MochiState,
     rigid_config: qd.template(),
 ):
-    func_post_stage(0, False, dyn_state, dyn_info, rigid_info, mochi_info, mochi_state, rigid_config)
+    func_post_stage(
+        0,
+        False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
+        dyn_state,
+        dyn_info,
+        rigid_info,
+        mochi_info,
+        mochi_state,
+        rigid_config,
+    )
 
 
 @qd.kernel
