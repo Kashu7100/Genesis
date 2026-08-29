@@ -609,6 +609,15 @@ class MochiSoftInfo:
     # Banded ordering of the open rods for the exact per-rod preconditioner: band row of every degree of freedom (-1
     # outside the rods), degree of freedom of every band row, and per deformable entity the row range plus the rod
     # element and stencil ranges (all zero-length for anything but an open rod).
+    # Sparsity of the deformable Hessian over the deformable degrees of freedom (vertex dofs 3 i_v + k, then the rod
+    # twist dofs), as a scalar CSR: row starts, columns, and the CSR index of every entry of every element block so the
+    # assembly kernels scatter straight into the values (-1 for the entries of a missing shell hinge vertex).
+    csr_start: qd.Tensor
+    csr_col: qd.Tensor
+    elems_csr: qd.Tensor
+    shell_csr: qd.Tensor
+    rod_elems_csr: qd.Tensor
+    rod_stencils_csr: qd.Tensor
     dofs_band_row: qd.Tensor
     band_rows_dof: qd.Tensor
     entities_band_start: qd.Tensor
@@ -707,6 +716,12 @@ def get_mochi_soft_info(solver):
         rod_stencils_L=V(dtype=gs.qd_float, shape=(n_rs_,)),
         rod_stencils_ref=V(dtype=gs.qd_vec3, shape=(n_rs_,)),
         rod_tiny=_scalar(gs.qd_float, float(np.finfo(gs.np_float).tiny)),
+        csr_start=V(dtype=gs.qd_int, shape=(solver.n_soft_dofs_ + 1,)),
+        csr_col=V(dtype=gs.qd_int, shape=(solver.n_csr_,)),
+        elems_csr=V(dtype=gs.qd_int, shape=(n_el_, 144)),
+        shell_csr=V(dtype=gs.qd_int, shape=(solver.n_shell_elems_, 324)),
+        rod_elems_csr=V(dtype=gs.qd_int, shape=(n_re_, 36)),
+        rod_stencils_csr=V(dtype=gs.qd_int, shape=(n_rs_, 121)),
         dofs_band_row=V(dtype=gs.qd_int, shape=(solver.n_dofs_total_,)),
         band_rows_dof=V(dtype=gs.qd_int, shape=(solver.n_band_rows_,)),
         entities_band_start=V(dtype=gs.qd_int, shape=(n_se_,)),
@@ -784,12 +799,12 @@ class MochiSoftState:
     verts_contact_force: qd.Tensor
     # Stage-start deformation gradient (stiffness damping) and the 12x12 Hessian block of every tetrahedron.
     elems_F_stage_start: qd.Tensor
-    elems_H: qd.Tensor
+    # Values of the deformable Hessian CSR (see MochiSoftInfo.csr_start), assembled once per Newton iteration.
+    csr_values: qd.Tensor
     # Shell triangles: stage-start membrane and bending strains (stiffness damping) and the 18x18 Hessian block of
     # the six-vertex stencil.
     shell_elems_eps_stage_start: qd.Tensor
     shell_elems_s_stage_start: qd.Tensor
-    shell_elems_H: qd.Tensor
     # Rods: material axis of every segment (current, stage start, line search reference), twist angle of the step
     # (recentered to zero at every step start) with its finite-difference rate and history, stage-start axial strain
     # and stencil measures, and the Hessian blocks (3x3 axial per segment, 11x11 per stencil over
@@ -891,10 +906,9 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         verts_H_diag=V(dtype=gs.qd_mat3, shape=(n_sv_, _B)),
         verts_contact_force=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
         elems_F_stage_start=V(dtype=gs.qd_mat3, shape=(n_el_, _B)),
-        elems_H=V_MAT(n=12, m=12, dtype=gs.qd_float, shape=(n_el_, _B)),
+        csr_values=V(dtype=gs.qd_float, shape=(solver.n_csr_, _B)),
         shell_elems_eps_stage_start=V_MAT(n=2, m=2, dtype=gs.qd_float, shape=(n_sh_, _B)),
         shell_elems_s_stage_start=V_MAT(n=2, m=2, dtype=gs.qd_float, shape=(n_sh_, _B)),
-        shell_elems_H=V_MAT(n=18, m=18, dtype=gs.qd_float, shape=(n_sh_, _B)),
         rod_elems_axis=V(dtype=gs.qd_vec3, shape=(n_re_, _B)),
         rod_elems_axis_stage_start=V(dtype=gs.qd_vec3, shape=(n_re_, _B)),
         rod_elems_axis_ls_ref=V(dtype=gs.qd_vec3, shape=(n_re_, _B)),

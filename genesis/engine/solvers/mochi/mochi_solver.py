@@ -864,11 +864,22 @@ class MochiSolver(KinematicSolver):
 
         band = self._rod_band_layout()
         self.n_band_rows_ = max(1, len(band["rows_dof"]))
+        csr = self._soft_csr_layout(
+            elems_v, shell_elems_v, shell_elems_hinge, rod_elems_v, rod_stencils_v, rod_stencils_e
+        )
+        self.n_soft_dofs_ = max(1, len(csr["start"]) - 1)
+        self.n_csr_ = max(1, len(csr["col"]))
         self.soft_info = get_mochi_soft_info(self)
         self.soft_state = get_mochi_soft_state(
             self, self._max_soft_pairs, self._max_soft_hits, self._max_sc_hits, self._max_pc_hits
         )
         self.soft_info.dofs_band_row.from_numpy(band["dofs_row"])
+        if len(csr["col"]) > 0:
+            self.soft_info.csr_start.from_numpy(csr["start"])
+            self.soft_info.csr_col.from_numpy(csr["col"])
+            for name in ("elems", "shell", "rod_elems", "rod_stencils"):
+                if len(csr[name]) > 0:
+                    getattr(self.soft_info, f"{name}_csr").from_numpy(csr[name])
         if len(band["rows_dof"]) > 0:
             self.soft_info.band_rows_dof.from_numpy(band["rows_dof"])
         if self.n_soft_entities > 0:
@@ -985,6 +996,49 @@ class MochiSolver(KinematicSolver):
         bary = np.tile(np.stack([1.0 - points, points, np.zeros(3)], axis=-1), (len(elems), 1))
         sample_weights = (weights[None, :] * lengths[:, None]).reshape((-1,))
         return tri.astype(gs.np_int), bary.astype(gs.np_float), sample_weights.astype(gs.np_float)
+
+    def _soft_csr_layout(self, elems_v, shell_elems_v, shell_elems_hinge, rod_elems_v, rod_stencils_v, rod_stencils_e):
+        """Scalar CSR sparsity of the deformable Hessian (local dofs: 3 i_v + k for the vertices, then one twist dof
+        per rod segment) and, for every element kind, the CSR index of each entry of the element block."""
+        n_dofs = 3 * self.n_soft_verts + self.n_rod_elems
+
+        def vertex_dofs(verts):
+            return (3 * verts[..., None] + np.arange(3)).reshape(len(verts), 3 * verts.shape[1])
+
+        def element_dofs():
+            yield "elems", vertex_dofs(elems_v.astype(np.int64))
+            nodes = np.concatenate([shell_elems_v, shell_elems_hinge], axis=1).astype(np.int64)
+            dofs = vertex_dofs(nodes)
+            dofs[np.repeat(nodes < 0, 3, axis=1)] = -1
+            yield "shell", dofs
+            yield "rod_elems", vertex_dofs(rod_elems_v.astype(np.int64))
+            v, e = rod_stencils_v.astype(np.int64), rod_stencils_e.astype(np.int64)
+            dofs = np.empty((len(v), 11), dtype=np.int64)
+            for a in range(3):
+                dofs[:, 4 * a : 4 * a + 3] = 3 * v[:, a : a + 1] + np.arange(3)
+            dofs[:, 3] = 3 * self.n_soft_verts + e[:, 0]
+            dofs[:, 7] = 3 * self.n_soft_verts + e[:, 1]
+            yield "rod_stencils", dofs
+
+        keys = [np.arange(n_dofs, dtype=np.int64) * (n_dofs + 1)]
+        blocks = {}
+        for name, dofs in element_dofs():
+            rows = np.repeat(dofs[:, :, None], dofs.shape[1], axis=2)
+            cols = np.repeat(dofs[:, None, :], dofs.shape[1], axis=1)
+            valid = (rows >= 0) & (cols >= 0)
+            block_keys = np.where(valid, rows * n_dofs + cols, -1)
+            blocks[name] = (block_keys, valid)
+            keys.append(block_keys[valid])
+        unique_keys = np.unique(np.concatenate(keys))
+        csr = {
+            "start": np.searchsorted(unique_keys // n_dofs, np.arange(n_dofs + 1)).astype(gs.np_int),
+            "col": (unique_keys % n_dofs).astype(gs.np_int),
+        }
+        for name, (block_keys, valid) in blocks.items():
+            index = np.searchsorted(unique_keys, np.where(valid, block_keys, 0))
+            n_block = block_keys.shape[1] * block_keys.shape[2]
+            csr[name] = np.where(valid, index, -1).reshape(len(block_keys), n_block).astype(gs.np_int)
+        return csr
 
     def _rod_band_layout(self):
         """Node-interleaved ordering [x_0, theta_0, x_1, theta_1, ..., x_(n-1)] of every open rod's degrees of freedom
