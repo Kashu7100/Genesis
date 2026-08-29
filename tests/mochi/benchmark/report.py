@@ -52,18 +52,16 @@ def main():
             and r["n_envs"] == 1
             and not r.get("options")
         ]
-        gen_gpu = sorted(
-            [
-                r
-                for r in runs
-                if r["engine"] == "genesis"
-                and r["scene"] == name
-                and r["backend"] == "gpu"
-                and r["precision"] == "32"
-                and not r.get("options")
-            ],
-            key=lambda r: r["n_envs"],
-        )
+        gen_gpu_by_envs = {
+            r["n_envs"]: r
+            for r in runs
+            if r["engine"] == "genesis"
+            and r["scene"] == name
+            and r["backend"] == "gpu"
+            and r["precision"] == "32"
+            and not r.get("options")
+        }
+        gen_gpu = [gen_gpu_by_envs[n_envs] for n_envs in sorted(gen_gpu_by_envs)]
         m = f"{mochi[-1]['ms_per_step_best']:.3f}" if mochi else "-"
         g = f"{gen_cpu[-1]['ms_per_step_best']:.3f}" if gen_cpu else "-"
         ratio = f"{gen_cpu[-1]['ms_per_step_best'] / mochi[-1]['ms_per_step_best']:.1f}x" if mochi and gen_cpu else "-"

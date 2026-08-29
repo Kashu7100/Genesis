@@ -76,19 +76,39 @@ articulated 9.1 us per environment step.
 
 | scene | mochi fp64 (T=0) ms/step | Genesis CPU fp64 ms/step | ratio | launches/step | Genesis GPU fp32 ms/step (B) | notes |
 |---|---|---|---|---|---|---|
-| rigid | 0.017 | 0.066 | 4.0x | 1 | 1.29 (B=1), 1.48 (B=64), 2.27 (B=1024) | 12 dofs, newton 1; mochi newton 0 |
-| articulated | 0.036 | 0.164 | 4.5x | 1 | 4.76 (B=1), 9.33 (B=1024) | 11 dofs, newton 2; mochi newton 2 |
-| equalities | 0.022 | 0.049 | 2.2x | 1 | - | 12 dofs, newton 4; mochi newton 4 |
-| soft_duck | 12.371 | 88.701 | 7.2x | 1 | 21.68 (B=1), 29.08 (B=8) | 5697 dofs, newton 3; mochi newton 3 |
-| cloth_tshirt | 32.201 | 239.807 | 7.4x | 744 | 32.55 (B=1) | 10779 dofs, newton 2; mochi newton 2 |
-| rod_helix | 2.277 | 5.988 | 2.6x | 1 | 157.83 (B=1), 228.95 (B=64) | 515 dofs, newton 20; mochi newton 20 |
-| franka | - | 0.075 | - | 1 | - | 15 dofs, newton 8 |
+| rigid | 0.017 | 0.066 | 4.0x | 1 | 1.18 (B=1), 1.61 (B=64), 2.20 (B=1024) | 12 dofs, newton 1; mochi newton 0 |
+| articulated | 0.036 | 0.164 | 4.5x | 1 | 5.12 (B=1), 5.70 (B=64), 9.89 (B=1024) | 11 dofs, newton 2; mochi newton 2 |
+| equalities | 0.022 | 0.049 | 2.2x | 1 | 0.93 (B=1), 2.89 (B=1024) | 12 dofs, newton 4; mochi newton 4 |
+| soft_duck | 12.371 | 88.701 | 7.2x | 1 | 21.48 (B=1), 29.53 (B=8) | 5697 dofs, newton 3; mochi newton 3 |
+| cloth_tshirt | 32.201 | 239.807 | 7.4x | 744 | 32.85 (B=1), 47.65 (B=4) | 10779 dofs, newton 2; mochi newton 2 |
+| rod_helix | 2.277 | 5.988 | 2.6x | 1 | 154.84 (B=1), 219.68 (B=64) | 515 dofs, newton 20; mochi newton 20 |
+| franka | - | 0.075 | - | 1 | 1.59 (B=1), 3.83 (B=1024) | 15 dofs, newton 8 |
 
 CPU fp32 (`--precision 32`) reproduces the fp64 trajectories on every scene (same probes) at the same speed: the CPU
-kernels are scalar, so the precision only matters on the GPU. The GPU column is fp32 with the automatic kernel choice
-(one kernel per step for the rigid/articulated scenes, the multi-kernel pipeline for the deformables); the helix with
-the one-kernel step on the GPU is slower (310 ms at B=1), because one GPU thread per environment runs its 515 dofs
-through 20 Newton iterations.
+kernels are scalar, so the precision only matters on the GPU.
+
+#### GPU fp32 (RTX 3080), `5f628355`, automatic kernel choice
+
+| scene | B=1 ms/step | B=4-8 ms/step | B=64 ms/step | B=1024 ms/step | us per env-step at the largest B | step kernel | GPU fp64 before (`2e467e90`) |
+|---|---|---|---|---|---|---|---|
+| rigid | 1.18 | - | 1.61 | 2.20 | 2.1 | monolith | 1.40 (B=1), 2.07 (B=64), 12.4 (B=1024) |
+| articulated | 5.12 | - | 5.70 | 9.89 | 9.7 | monolith | 8.5 (B=1024) |
+| equalities | 0.93 | - | - | 2.89 | 2.8 | monolith | - |
+| franka | 1.59 | - | - | 3.83 | 3.7 | monolith | - |
+| soft_duck | 21.5 | 29.5 (B=8) | - | - | 3690 | pipeline | 68.7 (B=1), 173 (B=8) |
+| cloth_tshirt | 32.9 | 47.7 (B=4) | - | - | 11900 | pipeline | 82 (B=1) |
+| rod_helix | 155 | - | 220 | - | 3430 | pipeline | 1311 (B=1), 2145 (B=64) |
+
+The small rigid/articulated scenes run as one kernel per step on the GPU too: 1024 environments cost 2-10 us per
+environment step (a single mochi core needs 17-36 us per step on these scenes), and one environment costs about the
+launch latency of the monolith (1-5 ms, mostly the kernel's serial per-environment work on one GPU thread). The
+deformables run the multi-kernel pipeline on the GPU (300-750 launches and the host-driven bounding-volume
+hierarchies per step): the duck at 8 environments and the t-shirt at 4 already amortize to 3.7 ms and 11.9 ms per
+environment step, but at one environment they are launch-bound (21-33 ms, on par with one mochi core on the t-shirt,
+1.7x slower on the duck); the helix (515 dofs, 20 Newton iterations, ~120 PCG iterations per step) is the worst case
+of the launch-bound pipeline at 155 ms - 26x its CPU time - and the one-kernel step is no better there (310 ms at B=1:
+one GPU thread per environment). A graph-launched step kernel with parallel element loops (Phase D of the plan) is the
+remaining route to a fast GPU path for deformables at small batch sizes.
 
 Where the remaining time goes (CPU fp64, one environment):
 
