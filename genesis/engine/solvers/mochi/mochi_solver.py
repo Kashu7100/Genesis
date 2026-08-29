@@ -1502,7 +1502,7 @@ class MochiSolver(KinematicSolver):
             kernel_project_links_residual(
                 self.dyn_state, self.dyn_info, self.mochi_info, self.mochi_state, self.rigid_config, skip_ls_done
             )
-            kernel_residual_norms(self.mochi_state, self.rigid_config, skip_ls_done)
+            kernel_residual_norms(self.mochi_state, self.island_state, self.rigid_config, skip_ls_done)
 
     def _select_linear_arms(self):
         """Decide, once per substep, which of the two linear arms have work to do. Islands are rebuilt at the start of
@@ -1587,12 +1587,14 @@ class MochiSolver(KinematicSolver):
                     self.mochi_info, self.mochi_state, self.soft_info, self.soft_state, self.rigid_config
                 )
         self._assemble(assem_res=True, assem_dres=True, skip_ls_done=False)
-        kernel_store_initial_norms(self.rigid_info, self.mochi_state, self.rigid_config)
+        kernel_store_initial_norms(self.rigid_info, self.mochi_state, self.island_state, self.rigid_config)
         if self.has_soft:
             kernel_soft_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, False)
             if self.n_rod_elems > 0:
                 kernel_rod_store_ls_ref(self.mochi_state, self.soft_state, self.rigid_config, False)
-        kernel_convergence_check(self.mochi_info, self.mochi_state, self.rigid_config, False, self._errno)
+        kernel_convergence_check(
+            self.mochi_info, self.mochi_state, self.island_state, self.rigid_config, False, self._errno
+        )
 
         n_linesearch = options.n_linesearch_iterations
         if self.mochi_config.linesearch_type == LINESEARCH.NONE:
@@ -1600,7 +1602,9 @@ class MochiSolver(KinematicSolver):
         for i_iter in range(options.n_newton_iterations):
             if i_iter > 0:
                 self._assemble(assem_res=True, assem_dres=True, skip_ls_done=False)
-                kernel_convergence_check(self.mochi_info, self.mochi_state, self.rigid_config, False, self._errno)
+                kernel_convergence_check(
+                    self.mochi_info, self.mochi_state, self.island_state, self.rigid_config, False, self._errno
+                )
             if kernel_any_active(self.mochi_state, False) == 0:
                 break
             if self._has_pcg_envs:
@@ -1638,7 +1642,9 @@ class MochiSolver(KinematicSolver):
                 # state it writes unchanged; the readback is worth it because a trial costs a full assembly.
                 if i_ls + 1 < n_trials and kernel_any_active(self.mochi_state, True) == 0:
                     break
-            kernel_convergence_check(self.mochi_info, self.mochi_state, self.rigid_config, True, self._errno)
+            kernel_convergence_check(
+                self.mochi_info, self.mochi_state, self.island_state, self.rigid_config, True, self._errno
+            )
 
     def substep_post_coupling(self, f):
         pass

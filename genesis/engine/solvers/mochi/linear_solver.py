@@ -336,6 +336,7 @@ def kernel_pcg_iter(
 ):
     n_dofs = mochi_state.res.shape[0]
     _B = mochi_state.is_active.shape[0]
+    abs_tol = mochi_info.pcg_abs_tol[None]
 
     func_matvec(
         mochi_state.pcg_p,
@@ -394,7 +395,7 @@ def kernel_pcg_iter(
             rel_tol = mochi_state.pcg_rel_tol[i_b]
             zTz0 = mochi_state.pcg_zTz0[i_b]
             zTz = mochi_state.pcg_zTz[i_b]
-            is_converged = not (zTz > zTz0 * rel_tol * rel_tol)
+            is_converged = not (zTz > zTz0 * rel_tol * rel_tol) or zTz <= abs_tol * abs_tol
             if is_converged or zTz > (zTz0 * PCG_DIV_REL_TOL) * PCG_DIV_REL_TOL:
                 mochi_state.pcg_is_active[i_b] = False
             beta = (mochi_state.pcg_rTz_new[i_b] - mochi_state.pcg_rTz_cross[i_b]) / mochi_state.pcg_rTz[i_b]

@@ -9,7 +9,7 @@ import genesis as gs
 import genesis.utils.geom as gu
 from genesis.utils import array_class
 
-from .data import LINEAR_TOLERANCE, LINESEARCH, SOLVE_STATUS, MochiInfo, MochiState
+from .data import LINEAR_TOLERANCE, LINESEARCH, SOLVE_STATUS, MochiInfo, MochiIslandState, MochiState
 
 # Forcing term of the adaptive linear tolerance ('choice 2' of Eisenstat and Walker): the tolerance of the next linear
 # solve is EW_GAMMA * (res / res_prev) ** EW_ALPHA, capped at EW_MAX_ETA (also the tolerance of the first iteration,
@@ -46,9 +46,16 @@ def kernel_reset_newton(mochi_state: MochiState, rigid_config: qd.template()):
 
 
 @qd.kernel
-def kernel_residual_norms(mochi_state: MochiState, rigid_config: qd.template(), skip_ls_done: qd.template()):
-    """Plain and convergence-weighted squared norms of the residual of every running environment."""
+def kernel_residual_norms(
+    mochi_state: MochiState,
+    island_state: MochiIslandState,
+    rigid_config: qd.template(),
+    skip_ls_done: qd.template(),
+):
+    """Plain and convergence-weighted squared norms of the residual of every running environment, the weighted one
+    also per entity."""
     n_dofs = mochi_state.res.shape[0]
+    n_nodes = island_state.nodes_res_w_sq.shape[0]
     _B = mochi_state.res.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_b in range(_B):
@@ -56,22 +63,30 @@ def kernel_residual_norms(mochi_state: MochiState, rigid_config: qd.template(), 
             mochi_state.res_norm_sq[i_b] = 0.0
             mochi_state.res_w_sq[i_b] = 0.0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_n, i_b in qd.ndrange(n_nodes, _B):
+        if func_is_env_active(i_b, mochi_state, skip_ls_done):
+            island_state.nodes_res_w_sq[i_n, i_b] = 0.0
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_d, i_b in qd.ndrange(n_dofs, _B):
         if func_is_env_active(i_b, mochi_state, skip_ls_done):
             r = mochi_state.res[i_d, i_b]
+            r_w_sq = mochi_state.conv_w[i_d, i_b] * r * r
             qd.atomic_add(mochi_state.res_norm_sq[i_b], r * r)
-            qd.atomic_add(mochi_state.res_w_sq[i_b], mochi_state.conv_w[i_d, i_b] * r * r)
+            qd.atomic_add(mochi_state.res_w_sq[i_b], r_w_sq)
+            qd.atomic_add(island_state.nodes_res_w_sq[island_state.dofs_node[i_d], i_b], r_w_sq)
 
 
 @qd.kernel
 def kernel_store_initial_norms(
     rigid_info: array_class.RigidInfo,
     mochi_state: MochiState,
+    island_state: MochiIslandState,
     rigid_config: qd.template(),
 ):
     """Record the residual norms of the initial iterate, the reference of the relative convergence and divergence
     tests, and take it as the first line search reference."""
     n_qs = rigid_info.qpos.shape[0]
+    n_nodes = island_state.nodes_res_w_sq.shape[0]
     _B = mochi_state.is_active.shape[0]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_b in range(_B):
@@ -79,6 +94,9 @@ def kernel_store_initial_norms(
         mochi_state.res_norm0_w[i_b] = qd.sqrt(mochi_state.res_w_sq[i_b])
         mochi_state.ls_ref_norm_sq[i_b] = mochi_state.res_norm_sq[i_b]
         mochi_state.obj_ref[i_b] = mochi_state.obj[i_b]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_n, i_b in qd.ndrange(n_nodes, _B):
+        island_state.nodes_res_norm0_w[i_n, i_b] = qd.sqrt(island_state.nodes_res_w_sq[i_n, i_b])
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_q, i_b in qd.ndrange(n_qs, _B):
         mochi_state.qpos_ls_ref[i_q, i_b] = rigid_info.qpos[i_q, i_b]
@@ -216,12 +234,15 @@ def kernel_linesearch_decide(
 def kernel_convergence_check(
     mochi_info: MochiInfo,
     mochi_state: MochiState,
+    island_state: MochiIslandState,
     rigid_config: qd.template(),
     increment_iter: qd.template(),
     errno: qd.Tensor,
 ):
-    """Classify every running environment from the residual of its accepted iterate: converged on the weighted norm
-    (absolute or relative to the initial iterate), diverged on residual blow-up, stopped at the iteration budget."""
+    """Classify every running environment from the residual of its accepted iterate: converged when every entity's
+    weighted norm is within the absolute tolerance or the relative tolerance of its initial value (mochi's per-actor
+    test), diverged on residual blow-up of the environment, stopped at the iteration budget."""
+    n_nodes = island_state.nodes_res_w_sq.shape[0]
     _B = mochi_state.is_active.shape[0]
     abs_tol = mochi_info.newton_abs_tol[None]
     rel_tol = mochi_info.newton_rel_tol[None]
@@ -240,11 +261,17 @@ def kernel_convergence_check(
         if div_abs_tol > 0.0:
             is_diverged |= res_norm > div_abs_tol
             is_diverged |= (res_norm > div_rel_tol * mochi_state.res_norm0[i_b]) and (res_norm_w > abs_tol)
+        is_converged = True
+        for i_n in range(n_nodes):
+            node_norm_w = qd.sqrt(island_state.nodes_res_w_sq[i_n, i_b])
+            node_norm0_w = island_state.nodes_res_norm0_w[i_n, i_b]
+            if not (node_norm_w <= abs_tol or (node_norm0_w > 0.0 and node_norm_w <= rel_tol * node_norm0_w)):
+                is_converged = False
         if is_diverged:
             mochi_state.status[i_b] = SOLVE_STATUS.DIVERGED
             mochi_state.is_active[i_b] = False
             qd.atomic_or(errno[i_b], array_class.ErrorCode.MOCHI_DIVERGED)
-        elif res_norm_w <= abs_tol or res_norm_w <= rel_tol * mochi_state.res_norm0_w[i_b]:
+        elif is_converged:
             mochi_state.status[i_b] = SOLVE_STATUS.CONVERGED
             mochi_state.is_active[i_b] = False
         elif mochi_state.n_iter[i_b] >= max_iter:

@@ -214,6 +214,7 @@ class MochiInfo:
     linesearch_alpha: qd.Tensor
     linesearch_wolfe1: qd.Tensor
     pcg_rel_tol: qd.Tensor
+    pcg_abs_tol: qd.Tensor
     n_newton_iterations: qd.Tensor
     EPS: qd.Tensor
 
@@ -240,6 +241,7 @@ def get_mochi_info(solver):
         linesearch_alpha=_scalar(gs.qd_float, options.linesearch_alpha),
         linesearch_wolfe1=_scalar(gs.qd_float, options.linesearch_wolfe1),
         pcg_rel_tol=_scalar(gs.qd_float, options.pcg_rel_tol),
+        pcg_abs_tol=_scalar(gs.qd_float, options.pcg_abs_tol),
         n_newton_iterations=_scalar(gs.qd_int, options.n_newton_iterations),
         EPS=_scalar(gs.qd_float, gs.EPS),
     )
@@ -249,6 +251,56 @@ def _scalar(dtype, value):
     data = V(dtype=dtype, shape=())
     data.fill(value)
     return data
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class MochiIslandState:
+    # Island nodes are the rigid entities (all links of an articulation move together) followed by the deformable
+    # entities. Build-time maps from links and degrees of freedom to nodes (-1 for links without dofs).
+    links_node: qd.Tensor
+    dofs_node: qd.Tensor
+    # Per-environment union-find forest over the nodes, compact island index of every node and island count.
+    nodes_parent: qd.Tensor
+    nodes_island: qd.Tensor
+    n_islands: qd.Tensor
+    # Degrees of freedom grouped by island: dofs of island k are island_dofs[island_start[k]:island_start[k + 1]].
+    island_start: qd.Tensor
+    island_n_dofs: qd.Tensor
+    island_dofs: qd.Tensor
+    dofs_island: qd.Tensor
+    island_max_dofs: qd.Tensor
+    # Whether the environment is solved by the island-wise direct solver (largest island within the dense limit).
+    uses_dense: qd.Tensor
+    # Weighted squared residual norm of every node (entity) at the current and the initial Newton iterate; an
+    # environment converges when every one of its entities does, as in mochi.
+    nodes_res_w_sq: qd.Tensor
+    nodes_res_norm0_w: qd.Tensor
+
+
+def get_mochi_island_state(solver, links_node, dofs_node):
+    _B = solver._B
+    n_nodes_ = max(1, len(solver._entities) + len(solver._soft_entities))
+    n_dofs_ = solver.n_dofs_total_
+    state = MochiIslandState(
+        links_node=V(dtype=gs.qd_int, shape=(solver.n_links_,)),
+        dofs_node=V(dtype=gs.qd_int, shape=(n_dofs_,)),
+        nodes_parent=V(dtype=gs.qd_int, shape=(n_nodes_, _B)),
+        nodes_island=V(dtype=gs.qd_int, shape=(n_nodes_, _B)),
+        n_islands=V(dtype=gs.qd_int, shape=(_B,)),
+        island_start=V(dtype=gs.qd_int, shape=(n_nodes_ + 1, _B)),
+        island_n_dofs=V(dtype=gs.qd_int, shape=(n_nodes_, _B)),
+        island_dofs=V(dtype=gs.qd_int, shape=(n_dofs_, _B)),
+        dofs_island=V(dtype=gs.qd_int, shape=(n_dofs_, _B)),
+        island_max_dofs=V(dtype=gs.qd_int, shape=(_B,)),
+        uses_dense=V(dtype=gs.qd_bool, shape=(_B,)),
+        nodes_res_w_sq=V(dtype=gs.qd_float, shape=(n_nodes_, _B)),
+        nodes_res_norm0_w=V(dtype=gs.qd_float, shape=(n_nodes_, _B)),
+    )
+    if len(links_node) > 0:
+        state.links_node.from_numpy(np.asarray(links_node, dtype=gs.np_int))
+    if len(dofs_node) > 0:
+        state.dofs_node.from_numpy(np.asarray(dofs_node, dtype=gs.np_int))
+    return state
 
 
 # =========================================== runtime state ===========================================

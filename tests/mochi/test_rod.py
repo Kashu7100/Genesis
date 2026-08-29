@@ -214,7 +214,9 @@ def test_rod_stencil_finite_difference():
 @pytest.mark.precision("64")
 def test_rod_free_fall(show_viewer):
     dt, g = 0.01, 9.8
-    scene = _mochi_scene(show_viewer, dt, gravity=(0.0, 0.0, -g))
+    # The free fall is checked to round-off, which needs the linear solves tight (the default adaptive tolerance
+    # leaves the truncation error of the first Newton step in the accepted iterate).
+    scene = _mochi_scene(show_viewer, dt, gravity=(0.0, 0.0, -g), linear_tolerance_strategy="constant", pcg_abs_tol=0.0)
     rod = scene.add_entity(
         gs.morphs.Rod(points=_straight_rod_points(20, 1.0), radius=0.01, pos=(0.0, 0.0, 1.0), euler=(0.0, 20.0, 0.0)),
         material=gs.materials.Mochi.Rod(E=1e7, nu=0.3, rho=1000.0),
