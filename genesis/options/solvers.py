@@ -1037,8 +1037,20 @@ class MochiOptions(Options):
         Bins of the spatial hash that locates the deformable colliders (collider spheres of shells and rods,
         deformed tetrahedra of solids) per inserted item, rounded up to a power of two; more bins shorten the chains
         a query walks at the cost of memory (4 bytes per bin per environment). Defaults to 2.
+    max_soft_hits_per_sample : int, optional
+        Capacity of the list of contacts between deformable boundary samples and rigid colliders, per sample.
+        Exceeding it halts the simulation with an error. Defaults to 2.
+    max_deformable_collider_hits_per_query : int, optional
+        Capacity of the list of contacts between sample points (rigid or deformable) and the tetrahedra of the
+        deformable solid colliders, per sample point. Defaults to 2.
+    max_point_cloud_hits_per_query : int, optional
+        Capacity of the list of contacts between deformable samples and the collider spheres of shells and rods,
+        per deformable sample (rigid samples get `max_soft_hits_per_sample` slots each). If None, 8 when a shell or
+        rod has self-contact (a sample then sees the spheres of the opposing layer of its own body) and 2 otherwise.
+        Defaults to None.
     record_contacts : bool, optional
-        Whether individual contact points are stored for readback through `entity.get_contacts()`. Defaults to True.
+        Whether individual contact points can be read back through `entity.get_contacts()`; their buffers are
+        allocated at the first readback. Defaults to True.
     step_kernel : str, optional
         How a step is executed: "monolith" runs the whole step of every environment in one kernel (environments in
         parallel, one launch per step, no host round trips), "pipeline" runs each stage as its own kernel with the host
@@ -1090,6 +1102,9 @@ class MochiOptions(Options):
     equality_damping: NonNegativeFloat = 0.0
     max_contact_pairs_per_env: PositiveInt | None = None
     spatial_hash_bins_per_item: PositiveInt = 2
+    max_soft_hits_per_sample: PositiveInt = 2
+    max_deformable_collider_hits_per_query: PositiveInt = 2
+    max_point_cloud_hits_per_query: PositiveInt | None = None
     broadphase_margin: NonNegativeFloat = 0.01
     record_contacts: StrictBool = True
     step_kernel: Literal["auto", "monolith", "pipeline"] = "auto"

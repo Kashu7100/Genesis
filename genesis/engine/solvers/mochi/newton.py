@@ -48,7 +48,6 @@ def func_reset_newton(
         mochi_state.ls_alpha[i_b] = 1.0
         mochi_state.ls_is_done[i_b] = False
         mochi_state.res_norm0[i_b] = 0.0
-        mochi_state.res_norm0_w[i_b] = 0.0
 
 
 @qd.kernel
@@ -118,7 +117,6 @@ def func_store_initial_norms(
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         mochi_state.res_norm0[i_b] = qd.sqrt(mochi_state.res_norm_sq[i_b])
-        mochi_state.res_norm0_w[i_b] = qd.sqrt(mochi_state.res_w_sq[i_b])
         mochi_state.ls_ref_norm_sq[i_b] = mochi_state.res_norm_sq[i_b]
         mochi_state.obj_ref[i_b] = mochi_state.obj[i_b]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))

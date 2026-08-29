@@ -27,6 +27,7 @@ from .data import (
     N_HISTORY,
     SOLVE_STATUS,
     MochiContactState,
+    MochiHitReadback,
     MochiInfo,
     MochiSoftInfo,
     MochiSoftState,
@@ -322,7 +323,6 @@ def func_soft_step_start(
             if mochi_state.n_hist[i_b] >= 2:
                 pos = x1 + BDF2_ALPHA_2 * (soft_state.verts_pos_prev[1, i_v, i_b] - x1)
                 vel = v1 + BDF2_ALPHA_2 * (soft_state.verts_vel_prev[1, i_v, i_b] - v1)
-        soft_state.verts_pos_step_start[i_v, i_b] = pos
         soft_state.verts_pos_stage_start[i_v, i_b] = pos
         soft_state.verts_vel_stage_start[i_v, i_b] = vel
         # A fixed vertex takes its prescribed end-of-step position at once (its rows of the Newton system are
@@ -923,6 +923,7 @@ def func_soft_contact_eval(
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
+    hit_readback: MochiHitReadback,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
     max_samples_per_entity: int,
@@ -1058,13 +1059,14 @@ def func_soft_contact_eval(
             if i_h < max_hits:
                 soft_state.hit_sample[i_h, i_b] = i_s
                 soft_state.hit_link_b[i_h, i_b] = -1 if is_static_b else i_lb
-                soft_state.hit_geom_b[i_h, i_b] = soft_state.pair_geom_b[i_p, i_b]
                 soft_state.hit_r_b[i_h, i_b] = r_b
                 soft_state.hit_D[i_h, i_b] = D
-                soft_state.hit_force[i_h, i_b] = w * force
-                soft_state.hit_pos[i_h, i_b] = pos
-                soft_state.hit_normal[i_h, i_b] = gu.qd_normalize(R_g @ grad, EPS)
-                soft_state.hit_distance[i_h, i_b] = d
+                if qd.static(record):
+                    hit_readback.soft_hit_geom_b[i_h, i_b] = soft_state.pair_geom_b[i_p, i_b]
+                    hit_readback.soft_hit_force[i_h, i_b] = w * force
+                    hit_readback.soft_hit_pos[i_h, i_b] = pos
+                    hit_readback.soft_hit_normal[i_h, i_b] = gu.qd_normalize(R_g @ grad, EPS)
+                    hit_readback.soft_hit_distance[i_h, i_b] = d
             else:
                 qd.atomic_or(errno[i_b], array_class.ErrorCode.OVERFLOW_MOCHI_CONTACTS)
         if qd.static(record):
@@ -1082,6 +1084,7 @@ def kernel_soft_contact_eval(
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
+    hit_readback: MochiHitReadback,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
     max_samples_per_entity: int,
@@ -1101,6 +1104,7 @@ def kernel_soft_contact_eval(
         mochi_state,
         soft_info,
         soft_state,
+        hit_readback,
         rigid_config,
         mochi_config,
         max_samples_per_entity,
@@ -2175,6 +2179,7 @@ def func_soft_collider_eval(
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
+    hit_readback: MochiHitReadback,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
     assem_obj: qd.template(),
@@ -2203,6 +2208,8 @@ def func_soft_collider_eval(
         kind_a, i_la, e_a, i_sample, pos, pos_start, normal_a0, w, k_a, falloff_a, mu_a, c_visc_a, c_ndamp_a = (
             func_query_point(i_q, i_b, dyn_state, mochi_info, mochi_state, soft_info, soft_state, EPS)
         )
+        if kind_a == 1 and soft_info.entities_queries_tets[e_a] == 0:
+            continue
         inv_cell = 1.0 / soft_state.tet_hash_cell[i_b]
         cell_q = func_hash_cell(pos, inv_cell)
         for i_cell in range(27):
@@ -2213,16 +2220,9 @@ def func_soft_collider_eval(
                     break
                 i_el_cur = i_el
                 i_el = soft_state.tet_hash_next[i_el_cur, i_b]
-                # Two cells hashed to the same bin share a chain: keep the items of this cell only (each is then visited
-                # exactly once over the 27 cells).
-                center, _ = func_tet_aabb_center_half_extent(i_el_cur, i_b, soft_info, soft_state)
-                if (func_hash_cell(center, inv_cell) != cell).any():
-                    continue
-                normal_a = normal_a0
                 e_b = soft_info.elems_entity_idx[i_el_cur]
                 if soft_info.entities_collider_type[e_b] == COLLIDER_TYPE.NONE:
                     continue
-
                 is_enabled = True
                 if kind_a == 0:
                     is_enabled = soft_info.entities_links_pair_enabled[e_b, i_la]
@@ -2230,6 +2230,12 @@ def func_soft_collider_eval(
                     is_enabled = (e_a != e_b) and soft_info.entities_pair_enabled[e_a, e_b]
                 if not is_enabled:
                     continue
+                # Two cells hashed to the same bin share a chain: keep the items of this cell only (each is then visited
+                # exactly once over the 27 cells).
+                center, _ = func_tet_aabb_center_half_extent(i_el_cur, i_b, soft_info, soft_state)
+                if (func_hash_cell(center, inv_cell) != cell).any():
+                    continue
+                normal_a = normal_a0
 
                 # Inclusion in the deformed tetrahedron and pull-back to the rest shape.
                 v = soft_info.elems_v[i_el_cur]
@@ -2342,10 +2348,11 @@ def func_soft_collider_eval(
                         soft_state.sc_hit_elem_b[i_h, i_b] = i_el_cur
                         soft_state.sc_hit_bary_b[i_h, i_b] = bary_b
                         soft_state.sc_hit_D[i_h, i_b] = D
-                        soft_state.sc_hit_force[i_h, i_b] = wf
-                        soft_state.sc_hit_pos[i_h, i_b] = pos
-                        soft_state.sc_hit_normal[i_h, i_b] = gu.qd_normalize(grad, EPS)
-                        soft_state.sc_hit_distance[i_h, i_b] = d
+                        if qd.static(record):
+                            hit_readback.sc_hit_force[i_h, i_b] = wf
+                            hit_readback.sc_hit_pos[i_h, i_b] = pos
+                            hit_readback.sc_hit_normal[i_h, i_b] = gu.qd_normalize(grad, EPS)
+                            hit_readback.sc_hit_distance[i_h, i_b] = d
                     else:
                         qd.atomic_or(errno[i_b], array_class.ErrorCode.OVERFLOW_MOCHI_CONTACTS)
                 if qd.static(record):
@@ -2368,6 +2375,7 @@ def kernel_soft_collider_eval(
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
+    hit_readback: MochiHitReadback,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
     assem_obj: qd.template(),
@@ -2386,6 +2394,7 @@ def kernel_soft_collider_eval(
         mochi_state,
         soft_info,
         soft_state,
+        hit_readback,
         rigid_config,
         mochi_config,
         assem_obj,
@@ -3237,6 +3246,7 @@ def func_pc_collider_eval(
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
+    hit_readback: MochiHitReadback,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
     assem_obj: qd.template(),
@@ -3265,6 +3275,8 @@ def func_pc_collider_eval(
         kind_a, i_la, e_a, i_sample, pos, pos_start, normal_a0, w, k_a, falloff_a, mu_a, c_visc_a, c_ndamp_a = (
             func_query_point(i_q, i_b, dyn_state, mochi_info, mochi_state, soft_info, soft_state, EPS)
         )
+        if kind_a == 1 and soft_info.entities_queries_spheres[e_a] == 0:
+            continue
         is_shell_a = kind_a == 1 and soft_info.entities_kind[e_a] != SOFT_KIND_SOLID
         cell_q = func_hash_cell(pos, inv_cell)
         for i_cell in range(27):
@@ -3275,19 +3287,7 @@ def func_pc_collider_eval(
                     break
                 i_vb = i_v
                 i_v = soft_state.pc_hash_next[i_vb, i_b]
-                x_b = soft_state.verts_pos[i_vb, i_b]
-                # Two cells hashed to the same bin share a chain: keep the items of this cell only (each is then visited
-                # exactly once over the 27 cells).
-                if (func_hash_cell(x_b, inv_cell) != cell).any():
-                    continue
-                normal_a = normal_a0
                 e_b = soft_info.verts_entity_idx[i_vb]
-                if soft_info.entities_collider_type[e_b] != COLLIDER_TYPE.POINT_CLOUD:
-                    continue
-                w_b = soft_info.verts_collider_weight[i_vb]
-                if w_b <= 0.0:
-                    continue
-
                 is_enabled = True
                 if kind_a == 0:
                     is_enabled = soft_info.entities_links_pair_enabled[e_b, i_la]
@@ -3297,6 +3297,13 @@ def func_pc_collider_eval(
                     is_enabled = soft_info.entities_pair_enabled[e_a, e_b]
                 if not is_enabled:
                     continue
+                x_b = soft_state.verts_pos[i_vb, i_b]
+                # Two cells hashed to the same bin share a chain: keep the items of this cell only (each is then visited
+                # exactly once over the 27 cells). Only collider vertices were inserted.
+                if (func_hash_cell(x_b, inv_cell) != cell).any():
+                    continue
+                normal_a = normal_a0
+                w_b = soft_info.verts_collider_weight[i_vb]
 
                 diff = pos - x_b
                 dist = diff.norm()
@@ -3405,10 +3412,11 @@ def func_pc_collider_eval(
                         soft_state.pc_hit_r_a[i_h, i_b] = r_a
                         soft_state.pc_hit_vert_b[i_h, i_b] = i_vb
                         soft_state.pc_hit_D[i_h, i_b] = D
-                        soft_state.pc_hit_force[i_h, i_b] = wf
-                        soft_state.pc_hit_pos[i_h, i_b] = pos
-                        soft_state.pc_hit_normal[i_h, i_b] = grad
-                        soft_state.pc_hit_distance[i_h, i_b] = d
+                        if qd.static(record):
+                            hit_readback.pc_hit_force[i_h, i_b] = wf
+                            hit_readback.pc_hit_pos[i_h, i_b] = pos
+                            hit_readback.pc_hit_normal[i_h, i_b] = grad
+                            hit_readback.pc_hit_distance[i_h, i_b] = d
                     else:
                         qd.atomic_or(errno[i_b], array_class.ErrorCode.OVERFLOW_MOCHI_CONTACTS)
                 if qd.static(record):
@@ -3430,6 +3438,7 @@ def kernel_pc_collider_eval(
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
+    hit_readback: MochiHitReadback,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
     assem_obj: qd.template(),
@@ -3448,6 +3457,7 @@ def kernel_pc_collider_eval(
         mochi_state,
         soft_info,
         soft_state,
+        hit_readback,
         rigid_config,
         mochi_config,
         assem_obj,

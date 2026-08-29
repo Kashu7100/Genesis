@@ -52,6 +52,7 @@ from .contact import (
     kernel_broadphase_pairs,
     kernel_conservative_bounds,
     kernel_contact_eval,
+    kernel_count_contact_records,
     kernel_gather_contact_records,
     kernel_init_mochi_fields,
     kernel_pairs_to_blocks,
@@ -68,8 +69,8 @@ from .data import (
     MochiInfo,
     MochiState,
     MochiStaticConfig,
-    get_mochi_contact_records,
     get_mochi_contact_state,
+    get_mochi_hit_readback,
     get_mochi_info,
     get_mochi_soft_info,
     get_mochi_soft_state,
@@ -352,11 +353,9 @@ class MochiSolver(KinematicSolver):
         self._init_mochi()
         self._init_soft()
         self._use_monolith = self._resolve_step_kernel()
-        # Unified contact readback over every kind of recorded contact point.
-        max_records = self._max_hits
-        if self.has_soft:
-            max_records += self._max_soft_hits + self._max_sc_hits + self._max_pc_hits
-        self.contact_records = get_mochi_contact_records(self, max_records if self._options.record_contacts else 1)
+        # The contact points recorded for readback are allocated at the first readback (see `_record_contacts`).
+        self.hit_readback = get_mochi_hit_readback(self, 1, 1, 1, 1)
+        self._is_hit_readback_allocated = False
         self._links_entity_idx = np.array([link.entity.idx for link in self.links] or [-1], dtype=gs.np_int)
         self._geoms_link_idx = np.array([geom.link.idx for geom in self.geoms] or [-1], dtype=gs.np_int)
         self._soft_entities_idx = np.array([entity.idx for entity in self._soft_entities] or [-1], dtype=gs.np_int)
@@ -646,7 +645,7 @@ class MochiSolver(KinematicSolver):
         )
         self.mochi_info = get_mochi_info(self)
         self.mochi_state = get_mochi_state(self, self._max_pairs, has_dense)
-        self.contact_state = get_mochi_contact_state(self, self._max_pairs, self._max_hits)
+        self.contact_state = get_mochi_contact_state(self, self._max_pairs)
         self.eq_info = get_mochi_equalities_info(self, self._equalities)
         self.eq_state = get_mochi_equalities_state(self, len(self._equalities))
 
@@ -822,18 +821,29 @@ class MochiSolver(KinematicSolver):
         self._max_soft_pairs = options.max_contact_pairs_per_env
         if self._max_soft_pairs is None:
             self._max_soft_pairs = max(1, len(entities) * n_collider_geoms)
-        self._max_soft_hits = max(1, 2 * n_samples)
+        self._max_soft_hits = max(1, options.max_soft_hits_per_sample * n_samples)
         self._n_soft_sdf_voxels = len(sdf_values)
         self.n_soft_sdf_voxels_ = max(1, len(sdf_values))
 
         # Deformable colliders: every rigid and deformable sample point is located in the collider spheres / deformed
         # tetrahedra through a spatial hash rebuilt at every assembly (the flags are resolved in `_init_mochi`).
         self._n_soft_queries = self.n_samples + n_samples
-        self._max_sc_hits = max(1, 2 * self._n_soft_queries) if self._has_soft_colliders else 1
-        # Self-contact makes every sample overlap the spheres of its own neighborhood before the exclusion test.
+        self._max_sc_hits = (
+            max(1, options.max_deformable_collider_hits_per_query * self._n_soft_queries)
+            if self._has_soft_colliders
+            else 1
+        )
+        # A deformable sample under self-contact sees the spheres of the opposing layer of its own body (up to
+        # about a dozen within the contact range), a rigid sample the spheres of the deformable it touches.
         has_self_contact = any((e.is_shell or e.is_rod) and e.material.self_contact for e in entities)
-        pc_hits_per_query = 16 if has_self_contact else 4
-        self._max_pc_hits = max(1, pc_hits_per_query * self._n_soft_queries) if self._has_pc_colliders else 1
+        pc_hits_per_query = options.max_point_cloud_hits_per_query
+        if pc_hits_per_query is None:
+            pc_hits_per_query = 8 if has_self_contact else 2
+        self._max_pc_hits = (
+            max(1, pc_hits_per_query * n_samples + options.max_soft_hits_per_sample * self.n_samples)
+            if self._has_pc_colliders
+            else 1
+        )
         bins_per_item = options.spatial_hash_bins_per_item
         self.n_pc_bins_ = _next_power_of_two(bins_per_item * self.n_soft_verts) if self._has_pc_colliders else 1
         self.n_tet_bins_ = _next_power_of_two(bins_per_item * self.n_soft_elems) if self._has_soft_colliders else 1
@@ -893,6 +903,24 @@ class MochiSolver(KinematicSolver):
             self.soft_state,
             self.rigid_config,
         )
+        # A sample only queries the colliders it can hit: the tetrahedra of other entities, the spheres of other
+        # entities or of its own body under self-contact.
+        kinds = [self._soft_collider_kind(entity) for entity in entities]
+        queries_tets = np.zeros((self.n_soft_entities_,), dtype=gs.np_int)
+        queries_spheres = np.zeros((self.n_soft_entities_,), dtype=gs.np_int)
+        for i, entity in enumerate(entities):
+            others = [kind for j, kind in enumerate(kinds) if j != i]
+            queries_tets[i] = int(any(kind == COLLIDER_TYPE.GRID for kind in others))
+            queries_spheres[i] = int(
+                any(kind == COLLIDER_TYPE.POINT_CLOUD for kind in others)
+                or (
+                    kinds[i] == COLLIDER_TYPE.POINT_CLOUD
+                    and (entity.is_shell or entity.is_rod)
+                    and entity.material.self_contact
+                )
+            )
+        self.soft_info.entities_queries_tets.from_numpy(queries_tets)
+        self.soft_info.entities_queries_spheres.from_numpy(queries_spheres)
         if self.n_shell_elems > 0:
             kernel_init_shell_fields(
                 shell_elems_v, shell_elems_hinge, shell_elems_entity_idx, self.soft_info, self.rigid_config
@@ -1340,6 +1368,7 @@ class MochiSolver(KinematicSolver):
                 self.mochi_info,
                 self.mochi_state,
                 self.contact_state,
+                self.hit_readback,
                 self.island_state,
                 self.eq_info,
                 self.eq_state,
@@ -1455,6 +1484,7 @@ class MochiSolver(KinematicSolver):
             self.dyn_state,
             self.mochi_state,
             self.contact_state,
+            self.hit_readback,
             self.rigid_config,
             assem_obj,
             assem_res,
@@ -1473,6 +1503,7 @@ class MochiSolver(KinematicSolver):
             self.mochi_info,
             self.mochi_state,
             self.contact_state,
+            self.hit_readback,
             self.rigid_config,
             self.mochi_config,
             assem_dres,
@@ -1489,6 +1520,7 @@ class MochiSolver(KinematicSolver):
                 self.mochi_state,
                 self.soft_info,
                 self.soft_state,
+                self.hit_readback,
                 self.rigid_config,
                 self.mochi_config,
                 self._max_samples_per_soft_entity,
@@ -1507,6 +1539,7 @@ class MochiSolver(KinematicSolver):
                     self.mochi_state,
                     self.soft_info,
                     self.soft_state,
+                    self.hit_readback,
                     self.rigid_config,
                     self.mochi_config,
                     assem_obj,
@@ -1527,6 +1560,7 @@ class MochiSolver(KinematicSolver):
                     self.mochi_state,
                     self.soft_info,
                     self.soft_state,
+                    self.hit_readback,
                     self.rigid_config,
                     self.mochi_config,
                     assem_obj,
@@ -1800,7 +1834,11 @@ class MochiSolver(KinematicSolver):
                 "MochiSolver's option 'max_contact_pairs_per_env'."
             )
         if errno & array_class.ErrorCode.OVERFLOW_MOCHI_CONTACTS:
-            gs.raise_exception(f"Exceeding max number of recorded contact points ({self._max_hits}).")
+            gs.raise_exception(
+                "Exceeding the capacity of a contact list: increase MochiSolver's option 'max_soft_hits_per_sample', "
+                "'max_deformable_collider_hits_per_query' or 'max_point_cloud_hits_per_query' (see "
+                "`get_contact_capacity_usage()`)."
+            )
         if errno & array_class.ErrorCode.MOCHI_DIVERGED:
             gs.raise_exception(
                 "MochiSolver diverged: the residual of the implicit solve blew up. Reduce the time step or the "
@@ -1931,6 +1969,11 @@ class MochiSolver(KinematicSolver):
             return
         if not self._options.record_contacts:
             gs.raise_exception("Contact readback requires MochiSolver option 'record_contacts=True'.")
+        if not self._is_hit_readback_allocated:
+            self.hit_readback = get_mochi_hit_readback(
+                self, self._max_hits, self._max_soft_hits, self._max_sc_hits, self._max_pc_hits
+            )
+            self._is_hit_readback_allocated = True
         _kernel_activate_all_envs(self.mochi_state, self.rigid_config)
         self._assemble(assem_res=False, assem_dres=False, skip_ls_done=False, record=True)
         self._is_contacts_recorded = True
@@ -1938,53 +1981,66 @@ class MochiSolver(KinematicSolver):
     def get_contacts(self, as_tensor: bool = True, to_torch: bool = True, is_padded: bool = False):
         """
         Contact points of the current state, as a dict of arrays laid out (n_envs, n_contacts, ...) (see
-        `MochiEntity.get_contacts` and `MochiSoftEntity.get_contacts`). Without padding, the contact axis is trimmed to
-        the largest per-environment count and shorter environments carry -1 indices in their unused slots.
+        `MochiEntity.get_contacts` and `MochiSoftEntity.get_contacts`). The contact axis holds the largest
+        per-environment count; shorter environments carry -1 indices and zeros in their unused slots.
         """
         self._record_contacts()
+        n_contacts = torch.zeros((self._B,), dtype=gs.tc_int, device=gs.device)
+        kernel_count_contact_records(self.hit_readback, self.soft_state, n_contacts, self.rigid_config, self.has_soft)
+        n_max = max(1, int(n_contacts.max()))
+
+        def ints(*shape):
+            return torch.full((self._B, n_max, *shape), -1, dtype=gs.tc_int, device=gs.device)
+
+        def floats(*shape):
+            return torch.zeros((self._B, n_max, *shape), dtype=gs.tc_float, device=gs.device)
+
+        contact_data = {
+            "entity_a": ints(),
+            "entity_b": ints(),
+            "link_a": ints(),
+            "link_b": ints(),
+            "geom_a": ints(),
+            "geom_b": ints(),
+            "verts_a": ints(3),
+            "bary_a": floats(3),
+            "verts_b": ints(4),
+            "bary_b": floats(4),
+            "position": floats(3),
+            "normal": floats(3),
+            "distance": floats(),
+            "force_a": floats(3),
+            "weight": floats(),
+        }
         kernel_gather_contact_records(
             self._links_entity_idx,
             self._geoms_link_idx,
             self._soft_entities_idx,
             self.mochi_info.samples,
-            self.contact_state,
+            self.hit_readback,
             self.soft_info,
             self.soft_state,
-            self.contact_records,
             self.rigid_config,
             self.has_soft,
+            contact_data["entity_a"],
+            contact_data["entity_b"],
+            contact_data["link_a"],
+            contact_data["link_b"],
+            contact_data["geom_a"],
+            contact_data["geom_b"],
+            contact_data["verts_a"],
+            contact_data["bary_a"],
+            contact_data["verts_b"],
+            contact_data["bary_b"],
+            contact_data["position"],
+            contact_data["normal"],
+            contact_data["force_a"],
+            contact_data["distance"],
+            contact_data["weight"],
         )
-        records = self.contact_records
-        n_contacts = qd_to_torch(records.n_records, copy=True)
-        contact_data = {
-            "entity_a": qd_to_torch(records.entity_a, transpose=True, copy=True),
-            "entity_b": qd_to_torch(records.entity_b, transpose=True, copy=True),
-            "link_a": qd_to_torch(records.link_a, transpose=True, copy=True),
-            "link_b": qd_to_torch(records.link_b, transpose=True, copy=True),
-            "geom_a": qd_to_torch(records.geom_a, transpose=True, copy=True),
-            "geom_b": qd_to_torch(records.geom_b, transpose=True, copy=True),
-            "verts_a": qd_to_torch(records.verts_a, transpose=True, copy=True),
-            "bary_a": qd_to_torch(records.bary_a, transpose=True, copy=True),
-            "verts_b": qd_to_torch(records.verts_b, transpose=True, copy=True),
-            "bary_b": qd_to_torch(records.bary_b, transpose=True, copy=True),
-            "position": qd_to_torch(records.pos, transpose=True, copy=True),
-            "normal": qd_to_torch(records.normal, transpose=True, copy=True),
-            "distance": qd_to_torch(records.distance, transpose=True, copy=True),
-            "force_a": qd_to_torch(records.force, transpose=True, copy=True),
-            "weight": qd_to_torch(records.weight, transpose=True, copy=True),
-        }
         contact_data["force_b"] = -contact_data["force_a"]
-        slots = torch.arange(records.entity_a.shape[0], device=n_contacts.device)
-        is_valid = slots[None, :] < n_contacts[:, None]
-        for key in ("entity_a", "entity_b", "link_a", "link_b", "geom_a", "geom_b"):
-            contact_data[key] = torch.where(is_valid, contact_data[key], -1)
-        for key in ("verts_a", "verts_b"):
-            contact_data[key] = torch.where(is_valid[..., None], contact_data[key], -1)
         if is_padded:
             contact_data["n_contacts"] = n_contacts if self.n_envs > 0 else n_contacts[0]
-        else:
-            n_max = int(n_contacts.max())
-            contact_data = {key: value[:, :n_max] for key, value in contact_data.items()}
         if self.n_envs == 0:
             contact_data = {key: value[0] for key, value in contact_data.items()}
         if not to_torch:
@@ -2102,7 +2158,7 @@ class MochiSolver(KinematicSolver):
             "eq_state",
             "soft_info",
             "soft_state",
-            "contact_records",
+            "hit_readback",
             "dyn_state",
             "dyn_info",
             "rigid_info",

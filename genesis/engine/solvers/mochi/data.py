@@ -363,7 +363,6 @@ class MochiState:
     res_norm_sq: qd.Tensor
     res_w_sq: qd.Tensor
     res_norm0: qd.Tensor
-    res_norm0_w: qd.Tensor
     ls_alpha: qd.Tensor
     ls_ref_norm_sq: qd.Tensor
     ls_is_done: qd.Tensor
@@ -432,7 +431,6 @@ def get_mochi_state(solver, max_pairs, has_dense):
         res_norm_sq=V(dtype=gs.qd_float, shape=(_B,)),
         res_w_sq=V(dtype=gs.qd_float, shape=(_B,)),
         res_norm0=V(dtype=gs.qd_float, shape=(_B,)),
-        res_norm0_w=V(dtype=gs.qd_float, shape=(_B,)),
         ls_alpha=V(dtype=gs.qd_float, shape=(_B,)),
         ls_ref_norm_sq=V(dtype=gs.qd_float, shape=(_B,)),
         ls_is_done=V(dtype=gs.qd_bool, shape=(_B,)),
@@ -476,21 +474,9 @@ class MochiContactState:
     links_step_aabb_min: qd.Tensor
     links_step_aabb_max: qd.Tensor
     links_step_pad: qd.Tensor
-    # Recorded contact points for readback.
-    hit_link_a: qd.Tensor
-    hit_geom_a: qd.Tensor
-    hit_link_b: qd.Tensor
-    hit_geom_b: qd.Tensor
-    hit_sample: qd.Tensor
-    hit_pos: qd.Tensor
-    hit_normal: qd.Tensor
-    hit_force: qd.Tensor
-    hit_distance: qd.Tensor
-    hit_weight: qd.Tensor
-    n_hits_total: qd.Tensor
 
 
-def get_mochi_contact_state(solver, max_pairs, max_hits):
+def get_mochi_contact_state(solver, max_pairs):
     _B = solver._B
     n_links_ = solver.n_links_
     return MochiContactState(
@@ -508,6 +494,49 @@ def get_mochi_contact_state(solver, max_pairs, max_hits):
         links_step_aabb_min=V(dtype=gs.qd_vec3, shape=(n_links_, _B)),
         links_step_aabb_max=V(dtype=gs.qd_vec3, shape=(n_links_, _B)),
         links_step_pad=V(dtype=gs.qd_float, shape=(n_links_, _B)),
+    )
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class MochiHitReadback:
+    """Contact points recorded for readback (positions, normals, forces, distances of every hit of the last recording
+    pass, per contact kind), allocated at the first readback: the solver itself only keeps the fields its linear
+    solve needs."""
+
+    # rigid samples on rigid colliders
+    n_hits_total: qd.Tensor
+    hit_link_a: qd.Tensor
+    hit_geom_a: qd.Tensor
+    hit_link_b: qd.Tensor
+    hit_geom_b: qd.Tensor
+    hit_sample: qd.Tensor
+    hit_pos: qd.Tensor
+    hit_normal: qd.Tensor
+    hit_force: qd.Tensor
+    hit_distance: qd.Tensor
+    hit_weight: qd.Tensor
+    # deformable samples on rigid colliders
+    soft_hit_geom_b: qd.Tensor
+    soft_hit_pos: qd.Tensor
+    soft_hit_normal: qd.Tensor
+    soft_hit_force: qd.Tensor
+    soft_hit_distance: qd.Tensor
+    # samples on deformable (tetrahedral) colliders
+    sc_hit_pos: qd.Tensor
+    sc_hit_normal: qd.Tensor
+    sc_hit_force: qd.Tensor
+    sc_hit_distance: qd.Tensor
+    # samples on point-cloud colliders
+    pc_hit_pos: qd.Tensor
+    pc_hit_normal: qd.Tensor
+    pc_hit_force: qd.Tensor
+    pc_hit_distance: qd.Tensor
+
+
+def get_mochi_hit_readback(solver, max_hits, max_soft_hits, max_sc_hits, max_pc_hits):
+    _B = solver._B
+    return MochiHitReadback(
+        n_hits_total=V(dtype=gs.qd_int, shape=(_B,)),
         hit_link_a=V(dtype=gs.qd_int, shape=(max_hits, _B)),
         hit_geom_a=V(dtype=gs.qd_int, shape=(max_hits, _B)),
         hit_link_b=V(dtype=gs.qd_int, shape=(max_hits, _B)),
@@ -518,54 +547,19 @@ def get_mochi_contact_state(solver, max_pairs, max_hits):
         hit_force=V(dtype=gs.qd_vec3, shape=(max_hits, _B)),
         hit_distance=V(dtype=gs.qd_float, shape=(max_hits, _B)),
         hit_weight=V(dtype=gs.qd_float, shape=(max_hits, _B)),
-        n_hits_total=V(dtype=gs.qd_int, shape=(_B,)),
-    )
-
-
-@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
-class MochiContactRecords:
-    # Unified readback of the contact points of every kind (rigid samples on rigid colliders, deformable samples on
-    # rigid colliders, any sample on deformable colliders), compacted per environment: scene entity, link and geom
-    # indices of the colliding side a and the collider side b (-1 where not applicable), the vertices (local to
-    # their entity, -1 padded) and weights the sample and the collider point are spread over, position, unit normal
-    # pointing away from b, signed distance, force on a and the quadrature weight of the sample.
-    n_records: qd.Tensor
-    entity_a: qd.Tensor
-    entity_b: qd.Tensor
-    link_a: qd.Tensor
-    link_b: qd.Tensor
-    geom_a: qd.Tensor
-    geom_b: qd.Tensor
-    verts_a: qd.Tensor
-    bary_a: qd.Tensor
-    verts_b: qd.Tensor
-    bary_b: qd.Tensor
-    pos: qd.Tensor
-    normal: qd.Tensor
-    force: qd.Tensor
-    distance: qd.Tensor
-    weight: qd.Tensor
-
-
-def get_mochi_contact_records(solver, max_records):
-    _B = solver._B
-    return MochiContactRecords(
-        n_records=V(dtype=gs.qd_int, shape=(_B,)),
-        entity_a=V(dtype=gs.qd_int, shape=(max_records, _B)),
-        entity_b=V(dtype=gs.qd_int, shape=(max_records, _B)),
-        link_a=V(dtype=gs.qd_int, shape=(max_records, _B)),
-        link_b=V(dtype=gs.qd_int, shape=(max_records, _B)),
-        geom_a=V(dtype=gs.qd_int, shape=(max_records, _B)),
-        geom_b=V(dtype=gs.qd_int, shape=(max_records, _B)),
-        verts_a=V(dtype=gs.qd_ivec3, shape=(max_records, _B)),
-        bary_a=V(dtype=gs.qd_vec3, shape=(max_records, _B)),
-        verts_b=V(dtype=gs.qd_ivec4, shape=(max_records, _B)),
-        bary_b=V(dtype=gs.qd_vec4, shape=(max_records, _B)),
-        pos=V(dtype=gs.qd_vec3, shape=(max_records, _B)),
-        normal=V(dtype=gs.qd_vec3, shape=(max_records, _B)),
-        force=V(dtype=gs.qd_vec3, shape=(max_records, _B)),
-        distance=V(dtype=gs.qd_float, shape=(max_records, _B)),
-        weight=V(dtype=gs.qd_float, shape=(max_records, _B)),
+        soft_hit_geom_b=V(dtype=gs.qd_int, shape=(max_soft_hits, _B)),
+        soft_hit_pos=V(dtype=gs.qd_vec3, shape=(max_soft_hits, _B)),
+        soft_hit_normal=V(dtype=gs.qd_vec3, shape=(max_soft_hits, _B)),
+        soft_hit_force=V(dtype=gs.qd_vec3, shape=(max_soft_hits, _B)),
+        soft_hit_distance=V(dtype=gs.qd_float, shape=(max_soft_hits, _B)),
+        sc_hit_pos=V(dtype=gs.qd_vec3, shape=(max_sc_hits, _B)),
+        sc_hit_normal=V(dtype=gs.qd_vec3, shape=(max_sc_hits, _B)),
+        sc_hit_force=V(dtype=gs.qd_vec3, shape=(max_sc_hits, _B)),
+        sc_hit_distance=V(dtype=gs.qd_float, shape=(max_sc_hits, _B)),
+        pc_hit_pos=V(dtype=gs.qd_vec3, shape=(max_pc_hits, _B)),
+        pc_hit_normal=V(dtype=gs.qd_vec3, shape=(max_pc_hits, _B)),
+        pc_hit_force=V(dtype=gs.qd_vec3, shape=(max_pc_hits, _B)),
+        pc_hit_distance=V(dtype=gs.qd_float, shape=(max_pc_hits, _B)),
     )
 
 
@@ -655,6 +649,9 @@ class MochiSoftInfo:
     entities_rot_inertia: qd.Tensor
     entities_self_contact: qd.Tensor
     entities_self_contact_exclusion_ratio: qd.Tensor
+    # whether the samples of the entity can hit the tetrahedra / the collider spheres of some entity at all
+    entities_queries_tets: qd.Tensor
+    entities_queries_spheres: qd.Tensor
     entities_penalty_coefficient: qd.Tensor
     entities_penalty_smoothing_half_distance: qd.Tensor
     entities_penalty_threshold: qd.Tensor
@@ -761,6 +758,8 @@ def get_mochi_soft_info(solver):
         entities_rot_inertia=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_self_contact=V(dtype=gs.qd_int, shape=(n_se_,)),
         entities_self_contact_exclusion_ratio=V(dtype=gs.qd_float, shape=(n_se_,)),
+        entities_queries_tets=V(dtype=gs.qd_int, shape=(n_se_,)),
+        entities_queries_spheres=V(dtype=gs.qd_int, shape=(n_se_,)),
         entities_penalty_coefficient=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_penalty_smoothing_half_distance=V(dtype=gs.qd_float, shape=(n_se_,)),
         entities_penalty_threshold=V(dtype=gs.qd_float, shape=(n_se_,)),
@@ -798,7 +797,6 @@ class MochiSoftState:
     verts_vel: qd.Tensor
     verts_pos_prev: qd.Tensor
     verts_vel_prev: qd.Tensor
-    verts_pos_step_start: qd.Tensor
     verts_pos_stage_start: qd.Tensor
     verts_vel_stage_start: qd.Tensor
     verts_pos_ls_ref: qd.Tensor
@@ -861,13 +859,8 @@ class MochiSoftState:
     n_soft_hits_max: qd.Tensor
     hit_sample: qd.Tensor
     hit_link_b: qd.Tensor
-    hit_geom_b: qd.Tensor
     hit_r_b: qd.Tensor
     hit_D: qd.Tensor
-    hit_force: qd.Tensor
-    hit_pos: qd.Tensor
-    hit_normal: qd.Tensor
-    hit_distance: qd.Tensor
     # Active samples against deformable colliders: colliding side (kind 0 = rigid link sample with lever arm r_a about
     # the link origin, kind 1 = deformable sample), collider tetrahedron with the barycentric coordinates of the point,
     # per-sample matrix D = -w df/dp, force on the colliding side and readback data.
@@ -880,10 +873,6 @@ class MochiSoftState:
     sc_hit_elem_b: qd.Tensor
     sc_hit_bary_b: qd.Tensor
     sc_hit_D: qd.Tensor
-    sc_hit_force: qd.Tensor
-    sc_hit_pos: qd.Tensor
-    sc_hit_normal: qd.Tensor
-    sc_hit_distance: qd.Tensor
     # Active samples against the point-cloud colliders of the shells: colliding side as above, collider vertex.
     n_pc_hits: qd.Tensor
     n_pc_hits_max: qd.Tensor
@@ -893,10 +882,6 @@ class MochiSoftState:
     pc_hit_r_a: qd.Tensor
     pc_hit_vert_b: qd.Tensor
     pc_hit_D: qd.Tensor
-    pc_hit_force: qd.Tensor
-    pc_hit_pos: qd.Tensor
-    pc_hit_normal: qd.Tensor
-    pc_hit_distance: qd.Tensor
     # spatial hashes of the deformable colliders (heads of the per-bin chains, -1 empty; next item of a chain)
     pc_hash_heads: qd.Tensor
     pc_hash_next: qd.Tensor
@@ -915,7 +900,6 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         verts_vel=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
         verts_pos_prev=V(dtype=gs.qd_vec3, shape=(N_HISTORY, n_sv_, _B)),
         verts_vel_prev=V(dtype=gs.qd_vec3, shape=(N_HISTORY, n_sv_, _B)),
-        verts_pos_step_start=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
         verts_pos_stage_start=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
         verts_vel_stage_start=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
         verts_pos_ls_ref=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
@@ -961,13 +945,8 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         n_soft_hits_max=_scalar(gs.qd_int, 0),
         hit_sample=V(dtype=gs.qd_int, shape=(max_soft_hits, _B)),
         hit_link_b=V(dtype=gs.qd_int, shape=(max_soft_hits, _B)),
-        hit_geom_b=V(dtype=gs.qd_int, shape=(max_soft_hits, _B)),
         hit_r_b=V(dtype=gs.qd_vec3, shape=(max_soft_hits, _B)),
         hit_D=V(dtype=gs.qd_mat3, shape=(max_soft_hits, _B)),
-        hit_force=V(dtype=gs.qd_vec3, shape=(max_soft_hits, _B)),
-        hit_pos=V(dtype=gs.qd_vec3, shape=(max_soft_hits, _B)),
-        hit_normal=V(dtype=gs.qd_vec3, shape=(max_soft_hits, _B)),
-        hit_distance=V(dtype=gs.qd_float, shape=(max_soft_hits, _B)),
         n_sc_hits=V(dtype=gs.qd_int, shape=(_B,)),
         n_sc_hits_max=_scalar(gs.qd_int, 0),
         sc_hit_kind_a=V(dtype=gs.qd_int, shape=(max_sc_hits, _B)),
@@ -977,10 +956,6 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         sc_hit_elem_b=V(dtype=gs.qd_int, shape=(max_sc_hits, _B)),
         sc_hit_bary_b=V(dtype=gs.qd_vec4, shape=(max_sc_hits, _B)),
         sc_hit_D=V(dtype=gs.qd_mat3, shape=(max_sc_hits, _B)),
-        sc_hit_force=V(dtype=gs.qd_vec3, shape=(max_sc_hits, _B)),
-        sc_hit_pos=V(dtype=gs.qd_vec3, shape=(max_sc_hits, _B)),
-        sc_hit_normal=V(dtype=gs.qd_vec3, shape=(max_sc_hits, _B)),
-        sc_hit_distance=V(dtype=gs.qd_float, shape=(max_sc_hits, _B)),
         n_pc_hits=V(dtype=gs.qd_int, shape=(_B,)),
         n_pc_hits_max=_scalar(gs.qd_int, 0),
         pc_hit_kind_a=V(dtype=gs.qd_int, shape=(max_pc_hits, _B)),
@@ -989,10 +964,6 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         pc_hit_r_a=V(dtype=gs.qd_vec3, shape=(max_pc_hits, _B)),
         pc_hit_vert_b=V(dtype=gs.qd_int, shape=(max_pc_hits, _B)),
         pc_hit_D=V(dtype=gs.qd_mat3, shape=(max_pc_hits, _B)),
-        pc_hit_force=V(dtype=gs.qd_vec3, shape=(max_pc_hits, _B)),
-        pc_hit_pos=V(dtype=gs.qd_vec3, shape=(max_pc_hits, _B)),
-        pc_hit_normal=V(dtype=gs.qd_vec3, shape=(max_pc_hits, _B)),
-        pc_hit_distance=V(dtype=gs.qd_float, shape=(max_pc_hits, _B)),
         pc_hash_heads=V(dtype=gs.qd_int, shape=(solver.n_pc_bins_, _B)),
         pc_hash_next=V(dtype=gs.qd_int, shape=(n_sv_, _B)),
         tet_hash_heads=V(dtype=gs.qd_int, shape=(solver.n_tet_bins_, _B)),
