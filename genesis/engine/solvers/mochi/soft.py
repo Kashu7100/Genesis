@@ -45,6 +45,7 @@ from .rod import (
     func_rod_normalize,
     func_rod_transport_axis,
 )
+from .rod_solver import func_rod_band_solve
 from .shell import func_shell_elastic, func_shell_rest_data, func_shell_strains
 from .soft_materials import (
     func_elastic_energy,
@@ -1208,11 +1209,13 @@ def func_soft_precondition(
         if not mochi_state.pcg_is_active[i_b] or soft_info.rod_elems_L[i_r] <= 0.0:
             continue
         i_d = func_rod_twist_dof(i_r, soft_info)
+        if soft_info.dofs_band_row[i_d] >= 0:
+            continue
         diag = mochi_state.dofs_H_diag[i_d, i_b] + soft_state.rod_elems_twist_pcg[i_r, i_b]
         z[i_d, i_b] = r[i_d, i_b] / qd.max(diag, eps)
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_v, i_b in qd.ndrange(n_verts, _B):
-        if not mochi_state.pcg_is_active[i_b]:
+        if not mochi_state.pcg_is_active[i_b] or soft_info.dofs_band_row[func_soft_dof(i_v, 0, soft_info)] >= 0:
             continue
         r_v = func_read_soft_vec(r, i_v, i_b, soft_info)
         z_v = r_v
@@ -1227,6 +1230,7 @@ def func_soft_precondition(
         i_d = func_soft_dof(i_v, 0, soft_info)
         for k in qd.static(range(3)):
             z[i_d + k, i_b] = z_v[k]
+    func_rod_band_solve(r, z, mochi_state, soft_info, soft_state, rigid_config)
 
 
 @qd.kernel

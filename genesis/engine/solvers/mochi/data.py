@@ -54,6 +54,9 @@ class SOLVE_STATUS(IntEnum):
 
 # Number of previous steps kept for multistep integration (BDF2 needs two).
 N_HISTORY = 2
+# Half bandwidth of a rod's Hessian in the node-interleaved ordering [x_0, theta_0, x_1, theta_1, ...]: a bending
+# stencil couples three consecutive nodes and the two segments between them, i.e. rows at most 10 apart.
+ROD_BAND = 10
 
 
 @qd.data_oriented
@@ -603,6 +606,17 @@ class MochiSoftInfo:
     # parallel-transport denominator. Resolved here rather than as a module constant because the value depends on the
     # precision selected at initialization.
     rod_tiny: qd.Tensor
+    # Banded ordering of the open rods for the exact per-rod preconditioner: band row of every degree of freedom (-1
+    # outside the rods), degree of freedom of every band row, and per deformable entity the row range plus the rod
+    # element and stencil ranges (all zero-length for anything but an open rod).
+    dofs_band_row: qd.Tensor
+    band_rows_dof: qd.Tensor
+    entities_band_start: qd.Tensor
+    entities_band_n: qd.Tensor
+    entities_rod_elem_start: qd.Tensor
+    entities_rod_elem_end: qd.Tensor
+    entities_rod_stencil_start: qd.Tensor
+    entities_rod_stencil_end: qd.Tensor
     # Boundary contact samples: triangle vertices, barycentric coordinates, rest area weight and owning entity.
     samples_tri: qd.Tensor
     samples_bary: qd.Tensor
@@ -693,6 +707,14 @@ def get_mochi_soft_info(solver):
         rod_stencils_L=V(dtype=gs.qd_float, shape=(n_rs_,)),
         rod_stencils_ref=V(dtype=gs.qd_vec3, shape=(n_rs_,)),
         rod_tiny=_scalar(gs.qd_float, float(np.finfo(gs.np_float).tiny)),
+        dofs_band_row=V(dtype=gs.qd_int, shape=(solver.n_dofs_total_,)),
+        band_rows_dof=V(dtype=gs.qd_int, shape=(solver.n_band_rows_,)),
+        entities_band_start=V(dtype=gs.qd_int, shape=(n_se_,)),
+        entities_band_n=V(dtype=gs.qd_int, shape=(n_se_,)),
+        entities_rod_elem_start=V(dtype=gs.qd_int, shape=(n_se_,)),
+        entities_rod_elem_end=V(dtype=gs.qd_int, shape=(n_se_,)),
+        entities_rod_stencil_start=V(dtype=gs.qd_int, shape=(n_se_,)),
+        entities_rod_stencil_end=V(dtype=gs.qd_int, shape=(n_se_,)),
         samples_tri=V(dtype=gs.qd_ivec3, shape=(n_ss_,)),
         samples_bary=V(dtype=gs.qd_vec3, shape=(n_ss_,)),
         samples_weight=V(dtype=gs.qd_float, shape=(n_ss_,)),
@@ -788,6 +810,9 @@ class MochiSoftState:
     rod_elems_twist_pcg: qd.Tensor
     rod_stencils_stage_start: qd.Tensor
     rod_stencils_H: qd.Tensor
+    # Lower Cholesky factor of every open rod's own Hessian block in band storage: rod_band[row, d] holds the entry
+    # (row, row - d) of the node-interleaved ordering.
+    rod_band: qd.Tensor
     # Conservative per-step world bounds of every entity.
     entities_step_aabb_min: qd.Tensor
     entities_step_aabb_max: qd.Tensor
@@ -886,6 +911,7 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         rod_elems_twist_pcg=V(dtype=gs.qd_float, shape=(n_re_, _B)),
         rod_stencils_stage_start=V(dtype=gs.qd_vec3, shape=(n_rs_, _B)),
         rod_stencils_H=V_MAT(n=11, m=11, dtype=gs.qd_float, shape=(n_rs_, _B)),
+        rod_band=V(dtype=gs.qd_float, shape=(solver.n_band_rows_, ROD_BAND + 1, _B)),
         entities_step_aabb_min=V(dtype=gs.qd_vec3, shape=(n_se_, _B)),
         entities_step_aabb_max=V(dtype=gs.qd_vec3, shape=(n_se_, _B)),
         n_pairs=V(dtype=gs.qd_int, shape=(_B,)),

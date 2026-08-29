@@ -862,10 +862,25 @@ class MochiSolver(KinematicSolver):
                 max_n_query_result_per_aabb=n_results_per_tet,
             )
 
+        band = self._rod_band_layout()
+        self.n_band_rows_ = max(1, len(band["rows_dof"]))
         self.soft_info = get_mochi_soft_info(self)
         self.soft_state = get_mochi_soft_state(
             self, self._max_soft_pairs, self._max_soft_hits, self._max_sc_hits, self._max_pc_hits
         )
+        self.soft_info.dofs_band_row.from_numpy(band["dofs_row"])
+        if len(band["rows_dof"]) > 0:
+            self.soft_info.band_rows_dof.from_numpy(band["rows_dof"])
+        if self.n_soft_entities > 0:
+            for name in (
+                "band_start",
+                "band_n",
+                "rod_elem_start",
+                "rod_elem_end",
+                "rod_stencil_start",
+                "rod_stencil_end",
+            ):
+                getattr(self.soft_info, f"entities_{name}").from_numpy(band[name])
         kernel_init_soft_fields(
             verts_rest,
             verts_entity_idx,
@@ -970,6 +985,48 @@ class MochiSolver(KinematicSolver):
         bary = np.tile(np.stack([1.0 - points, points, np.zeros(3)], axis=-1), (len(elems), 1))
         sample_weights = (weights[None, :] * lengths[:, None]).reshape((-1,))
         return tri.astype(gs.np_int), bary.astype(gs.np_float), sample_weights.astype(gs.np_float)
+
+    def _rod_band_layout(self):
+        """Node-interleaved ordering [x_0, theta_0, x_1, theta_1, ..., x_(n-1)] of every open rod's degrees of freedom
+        (band rows), the inverse map for all degrees of freedom, and the rod element / stencil ranges per entity."""
+        n_entities = self.n_soft_entities
+        dofs_row = np.full(self.n_dofs_total_, -1, dtype=gs.np_int)
+        rows_dof = []
+        band = {
+            name: np.zeros(max(1, n_entities), dtype=gs.np_int)
+            for name in (
+                "band_start",
+                "band_n",
+                "rod_elem_start",
+                "rod_elem_end",
+                "rod_stencil_start",
+                "rod_stencil_end",
+            )
+        }
+        elem_offset, stencil_offset = 0, 0
+        for entity in self._soft_entities:
+            if not entity.is_rod:
+                continue
+            i_e = entity.idx_in_solver
+            n_nodes, n_elems = entity.n_vertices, entity.n_elements
+            n_stencils = n_nodes if entity.morph.is_closed_loop else n_nodes - 2
+            band["rod_elem_start"][i_e], band["rod_elem_end"][i_e] = elem_offset, elem_offset + n_elems
+            band["rod_stencil_start"][i_e], band["rod_stencil_end"][i_e] = stencil_offset, stencil_offset + n_stencils
+            if not entity.morph.is_closed_loop:
+                band["band_start"][i_e] = len(rows_dof)
+                for i_n in range(n_nodes):
+                    for k in range(3):
+                        rows_dof.append(self.n_dofs + 3 * (entity.v_start + i_n) + k)
+                    if i_n < n_elems:
+                        rows_dof.append(self.n_dofs + 3 * self.n_soft_verts + elem_offset + i_n)
+                band["band_n"][i_e] = len(rows_dof) - band["band_start"][i_e]
+            elem_offset += n_elems
+            stencil_offset += n_stencils
+        rows_dof = np.array(rows_dof, dtype=gs.np_int)
+        dofs_row[rows_dof] = np.arange(len(rows_dof), dtype=gs.np_int)
+        band["rows_dof"] = rows_dof
+        band["dofs_row"] = dofs_row
+        return band
 
     @staticmethod
     def _rod_stencils(rods):

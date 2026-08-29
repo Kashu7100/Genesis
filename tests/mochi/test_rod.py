@@ -351,7 +351,8 @@ def test_rod_on_plane(show_viewer):
 @pytest.mark.precision("64")
 def test_rigid_ball_on_ropes(show_viewer):
     n_segments, length, rope_radius, ball_radius, gap = 40, 1.0, 0.02, 0.05, 0.03
-    scene = _mochi_scene(show_viewer, 0.01, n_newton_iterations=8)
+    # The force balance is checked to 1e-3 N, below what the default Newton tolerance guarantees for the ball.
+    scene = _mochi_scene(show_viewer, 0.01, n_newton_iterations=8, newton_abs_tol=1e-6)
     ropes = []
     for y in (-gap, gap):
         ropes.append(

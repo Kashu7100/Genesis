@@ -19,6 +19,7 @@ from .articulated import (
 from .data import MochiContactState, MochiInfo, MochiSoftInfo, MochiSoftState, MochiState
 from .equalities import MochiEqualitiesInfo, MochiEqualitiesState
 from .islands import MochiIslandState
+from .rod_solver import func_rod_band_factor
 from .soft import func_soft_hit_counts_max, func_soft_matvec, func_soft_precondition
 
 # Divergence factor of the conjugate gradient stopping test, on the norm of the preconditioned residual: an
@@ -281,6 +282,8 @@ def kernel_pcg_init(
         mochi_state.pcg_is_active[i_b] = mochi_state.is_active[i_b] and not island_state.uses_dense[i_b]
         mochi_state.pcg_rTz[i_b] = 0.0
         mochi_state.pcg_zTz[i_b] = 0.0
+    if qd.static(mochi_config.has_soft):
+        func_rod_band_factor(mochi_state, soft_info, soft_state, rigid_config, mochi_info.EPS[None])
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_d, i_b in qd.ndrange(n_dofs, _B):
         if mochi_state.pcg_is_active[i_b]:
