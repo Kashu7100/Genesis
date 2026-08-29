@@ -2050,13 +2050,119 @@ class MochiSolver(KinematicSolver):
         return distances, gradients, is_valid
 
     def get_convergence_info(self):
-        """Per-environment outcome of the last solve: number of Newton iterations, status (0 running, 1 converged,
-        2 stopped at the iteration budget, 3 diverged), and the plain residual norm before and after the solve."""
+        """Per-environment outcome of the last solve: number of Newton iterations, number of conjugate-gradient
+        iterations summed over the Newton iterations, status (0 running, 1 converged, 2 stopped at the iteration budget,
+        3 diverged), and the plain residual norm before and after the solve."""
         return {
             "n_iter": qd_to_torch(self.mochi_state.n_iter, copy=True),
+            "n_pcg_iter": qd_to_torch(self.mochi_state.n_pcg_iter, copy=True),
             "status": qd_to_torch(self.mochi_state.status, copy=True),
             "res_norm0": qd_to_torch(self.mochi_state.res_norm0, copy=True),
             "res_norm": qd_to_torch(self.mochi_state.res_norm_sq, copy=True).sqrt(),
+        }
+
+    def get_contact_capacity_usage(self):
+        """Per bounded contact list, the largest per-environment count of the last full assembly (the one the last
+        linear solve used) and the capacity of the list (what the `max_*` options size), to tune the capacities of a
+        scene."""
+        usage = {"contact_pairs": (int(qd_to_numpy(self.contact_state.n_pairs).max()), self._max_pairs)}
+        if self.has_soft:
+            usage["soft_hits"] = (int(qd_to_numpy(self.soft_state.n_soft_hits_max)), self._max_soft_hits)
+            usage["soft_collider_hits"] = (int(qd_to_numpy(self.soft_state.n_sc_hits_max)), self._max_sc_hits)
+            usage["point_cloud_hits"] = (int(qd_to_numpy(self.soft_state.n_pc_hits_max)), self._max_pc_hits)
+        return usage
+
+    def memory_report(self):
+        """Bytes held by the solver's arrays: totals, the per-environment and static parts (an array is per
+        environment when one of its axes has the batch size; unambiguous from two environments on) and every field
+        sorted by size, to size scenes for large batches."""
+        import dataclasses
+
+        from quadrants.lang.util import to_numpy_type
+
+        _B = self._B
+
+        def tensor_bytes(tensor):
+            if hasattr(tensor, "get_member_field") and hasattr(tensor, "keys"):
+                keys = tensor.keys() if callable(tensor.keys) else tensor.keys
+                return sum(tensor_bytes(tensor.get_member_field(key))[0] for key in keys), tuple(tensor.shape)
+            shape = tuple(int(n) for n in tensor.shape)
+            element_shape = tuple(int(n) for n in (getattr(tensor, "element_shape", None) or ()))
+            try:
+                itemsize = np.dtype(to_numpy_type(tensor.dtype)).itemsize
+            except (TypeError, ValueError, KeyError):
+                itemsize = 4
+            n_bytes = int(np.prod(shape, dtype=np.int64)) * int(np.prod(element_shape, dtype=np.int64)) * itemsize
+            return n_bytes, shape
+
+        def is_tensor(value):
+            return (
+                hasattr(value, "shape")
+                and hasattr(value, "dtype")
+                and not isinstance(value, (np.ndarray, torch.Tensor))
+            )
+
+        def walk(obj, prefix, fields, seen):
+            if obj is None or id(obj) in seen:
+                return
+            seen.add(id(obj))
+            if dataclasses.is_dataclass(obj):
+                items = [(field.name, getattr(obj, field.name)) for field in dataclasses.fields(obj)]
+            elif hasattr(obj, "__dict__"):
+                items = list(vars(obj).items())
+            else:
+                return
+            for name, value in items:
+                if is_tensor(value):
+                    n_bytes, shape = tensor_bytes(value)
+                    fields.append((f"{prefix}.{name}", n_bytes, shape))
+                elif dataclasses.is_dataclass(value) or type(value).__module__.startswith(("genesis.", "quadrants.")):
+                    if not isinstance(value, (str, bytes, np.ndarray, torch.Tensor)):
+                        walk(value, f"{prefix}.{name}", fields, seen)
+
+        fields = []
+        seen = set()
+        for name in (
+            "mochi_info",
+            "mochi_state",
+            "contact_state",
+            "island_state",
+            "eq_info",
+            "eq_state",
+            "soft_info",
+            "soft_state",
+            "contact_records",
+            "dyn_state",
+            "dyn_info",
+            "rigid_info",
+            "geoms_init_AABB",
+            "_soft_vverts_render",
+            "_errno",
+            "_pc_bvh",
+            "_soft_tet_bvh",
+            "_soft_query_aabb",
+            "_pc_aabb",
+            "_soft_tet_aabb",
+        ):
+            value = getattr(self, name, None)
+            if is_tensor(value):
+                n_bytes, shape = tensor_bytes(value)
+                fields.append((name, n_bytes, shape))
+            else:
+                walk(value, name, fields, seen)
+        if getattr(self, "sdf", None) is not None:
+            walk(getattr(self.sdf, "_sdf_info", None), "sdf_info", fields, seen)
+        total = sum(n_bytes for _, n_bytes, _ in fields)
+        per_env_bytes = sum(n_bytes for _, n_bytes, shape in fields if _B >= 2 and _B in shape)
+        return {
+            "total_bytes": total,
+            "per_env_bytes": per_env_bytes // _B if _B >= 2 else None,
+            "static_bytes": total - per_env_bytes if _B >= 2 else None,
+            "n_envs": _B,
+            "fields": sorted(
+                ({"name": name, "bytes": n_bytes, "shape": shape} for name, n_bytes, shape in fields),
+                key=lambda item: -item["bytes"],
+            ),
         }
 
     # ------------------------------------------------------------------------------------

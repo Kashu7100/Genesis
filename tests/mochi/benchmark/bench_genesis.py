@@ -3,22 +3,75 @@
     python tests/mochi/benchmark/bench_genesis.py rigid [--backend cpu|gpu] [--precision 64|32] [--n-envs B] [--profile]
 
 Protocol (shared with bench_mochi.py): warm-up steps, then `--n-windows` windows of `--n-steps` steps; the best and the
-mean window are reported in ms/step. `--profile` adds the quadrants kernel profiler (launches per step, kernel time, top
-kernels). Results are written as JSON into `--out` (default `results/`).
+mean window are reported in ms/step. Every run also records the solver's memory (per environment and static, from
+`MochiSolver.memory_report()`), the process' device memory (NVML, when available), the Newton and conjugate-gradient
+iteration counts and the usage of the bounded contact lists. `--profile` adds the quadrants kernel profiler (launches per
+step, kernel time, top kernels), `--hits` reads the contact-hit lists back (counts, redundancy of the self-contact
+couplings), `--cprofile` profiles the Python side of a step. Results are written as JSON into `--out` (default `results/`).
 """
 
 import argparse
 import contextlib
+import cProfile
 import io
 import json
 import os
+import pstats
 import re
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 import scenes
+
+MIB = 2**20
+
+
+def vram_mib():
+    """(device memory of this process, total device memory) in MiB, or (None, None) without NVML/amdsmi."""
+    try:
+        from gpu_info import detect_gpu_backend
+
+        backend = detect_gpu_backend()
+        if backend is None:
+            return None, None
+        return backend.get_per_process_vram_mib().get(os.getpid()), backend.get_device_vram_mib()[0]
+    except (ImportError, OSError, RuntimeError, KeyError, IndexError):
+        return None, None
+
+
+def hit_statistics(solver):
+    """Counts of the contact-hit lists of the last assembly (first environment) and the redundancy of the point-cloud
+    couplings: unique (vertex of the sample's triangle, collider vertex) pairs per hit-vertex product."""
+    from genesis.utils.misc import qd_to_numpy
+
+    if not solver.has_soft:
+        return {}
+    # The lists hold the last assembly of the step, which may be a skipped line-search trial: re-assemble at the
+    # accepted iterate (the contact-recording pass evaluates every environment).
+    solver._record_contacts()
+    soft_state = solver.soft_state
+    stats = {
+        "n_soft_hits": int(qd_to_numpy(soft_state.n_soft_hits)[0]),
+        "n_soft_collider_hits": int(qd_to_numpy(soft_state.n_sc_hits)[0]),
+        "n_point_cloud_hits": int(qd_to_numpy(soft_state.n_pc_hits)[0]),
+    }
+    n_pc = stats["n_point_cloud_hits"]
+    if n_pc > 0:
+        kind = qd_to_numpy(soft_state.pc_hit_kind_a)[:n_pc, 0]
+        sample = qd_to_numpy(soft_state.pc_hit_sample_a)[:n_pc, 0]
+        vert_b = qd_to_numpy(soft_state.pc_hit_vert_b)[:n_pc, 0]
+        tri = qd_to_numpy(solver.soft_info.samples_tri)
+        is_soft = kind == 1
+        pairs = set()
+        for i_s, i_v in zip(sample[is_soft], vert_b[is_soft]):
+            for i_w in tri[i_s]:
+                pairs.add((int(i_w), int(i_v)))
+        stats["n_point_cloud_hits_soft"] = int(is_soft.sum())
+        stats["point_cloud_pair_redundancy"] = len(pairs) / max(1, 3 * int(is_soft.sum()))
+    return stats
 
 
 def main():
@@ -30,7 +83,9 @@ def main():
     parser.add_argument("--n-steps", type=int, default=30)
     parser.add_argument("--n-windows", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile", action="store_true", help="quadrants kernel profiler: launches and kernel times")
+    parser.add_argument("--hits", action="store_true", help="read back the contact-hit lists")
+    parser.add_argument("--cprofile", action="store_true", help="profile the Python side of the step")
     parser.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "results"))
     parser.add_argument("--tag", default="", help="suffix of the result file name")
     parser.add_argument("--option", action="append", default=[], help="MochiOptions override, e.g. linear_solver=pcg")
@@ -74,6 +129,15 @@ def main():
         qd.sync()
         windows.append((time.perf_counter() - t0) / args.n_steps * 1e3)
     info = solver.get_convergence_info()
+    memory = solver.memory_report()
+    vram_process, vram_device = vram_mib()
+    mem_per_env = memory["per_env_bytes"] / MIB if memory["per_env_bytes"] is not None else None
+    max_envs = None
+    if mem_per_env and vram_process is not None and vram_device is not None:
+        # Memory not proportional to the batch (CUDA context, compiled kernels, static arrays) is what the process
+        # holds beyond the batched arrays; the rest of the device is available for more environments.
+        fixed = max(0.0, vram_process - args.n_envs * mem_per_env)
+        max_envs = int((vram_device - fixed) // mem_per_env)
     result = {
         "engine": "genesis",
         "scene": args.scene,
@@ -86,6 +150,7 @@ def main():
         "ms_per_step_best": min(windows),
         "ms_per_step_mean": sum(windows) / len(windows),
         "ms_per_step_windows": windows,
+        "us_per_env_step_best": min(windows) / max(1, args.n_envs) * 1e3,
         "build_s": build_time,
         "warmup_s": warmup_time,
         "n_dofs_total": int(solver.n_dofs_total),
@@ -95,9 +160,25 @@ def main():
         "n_shell_elems": int(solver.n_shell_elems),
         "n_rod_elems": int(solver.n_rod_elems),
         "newton_iterations_last": int(info["n_iter"][0]),
+        "newton_iterations_max": int(info["n_iter"].max()),
+        "pcg_iterations_last": int(info["n_pcg_iter"][0]),
+        "pcg_iterations_max": int(info["n_pcg_iter"].max()),
+        "mem_mib_total": memory["total_bytes"] / MIB,
+        "mem_mib_per_env": mem_per_env,
+        "mem_mib_static": memory["static_bytes"] / MIB if memory["static_bytes"] is not None else None,
+        "mem_top": [
+            {"name": field["name"], "mib": field["bytes"] / MIB, "shape": list(field["shape"])}
+            for field in memory["fields"][:12]
+        ],
+        "vram_mib_process": vram_process,
+        "vram_mib_device": vram_device,
+        "max_envs_estimate": max_envs,
+        "contact_capacity_usage": {k: list(v) for k, v in solver.get_contact_capacity_usage().items()},
         "probe": probe(),
         "options": overrides,
     }
+    if args.hits:
+        result["hits"] = hit_statistics(solver)
     if args.profile:
         qd.profiler.clear_kernel_profiler_info()
         t0 = time.perf_counter()
@@ -124,26 +205,44 @@ def main():
                 for r in rows[:15]
             ],
         )
+    if args.cprofile:
+        profiler = cProfile.Profile()
+        profiler.enable()
+        for _ in range(args.n_steps):
+            scene.step()
+        qd.sync()
+        profiler.disable()
+        buffer = io.StringIO()
+        pstats.Stats(profiler, stream=buffer).sort_stats("tottime").print_stats(20)
+        result["cprofile"] = buffer.getvalue()
     os.makedirs(args.out, exist_ok=True)
     tag = f"_{args.tag}" if args.tag else ""
     path = os.path.join(args.out, f"genesis_{args.scene}_{args.backend}_fp{args.precision}_B{args.n_envs}{tag}.json")
     with open(path, "w") as fp:
         json.dump(result, fp, indent=2)
+    mem_text = f"{mem_per_env:.2f} MiB/env" if mem_per_env is not None else f"{result['mem_mib_total']:.1f} MiB total"
+    vram_text = f", vram {vram_process} MiB" if vram_process is not None else ""
     print(
         f"[genesis] {args.scene} {args.backend} fp{args.precision} B={args.n_envs}: "
-        f"best {result['ms_per_step_best']:.3f} ms/step, mean {result['ms_per_step_mean']:.3f} ms/step, "
-        f"newton {result['newton_iterations_last']}, probe {result['probe']:.4f}"
+        f"best {result['ms_per_step_best']:.3f} ms/step ({result['us_per_env_step_best']:.1f} us/env-step), "
+        f"mean {result['ms_per_step_mean']:.3f} ms/step, newton {result['newton_iterations_last']}, "
+        f"pcg {result['pcg_iterations_last']}, {mem_text}{vram_text}, probe {result['probe']:.4f}"
         + (
             f", launches/step {result['launches_per_step']:.1f}, kernel {result['kernel_ms_per_step']:.3f} ms/step"
             if args.profile
             else ""
         )
     )
+    print(f"    capacity usage (max over envs / capacity): {result['contact_capacity_usage']}")
+    if args.hits:
+        print(f"    hits: {result['hits']}")
     if args.profile:
         for row in result["top_kernels"][:8]:
             print(
                 f"    {row['percent']:5.1f}%  {row['calls_per_step']:7.1f}/step  {row['avg_ms']:.3f} ms  {row['name']}"
             )
+    if args.cprofile:
+        print(result["cprofile"])
     print(f"[genesis] wrote {path}")
 
 

@@ -471,6 +471,7 @@ def func_pcg_iter(
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
         if mochi_state.pcg_is_active[i_b]:
+            mochi_state.n_pcg_iter[i_b] += 1
             if mochi_state.pcg_pTAp[i_b] <= 0.0:
                 mochi_state.pcg_is_active[i_b] = False
             mochi_state.pcg_rTz_new[i_b] = 0.0

@@ -357,6 +357,7 @@ class MochiState:
     is_active: qd.Tensor
     status: qd.Tensor
     n_iter: qd.Tensor
+    n_pcg_iter: qd.Tensor
     res_norm_sq: qd.Tensor
     res_w_sq: qd.Tensor
     res_norm0: qd.Tensor
@@ -425,6 +426,7 @@ def get_mochi_state(solver, max_pairs, has_dense):
         is_active=V(dtype=gs.qd_bool, shape=(_B,)),
         status=V(dtype=gs.qd_int, shape=(_B,)),
         n_iter=V(dtype=gs.qd_int, shape=(_B,)),
+        n_pcg_iter=V(dtype=gs.qd_int, shape=(_B,)),
         res_norm_sq=V(dtype=gs.qd_float, shape=(_B,)),
         res_w_sq=V(dtype=gs.qd_float, shape=(_B,)),
         res_norm0=V(dtype=gs.qd_float, shape=(_B,)),
