@@ -19,7 +19,7 @@ from .articulated import (
 from .data import MochiContactState, MochiInfo, MochiSoftInfo, MochiSoftState, MochiState
 from .equalities import MochiEqualitiesInfo, MochiEqualitiesState
 from .islands import MochiIslandState
-from .soft import func_soft_matvec, func_soft_precondition
+from .soft import func_soft_hit_counts_max, func_soft_matvec, func_soft_precondition
 
 # Divergence factor of the conjugate gradient stopping test, on the norm of the preconditioned residual: an
 # environment is dropped once that norm grows by this much, which also catches a non-finite residual. The stopping
@@ -274,6 +274,8 @@ def kernel_pcg_init(
     n_links = mochi_state.H_diag.shape[0]
     _B = mochi_state.is_active.shape[0]
 
+    if qd.static(mochi_config.has_soft):
+        func_soft_hit_counts_max(soft_state, rigid_config)
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_b in range(_B):
         mochi_state.pcg_is_active[i_b] = mochi_state.is_active[i_b] and not island_state.uses_dense[i_b]

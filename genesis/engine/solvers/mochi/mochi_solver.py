@@ -89,6 +89,7 @@ from .integration import (
     kernel_store_stage_start_poses,
 )
 from .islands import get_mochi_island_state, kernel_build_islands, kernel_cholesky_solve_islands
+from .kinematics import kernel_update_kinematics
 from .linear_solver import (
     kernel_condense_dense,
     kernel_pcg_any_active,
@@ -1145,14 +1146,26 @@ class MochiSolver(KinematicSolver):
     # ------------------------------------ stepping --------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def _forward_kinematics(self):
-        kernel_forward_kinematics(
-            self._scene._envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
-        )
-        kernel_update_geoms(
-            self._scene._envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, False
-        )
-        kernel_update_geom_aabbs(self.geoms_init_AABB, self.dyn_state, self.rigid_config)
+    def _forward_kinematics(self, with_velocity=True):
+        """Link and geom poses (and bounds) of the current joint coordinates; the joint-space velocities only when the
+        kinematic state is final (the Newton iterates never read them)."""
+        if with_velocity:
+            kernel_forward_kinematics(
+                self._scene._envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
+            )
+            kernel_update_geoms(
+                self._scene._envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, False
+            )
+            kernel_update_geom_aabbs(self.geoms_init_AABB, self.dyn_state, self.rigid_config)
+        else:
+            kernel_update_kinematics(
+                self._scene._envs_idx,
+                self.geoms_init_AABB,
+                self.dyn_state,
+                self.dyn_info,
+                self.rigid_info,
+                self.rigid_config,
+            )
 
     def _on_external_state_change(self, change, envs_idx):
         self._mark_external_state_dirty(self._scene._sanitize_envs_idx(envs_idx))
@@ -1205,7 +1218,7 @@ class MochiSolver(KinematicSolver):
                 kernel_rod_step_start(
                     self.mochi_state, self.soft_info, self.soft_state, self.rigid_config, self.mochi_config
                 )
-        self._forward_kinematics()
+        self._forward_kinematics(with_velocity=False)
         kernel_store_stage_start_poses(self.dyn_state, self.mochi_state, self.rigid_config)
         if self.mochi_config.has_equalities:
             kernel_equalities_stage_start(
@@ -1607,7 +1620,7 @@ class MochiSolver(KinematicSolver):
                     kernel_soft_apply_increment(self.mochi_state, self.soft_info, self.soft_state, self.rigid_config)
                     if self.n_rod_elems > 0:
                         kernel_rod_apply_increment(self.mochi_state, self.soft_info, self.soft_state, self.rigid_config)
-                self._forward_kinematics()
+                self._forward_kinematics(with_velocity=False)
                 self._assemble(assem_res=True, assem_dres=False, skip_ls_done=True)
                 kernel_linesearch_decide(
                     self.rigid_info,

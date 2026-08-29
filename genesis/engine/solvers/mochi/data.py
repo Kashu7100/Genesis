@@ -754,6 +754,7 @@ class MochiSoftState:
     # Active contact samples of the current iterate: sample, collider link (-1 if static), lever arm about the collider
     # link origin, and the per-sample matrix D = -w df/dp, from which the vertex and coupling blocks are formed.
     n_soft_hits: qd.Tensor
+    n_soft_hits_max: qd.Tensor
     hit_sample: qd.Tensor
     hit_link_b: qd.Tensor
     hit_geom_b: qd.Tensor
@@ -767,6 +768,7 @@ class MochiSoftState:
     # the link origin, kind 1 = deformable sample), collider tetrahedron with the barycentric coordinates of the point,
     # per-sample matrix D = -w df/dp, force on the colliding side and readback data.
     n_sc_hits: qd.Tensor
+    n_sc_hits_max: qd.Tensor
     sc_hit_kind_a: qd.Tensor
     sc_hit_sample_a: qd.Tensor
     sc_hit_link_a: qd.Tensor
@@ -780,6 +782,7 @@ class MochiSoftState:
     sc_hit_distance: qd.Tensor
     # Active samples against the point-cloud colliders of the shells: colliding side as above, collider vertex.
     n_pc_hits: qd.Tensor
+    n_pc_hits_max: qd.Tensor
     pc_hit_kind_a: qd.Tensor
     pc_hit_sample_a: qd.Tensor
     pc_hit_link_a: qd.Tensor
@@ -845,6 +848,7 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         acc_obj=V(dtype=gs.qd_float, shape=(max_soft_pairs, _B)),
         n_hits=V(dtype=gs.qd_int, shape=(max_soft_pairs, _B)),
         n_soft_hits=V(dtype=gs.qd_int, shape=(_B,)),
+        n_soft_hits_max=_scalar(gs.qd_int, 0),
         hit_sample=V(dtype=gs.qd_int, shape=(max_soft_hits, _B)),
         hit_link_b=V(dtype=gs.qd_int, shape=(max_soft_hits, _B)),
         hit_geom_b=V(dtype=gs.qd_int, shape=(max_soft_hits, _B)),
@@ -855,6 +859,7 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         hit_normal=V(dtype=gs.qd_vec3, shape=(max_soft_hits, _B)),
         hit_distance=V(dtype=gs.qd_float, shape=(max_soft_hits, _B)),
         n_sc_hits=V(dtype=gs.qd_int, shape=(_B,)),
+        n_sc_hits_max=_scalar(gs.qd_int, 0),
         sc_hit_kind_a=V(dtype=gs.qd_int, shape=(max_sc_hits, _B)),
         sc_hit_sample_a=V(dtype=gs.qd_int, shape=(max_sc_hits, _B)),
         sc_hit_link_a=V(dtype=gs.qd_int, shape=(max_sc_hits, _B)),
@@ -867,6 +872,7 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         sc_hit_normal=V(dtype=gs.qd_vec3, shape=(max_sc_hits, _B)),
         sc_hit_distance=V(dtype=gs.qd_float, shape=(max_sc_hits, _B)),
         n_pc_hits=V(dtype=gs.qd_int, shape=(_B,)),
+        n_pc_hits_max=_scalar(gs.qd_int, 0),
         pc_hit_kind_a=V(dtype=gs.qd_int, shape=(max_pc_hits, _B)),
         pc_hit_sample_a=V(dtype=gs.qd_int, shape=(max_pc_hits, _B)),
         pc_hit_link_a=V(dtype=gs.qd_int, shape=(max_pc_hits, _B)),
