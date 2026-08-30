@@ -629,8 +629,8 @@ def kernel_soft_zero_assembly(
     mochi_state: MochiState,
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
     record: qd.template(),
 ):
     func_soft_zero_assembly(
@@ -798,8 +798,8 @@ def kernel_soft_assemble_elements(
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
 ):
     func_soft_assemble_elements(
         0,
@@ -847,7 +847,7 @@ def kernel_soft_dirichlet(
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
-    skip_ls_done: qd.template(),
+    skip_ls_done: qd.i32,
 ):
     func_soft_dirichlet(
         0,
@@ -1197,8 +1197,8 @@ def kernel_soft_contact_eval(
     mochi_config: qd.template(),
     max_samples_per_entity: int,
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
     record: qd.template(),
     errno: qd.Tensor,
 ):
@@ -1286,8 +1286,8 @@ def kernel_soft_pairs_to_blocks(
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
 ):
     func_soft_pairs_to_blocks(
         0,
@@ -2529,8 +2529,8 @@ def kernel_soft_collider_eval(
     mochi_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
     record: qd.template(),
     errno: qd.Tensor,
 ):
@@ -2564,7 +2564,7 @@ def kernel_tet_tree_refit(
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
-    skip_ls_done: qd.template(),
+    skip_ls_done: qd.i32,
 ):
     func_tet_tree_refit(
         0,
@@ -2856,8 +2856,8 @@ def kernel_shell_assemble(
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
 ):
     func_shell_assemble(
         0,
@@ -3254,8 +3254,8 @@ def kernel_rod_assemble(
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
 ):
     func_rod_assemble(
         0,
@@ -3686,8 +3686,8 @@ def kernel_pc_collider_eval(
     mochi_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
     record: qd.template(),
     errno: qd.Tensor,
 ):
@@ -3720,7 +3720,7 @@ def kernel_pc_hash_build(
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
-    skip_ls_done: qd.template(),
+    skip_ls_done: qd.i32,
 ):
     func_pc_hash_build(
         0,

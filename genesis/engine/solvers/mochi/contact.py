@@ -250,8 +250,8 @@ def kernel_zero_assembly(
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
     record: qd.template(),
 ):
     func_zero_assembly(
@@ -684,8 +684,8 @@ def kernel_contact_eval(
     hit_readback: MochiHitReadback,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
     record: qd.template(),
     errno: qd.Tensor,
 ):
@@ -807,8 +807,8 @@ def kernel_pairs_to_blocks(
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
 ):
     func_pairs_to_blocks(
         0,

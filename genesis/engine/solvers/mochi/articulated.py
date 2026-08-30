@@ -150,7 +150,7 @@ def kernel_project_links_residual(
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     rigid_config: qd.template(),
-    skip_ls_done: qd.template(),
+    skip_ls_done: qd.i32,
 ):
     func_project_links_residual(
         0,
@@ -306,8 +306,8 @@ def kernel_assemble_joints(
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
 ):
     func_assemble_joints(
         0,

@@ -80,6 +80,8 @@ class MochiStaticConfig(metaclass=AutoInitMeta):
     record_contacts: bool
     batch_links_info: bool
     has_soft: bool
+    # tetrahedral elements present (the tetrahedron assembly is compiled only then)
+    has_tets: bool
     has_equalities: bool
     has_pc_colliders: bool
     has_soft_colliders: bool

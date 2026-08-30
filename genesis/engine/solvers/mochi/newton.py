@@ -108,7 +108,7 @@ def kernel_residual_norms(
     mochi_state: MochiState,
     island_state: MochiIslandState,
     rigid_config: qd.template(),
-    skip_ls_done: qd.template(),
+    skip_ls_done: qd.i32,
 ):
     func_residual_norms(
         0,

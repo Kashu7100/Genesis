@@ -371,21 +371,22 @@ def func_assemble(
             assem_dres,
             skip_ls_done,
         )
-        func_soft_assemble_elements(
-            i_b_env,
-            per_env,
-            envs,
-            n_envs,
-            mochi_info,
-            mochi_state,
-            soft_info,
-            soft_state,
-            rigid_config,
-            assem_obj,
-            assem_res,
-            assem_dres,
-            skip_ls_done,
-        )
+        if qd.static(mochi_config.has_tets):
+            func_soft_assemble_elements(
+                i_b_env,
+                per_env,
+                envs,
+                n_envs,
+                mochi_info,
+                mochi_state,
+                soft_info,
+                soft_state,
+                rigid_config,
+                assem_obj,
+                assem_res,
+                assem_dres,
+                skip_ls_done,
+            )
         if qd.static(has_shell):
             func_shell_assemble(
                 i_b_env,

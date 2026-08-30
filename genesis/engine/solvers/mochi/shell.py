@@ -55,6 +55,15 @@ def func_svk_tangent_pair(G1, G2, A_inv, lam, mu):
 
 
 @qd.func
+def func_svk_tangent_dof(G, A_inv):
+    """Per-dof factors of the tangent pairs: the metric product A^-1 G A^-1 (symmetric, three numbers) and the trace
+    A^-1 : G, so that G1 : D2Psi : G2 = 2 mu G1 : (A^-1 G2 A^-1) + lam (A^-1 : G1)(A^-1 : G2) costs a handful of
+    multiplications per pair instead of two matrix products."""
+    H = A_inv @ G @ A_inv
+    return qd.Vector([H[0, 0], H[0, 1], H[1, 1]], dt=gs.qd_float), func_colon(A_inv, G)
+
+
+@qd.func
 def func_project_psd_metric(S, A_inv, eps):
     """Clamp the eigenvalues of the symmetric 2x2 stress S in the metric A^-1 = L L^T: B = L^-1 S L^-T, eigenvalues of B
     clamped to at least eps, S' = L B' L^T."""
@@ -342,11 +351,18 @@ def func_shell_elastic(
         S_proj = dpsi_da
         if qd.static(project):
             S_proj = func_project_psd_metric(dpsi_da, A_inv, eps)
+        # G_p : D2Psi : G_q over the pairs of dofs from per-dof factors (see func_svk_tangent_dof)
+        Ha = qd.Matrix.zero(gs.qd_float, 9, 3)
+        ta = qd.Vector.zero(gs.qd_float, 9)
         for p in qd.static(range(9)):
-            Gp = func_sym2(Ga[p, 0], Ga[p, 1], Ga[p, 2])
+            h, t = func_svk_tangent_dof(func_sym2(Ga[p, 0], Ga[p, 1], Ga[p, 2]), A_inv)
+            for k in qd.static(range(3)):
+                Ha[p, k] = h[k]
+            ta[p] = t
+        for p in qd.static(range(9)):
             for q in qd.static(range(p, 9)):
-                Gq = func_sym2(Ga[q, 0], Ga[q, 1], Ga[q, 2])
-                K[p, q] += 0.25 * area * func_svk_tangent_pair(Gp, Gq, A_inv, lam, mu)
+                colon = Ga[p, 0] * Ha[q, 0] + 2.0 * Ga[p, 1] * Ha[q, 1] + Ga[p, 2] * Ha[q, 2]
+                K[p, q] += 0.25 * area * (2.0 * mu * colon + lam * ta[p] * ta[q])
         for na in qd.static(range(3)):
             for nb in qd.static(range(na, 3)):
                 h = qd.static(_METRIC_HESSIAN[na][nb])
@@ -364,11 +380,17 @@ def func_shell_elastic(
     for p in qd.static(range(18)):
         res[p] += area * func_colon(func_sym2(Gb[p, 0], Gb[p, 1], Gb[p, 2]), dpsi_db)
     if assem_dres:
+        Hb = qd.Matrix.zero(gs.qd_float, 18, 3)
+        tb = qd.Vector.zero(gs.qd_float, 18)
         for p in qd.static(range(18)):
-            Gp = func_sym2(Gb[p, 0], Gb[p, 1], Gb[p, 2])
+            h, t = func_svk_tangent_dof(func_sym2(Gb[p, 0], Gb[p, 1], Gb[p, 2]), A_inv)
+            for k in qd.static(range(3)):
+                Hb[p, k] = h[k]
+            tb[p] = t
+        for p in qd.static(range(18)):
             for q in qd.static(range(p, 18)):
-                Gq = func_sym2(Gb[q, 0], Gb[q, 1], Gb[q, 2])
-                K[p, q] += area * func_svk_tangent_pair(Gp, Gq, A_inv, alpha, 0.5 * beta)
+                colon = Gb[p, 0] * Hb[q, 0] + 2.0 * Gb[p, 1] * Hb[q, 1] + Gb[p, 2] * Hb[q, 2]
+                K[p, q] += area * (beta * colon + alpha * tb[p] * tb[q])
         for p in qd.static(range(18)):
             for q in qd.static(range(p + 1, 18)):
                 K[q, p] = K[p, q]

@@ -159,8 +159,8 @@ def kernel_assemble_links(
     mochi_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
 ):
     func_assemble_links(
         0,

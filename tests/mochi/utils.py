@@ -33,6 +33,7 @@ def make_static_config(**overrides):
         "record_contacts": True,
         "batch_links_info": False,
         "has_soft": False,
+        "has_tets": False,
         "has_equalities": False,
         "has_pc_colliders": False,
         "has_soft_colliders": False,

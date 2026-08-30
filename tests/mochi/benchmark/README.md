@@ -187,3 +187,56 @@ an overflow list every sample scans.
 With these, 1024 environments of every RL scene fit on the 10 GB card, and 4096 of each on 80 GB by projection (the
 t-shirt at 4096 needs ~67 GB; the symmetric Hessian storage planned in Phase K/G7 halves its largest remaining array).
 The deformables still run the multi-kernel pipeline on the GPU at this point; the graph step kernel is next.
+
+### Step kernels on the GPU, the tetrahedron hierarchy and compile time (Phases I, H4, K4)
+
+The one-launch graph step kernel (`step_kernel="graph"`: Newton, line-search and conjugate-gradient loops as nested
+device-side `do_while` levels, every stage parallel over items and environments) agrees with the pipeline and the
+monolith on every scene (`tests/mochi/test_step_kernels.py`, CPU and GPU). On the RTX 3080, which has no device-side
+graph conditionals, the runtime replays the loop bodies from the host with one flag readback per round, and the kernel
+runs at the pipeline's speed at every batch size while compiling as a single module several times slower - so it is
+opt-in and "auto" keeps the pipeline for deformable scenes on the GPU (the monolith for small rigid ones).
+
+| scene, GPU fp32 | B=1 graph / pipeline ms/step | B=64 | B=256 | B=1024 | cold compile graph / pipeline |
+|---|---|---|---|---|---|
+| soft_gripper | 33.4 / 33.0 | 79 / 76 | 214 / 208 | - | 85 s / 45 s |
+| cloth_arm | 15.1 / 15.2 | 39.4 / 37.9 | - | 372 / 415 | 300 s / 220 s |
+
+Compile time is measured per kernel (`bench_genesis.py --cold` records the first step's time with the offline cache
+off; a per-kernel breakdown wraps quadrants' `Kernel.materialize` and the first launch). The cost sits in the backend
+code generation at the first launch of a kernel (single-threaded; `num_compile_threads` changes nothing), it grows
+faster than linearly with the kernel's size, and one func dominated it: the shell assembly evaluated the 18x18 tangent
+as 216 fully unrolled pair contractions, each two 2x2 matrix products - about 100 s per compiled variant, twice per
+scene. The tangent now hoists the per-dof products `A^-1 G A^-1` and traces out of the pair loops (the same arithmetic,
+a quarter of the generated code), the pipeline kernels take the assembly flags as runtime values (one compiled
+variant instead of two), and the tetrahedron assembly is compiled only for scenes that have tetrahedra
+(`has_tets`; the monolith of a cloth scene no longer carries it).
+
+| cold compile (s) | soft_gripper | cloth_arm | cloth_tshirt |
+|---|---|---|---|
+| CPU monolith, before -> after | 79 -> 79 (no shells) | 275 -> 108 | 254 -> 118 |
+| CPU pipeline, before -> after | - | 142 -> 60 | - |
+| GPU pipeline, before -> after | 45 -> 31 | 220 -> 70 | 239 -> - |
+
+The tetrahedra of solids are no longer hashed: a uniform hash over a fine mesh (4263 tetrahedra of a 5 cm cube over
+~64 cells, every tetrahedron in up to eight cells) walked chains of 200-500 entries for every sample near the cube, 48%
+of the gripper step on the GPU and growing superlinearly with the batch. A bounding-box hierarchy built once over the
+rest tetrahedra (`tet_tree.py`, depth-first order with escape indices, like the contact-sample trees) is refit to the
+deformed vertices at every assembly one level at a time and queried with a stackless descent - a few dozen box tests
+per sample; `tests/mochi/test_spatial_hash.py` checks the hits against a brute-force evaluation. The collider spheres
+of shells and rods keep the hash. (Chunked per-environment reductions - 32 dofs per thread before one atomic - were
+tried for the conjugate-gradient dot products and rejected: the vector passes cost the same, 0.09-0.11 ms per
+iteration at B=256, so the per-environment atomics are not what limits them.)
+
+| scene, GPU fp32, pipeline | B=1 ms/step | B=64 (us/env-step) | B=256 (us/env-step) | B=1024 (us/env-step) | MiB/env |
+|---|---|---|---|---|---|
+| soft_gripper, hash (H3) | 33.0 | 76 (1190) | 208 (813) | ~1000 (~980) | 4.82 |
+| soft_gripper, hierarchy (H4) | 33.0 | 73 (1135) | 162 (633) | 678 (662) | 4.38 |
+| cloth_arm, hierarchy (H4) | 15.2 | 37.9 (592) | 101 (396) | 353 (345) | 6.28 |
+| cloth_tshirt (H4) | - | - | 253 (989) | - | 16.6 |
+| soft_duck (H4) | - | - | - | 673 (657) | 2.32 |
+| rope_arm (H4) | - | - | - | 10.0 (9.8) | 2.18 |
+
+Gripper profile at B=256 after the hierarchy: tetrahedral contact query 23% (was 48%), conjugate gradient 37% (the
+CSR matvec at ~75% of the card's bandwidth, the vector passes limited by per-environment atomics), tetrahedron assembly
+13% (12x12 element tangents; Phase K1).

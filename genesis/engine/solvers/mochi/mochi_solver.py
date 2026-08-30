@@ -646,6 +646,7 @@ class MochiSolver(KinematicSolver):
             record_contacts=options.record_contacts,
             batch_links_info=self._options.batch_links_info,
             has_soft=self.has_soft,
+            has_tets=self.n_soft_elems > 0,
             has_pc_colliders=self._has_pc_colliders,
             has_soft_colliders=self._has_soft_colliders,
             tet_tree_levels=self.n_tet_levels,
@@ -1725,17 +1726,18 @@ class MochiSolver(KinematicSolver):
                 assem_dres,
                 skip_ls_done,
             )
-            kernel_soft_assemble_elements(
-                self.mochi_info,
-                self.mochi_state,
-                self.soft_info,
-                self.soft_state,
-                self.rigid_config,
-                assem_obj,
-                assem_res,
-                assem_dres,
-                skip_ls_done,
-            )
+            if self.n_soft_elems > 0:
+                kernel_soft_assemble_elements(
+                    self.mochi_info,
+                    self.mochi_state,
+                    self.soft_info,
+                    self.soft_state,
+                    self.rigid_config,
+                    assem_obj,
+                    assem_res,
+                    assem_dres,
+                    skip_ls_done,
+                )
             if self.n_shell_elems > 0:
                 kernel_shell_assemble(
                     self.mochi_info,
