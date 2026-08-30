@@ -54,6 +54,12 @@ class SOLVE_STATUS(IntEnum):
 
 # Number of previous steps kept for multistep integration (BDF2 needs two).
 N_HISTORY = 2
+# Batched reductions on the GPU: a 256-thread block covers 32 consecutive environments (lanes, coalesced loads) by 8
+# chunks of a 64-dof tile; the chunks are summed in shared memory and each environment receives one atomic per tile.
+REDUCE_LANES = 32
+REDUCE_CHUNKS = 8
+REDUCE_TILE = 64
+REDUCE_BLOCK = REDUCE_LANES * REDUCE_CHUNKS
 # Half bandwidth of a rod's Hessian in the node-interleaved ordering [x_0, theta_0, x_1, theta_1, ...]: a bending
 # stencil couples three consecutive nodes and the two segments between them, i.e. rows at most 10 apart.
 ROD_BAND = 10

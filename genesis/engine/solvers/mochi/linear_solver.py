@@ -16,7 +16,17 @@ from .articulated import (
     func_jacobian_transpose_add,
     func_link_dof_jacobian,
 )
-from .data import MochiContactState, MochiInfo, MochiSoftInfo, MochiSoftState, MochiState
+from .data import (
+    REDUCE_BLOCK,
+    REDUCE_CHUNKS,
+    REDUCE_LANES,
+    REDUCE_TILE,
+    MochiContactState,
+    MochiInfo,
+    MochiSoftInfo,
+    MochiSoftState,
+    MochiState,
+)
 from .equalities import MochiEqualitiesInfo, MochiEqualitiesState
 from .islands import MochiIslandState
 from .rod_solver import func_rod_band_factor
@@ -499,11 +509,42 @@ def func_pcg_iter(
     for i_slot in range(n_envs[None]) if qd.static(not per_env) else range(1):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         mochi_state.pcg_pTAp[i_b] = 0.0
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if mochi_state.pcg_is_active[i_b]:
-            qd.atomic_add(mochi_state.pcg_pTAp[i_b], mochi_state.pcg_p[i_d, i_b] * mochi_state.pcg_Ap[i_d, i_b])
+    n_env_tiles = (n_envs[None] + REDUCE_LANES - 1) // REDUCE_LANES
+    n_dof_tiles = (n_dofs + REDUCE_TILE - 1) // REDUCE_TILE
+    if qd.static(not per_env and rigid_config.para_level >= gs.PARA_LEVEL.PARTIAL):
+        qd.loop_config(block_dim=REDUCE_BLOCK)
+        for i_flat in range(n_env_tiles * n_dof_tiles * REDUCE_BLOCK):
+            tid = i_flat % REDUCE_BLOCK
+            i_block = i_flat // REDUCE_BLOCK
+            lane = tid % REDUCE_LANES
+            chunk = tid // REDUCE_LANES
+            i_slot = REDUCE_LANES * (i_block % n_env_tiles) + lane
+            d0 = REDUCE_TILE * (i_block // n_env_tiles)
+            sh = qd.simt.block.SharedArray((REDUCE_BLOCK,), gs.qd_float)
+            acc = gs.qd_float(0.0)
+            i_b = 0
+            is_live = i_slot < n_envs[None]
+            if is_live:
+                i_b = envs[i_slot]
+                is_live = mochi_state.pcg_is_active[i_b] != 0
+            if is_live:
+                for k in range(REDUCE_TILE // REDUCE_CHUNKS):
+                    i_d = d0 + REDUCE_CHUNKS * k + chunk
+                    if i_d < n_dofs:
+                        acc += mochi_state.pcg_p[i_d, i_b] * mochi_state.pcg_Ap[i_d, i_b]
+            sh[tid] = acc
+            qd.simt.block.sync()
+            if chunk == 0 and is_live:
+                total = gs.qd_float(0.0)
+                for c in qd.static(range(REDUCE_CHUNKS)):
+                    total += sh[lane + REDUCE_LANES * c]
+                qd.atomic_add(mochi_state.pcg_pTAp[i_b], total)
+    else:
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+            i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+            if mochi_state.pcg_is_active[i_b]:
+                qd.atomic_add(mochi_state.pcg_pTAp[i_b], mochi_state.pcg_p[i_d, i_b] * mochi_state.pcg_Ap[i_d, i_b])
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_slot in range(n_envs[None]) if qd.static(not per_env) else range(1):
@@ -515,17 +556,52 @@ def func_pcg_iter(
             mochi_state.pcg_rTz_new[i_b] = 0.0
             mochi_state.pcg_rTz_cross[i_b] = 0.0
             mochi_state.pcg_zTz[i_b] = 0.0
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if mochi_state.pcg_is_active[i_b]:
-            alpha = mochi_state.pcg_rTz[i_b] / mochi_state.pcg_pTAp[i_b]
-            mochi_state.dx[i_d, i_b] += alpha * mochi_state.pcg_p[i_d, i_b]
-            r = mochi_state.pcg_r[i_d, i_b] - alpha * mochi_state.pcg_Ap[i_d, i_b]
-            mochi_state.pcg_r[i_d, i_b] = r
-            # The preconditioned residual of the previous iteration is still in pcg_z; its product with the new
-            # residual is the term that tells the Polak-Ribiere direction from the Fletcher-Reeves one.
-            qd.atomic_add(mochi_state.pcg_rTz_cross[i_b], r * mochi_state.pcg_z[i_d, i_b])
+    if qd.static(not per_env and rigid_config.para_level >= gs.PARA_LEVEL.PARTIAL):
+        qd.loop_config(block_dim=REDUCE_BLOCK)
+        for i_flat in range(n_env_tiles * n_dof_tiles * REDUCE_BLOCK):
+            tid = i_flat % REDUCE_BLOCK
+            i_block = i_flat // REDUCE_BLOCK
+            lane = tid % REDUCE_LANES
+            chunk = tid // REDUCE_LANES
+            i_slot = REDUCE_LANES * (i_block % n_env_tiles) + lane
+            d0 = REDUCE_TILE * (i_block // n_env_tiles)
+            sh = qd.simt.block.SharedArray((REDUCE_BLOCK,), gs.qd_float)
+            acc = gs.qd_float(0.0)
+            i_b = 0
+            is_live = i_slot < n_envs[None]
+            if is_live:
+                i_b = envs[i_slot]
+                is_live = mochi_state.pcg_is_active[i_b] != 0
+            if is_live:
+                alpha = mochi_state.pcg_rTz[i_b] / mochi_state.pcg_pTAp[i_b]
+                for k in range(REDUCE_TILE // REDUCE_CHUNKS):
+                    i_d = d0 + REDUCE_CHUNKS * k + chunk
+                    if i_d < n_dofs:
+                        mochi_state.dx[i_d, i_b] += alpha * mochi_state.pcg_p[i_d, i_b]
+                        r = mochi_state.pcg_r[i_d, i_b] - alpha * mochi_state.pcg_Ap[i_d, i_b]
+                        mochi_state.pcg_r[i_d, i_b] = r
+                        # The preconditioned residual of the previous iteration is still in pcg_z; its product with
+                        # the new residual tells the Polak-Ribiere direction from the Fletcher-Reeves one.
+                        acc += r * mochi_state.pcg_z[i_d, i_b]
+            sh[tid] = acc
+            qd.simt.block.sync()
+            if chunk == 0 and is_live:
+                total = gs.qd_float(0.0)
+                for c in qd.static(range(REDUCE_CHUNKS)):
+                    total += sh[lane + REDUCE_LANES * c]
+                qd.atomic_add(mochi_state.pcg_rTz_cross[i_b], total)
+    else:
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+            i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+            if mochi_state.pcg_is_active[i_b]:
+                alpha = mochi_state.pcg_rTz[i_b] / mochi_state.pcg_pTAp[i_b]
+                mochi_state.dx[i_d, i_b] += alpha * mochi_state.pcg_p[i_d, i_b]
+                r = mochi_state.pcg_r[i_d, i_b] - alpha * mochi_state.pcg_Ap[i_d, i_b]
+                mochi_state.pcg_r[i_d, i_b] = r
+                # The preconditioned residual of the previous iteration is still in pcg_z; its product with the new
+                # residual is the term that tells the Polak-Ribiere direction from the Fletcher-Reeves one.
+                qd.atomic_add(mochi_state.pcg_rTz_cross[i_b], r * mochi_state.pcg_z[i_d, i_b])
     func_apply_preconditioner(
         i_b_env,
         per_env,
@@ -540,13 +616,50 @@ def func_pcg_iter(
         rigid_config,
         mochi_config,
     )
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if mochi_state.pcg_is_active[i_b]:
-            z = mochi_state.pcg_z[i_d, i_b]
-            qd.atomic_add(mochi_state.pcg_rTz_new[i_b], mochi_state.pcg_r[i_d, i_b] * z)
-            qd.atomic_add(mochi_state.pcg_zTz[i_b], z * z)
+    if qd.static(not per_env and rigid_config.para_level >= gs.PARA_LEVEL.PARTIAL):
+        qd.loop_config(block_dim=REDUCE_BLOCK)
+        for i_flat in range(n_env_tiles * n_dof_tiles * REDUCE_BLOCK):
+            tid = i_flat % REDUCE_BLOCK
+            i_block = i_flat // REDUCE_BLOCK
+            lane = tid % REDUCE_LANES
+            chunk = tid // REDUCE_LANES
+            i_slot = REDUCE_LANES * (i_block % n_env_tiles) + lane
+            d0 = REDUCE_TILE * (i_block // n_env_tiles)
+            sh_rz = qd.simt.block.SharedArray((REDUCE_BLOCK,), gs.qd_float)
+            sh_zz = qd.simt.block.SharedArray((REDUCE_BLOCK,), gs.qd_float)
+            acc_rz = gs.qd_float(0.0)
+            acc_zz = gs.qd_float(0.0)
+            i_b = 0
+            is_live = i_slot < n_envs[None]
+            if is_live:
+                i_b = envs[i_slot]
+                is_live = mochi_state.pcg_is_active[i_b] != 0
+            if is_live:
+                for k in range(REDUCE_TILE // REDUCE_CHUNKS):
+                    i_d = d0 + REDUCE_CHUNKS * k + chunk
+                    if i_d < n_dofs:
+                        z = mochi_state.pcg_z[i_d, i_b]
+                        acc_rz += mochi_state.pcg_r[i_d, i_b] * z
+                        acc_zz += z * z
+            sh_rz[tid] = acc_rz
+            sh_zz[tid] = acc_zz
+            qd.simt.block.sync()
+            if chunk == 0 and is_live:
+                total_rz = gs.qd_float(0.0)
+                total_zz = gs.qd_float(0.0)
+                for c in qd.static(range(REDUCE_CHUNKS)):
+                    total_rz += sh_rz[lane + REDUCE_LANES * c]
+                    total_zz += sh_zz[lane + REDUCE_LANES * c]
+                qd.atomic_add(mochi_state.pcg_rTz_new[i_b], total_rz)
+                qd.atomic_add(mochi_state.pcg_zTz[i_b], total_zz)
+    else:
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+            i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+            if mochi_state.pcg_is_active[i_b]:
+                z = mochi_state.pcg_z[i_d, i_b]
+                qd.atomic_add(mochi_state.pcg_rTz_new[i_b], mochi_state.pcg_r[i_d, i_b] * z)
+                qd.atomic_add(mochi_state.pcg_zTz[i_b], z * z)
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_slot in range(n_envs[None]) if qd.static(not per_env) else range(1):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
