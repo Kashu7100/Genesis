@@ -262,6 +262,16 @@ against the contraction to 1e-10 on tension, compression, shear and inversion. G
 rest under compression the oracle fails - the rest state is exactly marginal by construction of the model's alpha - so
 most tetrahedra take the SVD + Jacobi eigenmode path, where the block form saves only a fifth of the arithmetic.
 
+Culling the rigid samples that query the deformable colliders was tried and rejected. Per assembly, each link's
+sample hierarchy (the trees the rigid contact evaluation traverses) was descended against the current collider bounds
+(tetrahedron-tree root box, sphere bounds plus contact range) and only the overlapping leaves' samples queried - exact,
+and on the gripper it cut the queries from 16k to ~3k once the fingers hold the cube (a per-step variant on the
+broadphase's conservative bounds kept 11k: 12 cm link pads and a 31 cm box around a 5 cm cube). The step did not move
+on the gripper (B=256 160 -> 170 ms, B=1024 652 -> 717) because a far sample already costs one root-box test, and it
+slowed the cloth + arm scene by 50% (B=256 101 -> 153 ms): the cloth spans the arm's workspace, so every link
+traverses its whole tree at every assembly and the list barely shrinks. What the tetrahedron query costs is the
+near-field: thousands of finger-pad samples inside the cube's box, each a divergent descent.
+
 Gripper profile at B=256 after the hierarchy: tetrahedral contact query 23% (was 48%), conjugate gradient 37% (the
 CSR matvec at ~75% of the card's bandwidth, the vector passes limited by per-environment atomics), tetrahedron assembly
 13% (12x12 element tangents; Phase K1).
