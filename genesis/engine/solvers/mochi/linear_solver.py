@@ -327,8 +327,11 @@ def func_apply_preconditioner(
     n_dofs = mochi_state.res.shape[0]
     _B = mochi_state.is_active.shape[0]
     EPS = mochi_info.EPS[None]
+    # The deformable dofs are all written by the deformable preconditioner below (vertex blocks, rod band, twist
+    # diagonal): the scalar Jacobi pass covers the rigid dofs only.
+    n_jacobi = soft_info.dof_start[None] if qd.static(mochi_config.has_soft) else n_dofs
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+    for i_d, i_slot in qd.ndrange(n_jacobi, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_jacobi, 1):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if mochi_state.pcg_is_active[i_b]:
             z[i_d, i_b] = r[i_d, i_b] / qd.max(mochi_state.pcg_diag[i_d, i_b], EPS)
