@@ -648,8 +648,10 @@ class MochiSoftInfo:
     # assembly kernels scatter straight into the values (-1 for the entries of a missing shell hinge vertex).
     csr_start: qd.Tensor
     csr_col: qd.Tensor
-    elems_csr: qd.Tensor
-    shell_csr: qd.Tensor
+    # position, in the shared column sequence of the rows of vertex f, of the first column of vertex g's block, per
+    # element block (f, g); the scalar CSR index of entry (3 f + r, 3 g + c) is csr_start[3 f + r] + position + c
+    elems_csr_block: qd.Tensor
+    shell_csr_block: qd.Tensor
     rod_elems_csr: qd.Tensor
     rod_stencils_csr: qd.Tensor
     dofs_band_row: qd.Tensor
@@ -770,8 +772,8 @@ def get_mochi_soft_info(solver):
         rod_tiny=_scalar(gs.qd_float, float(np.finfo(gs.np_float).tiny)),
         csr_start=V(dtype=gs.qd_int, shape=(solver.n_soft_dofs_ + 1,)),
         csr_col=V(dtype=gs.qd_int, shape=(solver.n_csr_,)),
-        elems_csr=V(dtype=gs.qd_int, shape=(n_el_, 144)),
-        shell_csr=V(dtype=gs.qd_int, shape=(solver.n_shell_elems_, 324)),
+        elems_csr_block=V(dtype=gs.qd_int, shape=(n_el_, 16)),
+        shell_csr_block=V(dtype=gs.qd_int, shape=(solver.n_shell_elems_, 36)),
         rod_elems_csr=V(dtype=gs.qd_int, shape=(n_re_, 36)),
         rod_stencils_csr=V(dtype=gs.qd_int, shape=(n_rs_, 121)),
         dofs_band_row=V(dtype=gs.qd_int, shape=(solver.n_dofs_total_,)),

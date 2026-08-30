@@ -886,9 +886,14 @@ class MochiSolver(KinematicSolver):
         if len(csr["col"]) > 0:
             self.soft_info.csr_start.from_numpy(csr["start"])
             self.soft_info.csr_col.from_numpy(csr["col"])
-            for name in ("elems", "shell", "rod_elems", "rod_stencils"):
+            for name, field in (
+                ("elems_block", "elems_csr_block"),
+                ("shell_block", "shell_csr_block"),
+                ("rod_elems", "rod_elems_csr"),
+                ("rod_stencils", "rod_stencils_csr"),
+            ):
                 if len(csr[name]) > 0:
-                    getattr(self.soft_info, f"{name}_csr").from_numpy(csr[name])
+                    getattr(self.soft_info, field).from_numpy(csr[name])
         if len(band["rows_dof"]) > 0:
             self.soft_info.band_rows_dof.from_numpy(band["rows_dof"])
         if self.n_soft_entities > 0:
@@ -1083,6 +1088,15 @@ class MochiSolver(KinematicSolver):
             index = np.searchsorted(unique_keys, np.where(valid, block_keys, 0))
             n_block = block_keys.shape[1] * block_keys.shape[2]
             csr[name] = np.where(valid, index, -1).reshape(len(block_keys), n_block).astype(gs.np_int)
+        # Tetrahedra and shells scatter per 3x3 vertex block: the position of the block's first column in the shared
+        # column sequence of the row vertex (the scalar index is csr_start[3 f + r] + position + c).
+        start = csr["start"].astype(np.int64)
+        for name, n_nodes in (("elems", 4), ("shell", 6)):
+            table = csr[name].astype(np.int64).reshape(-1, 3 * n_nodes, 3 * n_nodes)
+            first = table[:, ::3, ::3]  # entry (3 f, 3 g) of every block
+            row_dof = np.where(first >= 0, unique_keys[np.maximum(first, 0)] // n_dofs, 0)
+            position = np.where(first >= 0, first - start[row_dof], -1)
+            csr[name + "_block"] = position.reshape(len(table), n_nodes * n_nodes).astype(gs.np_int)
         return csr
 
     def _rod_band_layout(self):

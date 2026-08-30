@@ -300,6 +300,31 @@ The t-shirt reached the 2-3x band through the hash (240 -> 148) and the vertex-r
 remaining gap is the eigenmode path of its resting tetrahedra (44% of its step) and the scalar fp64 arithmetic that
 mochi does in 8-wide fp32.
 
+### fp32 against mochi's own fp32 (Phase L)
+
+mochi runs fp32 by default; its fp32-vs-fp64 deviation on a scene is the natural floor for judging Genesis fp32. Probe
+after 95 steps (the benchmark protocol), mochi fp64 as the reference:
+
+| scene | mochi fp64 | mochi fp32 - fp64 | Genesis fp64 (CPU) - mochi fp64 | Genesis fp32 (GPU) - mochi fp64 |
+|---|---|---|---|---|
+| soft_duck (height, m) | -0.00227 | 2.6e-9 | 5e-13 | 5.7e-9 |
+| cloth_tshirt (height, m) | 0.20986 | 3.6e-3 | 1.2e-3 | 9.9e-3 (2.7x mochi's own fp32 deviation) |
+| rigid (height, m) | 0.99925 | 1.3e-8 | 2.7e-4 | 2.7e-4 (both precisions equal) |
+| articulated | 0.15000 | 6e-9 | 0 | 6e-9 |
+
+The duck and the rigid scenes are precision-insensitive (the 0.27 mm rigid offset between the engines is the same in
+both precisions); the t-shirt - 95 steps of a self-colliding cloth - moves 3.6 mm between mochi's own precisions and
+9.9 mm between Genesis fp32 and mochi fp64, i.e. within three times mochi's floor. `tests/mochi/test_fp32_parity.py`
+pins these bounds (four times the floor plus 1 mm) for the duck and the t-shirt in fp32 on either backend. The
+equalities and helix probes measure different quantities in the two harnesses and are not compared.
+
+The tetrahedron and shell assemblies scatter their stiffness through per-block positions (the block's first column in
+the row vertex's shared column sequence; the scalar index is `csr_start[row] + position + column`): 16 + 12 / 36 + 18
+index loads per element instead of 144 / 324, and static tables nine times smaller. The preconditioner's scalar Jacobi
+pass covers the rigid dofs only (the deformable dofs are written by the block-Jacobi, rod-band and twist passes).
+GPU fp32: gripper B=1024 568 -> 549 ms/step, duck B=1024 577 -> 554, cloth + arm B=1024 365 -> 348; CPU fp64 duck
+67 -> 64.6 ms/step, t-shirt and gripper unchanged; total memory duck 15.2 -> 10.9 MiB, t-shirt 44.3 -> 36.3 at B=1.
+
 Gripper profile at B=256 after the hierarchy: tetrahedral contact query 23% (was 48%), conjugate gradient 37% (the
 CSR matvec at ~75% of the card's bandwidth, the vector passes limited by per-environment atomics), tetrahedron assembly
 13% (12x12 element tangents; Phase K1).

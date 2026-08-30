@@ -780,9 +780,14 @@ def func_soft_assemble_elements(
                             for c in qd.static(range(3)):
                                 block[r, c] = K[3 * f + r, 3 * f + c]
                         qd.atomic_add(soft_state.verts_H_diag[v[f], i_b], block)
-            for p in qd.static(range(12)):
-                for q in qd.static(range(12)):
-                    qd.atomic_add(soft_state.csr_values[soft_info.elems_csr[i_el, 12 * p + q], i_b], K[p, q])
+            # scatter per vertex block: row start + block position + column
+            for f in qd.static(range(4)):
+                for r in qd.static(range(3)):
+                    row_start = soft_info.csr_start[3 * v[f] + r]
+                    for g in qd.static(range(4)):
+                        pos = row_start + soft_info.elems_csr_block[i_el, 4 * f + g]
+                        for c in qd.static(range(3)):
+                            qd.atomic_add(soft_state.csr_values[pos + c, i_b], K[3 * f + r, 3 * g + c])
 
 
 @qd.kernel
@@ -2851,14 +2856,14 @@ def func_shell_assemble(
             qd.atomic_add(mochi_state.obj[i_b], energy)
         if assem_dres:
             for a in qd.static(range(6)):
-                for c in qd.static(range(6)):
-                    if nodes[a] >= 0 and nodes[c] >= 0:
-                        for r in qd.static(range(3)):
-                            for cc in qd.static(range(3)):
-                                qd.atomic_add(
-                                    soft_state.csr_values[soft_info.shell_csr[i_t, 18 * (3 * a + r) + 3 * c + cc], i_b],
-                                    K[3 * a + r, 3 * c + cc],
-                                )
+                if nodes[a] >= 0:
+                    for r in qd.static(range(3)):
+                        row_start = soft_info.csr_start[3 * nodes[a] + r]
+                        for c in qd.static(range(6)):
+                            if nodes[c] >= 0:
+                                pos = row_start + soft_info.shell_csr_block[i_t, 6 * a + c]
+                                for cc in qd.static(range(3)):
+                                    qd.atomic_add(soft_state.csr_values[pos + cc, i_b], K[3 * a + r, 3 * c + cc])
             for a in qd.static(range(6)):
                 if nodes[a] >= 0:
                     block = qd.Matrix.zero(gs.qd_float, 3, 3)
