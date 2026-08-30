@@ -237,6 +237,22 @@ iteration at B=256, so the per-environment atomics are not what limits them.)
 | soft_duck (H4) | - | - | - | 673 (657) | 2.32 |
 | rope_arm (H4) | - | - | - | 10.0 (9.8) | 2.18 |
 
+### GPU fp32 scaling at `1294b66e` (RTX 3080 10 GB, pipeline, cold-compiled once per scene)
+
+| scene | B=1 ms/step | B=64 ms/step (us/env-step) | B=256 | B=1024 | MiB/env | max B on 10 GB (estimate) |
+|---|---|---|---|---|---|---|
+| cloth_arm | 15.0 | 38.9 (608) | 101.0 (394) | 373.2 (364) | 6.28 | 1537 |
+| soft_gripper | 33.5 | 67.1 (1048) | 164.1 (641) | 669.4 (654) | 4.38 | 2204 |
+| rope_arm | 3.4 | 4.6 (72) | 6.6 (26) | 10.1 (10) | 2.19 | 4452 |
+| soft_duck | 21.5 | 62.6 (978) | 184.8 (722) | 669.1 (653) | 2.32 | 4180 |
+| cloth_tshirt | 25.3 | 85.7 (1340) | 268.6 (1049) | out of memory | 16.63 | 589 |
+| rod_helix | 154.8 | 224.2 (3503) | 305.8 (1195) | 374.7 (366) | 0.24 | 41430 |
+
+Against the Plan 2 baseline (`10b72f6f`): cloth + arm 4010 -> 364 us per env-step at the largest batch that fits (11x,
+and 1024 environments fit where 256 did not), gripper 5260 -> 654 (8x), rope + arm 71 -> 10 (7x); the projection to an
+80 GB card is 4096 environments for every RL scene (the t-shirt needs 16.6 MiB/env: ~4800 on 80 GB). The helix is
+launch-bound at small batches (20 Newton iterations per step) and only pays off at B >= 256.
+
 Gripper profile at B=256 after the hierarchy: tetrahedral contact query 23% (was 48%), conjugate gradient 37% (the
 CSR matvec at ~75% of the card's bandwidth, the vector passes limited by per-environment atomics), tetrahedron assembly
 13% (12x12 element tangents; Phase K1).
