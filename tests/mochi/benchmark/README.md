@@ -272,6 +272,34 @@ slowed the cloth + arm scene by 50% (B=256 101 -> 153 ms): the cloth spans the a
 traverses its whole tree at every assembly and the list barely shrinks. What the tetrahedron query costs is the
 near-field: thousands of finger-pad samples inside the cube's box, each a divergent descent.
 
+The CSR matvec of the deformable Hessian walks the column sequence of a vertex's three rows once per vertex (the
+sparsity is built from whole vertex blocks, so the three rows share it; the layout asserts this and adds every vertex's
+own 3x3 block): one thread per vertex reads each column index and source value once for three rows, a third of the
+index traffic and of the gathered loads. Rod twist rows keep the scalar walk. Gripper GPU B=256 matvec pass 0.209 ->
+0.181 ms per PCG iteration; duck GPU B=1024 641 -> 581 ms/step, gripper B=1024 652 -> 627; CPU fp64 single thread: duck 86 -> 67 ms/step (-22%, 5.4x mochi), gripper 71 -> 64,
+t-shirt 148 -> 87 (-41%, 2.7x mochi).
+
+The three per-environment reductions of a conjugate-gradient iteration (p.Ap; the residual update fused with the
+Polak-Ribiere cross term; r.z and z.z) run as 256-thread blocks tiled as 32 environment lanes by 8 chunks of a 64-dof
+tile: every warp reads 32 consecutive environments of one row, the chunks are summed in shared memory and each
+environment receives one atomic per tile instead of one per dof (standalone: 44 -> 15 us per pass at B=256, and a
+tenth of the fp32 rounding error of per-dof atomics). The CPU and per-environment paths are unchanged. GPU fp32 pipeline: gripper B=256 159 -> 154 ms/step, B=1024 627 -> 569 (-9%),
+cloth + arm B=1024 391 -> 365, t-shirt B=256 255 -> 236, duck B=1024 unchanged (581). (The kernel profiler cannot
+see this: it inflates every small task to ~0.1 ms, so only wall-clock step times are used to judge such passes.)
+
+### CPU fp64 single thread after Plan 2 (monolith, ms/step; mochi single-threaded in parentheses)
+
+| scene | before Plan 2 | now | vs mochi |
+|---|---|---|---|
+| soft_duck | 88.7 | 67 | 5.4x (12.4) |
+| cloth_tshirt | 240 | 87 | 2.7x (32.2) |
+| soft_gripper | 92-130 | 64 | - |
+| rod_helix | 6.0 | 6.0 | 2.6x (2.28) |
+
+The t-shirt reached the 2-3x band through the hash (240 -> 148) and the vertex-row matvec (148 -> 87); the duck's
+remaining gap is the eigenmode path of its resting tetrahedra (44% of its step) and the scalar fp64 arithmetic that
+mochi does in 8-wide fp32.
+
 Gripper profile at B=256 after the hierarchy: tetrahedral contact query 23% (was 48%), conjugate gradient 37% (the
 CSR matvec at ~75% of the card's bandwidth, the vector passes limited by per-environment atomics), tetrahedron assembly
 13% (12x12 element tangents; Phase K1).

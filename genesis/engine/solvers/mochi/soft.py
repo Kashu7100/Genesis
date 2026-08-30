@@ -1396,14 +1396,39 @@ def func_soft_matvec(
     n_soft_dofs = soft_info.csr_start.shape[0] - 1
     dof_start = soft_info.dof_start[None]
     twist_dof_start = soft_info.twist_dof_start[None]
+    n_vert_rows = (twist_dof_start - dof_start) // 3
+    # The three rows of a vertex share one column sequence (the pattern is built from whole vertex blocks): one thread
+    # per vertex reads every column index and source value once for the three rows.
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_slot in qd.ndrange(n_soft_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_soft_dofs, 1):
+    for i_v, i_slot in qd.ndrange(n_vert_rows, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_vert_rows, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+        if not mochi_state.pcg_is_active[i_b] or soft_state.verts_is_fixed[i_v, i_b]:
+            continue
+        j0 = soft_info.csr_start[3 * i_v]
+        j1 = soft_info.csr_start[3 * i_v + 1]
+        j2 = soft_info.csr_start[3 * i_v + 2]
+        acc = qd.Vector.zero(gs.qd_float, 3)
+        for jj in range(j1 - j0):
+            j_l = soft_info.csr_col[j0 + jj]
+            j_d = dof_start + j_l
+            if j_d < twist_dof_start and soft_state.verts_is_fixed[j_l // 3, i_b]:
+                continue
+            x = src[j_d, i_b]
+            acc[0] += soft_state.csr_values[j0 + jj, i_b] * x
+            acc[1] += soft_state.csr_values[j1 + jj, i_b] * x
+            acc[2] += soft_state.csr_values[j2 + jj, i_b] * x
+        for k in qd.static(range(3)):
+            dst[dof_start + 3 * i_v + k, i_b] += acc[k]
+    # rod twist rows: scalar walk
+    n_twist_rows = n_soft_dofs - 3 * n_vert_rows
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_t, i_slot in (
+        qd.ndrange(n_twist_rows, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_twist_rows, 1)
+    ):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not mochi_state.pcg_is_active[i_b]:
             continue
-        i_d = dof_start + i_l
-        if i_d < twist_dof_start and soft_state.verts_is_fixed[i_l // 3, i_b]:
-            continue
+        i_l = 3 * n_vert_rows + i_t
         acc = gs.qd_float(0.0)
         for j in range(soft_info.csr_start[i_l], soft_info.csr_start[i_l + 1]):
             j_l = soft_info.csr_col[j]
@@ -1411,7 +1436,7 @@ def func_soft_matvec(
             if j_d < twist_dof_start and soft_state.verts_is_fixed[j_l // 3, i_b]:
                 continue
             acc += soft_state.csr_values[j, i_b] * src[j_d, i_b]
-        dst[i_d, i_b] += acc
+        dst[dof_start + i_l, i_b] += acc
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_h, i_slot in (

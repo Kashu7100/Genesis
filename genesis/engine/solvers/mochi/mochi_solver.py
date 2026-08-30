@@ -1047,7 +1047,12 @@ class MochiSolver(KinematicSolver):
             dofs[:, 7] = 3 * self.n_soft_verts + e[:, 1]
             yield "rod_stencils", dofs
 
+        # diagonal of every dof, and the whole 3x3 block of every vertex so that its three rows share one column
+        # sequence (the matvec walks it once per vertex)
         keys = [np.arange(n_dofs, dtype=np.int64) * (n_dofs + 1)]
+        if self.n_soft_verts > 0:
+            v_dofs = 3 * np.arange(self.n_soft_verts, dtype=np.int64)[:, None] + np.arange(3)
+            keys.append((v_dofs[:, :, None] * n_dofs + v_dofs[:, None, :]).ravel())
         blocks = {}
         for name, dofs in element_dofs():
             rows = np.repeat(dofs[:, :, None], dofs.shape[1], axis=2)
@@ -1061,6 +1066,19 @@ class MochiSolver(KinematicSolver):
             "start": np.searchsorted(unique_keys // n_dofs, np.arange(n_dofs + 1)).astype(gs.np_int),
             "col": (unique_keys % n_dofs).astype(gs.np_int),
         }
+        if self.n_soft_verts > 0:
+            # the three rows of a vertex must hold the same columns in the same order
+            start = csr["start"]
+            lengths = np.diff(start)[: 3 * self.n_soft_verts].reshape(-1, 3)
+            assert (lengths[:, 1:] == lengths[:, :1]).all(), "vertex rows with different lengths"
+            cols = csr["col"]
+            for k in (1, 2):
+                same = np.ones(self.n_soft_verts, dtype=bool)
+                for i_v in range(self.n_soft_verts):
+                    a, b = start[3 * i_v], start[3 * i_v + k]
+                    n = start[3 * i_v + 1] - a
+                    same[i_v] = np.array_equal(cols[a : a + n], cols[b : b + n])
+                assert same.all(), "vertex rows with different columns"
         for name, (block_keys, valid) in blocks.items():
             index = np.searchsorted(unique_keys, np.where(valid, block_keys, 0))
             n_block = block_keys.shape[1] * block_keys.shape[2]
