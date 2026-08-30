@@ -50,9 +50,9 @@ from .shell import func_shell_elastic, func_shell_rest_data, func_shell_strains
 from .soft_materials import (
     func_elastic_energy,
     func_elastic_stress,
-    func_elastic_tangent,
     func_stiffness_damping_block,
     func_stiffness_damping_stress,
+    func_tet_stiffness,
 )
 
 # Kinds of deformable entities.
@@ -760,29 +760,25 @@ def func_soft_assemble_elements(
             qd.atomic_add(mochi_state.obj[i_b], energy)
 
         if assem_dres:
-            C = func_elastic_tangent(model, F, mu, lam, EPS, True)
-            K = qd.Matrix.zero(gs.qd_float, 12, 12)
+            # Elastic stiffness per node block (no 9x9 tangent), then the damping and the consistent mass.
+            K = func_tet_stiffness(model, F, mu, lam, EPS, True, grads, vol)
             for f in qd.static(range(4)):
                 g_f = qd.Vector([grads[f, 0], grads[f, 1], grads[f, 2]], dt=gs.qd_float)
                 for g in qd.static(range(4)):
                     g_g = qd.Vector([grads[g, 0], grads[g, 1], grads[g, 2]], dt=gs.qd_float)
-                    block = qd.Matrix.zero(gs.qd_float, 3, 3)
-                    for r in qd.static(range(3)):
-                        for c in qd.static(range(3)):
-                            value = gs.qd_float(0.0)
-                            for m in qd.static(range(3)):
-                                for n in qd.static(range(3)):
-                                    value += g_f[m] * C[3 * r + m, 3 * c + n] * g_g[n]
-                            block[r, c] = vol * value
                     if has_stiffness_damping:
-                        block += vol * func_stiffness_damping_block(F, g_f, g_g, mu, lam, kappa)
+                        damping = vol * func_stiffness_damping_block(F, g_f, g_g, mu, lam, kappa)
+                        for r in qd.static(range(3)):
+                            for c in qd.static(range(3)):
+                                K[3 * f + r, 3 * g + c] += damping[r, c]
                     m_fg = gs.qd_float(CONSISTENT_MASS[f][g]) * (c_inertia + c_damping)
                     for k in qd.static(range(3)):
-                        block[k, k] += m_fg
-                    for r in qd.static(range(3)):
-                        for c in qd.static(range(3)):
-                            K[3 * f + r, 3 * g + c] = block[r, c]
+                        K[3 * f + k, 3 * g + k] += m_fg
                     if qd.static(f == g):
+                        block = qd.Matrix.zero(gs.qd_float, 3, 3)
+                        for r in qd.static(range(3)):
+                            for c in qd.static(range(3)):
+                                block[r, c] = K[3 * f + r, 3 * f + c]
                         qd.atomic_add(soft_state.verts_H_diag[v[f], i_b], block)
             for p in qd.static(range(12)):
                 for q in qd.static(range(12)):

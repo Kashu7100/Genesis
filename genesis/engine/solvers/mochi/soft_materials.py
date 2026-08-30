@@ -193,38 +193,55 @@ def func_smith_nh_tangent(F, mu, lam, eps, project: qd.template()):
     C = qd.Matrix.zero(gs.qd_float, 9, 9)
     use_direct = True
     if qd.static(project):
-        mu_hat_k = mu_hat * (1.0 - 1.0 / (Ic + 1.0))
-        max_sigma_sq = func_max_eigenvalue_sym3(F.transpose() @ F)
-        use_direct = (lam_hat * (J - alpha)) ** 2 * max_sigma_sq <= mu_hat_k * mu_hat_k and J >= 0.0
+        use_direct = func_smith_nh_is_psd(F, mu_hat, lam_hat, alpha, Ic, J)
     if use_direct:
         C = func_smith_nh_direct_tangent(F, mu_hat, lam_hat, alpha, Ic, J)
     else:
-        U, sigma, V = func_rotation_variant_svd(F)
-        Ic = sigma.norm_sqr()
-        J = sigma[0] * sigma[1] * sigma[2]
-        Ic1 = Ic + 1.0
-        coeff0 = mu_hat * (1.0 - 1.0 / Ic1)
-        coeff1 = lam_hat * (J - alpha)
-        A = qd.Matrix.zero(gs.qd_float, 3, 3)
-        for i in qd.static(range(3)):
-            j, k = qd.static(_MODE_PAIRS[i])
-            A[i, i] = (
-                (2.0 * mu_hat * sigma[i] ** 2 - mu_hat * Ic1) / (Ic1 * Ic1)
-                + lam_hat * sigma[j] ** 2 * sigma[k] ** 2
-                + mu_hat
-            )
-        for i in qd.static(range(3)):
-            j, k = qd.static(_MODE_PAIRS[i])
-            # The off-diagonal (j, k) couples the modes other than i through sigma_i.
-            A[j, k] = (2.0 * J - alpha) * lam_hat * sigma[i] + 2.0 * mu_hat * sigma[j] * sigma[k] / (Ic1 * Ic1)
-            A[k, j] = A[j, k]
-        twist = qd.Vector.zero(gs.qd_float, 3)
-        flip = qd.Vector.zero(gs.qd_float, 3)
-        for n in qd.static(range(3)):
-            twist[n] = coeff1 * sigma[n] + coeff0
-            flip[n] = -coeff1 * sigma[n] + coeff0
+        U, V, A, twist, flip = func_smith_nh_eigensystem(F, mu_hat, lam_hat, alpha)
         C = func_tangent_from_eigensystem(U, V, A, twist, flip, eps, project)
     return C
+
+
+@qd.func
+def func_smith_nh_is_psd(F, mu_hat, lam_hat, alpha, Ic, J):
+    """mochi's oracle: only the twist and flip modes can make the Smith neo-Hookean tangent indefinite, with
+    eigenvalues +-lam_hat (J - alpha) sigma_i + mu_hat_k, mu_hat_k = mu_hat (1 - 1/(Ic+1)); when J >= 0 and
+    lam_hat^2 (J - alpha)^2 max_i sigma_i^2 <= mu_hat_k^2 the exact tangent is positive semidefinite (max_i sigma_i^2 is
+    the largest eigenvalue of F^T F)."""
+    mu_hat_k = mu_hat * (1.0 - 1.0 / (Ic + 1.0))
+    max_sigma_sq = func_max_eigenvalue_sym3(F.transpose() @ F)
+    return (lam_hat * (J - alpha)) ** 2 * max_sigma_sq <= mu_hat_k * mu_hat_k and J >= 0.0
+
+
+@qd.func
+def func_smith_nh_eigensystem(F, mu_hat, lam_hat, alpha):
+    """Analytic eigensystem of the Smith neo-Hookean tangent: the rotation-variant SVD, the scaling matrix in the
+    u_i v_i^T basis and the twist and flip eigenvalues."""
+    U, sigma, V = func_rotation_variant_svd(F)
+    Ic = sigma.norm_sqr()
+    J = sigma[0] * sigma[1] * sigma[2]
+    Ic1 = Ic + 1.0
+    coeff0 = mu_hat * (1.0 - 1.0 / Ic1)
+    coeff1 = lam_hat * (J - alpha)
+    A = qd.Matrix.zero(gs.qd_float, 3, 3)
+    for i in qd.static(range(3)):
+        j, k = qd.static(_MODE_PAIRS[i])
+        A[i, i] = (
+            (2.0 * mu_hat * sigma[i] ** 2 - mu_hat * Ic1) / (Ic1 * Ic1)
+            + lam_hat * sigma[j] ** 2 * sigma[k] ** 2
+            + mu_hat
+        )
+    for i in qd.static(range(3)):
+        j, k = qd.static(_MODE_PAIRS[i])
+        # The off-diagonal (j, k) couples the modes other than i through sigma_i.
+        A[j, k] = (2.0 * J - alpha) * lam_hat * sigma[i] + 2.0 * mu_hat * sigma[j] * sigma[k] / (Ic1 * Ic1)
+        A[k, j] = A[j, k]
+    twist = qd.Vector.zero(gs.qd_float, 3)
+    flip = qd.Vector.zero(gs.qd_float, 3)
+    for n in qd.static(range(3)):
+        twist[n] = coeff1 * sigma[n] + coeff0
+        flip[n] = -coeff1 * sigma[n] + coeff0
+    return U, V, A, twist, flip
 
 
 # ------------------------------------------------------------------------------------
@@ -252,6 +269,13 @@ def func_stvk_stress(F, mu, lam):
 
 @qd.func
 def func_stvk_tangent(F, mu, lam, eps, project: qd.template()):
+    U, V, A, twist, flip = func_stvk_eigensystem(F, mu, lam)
+    return func_tangent_from_eigensystem(U, V, A, twist, flip, eps, project)
+
+
+@qd.func
+def func_stvk_eigensystem(F, mu, lam):
+    """Analytic eigensystem of the Saint Venant-Kirchhoff tangent (see func_smith_nh_eigensystem)."""
     U, sigma, V = func_rotation_variant_svd(F)
     I2 = sigma.norm_sqr()
     base = -mu + 0.5 * lam * (I2 - 3.0)
@@ -268,7 +292,7 @@ def func_stvk_tangent(F, mu, lam, eps, project: qd.template()):
         j, k = qd.static(_MODE_PAIRS[n])
         twist[n] = base + mu * (sigma[j] ** 2 + sigma[k] ** 2 - sigma[j] * sigma[k])
         flip[n] = base + mu * (sigma[j] ** 2 + sigma[k] ** 2 + sigma[j] * sigma[k])
-    return func_tangent_from_eigensystem(U, V, A, twist, flip, eps, project)
+    return U, V, A, twist, flip
 
 
 # ------------------------------------------------------------------------------------
@@ -343,6 +367,163 @@ def func_elastic_tangent(model, F, mu, lam, eps, project: qd.template()):
     else:
         C = func_linear_tangent(mu, lam)
     return C
+
+
+# ------------------------------------------------------------------------------------
+# Element stiffness as node blocks
+# ------------------------------------------------------------------------------------
+
+
+@qd.func
+def func_add_mode_blocks(K, lam_n, M, grads, vol):
+    """Add vol lam_n (M g_f)(M g_g)^T to every node block (f, g) of the 12x12 element stiffness: the contribution of one
+    tangent eigenmode M (3x3, eigenvalue lam_n) contracted with the shape gradients, since
+    g_f^T (m m^T)_{rc} g_g = (M g_f)_r (M g_g)_c for the row-major flattening m of M."""
+    p = qd.Matrix.zero(gs.qd_float, 4, 3)
+    for f in qd.static(range(4)):
+        g_f = qd.Vector([grads[f, 0], grads[f, 1], grads[f, 2]], dt=gs.qd_float)
+        Mg = M @ g_f
+        for r in qd.static(range(3)):
+            p[f, r] = Mg[r]
+    # upper node blocks only (f <= g); func_blocks_from_eigensystem mirrors them once after the last mode
+    scale = vol * lam_n
+    for f in qd.static(range(4)):
+        for g in qd.static(range(f, 4)):
+            for r in qd.static(range(3)):
+                for c in qd.static(range(3)):
+                    K[3 * f + r, 3 * g + c] += scale * p[f, r] * p[g, c]
+    return K
+
+
+@qd.func
+def func_blocks_from_eigensystem(U, V, A, twist, flip, eps, project: qd.template(), grads, vol):
+    """Element stiffness vol g_f^T C g_g of a tangent given by its analytic eigensystem (see
+    func_tangent_from_eigensystem), accumulated mode by mode without forming the 9x9 tangent."""
+    K = qd.Matrix.zero(gs.qd_float, 12, 12)
+    evals, Q = sym_eig3(A, n_sweeps=8)
+    for n in qd.static(range(3)):
+        lam_n = evals[n]
+        if qd.static(project):
+            lam_n = qd.max(lam_n, eps)
+        M = qd.Matrix.zero(gs.qd_float, 3, 3)
+        for i in qd.static(range(3)):
+            u_i = qd.Vector([U[0, i], U[1, i], U[2, i]], dt=gs.qd_float)
+            v_i = qd.Vector([V[0, i], V[1, i], V[2, i]], dt=gs.qd_float)
+            M += Q[i, n] * u_i.outer_product(v_i)
+        K = func_add_mode_blocks(K, lam_n, M, grads, vol)
+    for n in qd.static(range(3)):
+        j, k = qd.static(_MODE_PAIRS[n])
+        u_j = qd.Vector([U[0, j], U[1, j], U[2, j]], dt=gs.qd_float)
+        u_k = qd.Vector([U[0, k], U[1, k], U[2, k]], dt=gs.qd_float)
+        v_j = qd.Vector([V[0, j], V[1, j], V[2, j]], dt=gs.qd_float)
+        v_k = qd.Vector([V[0, k], V[1, k], V[2, k]], dt=gs.qd_float)
+        T = u_j.outer_product(v_k) - u_k.outer_product(v_j)
+        Fl = u_j.outer_product(v_k) + u_k.outer_product(v_j)
+        lam_t = twist[n]
+        lam_f = flip[n]
+        if qd.static(project):
+            lam_t = qd.max(lam_t, eps)
+            lam_f = qd.max(lam_f, eps)
+        K = func_add_mode_blocks(K, 0.5 * lam_t, T, grads, vol)
+        K = func_add_mode_blocks(K, 0.5 * lam_f, Fl, grads, vol)
+    for f in qd.static(range(4)):
+        for g in qd.static(range(f + 1, 4)):
+            for r in qd.static(range(3)):
+                for c in qd.static(range(3)):
+                    K[3 * g + c, 3 * f + r] = K[3 * f + r, 3 * g + c]
+    return K
+
+
+@qd.func
+def func_smith_nh_direct_blocks(F, mu_hat, lam_hat, alpha, Ic, J, grads, vol):
+    """Element stiffness of the exact Smith neo-Hookean tangent c3 f f^T + lam_hat cof cof^T + c2 I
+    + lam_hat (J - alpha) d2J/dF2 in closed form per node block (f, g):
+    vol [c3 (F g_f)(F g_g)^T + lam_hat (cof g_f)(cof g_g)^T + c2 (g_f . g_g) I + coeff S(F (g_f x g_g))], where
+    S(w)_rc = eps_rck w_k is the contraction of d2J/dF2 = eps_rck eps_mnl F_kl with the two gradients."""
+    Ic1 = Ic + 1.0
+    c2 = mu_hat * (1.0 - 1.0 / Ic1)
+    c3 = 2.0 * mu_hat / (Ic1 * Ic1)
+    coeff = lam_hat * (J - alpha)
+    cof = func_cofactor(F)
+    a = qd.Matrix.zero(gs.qd_float, 4, 3)
+    b = qd.Matrix.zero(gs.qd_float, 4, 3)
+    for f in qd.static(range(4)):
+        g_f = qd.Vector([grads[f, 0], grads[f, 1], grads[f, 2]], dt=gs.qd_float)
+        Fg = F @ g_f
+        cg = cof @ g_f
+        for r in qd.static(range(3)):
+            a[f, r] = Fg[r]
+            b[f, r] = cg[r]
+    K = qd.Matrix.zero(gs.qd_float, 12, 12)
+    for f in qd.static(range(4)):
+        g_f = qd.Vector([grads[f, 0], grads[f, 1], grads[f, 2]], dt=gs.qd_float)
+        for g in qd.static(range(f, 4)):
+            g_g = qd.Vector([grads[g, 0], grads[g, 1], grads[g, 2]], dt=gs.qd_float)
+            gg = g_f.dot(g_g)
+            block = qd.Matrix.zero(gs.qd_float, 3, 3)
+            for r in qd.static(range(3)):
+                for c in qd.static(range(3)):
+                    block[r, c] = c3 * a[f, r] * a[g, c] + lam_hat * b[f, r] * b[g, c]
+                block[r, r] += c2 * gg
+            if qd.static(f != g):
+                w = F @ g_f.cross(g_g)
+                block[0, 1] += coeff * w[2]
+                block[0, 2] -= coeff * w[1]
+                block[1, 0] -= coeff * w[2]
+                block[1, 2] += coeff * w[0]
+                block[2, 0] += coeff * w[1]
+                block[2, 1] -= coeff * w[0]
+            for r in qd.static(range(3)):
+                for c in qd.static(range(3)):
+                    K[3 * f + r, 3 * g + c] = vol * block[r, c]
+                    if qd.static(f != g):
+                        K[3 * g + c, 3 * f + r] = vol * block[r, c]
+    return K
+
+
+@qd.func
+def func_linear_blocks(mu, lam, grads, vol):
+    """Element stiffness of the constant linear tangent: vol [lam g_f g_g^T + mu (g_f . g_g) I + mu g_g g_f^T]."""
+    K = qd.Matrix.zero(gs.qd_float, 12, 12)
+    for f in qd.static(range(4)):
+        g_f = qd.Vector([grads[f, 0], grads[f, 1], grads[f, 2]], dt=gs.qd_float)
+        for g in qd.static(range(4)):
+            g_g = qd.Vector([grads[g, 0], grads[g, 1], grads[g, 2]], dt=gs.qd_float)
+            gg = g_f.dot(g_g)
+            for r in qd.static(range(3)):
+                for c in qd.static(range(3)):
+                    value = lam * g_f[r] * g_g[c] + mu * g_g[r] * g_f[c]
+                    if qd.static(r == c):
+                        value += mu * gg
+                    K[3 * f + r, 3 * g + c] = vol * value
+    return K
+
+
+@qd.func
+def func_tet_stiffness(model, F, mu, lam, eps, project: qd.template(), grads, vol):
+    """Elastic part of the 12x12 stiffness of a linear tetrahedron, vol g_f^T (d2Psi/dF2) g_g per node block, with the
+    projected tangent of func_elastic_tangent but assembled block by block: the Smith neo-Hookean tangent in closed
+    form when mochi's oracle proves it definite, the analytic eigenmodes otherwise (and for Saint Venant-Kirchhoff),
+    the constant linear tangent directly."""
+    K = qd.Matrix.zero(gs.qd_float, 12, 12)
+    if model == ELASTIC_MODEL.STABLE_NEOHOOKEAN:
+        mu_hat, lam_hat, alpha = func_smith_params(mu, lam)
+        Ic = F.norm_sqr()
+        J = F.determinant()
+        use_direct = True
+        if qd.static(project):
+            use_direct = func_smith_nh_is_psd(F, mu_hat, lam_hat, alpha, Ic, J)
+        if use_direct:
+            K = func_smith_nh_direct_blocks(F, mu_hat, lam_hat, alpha, Ic, J, grads, vol)
+        else:
+            U, V, A, twist, flip = func_smith_nh_eigensystem(F, mu_hat, lam_hat, alpha)
+            K = func_blocks_from_eigensystem(U, V, A, twist, flip, eps, project, grads, vol)
+    elif model == ELASTIC_MODEL.STVK:
+        U, V, A, twist, flip = func_stvk_eigensystem(F, mu, lam)
+        K = func_blocks_from_eigensystem(U, V, A, twist, flip, eps, project, grads, vol)
+    else:
+        K = func_linear_blocks(mu, lam, grads, vol)
+    return K
 
 
 # ------------------------------------------------------------------------------------

@@ -253,6 +253,15 @@ and 1024 environments fit where 256 did not), gripper 5260 -> 654 (8x), rope + a
 80 GB card is 4096 environments for every RL scene (the t-shirt needs 16.6 MiB/env: ~4800 on 80 GB). The helix is
 launch-bound at small batches (20 Newton iterations per step) and only pays off at B >= 256.
 
+The tetrahedron stiffness is assembled per node block (`func_tet_stiffness`): the Smith neo-Hookean tangent in closed
+form when mochi's oracle proves it definite (`c3 (F g_f)(F g_g)^T + lam (cof g_f)(cof g_g)^T + c2 (g_f . g_g) I
++ coeff S(F (g_f x g_g))`), the analytic eigenmodes otherwise (nine rank-one block updates), instead of a 9x9 tangent
+contracted term by term (1296 multiply-adds per element); `tests/mochi/test_soft_materials.py` checks the blocks
+against the contraction to 1e-10 on tension, compression, shear and inversion. Gripper GPU B=256 assembly kernel 1.67
+-> 1.51 ms per call (step 165 -> 160 ms), duck B=1024 673 -> 641 ms. On the CPU the duck does not move (86 ms): near
+rest under compression the oracle fails - the rest state is exactly marginal by construction of the model's alpha - so
+most tetrahedra take the SVD + Jacobi eigenmode path, where the block form saves only a fifth of the arithmetic.
+
 Gripper profile at B=256 after the hierarchy: tetrahedral contact query 23% (was 48%), conjugate gradient 37% (the
 CSR matvec at ~75% of the card's bandwidth, the vector passes limited by per-environment atomics), tetrahedron assembly
 13% (12x12 element tangents; Phase K1).
