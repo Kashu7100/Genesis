@@ -85,7 +85,7 @@ from .soft import (
     func_soft_store_ls_ref,
     func_soft_update_conv_weights,
     func_soft_zero_assembly,
-    func_tet_hash_build,
+    func_tet_tree_refit,
 )
 
 
@@ -255,7 +255,7 @@ def func_assemble(
                 errno,
             )
         if qd.static(mochi_config.has_soft_colliders):
-            func_tet_hash_build(
+            func_tet_tree_refit(
                 i_b_env,
                 per_env,
                 envs,
@@ -264,8 +264,8 @@ def func_assemble(
                 soft_info,
                 soft_state,
                 rigid_config,
+                mochi_config,
                 skip_ls_done,
-                errno,
             )
             func_soft_collider_eval(
                 i_b_env,

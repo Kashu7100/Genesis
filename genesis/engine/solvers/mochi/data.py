@@ -83,6 +83,8 @@ class MochiStaticConfig(metaclass=AutoInitMeta):
     has_equalities: bool
     has_pc_colliders: bool
     has_soft_colliders: bool
+    # levels of the bounding-box hierarchy of the collider tetrahedra (the refit runs one task per level)
+    tet_tree_levels: int
 
 
 # =========================================== build-time info ===========================================
@@ -709,8 +711,18 @@ class MochiSoftInfo:
     n_rigid_queries: qd.Tensor
     n_queries: qd.Tensor
     pc_hash_cell: qd.Tensor
-    tet_hash_cell: qd.Tensor
-    tet_hash_cell_min: qd.Tensor
+    # bounding-box hierarchy of the collider tetrahedra (see tet_tree.py): per node its first leaf-ordered element and
+    # count, the depth-first index of the next node outside its subtree and whether it is a leaf; the nodes listed
+    # from the deepest level up (with the start of every level) for the refit; the leaf-ordered element indices; a
+    # test hook that makes every query visit every node
+    tet_tree_first: qd.Tensor
+    tet_tree_count: qd.Tensor
+    tet_tree_escape: qd.Tensor
+    tet_tree_is_leaf: qd.Tensor
+    tet_tree_level_nodes: qd.Tensor
+    tet_tree_level_start: qd.Tensor
+    tet_tree_elems: qd.Tensor
+    tet_tree_brute_force: qd.Tensor
 
 
 def get_mochi_soft_info(solver):
@@ -812,8 +824,14 @@ def get_mochi_soft_info(solver):
         n_rigid_queries=_scalar(gs.qd_int, solver.n_samples),
         n_queries=_scalar(gs.qd_int, solver._n_soft_queries),
         pc_hash_cell=_scalar(gs.qd_float, solver._pc_hash_cell),
-        tet_hash_cell=_scalar(gs.qd_float, solver._tet_hash_cell),
-        tet_hash_cell_min=_scalar(gs.qd_float, 0.0),
+        tet_tree_first=V(dtype=gs.qd_int, shape=(solver.n_tet_nodes_,)),
+        tet_tree_count=V(dtype=gs.qd_int, shape=(solver.n_tet_nodes_,)),
+        tet_tree_escape=V(dtype=gs.qd_int, shape=(solver.n_tet_nodes_,)),
+        tet_tree_is_leaf=V(dtype=gs.qd_int, shape=(solver.n_tet_nodes_,)),
+        tet_tree_level_nodes=V(dtype=gs.qd_int, shape=(solver.n_tet_nodes_,)),
+        tet_tree_level_start=V(dtype=gs.qd_int, shape=(solver.n_tet_levels + 1,)),
+        tet_tree_elems=V(dtype=gs.qd_int, shape=(solver.n_tet_tree_elems_,)),
+        tet_tree_brute_force=_scalar(gs.qd_int, 0),
     )
 
 
@@ -910,15 +928,13 @@ class MochiSoftState:
     pc_hit_r_a: qd.Tensor
     pc_hit_vert_b: qd.Tensor
     pc_hit_D: qd.Tensor
-    # spatial hashes of the deformable colliders: heads of the per-bin chains (-1 empty) and the next entry of a
-    # chain; an item has one entry (8 x item + k) per cell its bounds overlap, k encoding the cell offset
+    # spatial hash of the collider spheres: heads of the per-bin chains (-1 empty) and the next entry of a chain; a
+    # sphere has one entry (8 x item + k) per cell its bounds overlap, k encoding the cell offset
     pc_hash_heads: qd.Tensor
     pc_hash_next: qd.Tensor
-    tet_hash_heads: qd.Tensor
-    tet_hash_next: qd.Tensor
-    # tetrahedra larger than the hash cell, scanned by every query
-    tet_hash_big: qd.Tensor
-    n_tet_hash_big: qd.Tensor
+    # deformed bounds of the nodes of the tetrahedron hierarchy
+    tet_tree_min: qd.Tensor
+    tet_tree_max: qd.Tensor
 
 
 def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max_pc_hits):
@@ -997,8 +1013,6 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         pc_hit_D=V(dtype=gs.qd_mat3, shape=(max_pc_hits, _B)),
         pc_hash_heads=V(dtype=gs.qd_int, shape=(solver.n_pc_bins_, _B)),
         pc_hash_next=V(dtype=gs.qd_int, shape=(8 * n_sv_, _B)),
-        tet_hash_heads=V(dtype=gs.qd_int, shape=(solver.n_tet_bins_, _B)),
-        tet_hash_next=V(dtype=gs.qd_int, shape=(8 * n_el_, _B)),
-        tet_hash_big=V(dtype=gs.qd_int, shape=(solver.n_tet_hash_big_, _B)),
-        n_tet_hash_big=V(dtype=gs.qd_int, shape=(_B,)),
+        tet_tree_min=V(dtype=gs.qd_vec3, shape=(solver.n_tet_nodes_, _B)),
+        tet_tree_max=V(dtype=gs.qd_vec3, shape=(solver.n_tet_nodes_, _B)),
     )

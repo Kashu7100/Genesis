@@ -94,7 +94,7 @@ def test_point_cloud_hash_matches_brute_force(tmp_path, show_viewer):
 
 
 @pytest.mark.precision("64")
-def test_tetrahedron_hash_matches_brute_force(show_viewer):
+def test_tetrahedron_tree_matches_brute_force(show_viewer):
     # A soft cube resting on a soft slab under a rigid ball: sample points of one body inside the tetrahedra of the
     # other and rigid samples inside both.
     scene = _mochi_scene(show_viewer, 1.0 / 60.0, n_newton_iterations=4)
@@ -115,12 +115,12 @@ def test_tetrahedron_hash_matches_brute_force(show_viewer):
     solver = scene.mochi_solver
     assert solver._has_soft_colliders
 
-    hits_hash = _tetrahedron_hits(solver)
-    solver.soft_info.tet_hash_cell_min.fill(1e3)
+    hits_tree = _tetrahedron_hits(solver)
+    solver.soft_info.tet_tree_brute_force.fill(1)
     hits_brute = _tetrahedron_hits(solver)
-    solver.soft_info.tet_hash_cell_min.fill(0.0)
+    solver.soft_info.tet_tree_brute_force.fill(0)
 
     for i_b in range(2):
         assert len(hits_brute[i_b]) > 20
-        assert hits_hash[i_b] == hits_brute[i_b]
-    assert hits_hash[0] != hits_hash[1]
+        assert hits_tree[i_b] == hits_brute[i_b]
+    assert hits_tree[0] != hits_tree[1]

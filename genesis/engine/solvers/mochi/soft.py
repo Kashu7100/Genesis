@@ -595,23 +595,22 @@ def func_soft_zero_assembly(
                 soft_state.verts_H_diag[i_v, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
             if qd.static(record):
                 soft_state.verts_contact_force[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
-    if assem_dres:
-        n_csr = soft_state.csr_values.shape[0]
-        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-        for j, i_slot in qd.ndrange(n_csr, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_csr, 1):
-            i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-            if func_is_env_active(i_b, mochi_state, skip_ls_done):
-                soft_state.csr_values[j, i_b] = 0.0
-        # The rod blocks kept for the banded preconditioner are overwritten by the assembly kernels (padding elements
-        # keep their zero allocation); only the accumulated twist diagonal needs zeroing.
-        n_rod_elems = soft_state.rod_elems_H.shape[0]
-        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-        for i_r, i_slot in (
-            qd.ndrange(n_rod_elems, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_rod_elems, 1)
-        ):
-            i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-            if func_is_env_active(i_b, mochi_state, skip_ls_done):
-                soft_state.rod_elems_twist_pcg[i_r, i_b] = 0.0
+    # The Hessian is zeroed on full assemblies only. The runtime flag is tested inside the loops: a loop nested under a
+    # runtime condition is not offloaded as a parallel task and would run serially on one thread.
+    n_csr = soft_state.csr_values.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for j, i_slot in qd.ndrange(n_csr, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_csr, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+        if assem_dres and func_is_env_active(i_b, mochi_state, skip_ls_done):
+            soft_state.csr_values[j, i_b] = 0.0
+    # The rod blocks kept for the banded preconditioner are overwritten by the assembly kernels (padding elements
+    # keep their zero allocation); only the accumulated twist diagonal needs zeroing.
+    n_rod_elems = soft_state.rod_elems_H.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_r, i_slot in qd.ndrange(n_rod_elems, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_rod_elems, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+        if assem_dres and func_is_env_active(i_b, mochi_state, skip_ls_done):
+            soft_state.rod_elems_twist_pcg[i_r, i_b] = 0.0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_p, i_slot in qd.ndrange(max_pairs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(max_pairs, 1):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
@@ -2200,7 +2199,7 @@ def func_tet_aabb(i_el, i_b, soft_info: MochiSoftInfo, soft_state: MochiSoftStat
 
 
 @qd.func
-def func_tet_hash_build(
+def func_tet_tree_refit(
     i_b_env,
     per_env: qd.template(),
     envs: qd.types.ndarray(),
@@ -2209,48 +2208,33 @@ def func_tet_hash_build(
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
+    mochi_config: qd.template(),
     skip_ls_done,
-    errno: qd.Tensor,
 ):
-    """Insert the deformed tetrahedra of the collider entities in the hash (cell: twice the median rest extent, so a
-    typical tetrahedron overlaps at most two cells per axis); the tetrahedra larger than the cell go to the overflow list
-    every query scans."""
-    n_bins = soft_state.tet_hash_heads.shape[0]
-    n_elems = soft_info.elems_v.shape[0]
-    n_big_max = soft_state.tet_hash_big.shape[0]
-    cell = qd.max(soft_info.tet_hash_cell[None], soft_info.tet_hash_cell_min[None])
-    inv_cell = 1.0 / cell
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_slot in range(n_envs[None]) if qd.static(not per_env) else range(1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if func_is_env_active(i_b, mochi_state, skip_ls_done):
-            soft_state.n_tet_hash_big[i_b] = 0
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_bin, i_slot in qd.ndrange(n_bins, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_bins, 1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if func_is_env_active(i_b, mochi_state, skip_ls_done):
-            soft_state.tet_hash_heads[i_bin, i_b] = -1
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_el, i_slot in qd.ndrange(n_elems, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_elems, 1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if (
-            func_is_env_active(i_b, mochi_state, skip_ls_done)
-            and soft_info.entities_collider_type[soft_info.elems_entity_idx[i_el]] == COLLIDER_TYPE.GRID
-        ):
-            aabb_min, aabb_max = func_tet_aabb(i_el, i_b, soft_info, soft_state)
-            extent = aabb_max - aabb_min
-            if qd.max(qd.max(extent[0], extent[1]), extent[2]) <= cell:
-                cell_lo = func_hash_cell(aabb_min, inv_cell)
-                cell_hi = func_hash_cell(aabb_max, inv_cell)
-                func_hash_insert(
-                    soft_state.tet_hash_heads, soft_state.tet_hash_next, i_el, cell_lo, cell_hi, n_bins - 1, i_b
-                )
-            else:
-                i_big = qd.atomic_add(soft_state.n_tet_hash_big[i_b], 1)
-                if i_big < n_big_max:
-                    soft_state.tet_hash_big[i_big, i_b] = i_el
+    """Refit the bounds of the tetrahedron hierarchy to the deformed vertices, one level at a time from the leaves up
+    (the children of inner node i are i + 1 and the escape node of i + 1)."""
+    for i_level in qd.static(range(mochi_config.tet_tree_levels)):
+        n_level = soft_info.tet_tree_level_start[i_level + 1] - soft_info.tet_tree_level_start[i_level]
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for k, i_slot in qd.ndrange(n_level, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_level, 1):
+            i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+            if func_is_env_active(i_b, mochi_state, skip_ls_done):
+                i_node = soft_info.tet_tree_level_nodes[soft_info.tet_tree_level_start[i_level] + k]
+                aabb_min = qd.Vector([gs.qd_float(1e30)] * 3, dt=gs.qd_float)
+                aabb_max = qd.Vector([gs.qd_float(-1e30)] * 3, dt=gs.qd_float)
+                if soft_info.tet_tree_is_leaf[i_node] != 0:
+                    first = soft_info.tet_tree_first[i_node]
+                    for j in range(first, first + soft_info.tet_tree_count[i_node]):
+                        tet_min, tet_max = func_tet_aabb(soft_info.tet_tree_elems[j], i_b, soft_info, soft_state)
+                        aabb_min = qd.min(aabb_min, tet_min)
+                        aabb_max = qd.max(aabb_max, tet_max)
                 else:
-                    qd.atomic_or(errno[i_b], array_class.ErrorCode.OVERFLOW_MOCHI_CONTACTS)
+                    i_left = i_node + 1
+                    i_right = soft_info.tet_tree_escape[i_left]
+                    aabb_min = qd.min(soft_state.tet_tree_min[i_left, i_b], soft_state.tet_tree_min[i_right, i_b])
+                    aabb_max = qd.max(soft_state.tet_tree_max[i_left, i_b], soft_state.tet_tree_max[i_right, i_b])
+                soft_state.tet_tree_min[i_node, i_b] = aabb_min
+                soft_state.tet_tree_max[i_node, i_b] = aabb_max
 
 
 @qd.func
@@ -2346,13 +2330,12 @@ def func_soft_collider_eval(
     record: qd.template(),
     errno: qd.Tensor,
 ):
-    """Evaluate every sample point against the deformed tetrahedra of the collider entities found in the 27 hash cells
-    around it: samples inside a tetrahedron are pulled back to the rest shape of the collider entity, where its signed
-    distance field gives the penetration; the response acts on the colliding sample and on the four vertices of the
-    tetrahedron."""
+    """Evaluate every sample point against the deformed tetrahedra of the collider entities whose bounds contain it,
+    found by descending the tetrahedron hierarchy: samples inside a tetrahedron are pulled back to the rest shape of
+    the collider entity, where its signed distance field gives the penetration; the response acts on the colliding
+    sample and on the four vertices of the tetrahedron."""
     n_queries = soft_info.n_queries[None]
-    n_bins = soft_state.tet_hash_heads.shape[0]
-    n_elems = soft_info.elems_v.shape[0]
+    n_nodes = soft_state.tet_tree_min.shape[0]
     _B = soft_state.verts_pos.shape[1]
     max_hits = soft_state.sc_hit_kind_a.shape[0]
     EPS = mochi_info.EPS[None]
@@ -2369,179 +2352,168 @@ def func_soft_collider_eval(
         kind_a, i_la, e_a, i_sample, pos, pos_start, normal_a0, w, k_a, falloff_a, mu_a, c_visc_a, c_ndamp_a = (
             func_query_point(i_q, i_b, dyn_state, mochi_info, mochi_state, soft_info, soft_state, EPS)
         )
-        inv_cell = 1.0 / qd.max(soft_info.tet_hash_cell[None], soft_info.tet_hash_cell_min[None])
-        cell_q = func_hash_cell(pos, inv_cell)
-        entry = soft_state.tet_hash_heads[func_hash_bin(cell_q, n_bins - 1), i_b]
-        # the chain of the cell, then the tetrahedra too large for the hash
-        n_big = qd.min(soft_state.n_tet_hash_big[i_b], soft_state.tet_hash_big.shape[0])
-        i_big = 0
-        for _ in range(8 * n_elems + n_big):
-            i_el_cur = -1
-            k_cell = -1
-            if entry >= 0:
-                i_el_cur = entry // 8
-                k_cell = entry % 8
-                entry = soft_state.tet_hash_next[entry, i_b]
-            elif i_big < n_big:
-                i_el_cur = soft_state.tet_hash_big[i_big, i_b]
-                i_big += 1
-            if i_el_cur < 0:
-                break
-            e_b = soft_info.elems_entity_idx[i_el_cur]
-            if soft_info.entities_collider_type[e_b] == COLLIDER_TYPE.NONE:
-                continue
-            is_enabled = True
-            if kind_a == 0:
-                is_enabled = soft_info.entities_links_pair_enabled[e_b, i_la]
+        # Descend the hierarchy: a node whose deformed bounds do not contain the sample is skipped with its subtree.
+        brute_force = soft_info.tet_tree_brute_force[None] != 0
+        i_node = 0
+        while i_node < n_nodes:
+            if not brute_force and (
+                (pos < soft_state.tet_tree_min[i_node, i_b]).any() or (pos > soft_state.tet_tree_max[i_node, i_b]).any()
+            ):
+                i_node = soft_info.tet_tree_escape[i_node]
             else:
-                is_enabled = (e_a != e_b) and soft_info.entities_pair_enabled[e_a, e_b]
-            if not is_enabled:
-                continue
-            # Two cells hashed to the same bin share a chain: keep the entries of this cell only; then the sample must
-            # lie in the bounds of the tetrahedron before the inclusion test.
-            v_cur = soft_info.elems_v[i_el_cur]
-            aabb_min = soft_state.verts_pos[v_cur[0], i_b]
-            aabb_max = aabb_min
-            for j in qd.static(range(1, 4)):
-                pos_j = soft_state.verts_pos[v_cur[j], i_b]
-                aabb_min = qd.min(aabb_min, pos_j)
-                aabb_max = qd.max(aabb_max, pos_j)
-            if k_cell >= 0:
-                entry_cell = func_hash_cell(aabb_min, inv_cell) + func_cell_offset(k_cell)
-                if (entry_cell != cell_q).any():
-                    continue
-            if (pos < aabb_min).any() or (pos > aabb_max).any():
-                continue
-            normal_a = normal_a0
+                if soft_info.tet_tree_is_leaf[i_node] != 0:
+                    first = soft_info.tet_tree_first[i_node]
+                    for j_leaf in range(first, first + soft_info.tet_tree_count[i_node]):
+                        i_el_cur = soft_info.tet_tree_elems[j_leaf]
+                        e_b = soft_info.elems_entity_idx[i_el_cur]
+                        is_enabled = True
+                        if kind_a == 0:
+                            is_enabled = soft_info.entities_links_pair_enabled[e_b, i_la]
+                        else:
+                            is_enabled = (e_a != e_b) and soft_info.entities_pair_enabled[e_a, e_b]
+                        if not is_enabled:
+                            continue
+                        # the sample must lie in the bounds of the tetrahedron before the inclusion test
+                        v_cur = soft_info.elems_v[i_el_cur]
+                        aabb_min = soft_state.verts_pos[v_cur[0], i_b]
+                        aabb_max = aabb_min
+                        for j in qd.static(range(1, 4)):
+                            pos_j = soft_state.verts_pos[v_cur[j], i_b]
+                            aabb_min = qd.min(aabb_min, pos_j)
+                            aabb_max = qd.max(aabb_max, pos_j)
+                        if (pos < aabb_min).any() or (pos > aabb_max).any():
+                            continue
+                        normal_a = normal_a0
 
-            # Inclusion in the deformed tetrahedron and pull-back to the rest shape.
-            v = soft_info.elems_v[i_el_cur]
-            x3 = soft_state.verts_pos[v[3], i_b]
-            Ds = qd.Matrix.cols(
-                [
-                    soft_state.verts_pos[v[0], i_b] - x3,
-                    soft_state.verts_pos[v[1], i_b] - x3,
-                    soft_state.verts_pos[v[2], i_b] - x3,
-                ]
-            )
-            if qd.abs(Ds.determinant()) <= EPS:
-                continue
-            Ds_inv = Ds.inverse()
-            b3 = Ds_inv @ (pos - x3)
-            bary_b = qd.Vector([b3[0], b3[1], b3[2], 1.0 - b3[0] - b3[1] - b3[2]], dt=gs.qd_float)
-            if (bary_b < 0.0).any():
-                continue
-            Dm = soft_info.elems_Dm[i_el_cur]
-            p0 = soft_info.verts_rest[v[3]] + Dm @ b3
-            is_valid, d, grad_mat = func_soft_sdf(e_b, p0, soft_info)
-            if not is_valid:
-                continue
-            grad = (Dm @ Ds_inv).transpose() @ grad_mat
-            h = soft_info.entities_penalty_smoothing_half_distance[e_b]
-            if d > 0.0:
-                continue
-            if kind_a == 1 and soft_info.entities_kind[e_a] != SOFT_KIND_SOLID:
-                normal_a = -gu.qd_normalize(grad, EPS)
+                        # Inclusion in the deformed tetrahedron and pull-back to the rest shape.
+                        v = soft_info.elems_v[i_el_cur]
+                        x3 = soft_state.verts_pos[v[3], i_b]
+                        Ds = qd.Matrix.cols(
+                            [
+                                soft_state.verts_pos[v[0], i_b] - x3,
+                                soft_state.verts_pos[v[1], i_b] - x3,
+                                soft_state.verts_pos[v[2], i_b] - x3,
+                            ]
+                        )
+                        if qd.abs(Ds.determinant()) <= EPS:
+                            continue
+                        Ds_inv = Ds.inverse()
+                        b3 = Ds_inv @ (pos - x3)
+                        bary_b = qd.Vector([b3[0], b3[1], b3[2], 1.0 - b3[0] - b3[1] - b3[2]], dt=gs.qd_float)
+                        if (bary_b < 0.0).any():
+                            continue
+                        Dm = soft_info.elems_Dm[i_el_cur]
+                        p0 = soft_info.verts_rest[v[3]] + Dm @ b3
+                        is_valid, d, grad_mat = func_soft_sdf(e_b, p0, soft_info)
+                        if not is_valid:
+                            continue
+                        grad = (Dm @ Ds_inv).transpose() @ grad_mat
+                        h = soft_info.entities_penalty_smoothing_half_distance[e_b]
+                        if d > 0.0:
+                            continue
+                        if kind_a == 1 and soft_info.entities_kind[e_a] != SOFT_KIND_SOLID:
+                            normal_a = -gu.qd_normalize(grad, EPS)
 
-            # Stage displacement of the sample relative to the collider point (which moves with the tetrahedron).
-            pos_b_start = qd.Vector.zero(gs.qd_float, 3)
-            for j in qd.static(range(4)):
-                pos_b_start += bary_b[j] * soft_state.verts_pos_stage_start[v[j], i_b]
-            p_rel = pos_b_start - pos_start
-            d_start = d - grad.dot(p_rel)
+                        # Stage displacement of the sample relative to the collider point (which moves with the tetrahedron).
+                        pos_b_start = qd.Vector.zero(gs.qd_float, 3)
+                        for j in qd.static(range(4)):
+                            pos_b_start += bary_b[j] * soft_state.verts_pos_stage_start[v[j], i_b]
+                        p_rel = pos_b_start - pos_start
+                        d_start = d - grad.dot(p_rel)
 
-            k = qd.sqrt(k_a * soft_info.entities_penalty_coefficient[e_b])
-            falloff = qd.sqrt(falloff_a * soft_info.entities_friction_falloff_vel[e_b])
-            mu = qd.sqrt(mu_a * soft_info.entities_friction[e_b])
-            c_visc = qd.sqrt(c_visc_a * soft_info.entities_viscous_friction[e_b])
-            c_ndamp = qd.sqrt(c_ndamp_a * soft_info.entities_normal_viscous_damping[e_b])
-            max_align = soft_info.entities_max_alignment_normals[e_b]
-            energy, force, dforce, _ = collision_response(
-                d,
-                grad,
-                normal_a,
-                p_rel,
-                d_start,
-                k,
-                h,
-                0.0,
-                mu,
-                falloff,
-                c_visc,
-                c_ndamp,
-                max_align,
-                mochi_state.dt_stage[i_b],
-                EPS,
-                mochi_config,
-            )
-            wf = w * force
-            D = -w * dforce
-            r_a = pos - dyn_state.links.pos[qd.max(i_la, 0), i_b]
-            is_dynamic_a = kind_a == 1 or mochi_info.links.is_dynamic[i_la]
+                        k = qd.sqrt(k_a * soft_info.entities_penalty_coefficient[e_b])
+                        falloff = qd.sqrt(falloff_a * soft_info.entities_friction_falloff_vel[e_b])
+                        mu = qd.sqrt(mu_a * soft_info.entities_friction[e_b])
+                        c_visc = qd.sqrt(c_visc_a * soft_info.entities_viscous_friction[e_b])
+                        c_ndamp = qd.sqrt(c_ndamp_a * soft_info.entities_normal_viscous_damping[e_b])
+                        max_align = soft_info.entities_max_alignment_normals[e_b]
+                        energy, force, dforce, _ = collision_response(
+                            d,
+                            grad,
+                            normal_a,
+                            p_rel,
+                            d_start,
+                            k,
+                            h,
+                            0.0,
+                            mu,
+                            falloff,
+                            c_visc,
+                            c_ndamp,
+                            max_align,
+                            mochi_state.dt_stage[i_b],
+                            EPS,
+                            mochi_config,
+                        )
+                        wf = w * force
+                        D = -w * dforce
+                        r_a = pos - dyn_state.links.pos[qd.max(i_la, 0), i_b]
+                        is_dynamic_a = kind_a == 1 or mochi_info.links.is_dynamic[i_la]
 
-            if qd.static(assem_obj):
-                qd.atomic_add(mochi_state.obj[i_b], w * energy)
-            if qd.static(assem_res):
-                if kind_a == 0:
-                    if is_dynamic_a:
-                        torque = r_a.cross(wf)
-                        for kk in qd.static(range(3)):
-                            qd.atomic_add(mochi_state.links_res[i_la, i_b][kk], -wf[kk])
-                            qd.atomic_add(mochi_state.links_res[i_la, i_b][3 + kk], -torque[kk])
-                else:
-                    tri = soft_info.samples_tri[i_sample]
-                    bary = soft_info.samples_bary[i_sample]
-                    for i in qd.static(range(3)):
-                        func_add_soft_vec(mochi_state.res, tri[i], i_b, -(bary[i]) * wf, soft_info)
-                for j in qd.static(range(4)):
-                    func_add_soft_vec(mochi_state.res, v[j], i_b, bary_b[j] * wf, soft_info)
-            if assem_dres:
-                if kind_a == 0:
-                    if is_dynamic_a:
-                        S_a = skew(r_a)
-                        DS = D @ S_a
-                        SD = S_a @ D
-                        SDS = S_a @ D @ S_a
-                        for kk in qd.static(range(3)):
-                            for ll in qd.static(range(3)):
-                                qd.atomic_add(mochi_state.H_diag[i_la, i_b][kk, ll], D[kk, ll])
-                                qd.atomic_add(mochi_state.H_diag[i_la, i_b][kk, 3 + ll], -DS[kk, ll])
-                                qd.atomic_add(mochi_state.H_diag[i_la, i_b][3 + kk, ll], SD[kk, ll])
-                                qd.atomic_add(mochi_state.H_diag[i_la, i_b][3 + kk, 3 + ll], -SDS[kk, ll])
-                else:
-                    tri = soft_info.samples_tri[i_sample]
-                    bary = soft_info.samples_bary[i_sample]
-                    for i in qd.static(range(3)):
-                        qd.atomic_add(soft_state.verts_H_diag[tri[i], i_b], (bary[i] * bary[i]) * D)
-                for j in qd.static(range(4)):
-                    qd.atomic_add(soft_state.verts_H_diag[v[j], i_b], (bary_b[j] * bary_b[j]) * D)
-            if assem_dres or record:
-                i_h = qd.atomic_add(soft_state.n_sc_hits[i_b], 1)
-                if i_h < max_hits:
-                    soft_state.sc_hit_kind_a[i_h, i_b] = kind_a
-                    soft_state.sc_hit_sample_a[i_h, i_b] = i_sample
-                    soft_state.sc_hit_link_a[i_h, i_b] = i_la if (kind_a == 0 and is_dynamic_a) else -1
-                    soft_state.sc_hit_r_a[i_h, i_b] = r_a
-                    soft_state.sc_hit_elem_b[i_h, i_b] = i_el_cur
-                    soft_state.sc_hit_bary_b[i_h, i_b] = bary_b
-                    soft_state.sc_hit_D[i_h, i_b] = D
-                    if qd.static(record):
-                        hit_readback.sc_hit_force[i_h, i_b] = wf
-                        hit_readback.sc_hit_pos[i_h, i_b] = pos
-                        hit_readback.sc_hit_normal[i_h, i_b] = gu.qd_normalize(grad, EPS)
-                        hit_readback.sc_hit_distance[i_h, i_b] = d
-                else:
-                    qd.atomic_or(errno[i_b], array_class.ErrorCode.OVERFLOW_MOCHI_CONTACTS)
-            if qd.static(record):
-                if kind_a == 0:
-                    qd.atomic_add(dyn_state.links.contact_force[i_la, i_b], wf)
-                else:
-                    tri = soft_info.samples_tri[i_sample]
-                    bary = soft_info.samples_bary[i_sample]
-                    for i in qd.static(range(3)):
-                        qd.atomic_add(soft_state.verts_contact_force[tri[i], i_b], bary[i] * wf)
-                for j in qd.static(range(4)):
-                    qd.atomic_add(soft_state.verts_contact_force[v[j], i_b], -bary_b[j] * wf)
+                        if qd.static(assem_obj):
+                            qd.atomic_add(mochi_state.obj[i_b], w * energy)
+                        if qd.static(assem_res):
+                            if kind_a == 0:
+                                if is_dynamic_a:
+                                    torque = r_a.cross(wf)
+                                    for kk in qd.static(range(3)):
+                                        qd.atomic_add(mochi_state.links_res[i_la, i_b][kk], -wf[kk])
+                                        qd.atomic_add(mochi_state.links_res[i_la, i_b][3 + kk], -torque[kk])
+                            else:
+                                tri = soft_info.samples_tri[i_sample]
+                                bary = soft_info.samples_bary[i_sample]
+                                for i in qd.static(range(3)):
+                                    func_add_soft_vec(mochi_state.res, tri[i], i_b, -(bary[i]) * wf, soft_info)
+                            for j in qd.static(range(4)):
+                                func_add_soft_vec(mochi_state.res, v[j], i_b, bary_b[j] * wf, soft_info)
+                        if assem_dres:
+                            if kind_a == 0:
+                                if is_dynamic_a:
+                                    S_a = skew(r_a)
+                                    DS = D @ S_a
+                                    SD = S_a @ D
+                                    SDS = S_a @ D @ S_a
+                                    for kk in qd.static(range(3)):
+                                        for ll in qd.static(range(3)):
+                                            qd.atomic_add(mochi_state.H_diag[i_la, i_b][kk, ll], D[kk, ll])
+                                            qd.atomic_add(mochi_state.H_diag[i_la, i_b][kk, 3 + ll], -DS[kk, ll])
+                                            qd.atomic_add(mochi_state.H_diag[i_la, i_b][3 + kk, ll], SD[kk, ll])
+                                            qd.atomic_add(mochi_state.H_diag[i_la, i_b][3 + kk, 3 + ll], -SDS[kk, ll])
+                            else:
+                                tri = soft_info.samples_tri[i_sample]
+                                bary = soft_info.samples_bary[i_sample]
+                                for i in qd.static(range(3)):
+                                    qd.atomic_add(soft_state.verts_H_diag[tri[i], i_b], (bary[i] * bary[i]) * D)
+                            for j in qd.static(range(4)):
+                                qd.atomic_add(soft_state.verts_H_diag[v[j], i_b], (bary_b[j] * bary_b[j]) * D)
+                        if assem_dres or record:
+                            i_h = qd.atomic_add(soft_state.n_sc_hits[i_b], 1)
+                            if i_h < max_hits:
+                                soft_state.sc_hit_kind_a[i_h, i_b] = kind_a
+                                soft_state.sc_hit_sample_a[i_h, i_b] = i_sample
+                                soft_state.sc_hit_link_a[i_h, i_b] = i_la if (kind_a == 0 and is_dynamic_a) else -1
+                                soft_state.sc_hit_r_a[i_h, i_b] = r_a
+                                soft_state.sc_hit_elem_b[i_h, i_b] = i_el_cur
+                                soft_state.sc_hit_bary_b[i_h, i_b] = bary_b
+                                soft_state.sc_hit_D[i_h, i_b] = D
+                                if qd.static(record):
+                                    hit_readback.sc_hit_force[i_h, i_b] = wf
+                                    hit_readback.sc_hit_pos[i_h, i_b] = pos
+                                    hit_readback.sc_hit_normal[i_h, i_b] = gu.qd_normalize(grad, EPS)
+                                    hit_readback.sc_hit_distance[i_h, i_b] = d
+                            else:
+                                qd.atomic_or(errno[i_b], array_class.ErrorCode.OVERFLOW_MOCHI_CONTACTS)
+                        if qd.static(record):
+                            if kind_a == 0:
+                                qd.atomic_add(dyn_state.links.contact_force[i_la, i_b], wf)
+                            else:
+                                tri = soft_info.samples_tri[i_sample]
+                                bary = soft_info.samples_bary[i_sample]
+                                for i in qd.static(range(3)):
+                                    qd.atomic_add(soft_state.verts_contact_force[tri[i], i_b], bary[i] * wf)
+                            for j in qd.static(range(4)):
+                                qd.atomic_add(soft_state.verts_contact_force[v[j], i_b], -bary_b[j] * wf)
+                i_node += 1
 
 
 @qd.kernel
@@ -2586,15 +2558,15 @@ def kernel_soft_collider_eval(
 
 
 @qd.kernel
-def kernel_tet_hash_build(
+def kernel_tet_tree_refit(
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
+    mochi_config: qd.template(),
     skip_ls_done: qd.template(),
-    errno: qd.Tensor,
 ):
-    func_tet_hash_build(
+    func_tet_tree_refit(
         0,
         False,
         mochi_state.all_envs,
@@ -2603,8 +2575,8 @@ def kernel_tet_hash_build(
         soft_info,
         soft_state,
         rigid_config,
+        mochi_config,
         skip_ls_done,
-        errno,
     )
 
 

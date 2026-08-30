@@ -158,11 +158,12 @@ from .soft import (
     kernel_soft_store_ls_ref,
     kernel_soft_update_conv_weights,
     kernel_soft_zero_assembly,
-    kernel_tet_hash_build,
+    kernel_tet_tree_refit,
 )
 from .soft_materials import ELASTIC_MODEL_BY_NAME
 from .step_graph import kernel_step_graph
 from .step_monolith import kernel_step_monolith
+from .tet_tree import build_tet_tree
 
 if TYPE_CHECKING:
     from genesis.engine.scene import Scene
@@ -647,6 +648,7 @@ class MochiSolver(KinematicSolver):
             has_soft=self.has_soft,
             has_pc_colliders=self._has_pc_colliders,
             has_soft_colliders=self._has_soft_colliders,
+            tet_tree_levels=self.n_tet_levels,
             has_equalities=len(self._equalities) > 0,
         )
         self.mochi_info = get_mochi_info(self)
@@ -854,7 +856,6 @@ class MochiSolver(KinematicSolver):
         bins_per_item = options.spatial_hash_bins_per_item
         # every item occupies up to eight entries (the cells its bounds overlap)
         self.n_pc_bins_ = _next_power_of_two(bins_per_item * 8 * self.n_soft_verts) if self._has_pc_colliders else 1
-        self.n_tet_bins_ = _next_power_of_two(bins_per_item * 8 * self.n_soft_elems) if self._has_soft_colliders else 1
         # The hash cell of the spheres is the largest diameter of the contact range of a point-cloud collider (radius
         # plus penalty threshold, as mochi's, with a rounding margin): the range of a sphere then overlaps at most two
         # cells per axis, and a sample within it lies in one of them.
@@ -864,20 +865,6 @@ class MochiSolver(KinematicSolver):
             if self._soft_collider_kind(e) == COLLIDER_TYPE.POINT_CLOUD
         ]
         self._pc_hash_cell = 2.0 * max(pc_bands) * (1.0 + 1e-3) if pc_bands else 1.0
-        # The hash cell of the tetrahedra is twice the median rest extent of the collider tetrahedra, so a typical
-        # tetrahedron overlaps at most two cells per axis; the larger ones (a few in the rest mesh, more when the body
-        # stretches) go to an overflow list that every query scans.
-        kinds_by_entity = [self._soft_collider_kind(entity) for entity in entities]
-        self._tet_hash_cell = 1.0
-        n_big = 0
-        if self._has_soft_colliders and len(elems_v) > 0:
-            is_collider_tet = np.array([kinds_by_entity[i] == COLLIDER_TYPE.GRID for i in elems_entity_idx], dtype=bool)
-            if is_collider_tet.any():
-                rest = verts_rest[elems_v[is_collider_tet]]
-                extents = (rest.max(axis=1) - rest.min(axis=1)).max(axis=1)
-                self._tet_hash_cell = float(2.0 * np.median(extents))
-                n_big = int((extents > self._tet_hash_cell).sum())
-        self.n_tet_hash_big_ = max(16, 2 * n_big + 8)
 
         band = self._rod_band_layout()
         self.n_band_rows_ = max(1, len(band["rows_dof"]))
@@ -891,6 +878,10 @@ class MochiSolver(KinematicSolver):
             self, self._max_soft_pairs, self._max_soft_hits, self._max_sc_hits, self._max_pc_hits
         )
         self.soft_info.dofs_band_row.from_numpy(band["dofs_row"])
+        if self._tet_tree is not None:
+            for name in ("first", "count", "escape", "is_leaf", "level_nodes", "level_start"):
+                getattr(self.soft_info, f"tet_tree_{name}").from_numpy(self._tet_tree[name])
+            self.soft_info.tet_tree_elems.from_numpy(self._tet_tree_elems)
         if len(csr["col"]) > 0:
             self.soft_info.csr_start.from_numpy(csr["start"])
             self.soft_info.csr_col.from_numpy(csr["col"])
@@ -1259,6 +1250,30 @@ class MochiSolver(KinematicSolver):
         self._has_pc_colliders = (has_queries or has_self_contact) and any(
             kind == COLLIDER_TYPE.POINT_CLOUD for kind in kinds
         )
+        self._build_tet_tree(kinds)
+
+    def _build_tet_tree(self, kinds):
+        """Bounding-box hierarchy over the collider tetrahedra, built over the rest shape (see tet_tree.py); the
+        element indices follow the solids' concatenation order of the element arrays."""
+        self._tet_tree = None
+        self._tet_tree_elems = np.zeros((0,), dtype=gs.np_int)
+        aabb_min, aabb_max, elems = [], [], []
+        e_start = 0
+        for entity, kind in zip(self._soft_entities, kinds):
+            if entity.is_shell or entity.is_rod:
+                continue
+            if self._has_soft_colliders and kind == COLLIDER_TYPE.GRID and entity.n_elements > 0:
+                rest = np.asarray(entity.init_positions, dtype=np.float64)[np.asarray(entity.elems)]
+                aabb_min.append(rest.min(axis=1))
+                aabb_max.append(rest.max(axis=1))
+                elems.append(e_start + np.arange(entity.n_elements))
+            e_start += entity.n_elements
+        if elems:
+            self._tet_tree = build_tet_tree(np.concatenate(aabb_min), np.concatenate(aabb_max))
+            self._tet_tree_elems = np.concatenate(elems)[self._tet_tree["order"]].astype(gs.np_int)
+        self.n_tet_levels = self._tet_tree["n_levels"] if self._tet_tree is not None else 0
+        self.n_tet_nodes_ = max(1, len(self._tet_tree["first"])) if self._tet_tree is not None else 1
+        self.n_tet_tree_elems_ = max(1, len(self._tet_tree_elems))
 
     def _compute_soft_pair_enabled(self):
         """Deformable entity pair contact filter from the contact layers (an entity never collides with itself)."""
@@ -1364,9 +1379,11 @@ class MochiSolver(KinematicSolver):
 
     def _resolve_step_kernel(self):
         """How a step runs: "monolith" (one kernel, one thread per environment; the CPU, and small rigid scenes on
-        the GPU), "graph" (one graph-launched kernel whose loops run on the device, parallel over items and
-        environments; deformable and large scenes on the GPU) or "pipeline" (one kernel per stage, the host driving the
-        loops)."""
+        the GPU), "pipeline" (one kernel per stage, the host driving the loops; deformable and large scenes on the
+        GPU) or "graph" (one graph-launched kernel whose loops run on the device, parallel over items and
+        environments). The graph kernel is opt-in: on GPUs without device-side graph conditionals it replays its
+        loop bodies from the host and runs at the pipeline's speed, while compiling as one module several times
+        slower than the pipeline's kernels."""
         step_kernel = self._options.step_kernel
         if step_kernel != "auto":
             return step_kernel
@@ -1374,7 +1391,7 @@ class MochiSolver(KinematicSolver):
             return "monolith"
         if self.n_dofs_total <= 64 and not self.has_soft:
             return "monolith"
-        return "graph"
+        return "pipeline"
 
     def substep_pre_coupling(self, f):
         if not self.is_active:
@@ -1620,8 +1637,13 @@ class MochiSolver(KinematicSolver):
                     self._errno,
                 )
             if self._has_soft_colliders:
-                kernel_tet_hash_build(
-                    self.mochi_state, self.soft_info, self.soft_state, self.rigid_config, skip_ls_done, self._errno
+                kernel_tet_tree_refit(
+                    self.mochi_state,
+                    self.soft_info,
+                    self.soft_state,
+                    self.rigid_config,
+                    self.mochi_config,
+                    skip_ls_done,
                 )
                 kernel_soft_collider_eval(
                     self.dyn_state,

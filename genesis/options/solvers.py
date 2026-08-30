@@ -1034,9 +1034,9 @@ class MochiOptions(Options):
     broadphase_margin : float, optional
         Absolute padding of the per-step conservative bounding boxes in meters. Defaults to 0.01.
     spatial_hash_bins_per_item : int, optional
-        Bins of the spatial hash that locates the deformable colliders (collider spheres of shells and rods,
-        deformed tetrahedra of solids) per inserted item, rounded up to a power of two; more bins shorten the chains
-        a query walks at the cost of memory (4 bytes per bin per environment). Defaults to 2.
+        Bins of the spatial hash that locates the collider spheres of shells and rods per inserted sphere, rounded
+        up to a power of two; more bins shorten the chains a query walks at the cost of memory (4 bytes per bin per
+        environment). The tetrahedra of solids use a bounding-box hierarchy instead. Defaults to 2.
     max_soft_hits_per_sample : int, optional
         Capacity of the list of contacts between deformable boundary samples and rigid colliders, per sample.
         Exceeding it halts the simulation with an error. Defaults to 2.
@@ -1053,16 +1053,18 @@ class MochiOptions(Options):
         allocated at the first readback. Defaults to True.
     step_kernel : str, optional
         How a step is executed: "monolith" runs the whole step of every environment in one kernel (one thread per
-        environment, one launch per step, no host round trips), "graph" runs the step as one graph-launched kernel
-        whose Newton, line-search and conjugate-gradient loops run on the device with the stages parallel over items
-        and environments (one launch per step; on GPUs without device-side graph conditionals the runtime reads one
-        flag back per loop round), "pipeline" runs each stage as its own kernel with the host driving the loops.
-        "auto" picks the monolith on the CPU and, on the GPU, for rigid scenes of at most 64 degrees of freedom, the
-        graph otherwise. Defaults to "auto".
+        environment, one launch per step, no host round trips), "pipeline" runs each stage as its own kernel with the
+        host driving the loops, "graph" runs the step as one graph-launched kernel whose Newton, line-search and
+        conjugate-gradient loops run on the device with the stages parallel over items and environments (one launch
+        per step). "auto" picks the monolith on the CPU and, on the GPU, for rigid scenes of at most 64 degrees of
+        freedom, the pipeline otherwise. The graph kernel is opt-in: on GPUs without device-side graph conditionals
+        (before compute capability 9.0) the runtime replays its loop bodies from the host with one flag readback per
+        round, which runs at the pipeline's speed, and the single module compiles several times slower than the
+        pipeline's kernels (minutes for a cloth with self-contact and an arm). Defaults to "auto".
     graph_pcg_unroll : int, optional
         Conjugate-gradient iterations per round of the graph step kernel's inner loop (each round costs one flag
-        readback on GPUs without device-side graph conditionals; each iteration is compiled once per unrolled
-        slot). Defaults to 4.
+        readback on GPUs without device-side graph conditionals; each unrolled iteration is compiled once more).
+        Defaults to 1.
     joint_limit_stiffness : float, optional
         Stiffness in N/m (N*m/rad) of the penalty holding revolute and prismatic joints inside their range. Joint
         limits are soft: the violation at rest is the limit torque divided by this stiffness. Higher values reduce the
@@ -1115,7 +1117,7 @@ class MochiOptions(Options):
     broadphase_margin: NonNegativeFloat = 0.01
     record_contacts: StrictBool = True
     step_kernel: Literal["auto", "monolith", "pipeline", "graph"] = "auto"
-    graph_pcg_unroll: PositiveInt = 4
+    graph_pcg_unroll: PositiveInt = 1
     joint_limit_stiffness: PositiveFloat = 1e4
     joint_limit_damping: NonNegativeFloat = 0.0
     batch_links_info: StrictBool = False

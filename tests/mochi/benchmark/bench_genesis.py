@@ -89,15 +89,22 @@ def main():
     parser.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "results"))
     parser.add_argument("--tag", default="", help="suffix of the result file name")
     parser.add_argument("--option", action="append", default=[], help="MochiOptions override, e.g. linear_solver=pcg")
+    parser.add_argument("--cold", action="store_true", help="disable the quadrants offline cache: measures compilation")
+    parser.add_argument("--compile-threads", type=int, default=None, help="quadrants num_compile_threads (default 4)")
     args = parser.parse_args()
 
     import quadrants as qd
 
-    if args.profile:
+    if args.profile or args.cold or args.compile_threads is not None:
         _qd_init = qd.init
 
         def _init(**kwargs):
-            kwargs["kernel_profiler"] = True
+            if args.profile:
+                kwargs["kernel_profiler"] = True
+            if args.cold:
+                kwargs["offline_cache"] = False
+            if args.compile_threads is not None:
+                kwargs["num_compile_threads"] = args.compile_threads
             return _qd_init(**kwargs)
 
         qd.init = _init
@@ -115,8 +122,12 @@ def main():
     build_time = time.perf_counter() - t0
     solver = scene.mochi_solver
 
+    # The first step compiles (or loads from the cache) every kernel of the step; with --cold it is the compile time.
     t0 = time.perf_counter()
-    for _ in range(args.warmup):
+    scene.step()
+    qd.sync()
+    first_step_time = time.perf_counter() - t0
+    for _ in range(args.warmup - 1):
         scene.step()
     qd.sync()
     warmup_time = time.perf_counter() - t0
@@ -153,6 +164,10 @@ def main():
         "us_per_env_step_best": min(windows) / max(1, args.n_envs) * 1e3,
         "build_s": build_time,
         "warmup_s": warmup_time,
+        "first_step_s": first_step_time,
+        "cold": args.cold,
+        "compile_threads": args.compile_threads,
+        "step_kernel": solver._resolve_step_kernel(),
         "n_dofs_total": int(solver.n_dofs_total),
         "n_samples": int(solver.n_samples),
         "n_soft_verts": int(solver.n_soft_verts),
@@ -226,7 +241,8 @@ def main():
         f"[genesis] {args.scene} {args.backend} fp{args.precision} B={args.n_envs}: "
         f"best {result['ms_per_step_best']:.3f} ms/step ({result['us_per_env_step_best']:.1f} us/env-step), "
         f"mean {result['ms_per_step_mean']:.3f} ms/step, newton {result['newton_iterations_last']}, "
-        f"pcg {result['pcg_iterations_last']}, {mem_text}{vram_text}, probe {result['probe']:.4f}"
+        f"pcg {result['pcg_iterations_last']}, {mem_text}{vram_text}, probe {result['probe']:.4f}, "
+        f"{result['step_kernel']} first step {result['first_step_s']:.1f} s{' (cold)' if args.cold else ''}"
         + (
             f", launches/step {result['launches_per_step']:.1f}, kernel {result['kernel_ms_per_step']:.3f} ms/step"
             if args.profile
