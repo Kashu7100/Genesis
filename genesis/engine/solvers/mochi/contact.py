@@ -15,8 +15,8 @@ from .colliders import query_collider, query_collider_lower_bound
 from .contact_utils import collision_response
 from .data import (
     COLLIDER_TYPE,
-    MochiContactRecords,
     MochiContactState,
+    MochiHitReadback,
     MochiInfo,
     MochiSamplesInfo,
     MochiSoftInfo,
@@ -177,9 +177,12 @@ def kernel_set_links_pair_enabled(
 def func_zero_assembly(
     i_b_env,
     per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     mochi_state: MochiState,
     contact_state: MochiContactState,
+    hit_readback: MochiHitReadback,
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
@@ -190,27 +193,28 @@ def func_zero_assembly(
     n_dofs = mochi_state.res.shape[0]
     n_links = mochi_state.H_diag.shape[0]
     max_pairs = contact_state.pair_link_a.shape[0]
-    max_hits = contact_state.hit_sample.shape[0]
+    max_hits = hit_readback.hit_sample.shape[0]
     _B = mochi_state.is_active.shape[0]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
+    for i_slot in range(n_envs[None]) if qd.static(not per_env) else range(1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if func_is_env_active(i_b, mochi_state, skip_ls_done):
             if qd.static(assem_obj):
                 mochi_state.obj[i_b] = 0.0
             if qd.static(record):
-                contact_state.n_hits_total[i_b] = 0
+                hit_readback.n_hits_total[i_b] = 0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_b_ in qd.ndrange(n_dofs, _B) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if func_is_env_active(i_b, mochi_state, skip_ls_done):
             if qd.static(assem_res):
                 mochi_state.res[i_d, i_b] = 0.0
             if assem_dres:
                 mochi_state.dofs_H_diag[i_d, i_b] = 0.0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b_ in qd.ndrange(n_links, _B) if qd.static(not per_env) else qd.ndrange(n_links, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_l, i_slot in qd.ndrange(n_links, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_links, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if func_is_env_active(i_b, mochi_state, skip_ls_done):
             if qd.static(assem_res):
                 mochi_state.links_res[i_l, i_b] = qd.Vector.zero(gs.qd_float, 6)
@@ -220,13 +224,13 @@ def func_zero_assembly(
                 dyn_state.links.contact_force[i_l, i_b] = qd.Vector.zero(gs.qd_float, 3)
     if qd.static(record):
         qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-        for i_h, i_b_ in qd.ndrange(max_hits, _B) if qd.static(not per_env) else qd.ndrange(max_hits, 1):
-            i_b = i_b_ if qd.static(not per_env) else i_b_env
-            contact_state.hit_geom_a[i_h, i_b] = -1
-            contact_state.hit_geom_b[i_h, i_b] = -1
+        for i_h, i_slot in qd.ndrange(max_hits, n_envs[None]) if qd.static(not per_env) else qd.ndrange(max_hits, 1):
+            i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+            hit_readback.hit_geom_a[i_h, i_b] = -1
+            hit_readback.hit_geom_b[i_h, i_b] = -1
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_p, i_b_ in qd.ndrange(max_pairs, _B) if qd.static(not per_env) else qd.ndrange(max_pairs, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_p, i_slot in qd.ndrange(max_pairs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(max_pairs, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if func_is_env_active(i_b, mochi_state, skip_ls_done) and i_p < contact_state.n_pairs[i_b]:
             contact_state.acc_f[i_p, i_b] = qd.Vector.zero(gs.qd_float, 3)
             contact_state.acc_q[i_p, i_b] = qd.Vector.zero(gs.qd_float, 3)
@@ -242,19 +246,23 @@ def kernel_zero_assembly(
     dyn_state: array_class.DynState,
     mochi_state: MochiState,
     contact_state: MochiContactState,
+    hit_readback: MochiHitReadback,
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
     record: qd.template(),
 ):
     func_zero_assembly(
         0,
         False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
         dyn_state,
         mochi_state,
         contact_state,
+        hit_readback,
         rigid_config,
         assem_obj,
         assem_res,
@@ -268,6 +276,8 @@ def kernel_zero_assembly(
 def func_conservative_bounds(
     i_b_env,
     per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
@@ -283,8 +293,8 @@ def func_conservative_bounds(
     margin = mochi_info.broadphase_margin[None]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_b_ in qd.ndrange(n_links, _B) if qd.static(not per_env) else qd.ndrange(n_links, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_l, i_slot in qd.ndrange(n_links, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_links, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         aabb_min = mochi_info.links.samples_aabb_min[i_l]
         aabb_max = mochi_info.links.samples_aabb_max[i_l]
         pad = margin
@@ -323,13 +333,26 @@ def kernel_conservative_bounds(
     contact_state: MochiContactState,
     rigid_config: qd.template(),
 ):
-    func_conservative_bounds(0, False, dyn_state, dyn_info, mochi_info, mochi_state, contact_state, rigid_config)
+    func_conservative_bounds(
+        0,
+        False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
+        dyn_state,
+        dyn_info,
+        mochi_info,
+        mochi_state,
+        contact_state,
+        rigid_config,
+    )
 
 
 @qd.func
 def func_broadphase_pairs(
     i_b_env,
     per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
@@ -346,14 +369,15 @@ def func_broadphase_pairs(
     max_pairs = contact_state.pair_link_a.shape[0]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
+    for i_slot in range(n_envs[None]) if qd.static(not per_env) else range(1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         contact_state.n_pairs[i_b] = 0
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_la, i_gb, i_b_ in (
-        qd.ndrange(n_links, n_geoms, _B) if qd.static(not per_env) else qd.ndrange(n_links, n_geoms, 1)
+    for i_la, i_gb, i_slot in (
+        qd.ndrange(n_links, n_geoms, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_links, n_geoms, 1)
     ):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not mochi_state.is_active[i_b]:
             continue
         if mochi_info.links.sample_end[i_la] <= mochi_info.links.sample_start[i_la]:
@@ -369,11 +393,7 @@ def func_broadphase_pairs(
             continue
         # A plane is a half-space: its mesh bounds say nothing about the penetration side, so it is never culled.
         if mochi_info.geoms.collider_type[i_gb] != COLLIDER_TYPE.PLANE:
-            band = (
-                contact_state.links_step_pad[i_lb, i_b]
-                + mochi_info.geoms.penalty_threshold[i_gb]
-                + 2.0 * mochi_info.geoms.penalty_smoothing_half_distance[i_gb]
-            )
+            band = contact_state.links_step_pad[i_lb, i_b] + mochi_info.geoms.penalty_threshold[i_gb]
             geom_min = dyn_state.geoms.aabb_min[i_gb, i_b] - band
             geom_max = dyn_state.geoms.aabb_max[i_gb, i_b] + band
             if (contact_state.links_step_aabb_max[i_la, i_b] < geom_min).any():
@@ -389,7 +409,8 @@ def func_broadphase_pairs(
             qd.atomic_or(errno[i_b], array_class.ErrorCode.OVERFLOW_MOCHI_CONTACT_PAIRS)
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B) if qd.static(not per_env) else range(i_b_env, i_b_env + 1):
+    for i_slot in range(n_envs[None]) if qd.static(not per_env) else range(1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         contact_state.n_pairs[i_b] = qd.min(contact_state.n_pairs[i_b], max_pairs)
 
 
@@ -403,7 +424,19 @@ def kernel_broadphase_pairs(
     rigid_config: qd.template(),
     errno: qd.Tensor,
 ):
-    func_broadphase_pairs(0, False, dyn_state, dyn_info, mochi_info, mochi_state, contact_state, rigid_config, errno)
+    func_broadphase_pairs(
+        0,
+        False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
+        dyn_state,
+        dyn_info,
+        mochi_info,
+        mochi_state,
+        contact_state,
+        rigid_config,
+        errno,
+    )
 
 
 @qd.func
@@ -429,6 +462,7 @@ def func_contact_eval_sample(
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     contact_state: MochiContactState,
+    hit_readback: MochiHitReadback,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
     assem_dres,
@@ -437,7 +471,7 @@ def func_contact_eval_sample(
 ):
     """Evaluate one sample of a candidate pair against its collider at the current iterate and accumulate the pair's
     force, torque and Hessian sums."""
-    max_hits = contact_state.hit_sample.shape[0]
+    max_hits = hit_readback.hit_sample.shape[0]
     EPS = mochi_info.EPS[None]
     i_ga = mochi_info.samples.geom_idx[i_s]
     contype_a = dyn_info.geoms.contype[i_ga]
@@ -451,7 +485,8 @@ def func_contact_eval_sample(
     pos = gu.qd_transform_by_trans_quat(mochi_info.samples.pos[i_s], pos_a, quat_a)
     thr = mochi_info.geoms.penalty_threshold[i_gb]
     h = mochi_info.geoms.penalty_smoothing_half_distance[i_gb]
-    band = thr + 2.0 * h
+    # Contact range: the penalty and its derivatives vanish beyond the threshold (mochi's detection range).
+    band = thr
     if is_hit and mochi_info.geoms.collider_type[i_gb] != COLLIDER_TYPE.PLANE:
         if (pos < dyn_state.geoms.aabb_min[i_gb, i_b] - band).any():
             is_hit = False
@@ -537,18 +572,18 @@ def func_contact_eval_sample(
         if qd.static(record):
             qd.atomic_add(dyn_state.links.contact_force[i_la, i_b], w * force)
             qd.atomic_add(dyn_state.links.contact_force[i_lb, i_b], -w * force)
-            i_h = qd.atomic_add(contact_state.n_hits_total[i_b], 1)
+            i_h = qd.atomic_add(hit_readback.n_hits_total[i_b], 1)
             if i_h < max_hits:
-                contact_state.hit_link_a[i_h, i_b] = i_la
-                contact_state.hit_geom_a[i_h, i_b] = i_ga
-                contact_state.hit_link_b[i_h, i_b] = i_lb
-                contact_state.hit_geom_b[i_h, i_b] = i_gb
-                contact_state.hit_sample[i_h, i_b] = i_s
-                contact_state.hit_pos[i_h, i_b] = pos
-                contact_state.hit_normal[i_h, i_b] = gu.qd_normalize(R_g @ grad, EPS)
-                contact_state.hit_force[i_h, i_b] = w * force
-                contact_state.hit_distance[i_h, i_b] = d
-                contact_state.hit_weight[i_h, i_b] = w
+                hit_readback.hit_link_a[i_h, i_b] = i_la
+                hit_readback.hit_geom_a[i_h, i_b] = i_ga
+                hit_readback.hit_link_b[i_h, i_b] = i_lb
+                hit_readback.hit_geom_b[i_h, i_b] = i_gb
+                hit_readback.hit_sample[i_h, i_b] = i_s
+                hit_readback.hit_pos[i_h, i_b] = pos
+                hit_readback.hit_normal[i_h, i_b] = gu.qd_normalize(R_g @ grad, EPS)
+                hit_readback.hit_force[i_h, i_b] = w * force
+                hit_readback.hit_distance[i_h, i_b] = d
+                hit_readback.hit_weight[i_h, i_b] = w
             else:
                 qd.atomic_or(errno[i_b], array_class.ErrorCode.OVERFLOW_MOCHI_CONTACTS)
 
@@ -557,12 +592,15 @@ def func_contact_eval_sample(
 def func_contact_eval(
     i_b_env,
     per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     sdf_info: array_class.SDFInfo,
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     contact_state: MochiContactState,
+    hit_readback: MochiHitReadback,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
     assem_dres,
@@ -578,8 +616,8 @@ def func_contact_eval(
     _B = mochi_state.is_active.shape[0]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_p, i_b_ in qd.ndrange(max_pairs, _B) if qd.static(not per_env) else qd.ndrange(max_pairs, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_p, i_slot in qd.ndrange(max_pairs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(max_pairs, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
         if i_p >= contact_state.n_pairs[i_b]:
@@ -591,7 +629,7 @@ def func_contact_eval(
         quat_a = dyn_state.links.quat[i_la, i_b]
         pos_g = dyn_state.geoms.pos[i_gb, i_b]
         quat_g = dyn_state.geoms.quat[i_gb, i_b]
-        band = mochi_info.geoms.penalty_threshold[i_gb] + 2.0 * mochi_info.geoms.penalty_smoothing_half_distance[i_gb]
+        band = mochi_info.geoms.penalty_threshold[i_gb]
         i_node = mochi_info.links.tree_start[i_la]
         i_node_end = mochi_info.links.tree_end[i_la]
         while i_node < i_node_end:
@@ -625,6 +663,7 @@ def func_contact_eval(
                             mochi_info,
                             mochi_state,
                             contact_state,
+                            hit_readback,
                             rigid_config,
                             mochi_config,
                             assem_dres,
@@ -642,22 +681,26 @@ def kernel_contact_eval(
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     contact_state: MochiContactState,
+    hit_readback: MochiHitReadback,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
     record: qd.template(),
     errno: qd.Tensor,
 ):
     func_contact_eval(
         0,
         False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
         dyn_state,
         dyn_info,
         sdf_info,
         mochi_info,
         mochi_state,
         contact_state,
+        hit_readback,
         rigid_config,
         mochi_config,
         assem_dres,
@@ -671,6 +714,8 @@ def kernel_contact_eval(
 def func_pairs_to_blocks(
     i_b_env,
     per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     mochi_info: MochiInfo,
@@ -691,8 +736,8 @@ def func_pairs_to_blocks(
     _B = mochi_state.is_active.shape[0]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_p, i_b_ in qd.ndrange(max_pairs, _B) if qd.static(not per_env) else qd.ndrange(max_pairs, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_p, i_slot in qd.ndrange(max_pairs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(max_pairs, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
         if i_p >= contact_state.n_pairs[i_b] or contact_state.n_hits[i_p, i_b] == 0:
@@ -762,12 +807,14 @@ def kernel_pairs_to_blocks(
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
 ):
     func_pairs_to_blocks(
         0,
         False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
         dyn_state,
         dyn_info,
         mochi_info,
@@ -805,23 +852,40 @@ def func_write_record(
     force,
     distance,
     weight,
-    records: MochiContactRecords,
+    out_entity_a: qd.template(),
+    out_entity_b: qd.template(),
+    out_link_a: qd.template(),
+    out_link_b: qd.template(),
+    out_geom_a: qd.template(),
+    out_geom_b: qd.template(),
+    out_verts_a: qd.template(),
+    out_bary_a: qd.template(),
+    out_verts_b: qd.template(),
+    out_bary_b: qd.template(),
+    out_pos: qd.template(),
+    out_normal: qd.template(),
+    out_force: qd.template(),
+    out_distance: qd.template(),
+    out_weight: qd.template(),
 ):
-    records.entity_a[i_rec, i_b] = entity_a
-    records.entity_b[i_rec, i_b] = entity_b
-    records.link_a[i_rec, i_b] = link_a
-    records.link_b[i_rec, i_b] = link_b
-    records.geom_a[i_rec, i_b] = geom_a
-    records.geom_b[i_rec, i_b] = geom_b
-    records.verts_a[i_rec, i_b] = verts_a
-    records.bary_a[i_rec, i_b] = bary_a
-    records.verts_b[i_rec, i_b] = verts_b
-    records.bary_b[i_rec, i_b] = bary_b
-    records.pos[i_rec, i_b] = pos
-    records.normal[i_rec, i_b] = normal
-    records.force[i_rec, i_b] = force
-    records.distance[i_rec, i_b] = distance
-    records.weight[i_rec, i_b] = weight
+    """One readback record into the (n_envs, n_records, ...) output tensors."""
+    out_entity_a[i_b, i_rec] = entity_a
+    out_entity_b[i_b, i_rec] = entity_b
+    out_link_a[i_b, i_rec] = link_a
+    out_link_b[i_b, i_rec] = link_b
+    out_geom_a[i_b, i_rec] = geom_a
+    out_geom_b[i_b, i_rec] = geom_b
+    for k in qd.static(range(3)):
+        out_verts_a[i_b, i_rec, k] = verts_a[k]
+        out_bary_a[i_b, i_rec, k] = bary_a[k]
+        out_pos[i_b, i_rec, k] = pos[k]
+        out_normal[i_b, i_rec, k] = normal[k]
+        out_force[i_b, i_rec, k] = force[k]
+    for k in qd.static(range(4)):
+        out_verts_b[i_b, i_rec, k] = verts_b[k]
+        out_bary_b[i_b, i_rec, k] = bary_b[k]
+    out_distance[i_b, i_rec] = distance
+    out_weight[i_b, i_rec] = weight
 
 
 @qd.func
@@ -835,23 +899,59 @@ def func_soft_sample_verts(i_s, soft_info: MochiSoftInfo):
 
 
 @qd.kernel
+def kernel_count_contact_records(
+    hit_readback: MochiHitReadback,
+    soft_state: MochiSoftState,
+    n_records: qd.types.ndarray(),
+    rigid_config: qd.template(),
+    has_soft: qd.template(),
+):
+    """Number of contact points recorded per environment by the last recording pass, all kinds together."""
+    _B = n_records.shape[0]
+    max_hits = hit_readback.hit_sample.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
+    for i_b in range(_B):
+        n = qd.min(hit_readback.n_hits_total[i_b], max_hits)
+        if qd.static(has_soft):
+            n += qd.min(soft_state.n_soft_hits[i_b], soft_state.hit_sample.shape[0])
+            n += qd.min(soft_state.n_sc_hits[i_b], soft_state.sc_hit_kind_a.shape[0])
+            n += qd.min(soft_state.n_pc_hits[i_b], soft_state.pc_hit_kind_a.shape[0])
+        n_records[i_b] = n
+
+
+@qd.kernel
 def kernel_gather_contact_records(
     links_entity_idx: qd.types.ndarray(),
     geoms_link_idx: qd.types.ndarray(),
     soft_entities_idx: qd.types.ndarray(),
     samples_info: MochiSamplesInfo,
-    contact_state: MochiContactState,
+    hit_readback: MochiHitReadback,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
-    records: MochiContactRecords,
     rigid_config: qd.template(),
     has_soft: qd.template(),
+    out_entity_a: qd.types.ndarray(),
+    out_entity_b: qd.types.ndarray(),
+    out_link_a: qd.types.ndarray(),
+    out_link_b: qd.types.ndarray(),
+    out_geom_a: qd.types.ndarray(),
+    out_geom_b: qd.types.ndarray(),
+    out_verts_a: qd.types.ndarray(),
+    out_bary_a: qd.types.ndarray(),
+    out_verts_b: qd.types.ndarray(),
+    out_bary_b: qd.types.ndarray(),
+    out_pos: qd.types.ndarray(),
+    out_normal: qd.types.ndarray(),
+    out_force: qd.types.ndarray(),
+    out_distance: qd.types.ndarray(),
+    out_weight: qd.types.ndarray(),
 ):
     """Compact the contact points recorded by the last evaluation (rigid samples on rigid colliders, then deformable
     samples on rigid colliders, samples on deformable colliders and on point-cloud colliders) into the unified
-    per-environment readback records, resolving links, geoms and entities to scene indices."""
-    max_hits = contact_state.hit_sample.shape[0]
-    _B = records.n_records.shape[0]
+    per-environment readback records, resolving links, geoms and entities to scene indices. The outputs hold the
+    largest per-environment count (see kernel_count_contact_records)."""
+    max_hits = hit_readback.hit_sample.shape[0]
+    _B = out_entity_a.shape[0]
     no_verts3 = qd.Vector([-1, -1, -1], dt=gs.qd_int)
     no_verts4 = qd.Vector([-1, -1, -1, -1], dt=gs.qd_int)
     zero3 = qd.Vector.zero(gs.qd_float, 3)
@@ -859,13 +959,11 @@ def kernel_gather_contact_records(
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_h, i_b in qd.ndrange(max_hits, _B):
-        n_rigid = qd.min(contact_state.n_hits_total[i_b], max_hits)
-        if i_h == 0:
-            records.n_records[i_b] = n_rigid
+        n_rigid = qd.min(hit_readback.n_hits_total[i_b], max_hits)
         if i_h >= n_rigid:
             continue
-        i_la = contact_state.hit_link_a[i_h, i_b]
-        i_lb = contact_state.hit_link_b[i_h, i_b]
+        i_la = hit_readback.hit_link_a[i_h, i_b]
+        i_lb = hit_readback.hit_link_b[i_h, i_b]
         func_write_record(
             i_h,
             i_b,
@@ -873,18 +971,32 @@ def kernel_gather_contact_records(
             links_entity_idx[i_lb],
             i_la,
             i_lb,
-            contact_state.hit_geom_a[i_h, i_b],
-            contact_state.hit_geom_b[i_h, i_b],
+            hit_readback.hit_geom_a[i_h, i_b],
+            hit_readback.hit_geom_b[i_h, i_b],
             no_verts3,
             zero3,
             no_verts4,
             zero4,
-            contact_state.hit_pos[i_h, i_b],
-            contact_state.hit_normal[i_h, i_b],
-            contact_state.hit_force[i_h, i_b],
-            contact_state.hit_distance[i_h, i_b],
-            contact_state.hit_weight[i_h, i_b],
-            records,
+            hit_readback.hit_pos[i_h, i_b],
+            hit_readback.hit_normal[i_h, i_b],
+            hit_readback.hit_force[i_h, i_b],
+            hit_readback.hit_distance[i_h, i_b],
+            hit_readback.hit_weight[i_h, i_b],
+            out_entity_a,
+            out_entity_b,
+            out_link_a,
+            out_link_b,
+            out_geom_a,
+            out_geom_b,
+            out_verts_a,
+            out_bary_a,
+            out_verts_b,
+            out_bary_b,
+            out_pos,
+            out_normal,
+            out_force,
+            out_distance,
+            out_weight,
         )
 
     if qd.static(has_soft):
@@ -895,14 +1007,12 @@ def kernel_gather_contact_records(
         # Deformable samples on rigid colliders.
         qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
         for i_h, i_b in qd.ndrange(max_soft_hits, _B):
-            n_rigid = qd.min(contact_state.n_hits_total[i_b], max_hits)
+            n_rigid = qd.min(hit_readback.n_hits_total[i_b], max_hits)
             n_soft = qd.min(soft_state.n_soft_hits[i_b], max_soft_hits)
-            if i_h == 0:
-                qd.atomic_add(records.n_records[i_b], n_soft)
             if i_h >= n_soft:
                 continue
             i_e, verts_a, bary_a = func_soft_sample_verts(soft_state.hit_sample[i_h, i_b], soft_info)
-            i_gb = soft_state.hit_geom_b[i_h, i_b]
+            i_gb = hit_readback.soft_hit_geom_b[i_h, i_b]
             i_lb = geoms_link_idx[i_gb]
             func_write_record(
                 n_rigid + i_h,
@@ -917,22 +1027,34 @@ def kernel_gather_contact_records(
                 bary_a,
                 no_verts4,
                 zero4,
-                soft_state.hit_pos[i_h, i_b],
-                soft_state.hit_normal[i_h, i_b],
-                soft_state.hit_force[i_h, i_b],
-                soft_state.hit_distance[i_h, i_b],
+                hit_readback.soft_hit_pos[i_h, i_b],
+                hit_readback.soft_hit_normal[i_h, i_b],
+                hit_readback.soft_hit_force[i_h, i_b],
+                hit_readback.soft_hit_distance[i_h, i_b],
                 soft_info.samples_weight[soft_state.hit_sample[i_h, i_b]],
-                records,
+                out_entity_a,
+                out_entity_b,
+                out_link_a,
+                out_link_b,
+                out_geom_a,
+                out_geom_b,
+                out_verts_a,
+                out_bary_a,
+                out_verts_b,
+                out_bary_b,
+                out_pos,
+                out_normal,
+                out_force,
+                out_distance,
+                out_weight,
             )
 
         # Samples of either kind on deformable (tetrahedral) colliders.
         qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
         for i_h, i_b in qd.ndrange(max_sc_hits, _B):
-            n_rigid = qd.min(contact_state.n_hits_total[i_b], max_hits)
+            n_rigid = qd.min(hit_readback.n_hits_total[i_b], max_hits)
             n_soft = qd.min(soft_state.n_soft_hits[i_b], max_soft_hits)
             n_sc = qd.min(soft_state.n_sc_hits[i_b], max_sc_hits)
-            if i_h == 0:
-                qd.atomic_add(records.n_records[i_b], n_sc)
             if i_h >= n_sc:
                 continue
             i_sample = soft_state.sc_hit_sample_a[i_h, i_b]
@@ -969,23 +1091,35 @@ def kernel_gather_contact_records(
                 bary_a,
                 verts_b,
                 soft_state.sc_hit_bary_b[i_h, i_b],
-                soft_state.sc_hit_pos[i_h, i_b],
-                soft_state.sc_hit_normal[i_h, i_b],
-                soft_state.sc_hit_force[i_h, i_b],
-                soft_state.sc_hit_distance[i_h, i_b],
+                hit_readback.sc_hit_pos[i_h, i_b],
+                hit_readback.sc_hit_normal[i_h, i_b],
+                hit_readback.sc_hit_force[i_h, i_b],
+                hit_readback.sc_hit_distance[i_h, i_b],
                 weight,
-                records,
+                out_entity_a,
+                out_entity_b,
+                out_link_a,
+                out_link_b,
+                out_geom_a,
+                out_geom_b,
+                out_verts_a,
+                out_bary_a,
+                out_verts_b,
+                out_bary_b,
+                out_pos,
+                out_normal,
+                out_force,
+                out_distance,
+                out_weight,
             )
 
         # Samples of either kind on point-cloud colliders (one collider vertex).
         qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
         for i_h, i_b in qd.ndrange(max_pc_hits, _B):
-            n_rigid = qd.min(contact_state.n_hits_total[i_b], max_hits)
+            n_rigid = qd.min(hit_readback.n_hits_total[i_b], max_hits)
             n_soft = qd.min(soft_state.n_soft_hits[i_b], max_soft_hits)
             n_sc = qd.min(soft_state.n_sc_hits[i_b], max_sc_hits)
             n_pc = qd.min(soft_state.n_pc_hits[i_b], max_pc_hits)
-            if i_h == 0:
-                qd.atomic_add(records.n_records[i_b], n_pc)
             if i_h >= n_pc:
                 continue
             i_sample = soft_state.pc_hit_sample_a[i_h, i_b]
@@ -1021,10 +1155,24 @@ def kernel_gather_contact_records(
                 bary_a,
                 verts_b,
                 bary_b,
-                soft_state.pc_hit_pos[i_h, i_b],
-                soft_state.pc_hit_normal[i_h, i_b],
-                soft_state.pc_hit_force[i_h, i_b],
-                soft_state.pc_hit_distance[i_h, i_b],
+                hit_readback.pc_hit_pos[i_h, i_b],
+                hit_readback.pc_hit_normal[i_h, i_b],
+                hit_readback.pc_hit_force[i_h, i_b],
+                hit_readback.pc_hit_distance[i_h, i_b],
                 weight,
-                records,
+                out_entity_a,
+                out_entity_b,
+                out_link_a,
+                out_link_b,
+                out_geom_a,
+                out_geom_b,
+                out_verts_a,
+                out_bary_a,
+                out_verts_b,
+                out_bary_b,
+                out_pos,
+                out_normal,
+                out_force,
+                out_distance,
+                out_weight,
             )

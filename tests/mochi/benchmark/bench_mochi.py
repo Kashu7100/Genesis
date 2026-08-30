@@ -8,6 +8,7 @@ Same protocol as bench_genesis.py. The rigid and articulated scenes need the mes
 import argparse
 import json
 import os
+import re
 import sys
 import time
 
@@ -43,6 +44,33 @@ def main():
             scene.step(scenes.DT)
         windows.append((time.perf_counter() - t0) / args.n_steps * 1e3)
     stats = scene.get_solver_stats()
+
+    # Linear-solver iteration counts: the solver stats do not expose them, the verbose Newton log does. One extra
+    # window with verbose logging (untimed), the messages caught by the log callback.
+    linear_iterations = []
+    newton_iterations = []
+    pattern_linear = re.compile(r"Linear solver converged after (\d+) iterations")
+    pattern_newton = re.compile(r"Newton-Raphson iteration (\d+)")
+
+    def on_log(*args):
+        text = " ".join(str(arg) for arg in args)
+        match = pattern_linear.search(text)
+        if match:
+            linear_iterations[-1] += int(match.group(1))
+        match = pattern_newton.search(text)
+        if match:
+            newton_iterations[-1] = max(newton_iterations[-1], int(match.group(1)) + 1)
+
+    params = scene.get_solver_params()
+    params.non_linear_solver.verbosity = physics.VerbosityLevel.VERBOSE
+    scene.set_solver_params(params)
+    physics.set_log_callback(on_log)
+    for _ in range(args.n_steps):
+        linear_iterations.append(0)
+        newton_iterations.append(0)
+        scene.step(scenes.DT)
+    params.non_linear_solver.verbosity = physics.VerbosityLevel.WARNING
+    scene.set_solver_params(params)
     result = {
         "engine": "mochi",
         "scene": args.scene,
@@ -58,6 +86,8 @@ def main():
         "ms_per_step_windows": windows,
         "build_s": build_time,
         "newton_iterations_last": int(getattr(stats, "max_non_linear_iters", -1)),
+        "linear_iterations_per_step": sum(linear_iterations) / max(1, len(linear_iterations)),
+        "newton_iterations_per_step": sum(newton_iterations) / max(1, len(newton_iterations)),
         "probe": probe(),
     }
     os.makedirs(args.out, exist_ok=True)
@@ -68,7 +98,7 @@ def main():
     print(
         f"[mochi] {args.scene} fp{precision} threads={args.threads}: best {result['ms_per_step_best']:.3f} ms/step, "
         f"mean {result['ms_per_step_mean']:.3f} ms/step, newton {result['newton_iterations_last']}, "
-        f"probe {result['probe']:.4f}"
+        f"linear iterations/step {result['linear_iterations_per_step']:.1f}, probe {result['probe']:.4f}"
     )
     print(f"[mochi] wrote {path}")
     physics.shutdown()

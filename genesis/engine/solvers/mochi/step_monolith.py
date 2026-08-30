@@ -7,8 +7,7 @@ The multi-kernel pipeline of `MochiSolver` launches every stage of the step as i
 the Newton, line-search and conjugate gradient loops; at one environment each launch costs more than the work it
 carries. This kernel runs the whole step for one environment as one serial program (the same per-item functions as the
 pipeline, in their per-environment form), environments in parallel: no host round trips, one launch per step. It is
-used when the scene has no deformable collider that needs the bounding-volume hierarchies (built by host-driven
-kernels), and on the GPU when the environments are small enough to be worth one thread each.
+used on the CPU, and on the GPU when the environments are small enough to be worth one thread each.
 """
 
 import quadrants as qd
@@ -34,6 +33,7 @@ from .contact import (
 from .data import (
     LINESEARCH,
     MochiContactState,
+    MochiHitReadback,
     MochiInfo,
     MochiIslandState,
     MochiSoftInfo,
@@ -61,6 +61,8 @@ from .newton import (
 )
 from .rigid_assembly import func_assemble_links
 from .soft import (
+    func_pc_collider_eval,
+    func_pc_hash_build,
     func_rod_apply_increment,
     func_rod_assemble,
     func_rod_post_stage,
@@ -72,6 +74,7 @@ from .soft import (
     func_soft_apply_increment,
     func_soft_assemble_elements,
     func_soft_broadphase,
+    func_soft_collider_eval,
     func_soft_condense_dense,
     func_soft_conservative_bounds,
     func_soft_contact_eval,
@@ -82,6 +85,7 @@ from .soft import (
     func_soft_store_ls_ref,
     func_soft_update_conv_weights,
     func_soft_zero_assembly,
+    func_tet_tree_refit,
 )
 
 
@@ -116,8 +120,11 @@ def func_update_kinematics_env(
 
 
 @qd.func
-def func_assemble_env(
-    i_b,
+def func_assemble(
+    i_b_env,
+    per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
@@ -125,6 +132,7 @@ def func_assemble_env(
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     contact_state: MochiContactState,
+    hit_readback: MochiHitReadback,
     island_state: MochiIslandState,
     eq_info: MochiEqualitiesInfo,
     eq_state: MochiEqualitiesState,
@@ -140,14 +148,17 @@ def func_assemble_env(
     skip_ls_done,
     errno: qd.Tensor,
 ):
-    """Residual and/or Hessian of one environment at its current iterate (contact re-detected)."""
+    """Residual and/or Hessian of the environments of the list at their current iterate (contact re-detected)."""
     assem_obj = qd.static(mochi_config.linesearch_type == LINESEARCH.ARMIJO)
     func_zero_assembly(
-        i_b,
-        True,
+        i_b_env,
+        per_env,
+        envs,
+        n_envs,
         dyn_state,
         mochi_state,
         contact_state,
+        hit_readback,
         rigid_config,
         assem_obj,
         assem_res,
@@ -156,16 +167,30 @@ def func_assemble_env(
         False,
     )
     if qd.static(mochi_config.has_soft):
-        func_soft_zero_assembly(i_b, True, mochi_state, soft_state, rigid_config, assem_dres, skip_ls_done, False)
+        func_soft_zero_assembly(
+            i_b_env,
+            per_env,
+            envs,
+            n_envs,
+            mochi_state,
+            soft_state,
+            rigid_config,
+            assem_dres,
+            skip_ls_done,
+            False,
+        )
     func_contact_eval(
-        i_b,
-        True,
+        i_b_env,
+        per_env,
+        envs,
+        n_envs,
         dyn_state,
         dyn_info,
         sdf_info,
         mochi_info,
         mochi_state,
         contact_state,
+        hit_readback,
         rigid_config,
         mochi_config,
         assem_dres,
@@ -175,8 +200,10 @@ def func_assemble_env(
     )
     if qd.static(mochi_config.has_soft):
         func_soft_contact_eval(
-            i_b,
-            True,
+            i_b_env,
+            per_env,
+            envs,
+            n_envs,
             dyn_state,
             dyn_info,
             sdf_info,
@@ -184,6 +211,7 @@ def func_assemble_env(
             mochi_state,
             soft_info,
             soft_state,
+            hit_readback,
             rigid_config,
             mochi_config,
             max_samples_per_soft_entity,
@@ -193,9 +221,78 @@ def func_assemble_env(
             False,
             errno,
         )
+        if qd.static(mochi_config.has_pc_colliders):
+            func_pc_hash_build(
+                i_b_env,
+                per_env,
+                envs,
+                n_envs,
+                mochi_state,
+                soft_info,
+                soft_state,
+                rigid_config,
+                skip_ls_done,
+            )
+            func_pc_collider_eval(
+                i_b_env,
+                per_env,
+                envs,
+                n_envs,
+                dyn_state,
+                dyn_info,
+                mochi_info,
+                mochi_state,
+                soft_info,
+                soft_state,
+                hit_readback,
+                rigid_config,
+                mochi_config,
+                assem_obj,
+                assem_res,
+                assem_dres,
+                skip_ls_done,
+                False,
+                errno,
+            )
+        if qd.static(mochi_config.has_soft_colliders):
+            func_tet_tree_refit(
+                i_b_env,
+                per_env,
+                envs,
+                n_envs,
+                mochi_state,
+                soft_info,
+                soft_state,
+                rigid_config,
+                mochi_config,
+                skip_ls_done,
+            )
+            func_soft_collider_eval(
+                i_b_env,
+                per_env,
+                envs,
+                n_envs,
+                dyn_state,
+                dyn_info,
+                mochi_info,
+                mochi_state,
+                soft_info,
+                soft_state,
+                hit_readback,
+                rigid_config,
+                mochi_config,
+                assem_obj,
+                assem_res,
+                assem_dres,
+                skip_ls_done,
+                False,
+                errno,
+            )
     func_pairs_to_blocks(
-        i_b,
-        True,
+        i_b_env,
+        per_env,
+        envs,
+        n_envs,
         dyn_state,
         dyn_info,
         mochi_info,
@@ -208,8 +305,10 @@ def func_assemble_env(
         skip_ls_done,
     )
     func_assemble_links(
-        i_b,
-        True,
+        i_b_env,
+        per_env,
+        envs,
+        n_envs,
         dyn_state,
         dyn_info,
         mochi_info,
@@ -222,8 +321,10 @@ def func_assemble_env(
         skip_ls_done,
     )
     func_assemble_joints(
-        i_b,
-        True,
+        i_b_env,
+        per_env,
+        envs,
+        n_envs,
         dyn_state,
         dyn_info,
         rigid_info,
@@ -237,8 +338,10 @@ def func_assemble_env(
     )
     if qd.static(mochi_config.has_equalities):
         func_assemble_equalities(
-            i_b,
-            True,
+            i_b_env,
+            per_env,
+            envs,
+            n_envs,
             dyn_state,
             dyn_info,
             rigid_info,
@@ -254,8 +357,10 @@ def func_assemble_env(
         )
     if qd.static(mochi_config.has_soft):
         func_soft_pairs_to_blocks(
-            i_b,
-            True,
+            i_b_env,
+            per_env,
+            envs,
+            n_envs,
             dyn_state,
             mochi_info,
             mochi_state,
@@ -266,23 +371,28 @@ def func_assemble_env(
             assem_dres,
             skip_ls_done,
         )
-        func_soft_assemble_elements(
-            i_b,
-            True,
-            mochi_info,
-            mochi_state,
-            soft_info,
-            soft_state,
-            rigid_config,
-            assem_obj,
-            assem_res,
-            assem_dres,
-            skip_ls_done,
-        )
+        if qd.static(mochi_config.has_tets):
+            func_soft_assemble_elements(
+                i_b_env,
+                per_env,
+                envs,
+                n_envs,
+                mochi_info,
+                mochi_state,
+                soft_info,
+                soft_state,
+                rigid_config,
+                assem_obj,
+                assem_res,
+                assem_dres,
+                skip_ls_done,
+            )
         if qd.static(has_shell):
             func_shell_assemble(
-                i_b,
-                True,
+                i_b_env,
+                per_env,
+                envs,
+                n_envs,
                 mochi_info,
                 mochi_state,
                 soft_info,
@@ -295,8 +405,10 @@ def func_assemble_env(
             )
         if qd.static(has_rod):
             func_rod_assemble(
-                i_b,
-                True,
+                i_b_env,
+                per_env,
+                envs,
+                n_envs,
                 mochi_info,
                 mochi_state,
                 soft_info,
@@ -309,9 +421,39 @@ def func_assemble_env(
             )
     if qd.static(assem_res):
         if qd.static(mochi_config.has_soft):
-            func_soft_dirichlet(i_b, True, mochi_state, soft_info, soft_state, rigid_config, skip_ls_done)
-        func_project_links_residual(i_b, True, dyn_state, dyn_info, mochi_info, mochi_state, rigid_config, skip_ls_done)
-        func_residual_norms(i_b, True, mochi_state, island_state, rigid_config, skip_ls_done)
+            func_soft_dirichlet(
+                i_b_env,
+                per_env,
+                envs,
+                n_envs,
+                mochi_state,
+                soft_info,
+                soft_state,
+                rigid_config,
+                skip_ls_done,
+            )
+        func_project_links_residual(
+            i_b_env,
+            per_env,
+            envs,
+            n_envs,
+            dyn_state,
+            dyn_info,
+            mochi_info,
+            mochi_state,
+            rigid_config,
+            skip_ls_done,
+        )
+        func_residual_norms(
+            i_b_env,
+            per_env,
+            envs,
+            n_envs,
+            mochi_state,
+            island_state,
+            rigid_config,
+            skip_ls_done,
+        )
 
 
 @qd.func
@@ -322,6 +464,7 @@ def func_linear_solve_env(
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     contact_state: MochiContactState,
+    hit_readback: MochiHitReadback,
     island_state: MochiIslandState,
     eq_info: MochiEqualitiesInfo,
     eq_state: MochiEqualitiesState,
@@ -341,6 +484,8 @@ def func_linear_solve_env(
             func_condense_dense(
                 i_b,
                 True,
+                mochi_state.all_envs,
+                mochi_state.n_envs_all,
                 dyn_state,
                 dyn_info,
                 mochi_info,
@@ -354,14 +499,44 @@ def func_linear_solve_env(
             )
             if qd.static(mochi_config.has_soft):
                 func_soft_condense_dense(
-                    i_b, True, dyn_state, dyn_info, mochi_state, soft_info, soft_state, island_state, rigid_config
+                    i_b,
+                    True,
+                    mochi_state.all_envs,
+                    mochi_state.n_envs_all,
+                    dyn_state,
+                    dyn_info,
+                    mochi_state,
+                    soft_info,
+                    soft_state,
+                    island_state,
+                    rigid_config,
                 )
-            func_cholesky_solve_islands(i_b, True, mochi_info, mochi_state, island_state, rigid_config)
+            func_cholesky_solve_islands(
+                i_b,
+                True,
+                mochi_state.all_envs,
+                mochi_state.n_envs_all,
+                mochi_info,
+                mochi_state,
+                island_state,
+                rigid_config,
+            )
     else:
-        func_update_linear_tolerance(i_b, True, mochi_info, mochi_state, rigid_config, mochi_config)
+        func_update_linear_tolerance(
+            i_b,
+            True,
+            mochi_state.all_envs,
+            mochi_state.n_envs_all,
+            mochi_info,
+            mochi_state,
+            rigid_config,
+            mochi_config,
+        )
         func_pcg_init(
             i_b,
             True,
+            mochi_state.all_envs,
+            mochi_state.n_envs_all,
             dyn_state,
             dyn_info,
             mochi_info,
@@ -378,6 +553,8 @@ def func_linear_solve_env(
             func_pcg_iter(
                 i_b,
                 True,
+                mochi_state.all_envs,
+                mochi_state.n_envs_all,
                 dyn_state,
                 dyn_info,
                 mochi_info,
@@ -402,6 +579,7 @@ def kernel_step_monolith(
     mochi_info: MochiInfo,
     mochi_state: MochiState,
     contact_state: MochiContactState,
+    hit_readback: MochiHitReadback,
     island_state: MochiIslandState,
     eq_info: MochiEqualitiesInfo,
     eq_state: MochiEqualitiesState,
@@ -423,29 +601,126 @@ def kernel_step_monolith(
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_b in range(_B):
         # Stage start: history, warm start, kinematics, conservative bounds, candidate pairs and islands.
-        func_step_start(i_b, True, dyn_state, dyn_info, rigid_info, mochi_info, mochi_state, rigid_config, mochi_config)
-        if qd.static(mochi_config.has_soft):
-            func_soft_step_start(i_b, True, mochi_state, soft_info, soft_state, rigid_config, mochi_config)
-            if qd.static(has_shell):
-                func_shell_stage_start(i_b, True, soft_info, soft_state, rigid_config)
-            if qd.static(has_rod):
-                func_rod_step_start(i_b, True, mochi_state, soft_info, soft_state, rigid_config, mochi_config)
-        func_update_kinematics_env(i_b, geoms_init_AABB, dyn_state, dyn_info, rigid_info, rigid_config, False)
-        func_store_stage_start_poses(i_b, True, dyn_state, mochi_state, rigid_config)
-        if qd.static(mochi_config.has_equalities):
-            func_equalities_stage_start(
-                i_b, True, dyn_info, rigid_info, mochi_info, mochi_state, eq_info, eq_state, rigid_config
-            )
-        func_reset_newton(i_b, True, mochi_state, rigid_config)
-        func_conservative_bounds(i_b, True, dyn_state, dyn_info, mochi_info, mochi_state, contact_state, rigid_config)
-        func_broadphase_pairs(
-            i_b, True, dyn_state, dyn_info, mochi_info, mochi_state, contact_state, rigid_config, errno
+        func_step_start(
+            i_b,
+            True,
+            mochi_state.all_envs,
+            mochi_state.n_envs_all,
+            dyn_state,
+            dyn_info,
+            rigid_info,
+            mochi_info,
+            mochi_state,
+            rigid_config,
+            mochi_config,
         )
         if qd.static(mochi_config.has_soft):
-            func_soft_conservative_bounds(i_b, True, mochi_info, soft_info, soft_state, rigid_config)
+            func_soft_step_start(
+                i_b,
+                True,
+                mochi_state.all_envs,
+                mochi_state.n_envs_all,
+                mochi_state,
+                soft_info,
+                soft_state,
+                rigid_config,
+                mochi_config,
+            )
+            if qd.static(has_shell):
+                func_shell_stage_start(
+                    i_b,
+                    True,
+                    mochi_state.all_envs,
+                    mochi_state.n_envs_all,
+                    soft_info,
+                    soft_state,
+                    rigid_config,
+                )
+            if qd.static(has_rod):
+                func_rod_step_start(
+                    i_b,
+                    True,
+                    mochi_state.all_envs,
+                    mochi_state.n_envs_all,
+                    mochi_state,
+                    soft_info,
+                    soft_state,
+                    rigid_config,
+                    mochi_config,
+                )
+        func_update_kinematics_env(i_b, geoms_init_AABB, dyn_state, dyn_info, rigid_info, rigid_config, False)
+        func_store_stage_start_poses(
+            i_b,
+            True,
+            mochi_state.all_envs,
+            mochi_state.n_envs_all,
+            dyn_state,
+            mochi_state,
+            rigid_config,
+        )
+        if qd.static(mochi_config.has_equalities):
+            func_equalities_stage_start(
+                i_b,
+                True,
+                mochi_state.all_envs,
+                mochi_state.n_envs_all,
+                dyn_info,
+                rigid_info,
+                mochi_info,
+                mochi_state,
+                eq_info,
+                eq_state,
+                rigid_config,
+            )
+        func_reset_newton(
+            i_b,
+            True,
+            mochi_state.all_envs,
+            mochi_state.n_envs_all,
+            mochi_state,
+            rigid_config,
+        )
+        func_conservative_bounds(
+            i_b,
+            True,
+            mochi_state.all_envs,
+            mochi_state.n_envs_all,
+            dyn_state,
+            dyn_info,
+            mochi_info,
+            mochi_state,
+            contact_state,
+            rigid_config,
+        )
+        func_broadphase_pairs(
+            i_b,
+            True,
+            mochi_state.all_envs,
+            mochi_state.n_envs_all,
+            dyn_state,
+            dyn_info,
+            mochi_info,
+            mochi_state,
+            contact_state,
+            rigid_config,
+            errno,
+        )
+        if qd.static(mochi_config.has_soft):
+            func_soft_conservative_bounds(
+                i_b,
+                True,
+                mochi_state.all_envs,
+                mochi_state.n_envs_all,
+                mochi_info,
+                soft_info,
+                soft_state,
+                rigid_config,
+            )
             func_soft_broadphase(
                 i_b,
                 True,
+                mochi_state.all_envs,
+                mochi_state.n_envs_all,
                 dyn_state,
                 dyn_info,
                 mochi_info,
@@ -459,6 +734,8 @@ def kernel_step_monolith(
         func_build_islands(
             i_b,
             True,
+            mochi_state.all_envs,
+            mochi_state.n_envs_all,
             dyn_info,
             mochi_info,
             mochi_state,
@@ -479,25 +756,86 @@ def kernel_step_monolith(
         # iterate through the single assembly call site below: a round with i_ls == 0 is the full assembly (with the
         # Hessian) at the accepted iterate that opens a Newton iteration, a round with i_ls > 0 is a line-search trial
         # (residual only) after moving to the trial iterate.
-        func_update_conv_weights(i_b, True, dyn_state, dyn_info, mochi_info, mochi_state, rigid_config)
+        func_update_conv_weights(
+            i_b,
+            True,
+            mochi_state.all_envs,
+            mochi_state.n_envs_all,
+            dyn_state,
+            dyn_info,
+            mochi_info,
+            mochi_state,
+            rigid_config,
+        )
         if qd.static(mochi_config.has_soft):
-            func_soft_update_conv_weights(i_b, True, mochi_info, mochi_state, soft_info, soft_state, rigid_config)
+            func_soft_update_conv_weights(
+                i_b,
+                True,
+                mochi_state.all_envs,
+                mochi_state.n_envs_all,
+                mochi_info,
+                mochi_state,
+                soft_info,
+                soft_state,
+                rigid_config,
+            )
             if qd.static(has_rod):
-                func_rod_update_conv_weights(i_b, True, mochi_info, mochi_state, soft_info, soft_state, rigid_config)
+                func_rod_update_conv_weights(
+                    i_b,
+                    True,
+                    mochi_state.all_envs,
+                    mochi_state.n_envs_all,
+                    mochi_info,
+                    mochi_state,
+                    soft_info,
+                    soft_state,
+                    rigid_config,
+                )
         i_ls = 0
         is_first = True
         for _ in range(n_newton * (n_trials + 1) + 2):
             if not mochi_state.is_active[i_b]:
                 break
             if i_ls > 0:
-                func_apply_increment(i_b, True, dyn_info, rigid_info, mochi_info, mochi_state, rigid_config)
+                func_apply_increment(
+                    i_b,
+                    True,
+                    mochi_state.all_envs,
+                    mochi_state.n_envs_all,
+                    dyn_info,
+                    rigid_info,
+                    mochi_info,
+                    mochi_state,
+                    rigid_config,
+                )
                 if qd.static(mochi_config.has_soft):
-                    func_soft_apply_increment(i_b, True, mochi_state, soft_info, soft_state, rigid_config)
+                    func_soft_apply_increment(
+                        i_b,
+                        True,
+                        mochi_state.all_envs,
+                        mochi_state.n_envs_all,
+                        mochi_state,
+                        soft_info,
+                        soft_state,
+                        rigid_config,
+                    )
                     if qd.static(has_rod):
-                        func_rod_apply_increment(i_b, True, mochi_state, soft_info, soft_state, rigid_config)
+                        func_rod_apply_increment(
+                            i_b,
+                            True,
+                            mochi_state.all_envs,
+                            mochi_state.n_envs_all,
+                            mochi_state,
+                            soft_info,
+                            soft_state,
+                            rigid_config,
+                        )
                 func_update_kinematics_env(i_b, geoms_init_AABB, dyn_state, dyn_info, rigid_info, rigid_config, False)
-            func_assemble_env(
+            func_assemble(
                 i_b,
+                True,
+                mochi_state.all_envs,
+                mochi_state.n_envs_all,
                 dyn_state,
                 dyn_info,
                 rigid_info,
@@ -505,6 +843,7 @@ def kernel_step_monolith(
                 mochi_info,
                 mochi_state,
                 contact_state,
+                hit_readback,
                 island_state,
                 eq_info,
                 eq_state,
@@ -522,13 +861,51 @@ def kernel_step_monolith(
             )
             if i_ls == 0:
                 if is_first:
-                    func_store_initial_norms(i_b, True, rigid_info, mochi_state, island_state, rigid_config)
+                    func_store_initial_norms(
+                        i_b,
+                        True,
+                        mochi_state.all_envs,
+                        mochi_state.n_envs_all,
+                        rigid_info,
+                        mochi_state,
+                        island_state,
+                        rigid_config,
+                    )
                     if qd.static(mochi_config.has_soft):
-                        func_soft_store_ls_ref(i_b, True, mochi_state, soft_state, rigid_config, False)
+                        func_soft_store_ls_ref(
+                            i_b,
+                            True,
+                            mochi_state.all_envs,
+                            mochi_state.n_envs_all,
+                            mochi_state,
+                            soft_state,
+                            rigid_config,
+                            False,
+                        )
                         if qd.static(has_rod):
-                            func_rod_store_ls_ref(i_b, True, mochi_state, soft_state, rigid_config, False)
+                            func_rod_store_ls_ref(
+                                i_b,
+                                True,
+                                mochi_state.all_envs,
+                                mochi_state.n_envs_all,
+                                mochi_state,
+                                soft_state,
+                                rigid_config,
+                                False,
+                            )
                     is_first = False
-                func_convergence_check(i_b, True, mochi_info, mochi_state, island_state, rigid_config, False, errno)
+                func_convergence_check(
+                    i_b,
+                    True,
+                    mochi_state.all_envs,
+                    mochi_state.n_envs_all,
+                    mochi_info,
+                    mochi_state,
+                    island_state,
+                    rigid_config,
+                    False,
+                    errno,
+                )
                 if mochi_state.is_active[i_b]:
                     func_linear_solve_env(
                         i_b,
@@ -537,6 +914,7 @@ def kernel_step_monolith(
                         mochi_info,
                         mochi_state,
                         contact_state,
+                        hit_readback,
                         island_state,
                         eq_info,
                         eq_state,
@@ -546,30 +924,123 @@ def kernel_step_monolith(
                         mochi_config,
                         n_pcg,
                     )
-                    func_linesearch_begin(i_b, True, rigid_info, mochi_state, rigid_config)
+                    func_linesearch_begin(
+                        i_b,
+                        True,
+                        mochi_state.all_envs,
+                        mochi_state.n_envs_all,
+                        rigid_info,
+                        mochi_state,
+                        rigid_config,
+                    )
                     if qd.static(mochi_config.has_soft):
-                        func_soft_store_ls_ref(i_b, True, mochi_state, soft_state, rigid_config, False)
+                        func_soft_store_ls_ref(
+                            i_b,
+                            True,
+                            mochi_state.all_envs,
+                            mochi_state.n_envs_all,
+                            mochi_state,
+                            soft_state,
+                            rigid_config,
+                            False,
+                        )
                         if qd.static(has_rod):
-                            func_rod_store_ls_ref(i_b, True, mochi_state, soft_state, rigid_config, False)
+                            func_rod_store_ls_ref(
+                                i_b,
+                                True,
+                                mochi_state.all_envs,
+                                mochi_state.n_envs_all,
+                                mochi_state,
+                                soft_state,
+                                rigid_config,
+                                False,
+                            )
                     i_ls = 1
             else:
                 func_linesearch_decide(
-                    i_b, True, rigid_info, mochi_info, mochi_state, rigid_config, mochi_config, i_ls == n_trials
+                    i_b,
+                    True,
+                    mochi_state.all_envs,
+                    mochi_state.n_envs_all,
+                    rigid_info,
+                    mochi_info,
+                    mochi_state,
+                    rigid_config,
+                    mochi_config,
+                    i_ls == n_trials,
                 )
                 if qd.static(mochi_config.has_soft):
-                    func_soft_store_ls_ref(i_b, True, mochi_state, soft_state, rigid_config, True)
+                    func_soft_store_ls_ref(
+                        i_b,
+                        True,
+                        mochi_state.all_envs,
+                        mochi_state.n_envs_all,
+                        mochi_state,
+                        soft_state,
+                        rigid_config,
+                        True,
+                    )
                     if qd.static(has_rod):
-                        func_rod_store_ls_ref(i_b, True, mochi_state, soft_state, rigid_config, True)
+                        func_rod_store_ls_ref(
+                            i_b,
+                            True,
+                            mochi_state.all_envs,
+                            mochi_state.n_envs_all,
+                            mochi_state,
+                            soft_state,
+                            rigid_config,
+                            True,
+                        )
                 if mochi_state.ls_is_done[i_b]:
-                    func_convergence_check(i_b, True, mochi_info, mochi_state, island_state, rigid_config, True, errno)
+                    func_convergence_check(
+                        i_b,
+                        True,
+                        mochi_state.all_envs,
+                        mochi_state.n_envs_all,
+                        mochi_info,
+                        mochi_state,
+                        island_state,
+                        rigid_config,
+                        True,
+                        errno,
+                    )
                     i_ls = 0
                 else:
                     i_ls += 1
 
         # Stage end: finite-difference velocities, history, final kinematics with the joint-space velocities.
-        func_post_stage(i_b, True, dyn_state, dyn_info, rigid_info, mochi_info, mochi_state, rigid_config)
+        func_post_stage(
+            i_b,
+            True,
+            mochi_state.all_envs,
+            mochi_state.n_envs_all,
+            dyn_state,
+            dyn_info,
+            rigid_info,
+            mochi_info,
+            mochi_state,
+            rigid_config,
+        )
         if qd.static(mochi_config.has_soft):
-            func_soft_post_stage(i_b, True, mochi_state, soft_info, soft_state, rigid_config)
+            func_soft_post_stage(
+                i_b,
+                True,
+                mochi_state.all_envs,
+                mochi_state.n_envs_all,
+                mochi_state,
+                soft_info,
+                soft_state,
+                rigid_config,
+            )
             if qd.static(has_rod):
-                func_rod_post_stage(i_b, True, mochi_state, soft_info, soft_state, rigid_config)
+                func_rod_post_stage(
+                    i_b,
+                    True,
+                    mochi_state.all_envs,
+                    mochi_state.n_envs_all,
+                    mochi_state,
+                    soft_info,
+                    soft_state,
+                    rigid_config,
+                )
         func_update_kinematics_env(i_b, geoms_init_AABB, dyn_state, dyn_info, rigid_info, rigid_config, True)

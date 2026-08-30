@@ -121,3 +121,185 @@ Where the remaining time goes (CPU fp64, one environment):
   broadphase (which would also let the t-shirt run as one kernel) are the next steps if it needs to be faster.
 - rigid/articulated/equalities: one kernel launch (15-25 us) plus 30-140 us of serial work (forward kinematics, contact
   sampling over the culled sample tree, dense Cholesky, line search); mochi's 9-36 us is the same work in C++.
+
+## Plan 2: batched deformables on the GPU, memory per environment (2026-08-29)
+
+Three Genesis-only scenes model batched reinforcement learning with deformables (a Franka arm pressing a 31x31 cloth
+with self-contact, a Franka gripper closing on a 4263-tetrahedron cube, the arm pressing a 64-node rope); `sweep.py`
+runs a scene over batch sizes and every run records the solver's memory per environment (`memory_report()`), the
+process' device memory, the conjugate-gradient iteration counts of both engines and the usage of the bounded contact
+lists.
+
+### Baseline before Plan 2 (`10b72f6f`, GPU fp32, host-driven pipeline with bounding-volume hierarchies)
+
+| scene | B=1 ms/step | B=64 ms/step (us/env-step) | B=256 ms/step (us/env-step) | MiB/env | fits on 10 GB |
+|---|---|---|---|---|---|
+| cloth_arm | 30.0 | 257 (4010) | out of memory | 84.5 | 64 |
+| soft_gripper | 44.4 | 294 (4590) | 1347 (5260) | 17.8 | 256 |
+| rope_arm | 5.6 | 9.8 (154) | 18.2 (71) | 20.4 | 256 |
+
+### After the spatial hash (Phase H): deformable colliders located by an in-kernel hash
+
+Both deformable collider kinds (collider spheres of shells and rods, deformed tetrahedra of solids) are found through
+a per-environment spatial hash rebuilt at every assembly, as in mochi (items inserted once in the bin of their cell, a
+query walks the 27 cells around its own; with a cell no smaller than the contact range the candidate set is a superset
+of the exact one and `tests/mochi/test_spatial_hash.py` checks that the hits equal a brute-force evaluation). No host
+synchronization remains in an assembly, so every scene now runs as one kernel per step on the CPU, and the contact
+range follows mochi's (`radius + penalty threshold`; the former `threshold + 2 x smoothing` band only added zero-force
+hits: 30k of the 33k hits of the flat cloth+arm scene).
+
+| scene | CPU fp64 ms/step (before -> after) | GPU B=1 ms/step | GPU B=64 ms/step (us/env-step) | GPU B=256 ms/step (us/env-step) | MiB/env |
+|---|---|---|---|---|---|
+| cloth_arm | 105 -> 8.9 (at rest) | 30.0 -> 14.6 | 257 -> 40.3 (630) | out of memory | 83.8 |
+| soft_gripper | 130 -> 145 (see below) | 44.4 -> 32.1 | 294 -> 102 (1590) | 1347 -> 358 (1400) | 16.9 |
+| rope_arm | 10.0 -> 2.8 | 5.6 -> 3.1 | 9.8 -> 4.8 (75) | 18.2 -> 7.8 (30) | 20.2 |
+| soft_duck | 88.7 -> 86.8 | 21.7 -> 20.8 | 60.1 (940) | 177 (690) | 3.98 |
+| cloth_tshirt | 240 -> 148 | 32.9 -> 25.1 | 81.5 (1270) | out of memory | 86.7 |
+
+The GPU still runs the multi-kernel pipeline for deformables (the one-kernel graph step is Phase I); the gain is the
+removal of the per-assembly hierarchy rebuilds (a host sync per tree layer) and of the flat shared query buffer. The
+gripper on the CPU got slower because a coarse hash cell (the largest tetrahedron) made the cube's own samples walk
+thousands of its own tetrahedra before the entity filter; the follow-up skips queries that cannot hit anything and
+tests the entity filter before the dedupe. Memory per environment is unchanged: the hit buffers dominate (cloth+arm
+84 MiB of which 33.7 MiB point-cloud hit records sized `16 x queries` and 45 MiB contact-readback records) - Phase G.
+
+Conjugate-gradient iterations per step, mochi / Genesis (fp64, single thread): duck 92 / 101, t-shirt 78 / 86, helix
+17.5 / ~120 - the tetrahedron and shell counts match (same block-Jacobi preconditioner and adaptive tolerance), the
+rod's exact banded solve should bring the helix to mochi's count (Phase K).
+
+### Memory diet (Phase G) and the bounds hash (H2, H3)
+
+Contact points are recorded for readback only on demand (`get_contacts` counts, allocates and gathers; the readback
+fields of the hit lists live in a struct allocated at the first readback), the hit lists keep the solver-side fields
+only and their capacities follow three options (`max_soft_hits_per_sample`, `max_deformable_collider_hits_per_query`,
+`max_point_cloud_hits_per_query`). The hash then inserts every item in the (at most eight) cells its bounds overlap and a
+sample walks its own cell only; the tetrahedron cell is twice the median rest extent, the few larger tetrahedra live in
+an overflow list every sample scans.
+
+| scene | MiB/env before | MiB/env after | GPU fp32 B=256 ms/step (us/env-step) | GPU fp32 B=1024 ms/step (us/env-step) |
+|---|---|---|---|---|
+| cloth_arm | 84.5 | 6.3 | 120 (468) | 548 -> 382 (373) |
+| soft_gripper | 17.8 | 4.8 | 1347 -> 257-282 (1000-1100) | out of memory -> 970 (947) |
+| rope_arm | 20.4 | 2.2 | 8.2 (32) | 16.6 (16) |
+| soft_duck | 3.98 | 2.30 | 176 (689) | 648 (633) |
+| cloth_tshirt | 86.7 | 16.3 | 266 (1040) | out of memory (16.7 GB) |
+
+With these, 1024 environments of every RL scene fit on the 10 GB card, and 4096 of each on 80 GB by projection (the
+t-shirt at 4096 needs ~67 GB; the symmetric Hessian storage planned in Phase K/G7 halves its largest remaining array).
+The deformables still run the multi-kernel pipeline on the GPU at this point; the graph step kernel is next.
+
+### Step kernels on the GPU, the tetrahedron hierarchy and compile time (Phases I, H4, K4)
+
+The one-launch graph step kernel (`step_kernel="graph"`: Newton, line-search and conjugate-gradient loops as nested
+device-side `do_while` levels, every stage parallel over items and environments) agrees with the pipeline and the
+monolith on every scene (`tests/mochi/test_step_kernels.py`, CPU and GPU). On the RTX 3080, which has no device-side
+graph conditionals, the runtime replays the loop bodies from the host with one flag readback per round, and the kernel
+runs at the pipeline's speed at every batch size while compiling as a single module several times slower - so it is
+opt-in and "auto" keeps the pipeline for deformable scenes on the GPU (the monolith for small rigid ones).
+
+| scene, GPU fp32 | B=1 graph / pipeline ms/step | B=64 | B=256 | B=1024 | cold compile graph / pipeline |
+|---|---|---|---|---|---|
+| soft_gripper | 33.4 / 33.0 | 79 / 76 | 214 / 208 | - | 85 s / 45 s |
+| cloth_arm | 15.1 / 15.2 | 39.4 / 37.9 | - | 372 / 415 | 300 s / 220 s |
+
+Compile time is measured per kernel (`bench_genesis.py --cold` records the first step's time with the offline cache
+off; a per-kernel breakdown wraps quadrants' `Kernel.materialize` and the first launch). The cost sits in the backend
+code generation at the first launch of a kernel (single-threaded; `num_compile_threads` changes nothing), it grows
+faster than linearly with the kernel's size, and one func dominated it: the shell assembly evaluated the 18x18 tangent
+as 216 fully unrolled pair contractions, each two 2x2 matrix products - about 100 s per compiled variant, twice per
+scene. The tangent now hoists the per-dof products `A^-1 G A^-1` and traces out of the pair loops (the same arithmetic,
+a quarter of the generated code), the pipeline kernels take the assembly flags as runtime values (one compiled
+variant instead of two), and the tetrahedron assembly is compiled only for scenes that have tetrahedra
+(`has_tets`; the monolith of a cloth scene no longer carries it).
+
+| cold compile (s) | soft_gripper | cloth_arm | cloth_tshirt |
+|---|---|---|---|
+| CPU monolith, before -> after | 79 -> 79 (no shells) | 275 -> 108 | 254 -> 118 |
+| CPU pipeline, before -> after | - | 142 -> 60 | - |
+| GPU pipeline, before -> after | 45 -> 31 | 220 -> 70 | 239 -> - |
+
+The tetrahedra of solids are no longer hashed: a uniform hash over a fine mesh (4263 tetrahedra of a 5 cm cube over
+~64 cells, every tetrahedron in up to eight cells) walked chains of 200-500 entries for every sample near the cube, 48%
+of the gripper step on the GPU and growing superlinearly with the batch. A bounding-box hierarchy built once over the
+rest tetrahedra (`tet_tree.py`, depth-first order with escape indices, like the contact-sample trees) is refit to the
+deformed vertices at every assembly one level at a time and queried with a stackless descent - a few dozen box tests
+per sample; `tests/mochi/test_spatial_hash.py` checks the hits against a brute-force evaluation. The collider spheres
+of shells and rods keep the hash. (Chunked per-environment reductions - 32 dofs per thread before one atomic - were
+tried for the conjugate-gradient dot products and rejected: the vector passes cost the same, 0.09-0.11 ms per
+iteration at B=256, so the per-environment atomics are not what limits them.)
+
+| scene, GPU fp32, pipeline | B=1 ms/step | B=64 (us/env-step) | B=256 (us/env-step) | B=1024 (us/env-step) | MiB/env |
+|---|---|---|---|---|---|
+| soft_gripper, hash (H3) | 33.0 | 76 (1190) | 208 (813) | ~1000 (~980) | 4.82 |
+| soft_gripper, hierarchy (H4) | 33.0 | 73 (1135) | 162 (633) | 678 (662) | 4.38 |
+| cloth_arm, hierarchy (H4) | 15.2 | 37.9 (592) | 101 (396) | 353 (345) | 6.28 |
+| cloth_tshirt (H4) | - | - | 253 (989) | - | 16.6 |
+| soft_duck (H4) | - | - | - | 673 (657) | 2.32 |
+| rope_arm (H4) | - | - | - | 10.0 (9.8) | 2.18 |
+
+### GPU fp32 scaling at `1294b66e` (RTX 3080 10 GB, pipeline, cold-compiled once per scene)
+
+| scene | B=1 ms/step | B=64 ms/step (us/env-step) | B=256 | B=1024 | MiB/env | max B on 10 GB (estimate) |
+|---|---|---|---|---|---|---|
+| cloth_arm | 15.0 | 38.9 (608) | 101.0 (394) | 373.2 (364) | 6.28 | 1537 |
+| soft_gripper | 33.5 | 67.1 (1048) | 164.1 (641) | 669.4 (654) | 4.38 | 2204 |
+| rope_arm | 3.4 | 4.6 (72) | 6.6 (26) | 10.1 (10) | 2.19 | 4452 |
+| soft_duck | 21.5 | 62.6 (978) | 184.8 (722) | 669.1 (653) | 2.32 | 4180 |
+| cloth_tshirt | 25.3 | 85.7 (1340) | 268.6 (1049) | out of memory | 16.63 | 589 |
+| rod_helix | 154.8 | 224.2 (3503) | 305.8 (1195) | 374.7 (366) | 0.24 | 41430 |
+
+Against the Plan 2 baseline (`10b72f6f`): cloth + arm 4010 -> 364 us per env-step at the largest batch that fits (11x,
+and 1024 environments fit where 256 did not), gripper 5260 -> 654 (8x), rope + arm 71 -> 10 (7x); the projection to an
+80 GB card is 4096 environments for every RL scene (the t-shirt needs 16.6 MiB/env: ~4800 on 80 GB). The helix is
+launch-bound at small batches (20 Newton iterations per step) and only pays off at B >= 256.
+
+The tetrahedron stiffness is assembled per node block (`func_tet_stiffness`): the Smith neo-Hookean tangent in closed
+form when mochi's oracle proves it definite (`c3 (F g_f)(F g_g)^T + lam (cof g_f)(cof g_g)^T + c2 (g_f . g_g) I
++ coeff S(F (g_f x g_g))`), the analytic eigenmodes otherwise (nine rank-one block updates), instead of a 9x9 tangent
+contracted term by term (1296 multiply-adds per element); `tests/mochi/test_soft_materials.py` checks the blocks
+against the contraction to 1e-10 on tension, compression, shear and inversion. Gripper GPU B=256 assembly kernel 1.67
+-> 1.51 ms per call (step 165 -> 160 ms), duck B=1024 673 -> 641 ms. On the CPU the duck does not move (86 ms): near
+rest under compression the oracle fails - the rest state is exactly marginal by construction of the model's alpha - so
+most tetrahedra take the SVD + Jacobi eigenmode path, where the block form saves only a fifth of the arithmetic.
+
+Culling the rigid samples that query the deformable colliders was tried and rejected. Per assembly, each link's
+sample hierarchy (the trees the rigid contact evaluation traverses) was descended against the current collider bounds
+(tetrahedron-tree root box, sphere bounds plus contact range) and only the overlapping leaves' samples queried - exact,
+and on the gripper it cut the queries from 16k to ~3k once the fingers hold the cube (a per-step variant on the
+broadphase's conservative bounds kept 11k: 12 cm link pads and a 31 cm box around a 5 cm cube). The step did not move
+on the gripper (B=256 160 -> 170 ms, B=1024 652 -> 717) because a far sample already costs one root-box test, and it
+slowed the cloth + arm scene by 50% (B=256 101 -> 153 ms): the cloth spans the arm's workspace, so every link
+traverses its whole tree at every assembly and the list barely shrinks. What the tetrahedron query costs is the
+near-field: thousands of finger-pad samples inside the cube's box, each a divergent descent.
+
+The CSR matvec of the deformable Hessian walks the column sequence of a vertex's three rows once per vertex (the
+sparsity is built from whole vertex blocks, so the three rows share it; the layout asserts this and adds every vertex's
+own 3x3 block): one thread per vertex reads each column index and source value once for three rows, a third of the
+index traffic and of the gathered loads. Rod twist rows keep the scalar walk. Gripper GPU B=256 matvec pass 0.209 ->
+0.181 ms per PCG iteration; duck GPU B=1024 641 -> 581 ms/step, gripper B=1024 652 -> 627; CPU fp64 single thread: duck 86 -> 67 ms/step (-22%, 5.4x mochi), gripper 71 -> 64,
+t-shirt 148 -> 87 (-41%, 2.7x mochi).
+
+The three per-environment reductions of a conjugate-gradient iteration (p.Ap; the residual update fused with the
+Polak-Ribiere cross term; r.z and z.z) run as 256-thread blocks tiled as 32 environment lanes by 8 chunks of a 64-dof
+tile: every warp reads 32 consecutive environments of one row, the chunks are summed in shared memory and each
+environment receives one atomic per tile instead of one per dof (standalone: 44 -> 15 us per pass at B=256, and a
+tenth of the fp32 rounding error of per-dof atomics). The CPU and per-environment paths are unchanged. GPU fp32 pipeline: gripper B=256 159 -> 154 ms/step, B=1024 627 -> 569 (-9%),
+cloth + arm B=1024 391 -> 365, t-shirt B=256 255 -> 236, duck B=1024 unchanged (581). (The kernel profiler cannot
+see this: it inflates every small task to ~0.1 ms, so only wall-clock step times are used to judge such passes.)
+
+### CPU fp64 single thread after Plan 2 (monolith, ms/step; mochi single-threaded in parentheses)
+
+| scene | before Plan 2 | now | vs mochi |
+|---|---|---|---|
+| soft_duck | 88.7 | 67 | 5.4x (12.4) |
+| cloth_tshirt | 240 | 87 | 2.7x (32.2) |
+| soft_gripper | 92-130 | 64 | - |
+| rod_helix | 6.0 | 6.0 | 2.6x (2.28) |
+
+The t-shirt reached the 2-3x band through the hash (240 -> 148) and the vertex-row matvec (148 -> 87); the duck's
+remaining gap is the eigenmode path of its resting tetrahedra (44% of its step) and the scalar fp64 arithmetic that
+mochi does in 8-wide fp32.
+
+Gripper profile at B=256 after the hierarchy: tetrahedral contact query 23% (was 48%), conjugate gradient 37% (the
+CSR matvec at ~75% of the card's bandwidth, the vector passes limited by per-environment atomics), tetrahedron assembly
+13% (12x12 element tangents; Phase K1).

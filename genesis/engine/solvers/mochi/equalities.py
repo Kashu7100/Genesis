@@ -135,6 +135,8 @@ def func_joint_coupling(
 def func_equalities_stage_start(
     i_b_env,
     per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
     mochi_info: MochiInfo,
@@ -148,8 +150,8 @@ def func_equalities_stage_start(
     _B = mochi_state.is_active.shape[0]
     EPS = mochi_info.EPS[None]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_eq, i_b_ in qd.ndrange(n_eq, _B) if qd.static(not per_env) else qd.ndrange(n_eq, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_eq, i_slot in qd.ndrange(n_eq, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_eq, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         c = qd.Vector.zero(gs.qd_float, 6)
         eq_type = eq_info.eq_type[i_eq]
         if eq_type == gs.EQUALITY_TYPE.JOINT:
@@ -182,7 +184,17 @@ def kernel_equalities_stage_start(
     rigid_config: qd.template(),
 ):
     func_equalities_stage_start(
-        0, False, dyn_info, rigid_info, mochi_info, mochi_state, eq_info, eq_state, rigid_config
+        0,
+        False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
+        dyn_info,
+        rigid_info,
+        mochi_info,
+        mochi_state,
+        eq_info,
+        eq_state,
+        rigid_config,
     )
 
 
@@ -190,6 +202,8 @@ def kernel_equalities_stage_start(
 def func_assemble_equalities(
     i_b_env,
     per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
@@ -213,8 +227,8 @@ def func_assemble_equalities(
     d = mochi_info.equality_damping[None]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_eq, i_b_ in qd.ndrange(n_eq, _B) if qd.static(not per_env) else qd.ndrange(n_eq, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_eq, i_slot in qd.ndrange(n_eq, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_eq, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
         h = mochi_state.dt_stage[i_b]
@@ -316,12 +330,14 @@ def kernel_assemble_equalities(
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.template(),
-    skip_ls_done: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
 ):
     func_assemble_equalities(
         0,
         False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
         dyn_state,
         dyn_info,
         rigid_info,

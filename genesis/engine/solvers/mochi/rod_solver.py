@@ -25,6 +25,8 @@ def func_rod_band_add(row, col, value, i_b, soft_state: MochiSoftState):
 def func_rod_band_factor(
     i_b_env,
     per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     mochi_state: MochiState,
     soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
@@ -38,8 +40,8 @@ def func_rod_band_factor(
     dof_start = soft_info.dof_start[None]
     twist_dof_start = soft_info.twist_dof_start[None]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_e, i_b_ in qd.ndrange(n_entities, _B) if qd.static(not per_env) else qd.ndrange(n_entities, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_e, i_slot in qd.ndrange(n_entities, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_entities, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         n = soft_info.entities_band_n[i_e]
         if n == 0 or not mochi_state.pcg_is_active[i_b]:
             continue
@@ -106,6 +108,8 @@ def func_rod_band_factor(
 def func_rod_band_solve(
     i_b_env,
     per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
     r: qd.Tensor,
     z: qd.Tensor,
     mochi_state: MochiState,
@@ -117,8 +121,8 @@ def func_rod_band_solve(
     n_entities = soft_info.entities_band_n.shape[0]
     _B = soft_state.verts_pos.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_e, i_b_ in qd.ndrange(n_entities, _B) if qd.static(not per_env) else qd.ndrange(n_entities, 1):
-        i_b = i_b_ if qd.static(not per_env) else i_b_env
+    for i_e, i_slot in qd.ndrange(n_entities, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_entities, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         n = soft_info.entities_band_n[i_e]
         if n == 0 or not mochi_state.pcg_is_active[i_b]:
             continue

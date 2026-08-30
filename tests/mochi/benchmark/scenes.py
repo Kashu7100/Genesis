@@ -38,6 +38,23 @@ SCENES = {
         "description": "Franka arm on a plane next to a box (Genesis only)",
         "genesis_only": True,
     },
+    # Reinforcement-learning shaped scenes (mochi's default Newton budget): a Franka arm descends onto a deformable and
+    # closes its fingers; every environment runs the same scripted motion.
+    "cloth_arm": {
+        "newton_cap": 4,
+        "description": "Franka arm pressing a 31x31 cloth with self-contact lying on the ground (Genesis only)",
+        "genesis_only": True,
+    },
+    "soft_gripper": {
+        "newton_cap": 4,
+        "description": "Franka gripper closing on a tetrahedral cube (Genesis only)",
+        "genesis_only": True,
+    },
+    "rope_arm": {
+        "newton_cap": 4,
+        "description": "Franka arm pressing a 64-node rope lying on the ground (Genesis only)",
+        "genesis_only": True,
+    },
 }
 
 # --- rigid -----------------------------------------------------------------------------------------------------------
@@ -82,18 +99,53 @@ ROD_E = 1e9
 ROD_G = 1e9
 ROD_RHO = 1000.0
 
+# --- RL scenes: Franka arm + deformable (poses from examples/mochi/articulated_arm.py: the hand starts ~0.30 m above the
+# work point and is driven to ~0.13 m, where the closing fingertips reach the ground) -----------------------------------
+FRANKA_XML = "xml/franka_emika_panda/panda.xml"
+FRANKA_START_QPOS = (-1.0418, 1.3805, 1.5885, -1.7021, -1.3798, 1.5783, 1.4467, 0.04, 0.04)
+FRANKA_TARGET_QPOS = (-1.0095, 1.5617, 1.3595, -1.6830, -1.5855, 1.7817, 1.4595, 0.04, 0.04)
+FRANKA_MOTORS = np.arange(7)
+FRANKA_FINGERS = np.arange(7, 9)
+FRANKA_FINGER_FORCE = -1.0
+WORK_XY = (0.65, 0.0)
+CLOTH_CELLS, CLOTH_SIZE, CLOTH_HEIGHT = 30, 0.3, 0.01
+CLOTH_E, CLOTH_NU, CLOTH_RHO, CLOTH_THICKNESS = 2e4, 0.3, 200.0, 1e-3
+CLOTH_CONTACT_RADIUS, CLOTH_FRICTION, CLOTH_PENALTY = 5e-3, 0.6, 1e7
+SOFT_CUBE_SIZE, SOFT_CUBE_MAXVOLUME = 0.05, 6e-8
+SOFT_CUBE_E, SOFT_CUBE_NU, SOFT_CUBE_RHO = 2e4, 0.4, 800.0
+ROPE_NODES, ROPE_LENGTH, ROPE_RADIUS = 64, 0.5, 5e-3
+ROPE_E, ROPE_G, ROPE_RHO = 1e7, 1e7, 1000.0
 
-def rod_material_params():
-    area = np.pi * ROD_RADIUS**2
-    second_moment = 0.25 * np.pi * ROD_RADIUS**4
-    polar_moment = 0.5 * np.pi * ROD_RADIUS**4
+
+def rod_material_params(radius=ROD_RADIUS, E=ROD_E, G=ROD_G, rho=ROD_RHO):
+    area = np.pi * radius**2
+    second_moment = 0.25 * np.pi * radius**4
+    polar_moment = 0.5 * np.pi * radius**4
     return {
-        "axial_stiffness": ROD_E * area,
-        "flexural_stiffness": ROD_E * second_moment,
-        "torsional_stiffness": ROD_G * polar_moment,
-        "linear_density": ROD_RHO * area,
-        "linear_rotational_inertia": ROD_RHO * polar_moment,
+        "axial_stiffness": E * area,
+        "flexural_stiffness": E * second_moment,
+        "torsional_stiffness": G * polar_moment,
+        "linear_density": rho * area,
+        "linear_rotational_inertia": rho * polar_moment,
     }
+
+
+def _sheet_obj(directory, n_cells, size):
+    """Square shell mesh of n_cells x n_cells cells (two triangles each) centered at the origin, written as an .obj."""
+    import trimesh
+
+    axis = np.linspace(-0.5 * size, 0.5 * size, n_cells + 1)
+    X, Y = np.meshgrid(axis, axis, indexing="ij")
+    verts = np.stack([X.reshape(-1), Y.reshape(-1), np.zeros(X.size)], axis=-1)
+    faces = []
+    for i in range(n_cells):
+        for j in range(n_cells):
+            a = i * (n_cells + 1) + j
+            faces.append([a, a + 1, a + n_cells + 2])
+            faces.append([a, a + n_cells + 2, a + n_cells + 1])
+    path = os.path.join(directory, f"sheet_{n_cells}.obj")
+    trimesh.Trimesh(vertices=verts, faces=np.array(faces), process=False).export(path)
+    return path
 
 
 def z_up_to_y_up(points):
@@ -358,6 +410,61 @@ def build_genesis(name, n_envs=1, show_viewer=False, **mochi_kwargs):
 
         def probe():
             return float(_as_points(franka.get_link("hand").get_pos())[0, 2])
+    elif name in ("cloth_arm", "soft_gripper", "rope_arm"):
+        scene.add_entity(gs.morphs.Plane(), material=gs.materials.Mochi.Rigid())
+        franka = scene.add_entity(
+            gs.morphs.MJCF(file=FRANKA_XML), material=gs.materials.Mochi.Rigid(friction=1.0, viscous_friction=1.0)
+        )
+        if name == "cloth_arm":
+            directory = tempfile.mkdtemp(prefix="mochi_bench_")
+            cloth = scene.add_entity(
+                gs.morphs.Mesh(file=_sheet_obj(directory, CLOTH_CELLS, CLOTH_SIZE), pos=(*WORK_XY, CLOTH_HEIGHT)),
+                material=gs.materials.Mochi.Shell(
+                    E=CLOTH_E,
+                    nu=CLOTH_NU,
+                    rho=CLOTH_RHO,
+                    thickness=CLOTH_THICKNESS,
+                    friction=CLOTH_FRICTION,
+                    collider_radius=CLOTH_CONTACT_RADIUS,
+                    penalty_coefficient=CLOTH_PENALTY,
+                    self_contact=True,
+                ),
+            )
+
+            def probe():
+                return float(_as_points(cloth.get_vertices_position())[:, 2].max())
+        elif name == "soft_gripper":
+            cube = scene.add_entity(
+                gs.morphs.Box(
+                    size=(SOFT_CUBE_SIZE,) * 3,
+                    pos=(*WORK_XY, 0.5 * SOFT_CUBE_SIZE),
+                    maxvolume=SOFT_CUBE_MAXVOLUME,
+                    nobisect=False,
+                ),
+                material=gs.materials.Mochi.Elastic(
+                    E=SOFT_CUBE_E, nu=SOFT_CUBE_NU, rho=SOFT_CUBE_RHO, friction=1.0, viscous_friction=1.0
+                ),
+            )
+
+            def probe():
+                return float(_as_points(cube.get_vertices_position())[:, 2].max())
+        else:
+            # The rope lies on the ground along x through the work point; the descending hand presses its middle.
+            xs = WORK_XY[0] + np.linspace(-0.5 * ROPE_LENGTH, 0.5 * ROPE_LENGTH, ROPE_NODES)
+            points = np.stack([xs, np.full(ROPE_NODES, WORK_XY[1]), np.full(ROPE_NODES, ROPE_RADIUS + 1e-3)], axis=-1)
+            rope = scene.add_entity(
+                gs.morphs.Rod(points=points, radius=ROPE_RADIUS),
+                material=gs.materials.Mochi.Rod(**rod_material_params(ROPE_RADIUS, ROPE_E, ROPE_G, ROPE_RHO)),
+            )
+
+            def probe():
+                return float(_as_points(rope.get_vertices_position())[ROPE_NODES // 2, 2])
+
+        post_build.append(lambda: franka.set_qpos(np.array(FRANKA_START_QPOS)))
+        post_build.append(
+            lambda: franka.control_dofs_position(np.array(FRANKA_TARGET_QPOS)[FRANKA_MOTORS], FRANKA_MOTORS)
+        )
+        post_build.append(lambda: franka.control_dofs_force(np.full(2, FRANKA_FINGER_FORCE), FRANKA_FINGERS))
     else:
         raise ValueError(f"unknown scene {name}")
 
