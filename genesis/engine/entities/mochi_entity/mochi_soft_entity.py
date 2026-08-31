@@ -192,10 +192,8 @@ class MochiSoftEntity(Entity):
                 gs.raise_exception("Shells are surface meshes: a tetrahedral mesh file cannot be used for a shell.")
             load_files = load_tet_files if morph.file.endswith(TET_NODE_FORMAT) else load_vtk_tet_files
             verts, elems = load_files(morph.file)
-            verts = verts * np.asarray(morph.scale, dtype=np.float64)
-            verts = verts @ gu.quat_to_R(np.asarray(morph.quat, dtype=np.float64)).T + np.asarray(
-                morph.pos, dtype=np.float64
-            )
+            # The morph rotation is applied by `instantiate` (about the vertex centroid, like every other morph).
+            verts = verts * np.asarray(morph.scale, dtype=np.float64) + np.asarray(morph.pos, dtype=np.float64)
             self.instantiate(verts, elems)
             surface_tri, _ = self._boundary_triangles(self.elems)
             vmesh = gs.Mesh.from_trimesh(
