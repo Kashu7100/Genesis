@@ -20,6 +20,7 @@ from ..base_entity import Entity
 from .mochi_entity import filter_entity_contacts
 
 TET_NODE_FORMAT = ".node"
+TET_VTK_FORMAT = ".vtk"
 
 
 def load_tet_files(node_path):
@@ -53,6 +54,57 @@ def load_tet_files(node_path):
     tets = elems[:, 1:5].astype(np.int64) - index_base
     if tets.min(initial=0) < 0 or tets.max(initial=-1) >= len(verts):
         gs.raise_exception(f"Tetrahedral mesh '{ele_path}' references vertices outside '{node_path}'.")
+    return verts, tets
+
+
+def load_vtk_tet_files(path):
+    """Vertices and tetrahedra of a legacy ASCII VTK unstructured grid holding a tetrahedral mesh (the format Drake
+    ships its deformable meshes in)."""
+    with open(path) as f:
+        lines = [line.split("#", 1)[0] for line in f]
+
+    def read_tokens(start, count):
+        tokens = []
+        i = start
+        while len(tokens) < count and i < len(lines):
+            tokens.extend(lines[i].split())
+            i += 1
+        if len(tokens) < count:
+            gs.raise_exception(f"Truncated VTK mesh file: '{path}'.")
+        return tokens[:count], i
+
+    verts = cells = cell_types = None
+    i = 0
+    while i < len(lines):
+        parts = lines[i].split()
+        if parts and parts[0] == "POINTS":
+            values, i = read_tokens(i + 1, 3 * int(parts[1]))
+            verts = np.array(values, dtype=np.float64).reshape((-1, 3))
+        elif parts and parts[0] == "CELLS":
+            values, i = read_tokens(i + 1, int(parts[2]))
+            cells = np.array(values, dtype=np.int64)
+        elif parts and parts[0] == "CELL_TYPES":
+            values, i = read_tokens(i + 1, int(parts[1]))
+            cell_types = np.array(values, dtype=np.int64)
+        else:
+            i += 1
+    if verts is None or cells is None or cell_types is None:
+        gs.raise_exception(f"'{path}' is not an ASCII VTK unstructured grid (POINTS, CELLS and CELL_TYPES required).")
+
+    tets = []
+    offset = 0
+    for cell_type in cell_types:
+        n_nodes = int(cells[offset])
+        if cell_type == 10:
+            if n_nodes != 4:
+                gs.raise_exception(f"Malformed tetrahedron in VTK mesh file '{path}'.")
+            tets.append(cells[offset + 1 : offset + 5])
+        offset += 1 + n_nodes
+    if not tets:
+        gs.raise_exception(f"VTK mesh file '{path}' holds no tetrahedra.")
+    tets = np.stack(tets)
+    if tets.min() < 0 or tets.max() >= len(verts):
+        gs.raise_exception(f"VTK mesh file '{path}' references vertices outside its POINTS block.")
     return verts, tets
 
 
@@ -95,6 +147,7 @@ class MochiSoftEntity(Entity):
         self._vvert_start = vvert_start
         self._vface_start = vface_start
         self._queried_states = QueriedStates()
+        self._attachments = []
 
         self.sample()
 
@@ -134,11 +187,15 @@ class MochiSoftEntity(Entity):
         if self._is_rod:
             self._sample_rod()
             return
-        if isinstance(morph, gs.morphs.Mesh) and morph.file.endswith(TET_NODE_FORMAT):
+        if isinstance(morph, gs.morphs.Mesh) and morph.file.endswith((TET_NODE_FORMAT, TET_VTK_FORMAT)):
             if self._is_shell:
                 gs.raise_exception("Shells are surface meshes: a tetrahedral mesh file cannot be used for a shell.")
-            verts, elems = load_tet_files(morph.file)
-            verts = verts * np.asarray(morph.scale, dtype=np.float64) + np.asarray(morph.pos, dtype=np.float64)
+            load_files = load_tet_files if morph.file.endswith(TET_NODE_FORMAT) else load_vtk_tet_files
+            verts, elems = load_files(morph.file)
+            verts = verts * np.asarray(morph.scale, dtype=np.float64)
+            verts = verts @ gu.quat_to_R(np.asarray(morph.quat, dtype=np.float64)).T + np.asarray(
+                morph.pos, dtype=np.float64
+            )
             self.instantiate(verts, elems)
             surface_tri, _ = self._boundary_triangles(self.elems)
             vmesh = gs.Mesh.from_trimesh(
@@ -303,6 +360,41 @@ class MochiSoftEntity(Entity):
         self._solver.get_soft_entity_state(self, state.pos, state.vel)
         self._queried_states.append(state)
         return state
+
+    def attach_to_link(self, link, verts_idx, stiffness=1e6, damping=0.0):
+        """Rigidly attach vertices of this deformable body to a rigid link.
+
+        Each attached vertex is tied by a stiff penalty (inside the implicit solve) to the point of the link it
+        coincides with when the scene is built, so place the body at its mounted pose. Forces act on both sides and
+        the coupled bodies form one simulation island. Must be called before the scene is built.
+
+        Parameters
+        ----------
+        link : RigidLink
+            A link of a rigid or articulated entity simulated by the MochiSolver.
+        verts_idx : array_like
+            Indices of the vertices of this entity to attach.
+        stiffness : float, optional
+            Penalty stiffness k of the energy 1/2 k |c|^2 per vertex, in N/m. Defaults to 1e6 (mochi's constraint
+            default).
+        damping : float, optional
+            Damping d on the violation rate, adding 1/2 (d / dt) |c - c_stage_start|^2 per stage. Defaults to 0.
+        """
+        if self.is_built:
+            gs.raise_exception("Attachments must be registered before the scene is built.")
+        verts_idx = np.unique(np.asarray(verts_idx, dtype=gs.np_int).reshape((-1,)))
+        if len(verts_idx) == 0 or verts_idx[0] < 0 or verts_idx[-1] >= self.n_vertices:
+            gs.raise_exception(f"'verts_idx' must be non-empty vertex indices within [0, {self.n_vertices}).")
+        if stiffness <= 0.0 or damping < 0.0:
+            gs.raise_exception("'stiffness' must be positive and 'damping' non-negative.")
+        self._attachments.append(
+            {"link": link, "verts_idx": verts_idx, "stiffness": float(stiffness), "damping": float(damping)}
+        )
+
+    @property
+    def attachments(self):
+        """Rigid-link attachment registrations of this entity."""
+        return self._attachments
 
     def get_vertices_position(self, envs_idx=None):
         """World positions of the vertices, shape (n_vertices, 3) or (n_envs, n_vertices, 3)."""
