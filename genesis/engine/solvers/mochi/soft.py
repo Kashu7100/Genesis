@@ -3549,7 +3549,7 @@ def func_pc_collider_eval(
         is_shell_a = kind_a == 1 and soft_info.entities_kind[e_a] != SOFT_KIND_SOLID
         cell_q = func_hash_cell(pos, inv_cell)
         entry = soft_state.pc_hash_heads[func_hash_bin(cell_q, n_bins - 1), i_b]
-        for _ in range(8 * n_verts):
+        for _walk in range(8 * n_verts):
             if entry < 0:
                 break
             i_vb = entry // 8
