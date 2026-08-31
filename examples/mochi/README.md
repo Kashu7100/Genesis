@@ -71,7 +71,6 @@ to record a video):
   scene).
 - `rod_helix.py`: a helical spring hanging from its first node (`rod_helix` benchmark scene).
 - `cloth_arm.py`: a Franka arm pressing a 31x31 self-colliding cloth on the ground (`cloth_arm` benchmark scene).
-- `soft_gripper.py`: a Franka gripper closing on a soft tetrahedral cube (`soft_gripper` benchmark scene).
 - `rope_arm.py`: a Franka arm pressing the middle of a 64-node rope on the ground (`rope_arm` benchmark scene).
 
 The benchmark-scene examples reproduce the acceptance scenes of `tests/mochi/benchmark` (same meshes, materials and
