@@ -86,6 +86,9 @@ to record a video):
 - `rigid_bodies.py`: a sphere and a cube dropped onto a table standing on the ground.
 - `articulated_arm.py`: a Franka Panda arm grasping and lifting a soft box under PD joint control.
 - `loop_closure.py`: a four-bar linkage closed by a connect equality constraint, next to two welded boxes.
+- `bolt_nut_self_screw.py`: a nut screwing itself down a fixed bolt through non-convex thread contact (the
+  mochi counterpart of `examples/rigid/bolt_nut_self_screw.py`), at plain 60 Hz steps with no substeps;
+  `--torque 1.0` unscrews it back up, and the self-locking thread holds the nut once the torque is released.
 - `cloth.py`: a sheet draped over a rigid box, and a ball caught by a sheet whose held corners then sway.
 - `cloth_p1q6.py`: the drape of `cloth.py` with six contact samples per triangle (`-q P1Q3` for the default
   three), printing how deep the box edge shows through the cloth surface — an A/B of the sampled-contact edge
