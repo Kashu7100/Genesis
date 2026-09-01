@@ -1077,8 +1077,12 @@ class MochiOptions(Options):
         Whether to batch joint info. Defaults to False.
     batch_dofs_info : bool, optional
         Whether to batch DOF info. Defaults to False.
+    IK_max_targets : int, optional
+        Maximum number of simultaneous target links of an inverse-kinematics solve (the scratch buffers are quadratic
+        in it and allocated at the first solve). Defaults to 6.
     """
 
+    IK_max_targets: PositiveInt = 6
     dt: PositiveFloat | None = None
     gravity: Vec3FType | None = None
     integrator: Literal["backward_euler", "bdf2"] = "backward_euler"

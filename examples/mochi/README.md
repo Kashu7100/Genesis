@@ -86,6 +86,9 @@ to record a video):
 - `rod_helix.py`: a helical spring hanging from its first node (`rod_helix` benchmark scene).
 - `cloth_arm.py`: a Franka arm pressing a 31x31 self-colliding cloth on the ground (`cloth_arm` benchmark scene).
 - `rope_arm.py`: a Franka arm pressing the middle of a 64-node rope on the ground (`rope_arm` benchmark scene).
+- `cloth_teleop.py`: keyboard teleoperation of a Franka arm grabbing two stacked cloths draped over a grid of
+  cubes (inverse kinematics on the target frame; the mochi counterpart of the IPC robot-cloth teleoperation
+  example).
 
 The benchmark-scene examples reproduce the acceptance scenes of `tests/mochi/benchmark` (same meshes, materials and
 Newton budgets; the duck, t-shirt and helix assets are converted from the original mochi engine's examples) and read
