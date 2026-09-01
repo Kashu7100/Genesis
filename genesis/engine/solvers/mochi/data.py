@@ -89,6 +89,8 @@ class MochiStaticConfig(metaclass=AutoInitMeta):
     # tetrahedral elements present (the tetrahedron assembly is compiled only then)
     has_tets: bool
     has_equalities: bool
+    # rigid-deformable vertex attachments present (their assembly is compiled only then)
+    has_attachments: bool
     has_pc_colliders: bool
     has_soft_colliders: bool
     # levels of the bounding-box hierarchy of the collider tetrahedra (the refit runs one task per level)
@@ -667,6 +669,15 @@ class MochiSoftInfo:
     samples_bary: qd.Tensor
     samples_weight: qd.Tensor
     samples_entity_idx: qd.Tensor
+    # Rigid-deformable attachments: the attached vertex, its link, the anchor in the link frame and the penalty
+    # stiffness and damping of every attachment; n_attachments bounds the loops (the arrays hold at least one row).
+    att_vert: qd.Tensor
+    att_link: qd.Tensor
+    att_link_is_dynamic: qd.Tensor
+    att_pos_local: qd.Tensor
+    att_stiffness: qd.Tensor
+    att_damping: qd.Tensor
+    n_attachments: qd.Tensor
     # Per deformable entity: kind (0 solid, 1 shell), mass, material, contact parameters, vertex and sample ranges.
     entities_kind: qd.Tensor
     entities_mass: qd.Tensor
@@ -744,6 +755,7 @@ def get_mochi_soft_info(solver):
     )
     n_sh_ = solver.n_shell_elems_
     n_re_, n_rs_ = solver.n_rod_elems_, solver.n_rod_stencils_
+    n_att_ = solver.n_attachments_
     return MochiSoftInfo(
         verts_rest=V(dtype=gs.qd_vec3, shape=(n_sv_,)),
         verts_mass=V(dtype=gs.qd_float, shape=(n_sv_,)),
@@ -829,6 +841,13 @@ def get_mochi_soft_info(solver):
         sdf_values=V(dtype=gs.qd_float, shape=(solver.n_soft_sdf_voxels_,)),
         entities_links_pair_enabled=V(dtype=gs.qd_bool, shape=(n_se_, solver.n_links_)),
         entities_pair_enabled=V(dtype=gs.qd_bool, shape=(n_se_, n_se_)),
+        att_vert=V(dtype=gs.qd_int, shape=(n_att_,)),
+        att_link=V(dtype=gs.qd_int, shape=(n_att_,)),
+        att_link_is_dynamic=V(dtype=gs.qd_int, shape=(n_att_,)),
+        att_pos_local=V(dtype=gs.qd_vec3, shape=(n_att_,)),
+        att_stiffness=V(dtype=gs.qd_float, shape=(n_att_,)),
+        att_damping=V(dtype=gs.qd_float, shape=(n_att_,)),
+        n_attachments=_scalar(gs.qd_int, solver.n_attachments),
         dof_start=_scalar(gs.qd_int, solver.n_dofs),
         twist_dof_start=_scalar(gs.qd_int, solver.n_dofs + 3 * solver.n_soft_verts),
         n_rigid_queries=_scalar(gs.qd_int, solver.n_samples),
@@ -946,6 +965,9 @@ class MochiSoftState:
     tet_tree_min: qd.Tensor
     tet_tree_max: qd.Tensor
 
+    # Attachment violation at the stage start, the reference of the penalty damping.
+    att_c_start: qd.Tensor
+
 
 def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max_pc_hits):
     _B = solver._B
@@ -958,6 +980,7 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         verts_pos_prev=V(dtype=gs.qd_vec3, shape=(N_HISTORY, n_sv_, _B)),
         verts_vel_prev=V(dtype=gs.qd_vec3, shape=(N_HISTORY, n_sv_, _B)),
         verts_pos_stage_start=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
+        att_c_start=V(dtype=gs.qd_vec3, shape=(solver.n_attachments_, _B)),
         verts_vel_stage_start=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
         verts_pos_ls_ref=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
         verts_is_fixed=V(dtype=gs.qd_bool, shape=(n_sv_, _B)),

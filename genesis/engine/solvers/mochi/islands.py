@@ -119,6 +119,17 @@ def func_build_islands(
                         i_b,
                         island_state,
                     )
+            # Attachments couple the deformable entity with the link they anchor to.
+            for i_a in range(soft_info.att_vert.shape[0]):
+                if i_a >= soft_info.n_attachments[None]:
+                    continue
+                if soft_info.att_link_is_dynamic[i_a] != 0:
+                    func_union(
+                        n_rigid_entities + soft_info.verts_entity_idx[soft_info.att_vert[i_a]],
+                        island_state.links_node[soft_info.att_link[i_a]],
+                        i_b,
+                        island_state,
+                    )
             for i_e in range(n_soft_entities):
                 if soft_info.entities_collider_type[i_e] == COLLIDER_TYPE.NONE:
                     continue

@@ -36,6 +36,18 @@ points inside the body, so a few millimeters of interpenetration remain) and its
 mapping, as in mochi; a soft body never collides with itself. Mesh soft bodies reasonably finely
 (`maxvolume=..., nobisect=False`) where sharp rigid features touch them.
 
+Vertices of a deformable body can be rigidly attached to a link of a rigid or articulated entity
+(`entity.attach_to_link(link, verts_idx, stiffness=1e6, damping=0.0)`, mochi's deformable-node-to-rigid constraint):
+each attached vertex is tied by a stiff penalty `1/2 k |c|^2` (plus an optional damping on the violation rate) to the
+point of the link it coincides with at build time, inside the same implicit solve - forces act on both sides and the
+coupled bodies form one simulation island. This is how a robot gets soft parts, e.g. compliant fingertips mounted on
+a gripper (`finray_gripper.py`). A solid can carry a detailed visual mesh skinned by its simulation tetrahedra
+(`entity.set_visual_mesh(file, pos=..., euler=..., scale=...)`, placed in the frame of the simulation mesh file):
+every render vertex is embedded barycentrically in the tetrahedron it falls in (vertices outside the coarse mesh
+extrapolate linearly from the nearest one) and follows the deformation - the usual pairing of a fine render mesh
+with a coarse collision mesh. Tetrahedral simulation meshes can also be read from legacy ASCII VTK unstructured
+grids (`gs.morphs.Mesh(file="....vtk")`), the format Drake ships its deformable meshes in.
+
 Thin shells (`gs.materials.Mochi.Shell`) use the surface triangles of a `Mesh` (or primitive) morph as elements: a
 Saint Venant-Kirchhoff membrane on the metric of the mid-surface and a Koiter-type bending term on its discrete
 curvature, both thickness-integrated from `E`, `nu`, `rho` and `thickness` (each stiffness can be overridden). Shell
@@ -66,6 +78,8 @@ to record a video):
 - `cloth.py`: a sheet draped over a rigid box, and a ball caught by a sheet whose held corners then sway.
 - `rods.py`: a rope clamped at both ends, a stiff cantilever, and a loose rope dropped onto the ground.
 - `soft_bodies.py`: a soft sphere and cube dropped onto the ground, and a rigid box landing on a soft slab.
+- `finray_gripper.py`: a Schunk WSG-50 gripper with deformable FinRay fingers attached to its finger links and
+  skinned visual meshes, closing on a box (requires the LBM eval models, see the example).
 - `soft_duck.py`: the mochi duck (1899 nodes, 8608 tetrahedra) dropped onto the ground (`soft_duck` benchmark scene).
 - `cloth_tshirt.py`: the mochi t-shirt (3593 nodes, self-contact) falling onto the ground (`cloth_tshirt` benchmark
   scene).

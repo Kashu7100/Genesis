@@ -116,6 +116,8 @@ from .soft import (
     SOFT_KIND_SHELL,
     SOFT_KIND_SOLID,
     build_soft_samples,
+    kernel_assemble_attachments,
+    kernel_attachments_stage_start,
     kernel_init_rod_fields,
     kernel_init_shell_fields,
     kernel_init_soft_fields,
@@ -301,6 +303,11 @@ class MochiSolver(KinematicSolver):
     # ------------------------------------ build -----------------------------------------
     # ------------------------------------------------------------------------------------
 
+    @property
+    def n_attachments(self):
+        """Number of rigid-deformable vertex attachments registered on the deformable entities."""
+        return sum(len(att["verts_idx"]) for entity in self._soft_entities for att in entity.attachments)
+
     def build(self):
         self._n_geoms = self.n_geoms
         self._n_cells = self.n_cells
@@ -337,6 +344,7 @@ class MochiSolver(KinematicSolver):
         self.n_shell_elems_ = max(1, self.n_shell_elems)
         self.n_rod_elems_ = max(1, self.n_rod_elems)
         self.n_rod_stencils_ = max(1, self.n_rod_stencils)
+        self.n_attachments_ = max(1, self.n_attachments)
         self.n_dofs_total_ = max(1, self.n_dofs_total)
 
         if gs.qd_float == qd.f32 and any(
@@ -651,6 +659,7 @@ class MochiSolver(KinematicSolver):
             has_soft_colliders=self._has_soft_colliders,
             tet_tree_levels=self.n_tet_levels,
             has_equalities=len(self._equalities) > 0,
+            has_attachments=self.n_attachments > 0,
         )
         self.mochi_info = get_mochi_info(self)
         self.mochi_state = get_mochi_state(self, self._max_pairs, has_dense)
@@ -957,15 +966,46 @@ class MochiSolver(KinematicSolver):
                 self.rigid_config,
             )
 
-        # Render geometry of the deformable surfaces.
+        # Render geometry of the deformable surfaces. The render-vertex offsets are renormalized here because an
+        # entity's visual geoms may have been replaced after later entities were added (`set_visual_mesh`).
+        vvert_start, vface_start = 0, 0
+        for entity in entities:
+            entity._vvert_start, entity._vface_start = vvert_start, vface_start
+            for vgeom in entity.vgeoms:
+                vgeom._vvert_start, vgeom._vface_start = vvert_start, vface_start
+                vvert_start += vgeom.n_vverts
+                vface_start += vgeom.n_vfaces
         n_soft_vverts_ = max(1, self.n_soft_vverts)
         self._soft_vverts_render = array_class.V_VEC(3, dtype=qd.f32, shape=(n_soft_vverts_, _B))
         self._soft_vverts_vert_idx = array_class.V(dtype=gs.qd_int, shape=(n_soft_vverts_,))
+        self._soft_vverts_elem = array_class.V(dtype=gs.qd_int, shape=(n_soft_vverts_,))
+        self._soft_vverts_bary = array_class.V_VEC(4, dtype=gs.qd_float, shape=(n_soft_vverts_,))
         if self.n_soft_vverts > 0:
-            vert_idx = np.concatenate(
-                [vgeom.sim_verts_idx + entity.v_start for entity in entities for vgeom in entity.vgeoms]
-            ).astype(gs.np_int)
-            kernel_soft_init_render(vert_idx, self._soft_vverts_vert_idx)
+            # Global tetrahedron offset of every solid entity, in the concatenation order of the element tables.
+            tet_start, n_tets = {}, 0
+            for entity in entities:
+                if not (entity.is_shell or entity.is_rod):
+                    tet_start[entity.idx_in_solver] = n_tets
+                    n_tets += entity.n_elements
+            vert_idx, elems_idx, bary = [], [], []
+            for entity in entities:
+                for vgeom in entity.vgeoms:
+                    if vgeom.elems_idx is not None:
+                        vert_idx.append(np.zeros(vgeom.n_vverts, dtype=gs.np_int))
+                        elems_idx.append(vgeom.elems_idx + tet_start[entity.idx_in_solver])
+                        bary.append(vgeom.bary)
+                    else:
+                        vert_idx.append(vgeom.sim_verts_idx + entity.v_start)
+                        elems_idx.append(np.full(vgeom.n_vverts, -1, dtype=gs.np_int))
+                        bary.append(np.zeros((vgeom.n_vverts, 4), dtype=gs.np_float))
+            kernel_soft_init_render(
+                np.concatenate(vert_idx).astype(gs.np_int),
+                np.concatenate(elems_idx).astype(gs.np_int),
+                np.concatenate(bary).astype(gs.np_float),
+                self._soft_vverts_vert_idx,
+                self._soft_vverts_elem,
+                self._soft_vverts_bary,
+            )
         rods = [entity for entity in entities if entity.is_rod]
         self._n_rod_vverts = sum(entity.n_vverts for entity in rods)
         n_rod_vverts_ = max(1, self._n_rod_vverts)
@@ -994,6 +1034,8 @@ class MochiSolver(KinematicSolver):
                 self._rod_vverts_offset,
             )
         self._envs_offset = np.asarray(self._scene.envs_offset, dtype=gs.np_float).reshape((_B, 3))
+        if self.n_attachments > 0:
+            self._init_attachments(verts_rest)
 
     @staticmethod
     def _shell_hinges(entity):
@@ -1028,6 +1070,48 @@ class MochiSolver(KinematicSolver):
         bary = np.tile(np.stack([1.0 - points, points, np.zeros(3)], axis=-1), (len(elems), 1))
         sample_weights = (weights[None, :] * lengths[:, None]).reshape((-1,))
         return tri.astype(gs.np_int), bary.astype(gs.np_float), sample_weights.astype(gs.np_float)
+
+    def _init_attachments(self, verts_rest):
+        """Static tables of the rigid-deformable attachments, with the anchors expressed in the link frames of the
+        build pose so that every attachment starts at zero violation."""
+        # The link poses of the build configuration (the deformable rest state is already in world coordinates).
+        self._forward_kinematics(with_velocity=False)
+        att_vert, att_link, att_is_dynamic, att_stiffness, att_damping = [], [], [], [], []
+        for entity in self._soft_entities:
+            for att in entity.attachments:
+                verts_idx = np.asarray(att["verts_idx"], dtype=gs.np_int)
+                link = att["link"]
+                if not (0 <= link.idx < self.n_links):
+                    gs.raise_exception(f"Attachment link '{link.name}' is not simulated by this solver.")
+                att_vert.append(verts_idx + entity.v_start)
+                att_link.append(np.full(len(verts_idx), link.idx, dtype=gs.np_int))
+                att_is_dynamic.append(np.full(len(verts_idx), 0 if link.is_fixed else 1, dtype=gs.np_int))
+                att_stiffness.append(np.full(len(verts_idx), att["stiffness"], dtype=gs.np_float))
+                att_damping.append(np.full(len(verts_idx), att["damping"], dtype=gs.np_float))
+        att_vert = np.concatenate(att_vert)
+        att_link = np.concatenate(att_link)
+        links_pos = self.dyn_state.links.pos.to_numpy()[:, 0].astype(np.float64)
+        links_quat = self.dyn_state.links.quat.to_numpy()[:, 0].astype(np.float64)
+        quat = links_quat[att_link]
+        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        rot = np.empty((len(att_vert), 3, 3))
+        rot[:, 0, 0] = 1.0 - 2.0 * (y * y + z * z)
+        rot[:, 0, 1] = 2.0 * (x * y - z * w)
+        rot[:, 0, 2] = 2.0 * (x * z + y * w)
+        rot[:, 1, 0] = 2.0 * (x * y + z * w)
+        rot[:, 1, 1] = 1.0 - 2.0 * (x * x + z * z)
+        rot[:, 1, 2] = 2.0 * (y * z - x * w)
+        rot[:, 2, 0] = 2.0 * (x * z - y * w)
+        rot[:, 2, 1] = 2.0 * (y * z + x * w)
+        rot[:, 2, 2] = 1.0 - 2.0 * (x * x + y * y)
+        lever = verts_rest[att_vert].astype(np.float64) - links_pos[att_link]
+        pos_local = np.einsum("nij,ni->nj", rot, lever)
+        self.soft_info.att_vert.from_numpy(att_vert.astype(gs.np_int))
+        self.soft_info.att_link.from_numpy(att_link)
+        self.soft_info.att_link_is_dynamic.from_numpy(np.concatenate(att_is_dynamic))
+        self.soft_info.att_pos_local.from_numpy(pos_local.astype(gs.np_float))
+        self.soft_info.att_stiffness.from_numpy(np.concatenate(att_stiffness))
+        self.soft_info.att_damping.from_numpy(np.concatenate(att_damping))
 
     def _soft_csr_layout(self, elems_v, shell_elems_v, shell_elems_hinge, rod_elems_v, rod_stencils_v, rod_stencils_e):
         """Scalar CSR sparsity of the deformable Hessian (local dofs: 3 i_v + k for the vertices, then one twist dof
@@ -1540,6 +1624,8 @@ class MochiSolver(KinematicSolver):
                 self.eq_state,
                 self.rigid_config,
             )
+        if self.mochi_config.has_attachments:
+            kernel_attachments_stage_start(self.mochi_state, self.soft_info, self.soft_state, self.rigid_config)
         kernel_reset_newton(self.mochi_state, self.rigid_config)
         kernel_conservative_bounds(
             self.dyn_state, self.dyn_info, self.mochi_info, self.mochi_state, self.contact_state, self.rigid_config
@@ -1740,6 +1826,18 @@ class MochiSolver(KinematicSolver):
                 self.mochi_state,
                 self.eq_info,
                 self.eq_state,
+                self.rigid_config,
+                assem_obj,
+                assem_res,
+                assem_dres,
+                skip_ls_done,
+            )
+        if self.mochi_config.has_attachments:
+            kernel_assemble_attachments(
+                self.dyn_state,
+                self.mochi_state,
+                self.soft_info,
+                self.soft_state,
                 self.rigid_config,
                 assem_obj,
                 assem_res,
@@ -1985,7 +2083,14 @@ class MochiSolver(KinematicSolver):
         if not self.has_soft or self.n_soft_vverts == 0:
             return None, None, None
         kernel_soft_get_state_render(
-            self._soft_vverts_render, self._soft_vverts_vert_idx, self._envs_offset, self.soft_state, self.rigid_config
+            self._soft_vverts_render,
+            self._soft_vverts_vert_idx,
+            self._soft_vverts_elem,
+            self._soft_vverts_bary,
+            self._envs_offset,
+            self.soft_info,
+            self.soft_state,
+            self.rigid_config,
         )
         if self._n_rod_vverts > 0:
             kernel_rod_get_state_render(

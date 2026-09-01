@@ -53,6 +53,7 @@ from .newton import (
     func_update_linear_tolerance,
 )
 from .soft import (
+    func_attachments_stage_start,
     func_rod_apply_increment,
     func_rod_post_stage,
     func_rod_step_start,
@@ -289,6 +290,17 @@ def kernel_step_graph(
             mochi_state,
             eq_info,
             eq_state,
+            rigid_config,
+        )
+    if qd.static(mochi_config.has_attachments):
+        func_attachments_stage_start(
+            0,
+            False,
+            mochi_state.all_envs,
+            mochi_state.n_envs_all,
+            mochi_state,
+            soft_info,
+            soft_state,
             rigid_config,
         )
     func_reset_newton(0, False, mochi_state.all_envs, mochi_state.n_envs_all, mochi_state, rigid_config)

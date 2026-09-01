@@ -61,6 +61,8 @@ from .newton import (
 )
 from .rigid_assembly import func_assemble_links
 from .soft import (
+    func_assemble_attachments,
+    func_attachments_stage_start,
     func_pc_collider_eval,
     func_pc_hash_build,
     func_rod_apply_increment,
@@ -349,6 +351,22 @@ def func_assemble(
             mochi_state,
             eq_info,
             eq_state,
+            rigid_config,
+            assem_obj,
+            assem_res,
+            assem_dres,
+            skip_ls_done,
+        )
+    if qd.static(mochi_config.has_attachments):
+        func_assemble_attachments(
+            i_b_env,
+            per_env,
+            envs,
+            n_envs,
+            dyn_state,
+            mochi_state,
+            soft_info,
+            soft_state,
             rigid_config,
             assem_obj,
             assem_res,
@@ -670,6 +688,17 @@ def kernel_step_monolith(
                 mochi_state,
                 eq_info,
                 eq_state,
+                rigid_config,
+            )
+        if qd.static(mochi_config.has_attachments):
+            func_attachments_stage_start(
+                i_b,
+                True,
+                mochi_state.all_envs,
+                mochi_state.n_envs_all,
+                mochi_state,
+                soft_info,
+                soft_state,
                 rigid_config,
             )
         func_reset_newton(

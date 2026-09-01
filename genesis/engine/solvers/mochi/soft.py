@@ -1378,6 +1378,133 @@ def func_soft_hit_counts_max(
 
 
 @qd.func
+def func_attachments_stage_start(
+    i_b_env,
+    per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    """Attachment violations at the stage start, the reference of the penalty damping. Runs after the stage-start
+    poses of the links are stored."""
+    n_att = soft_info.att_vert.shape[0]
+    _B = mochi_state.is_active.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_a, i_slot in qd.ndrange(n_att, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_att, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+        if i_a >= soft_info.n_attachments[None]:
+            continue
+        i_v = soft_info.att_vert[i_a]
+        i_l = soft_info.att_link[i_a]
+        rho = gu.qd_transform_by_quat(soft_info.att_pos_local[i_a], mochi_state.links_quat_stage_start[i_l, i_b])
+        soft_state.att_c_start[i_a, i_b] = (
+            soft_state.verts_pos_stage_start[i_v, i_b] - mochi_state.links_pos_stage_start[i_l, i_b] - rho
+        )
+
+
+@qd.kernel
+def kernel_attachments_stage_start(
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    func_attachments_stage_start(
+        0, False, mochi_state.all_envs, mochi_state.n_envs_all, mochi_state, soft_info, soft_state, rigid_config
+    )
+
+
+@qd.func
+def func_assemble_attachments(
+    i_b_env,
+    per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
+    dyn_state: array_class.DynState,
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    assem_obj: qd.template(),
+    assem_res: qd.template(),
+    assem_dres,
+    skip_ls_done,
+):
+    """Penalty of every rigid-deformable attachment: E = 1/2 k |c|^2 + 1/2 (d / h) |c - c_stage_start|^2 on the
+    violation c = x_v - (t_l + R_l p_local), with Gauss-Newton blocks on the vertex and on the link; the coupling
+    between them is applied by the linear solver straight from the attachment tables."""
+    n_att = soft_info.att_vert.shape[0]
+    _B = mochi_state.is_active.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_a, i_slot in qd.ndrange(n_att, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_att, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+        if not func_is_env_active(i_b, mochi_state, skip_ls_done) or i_a >= soft_info.n_attachments[None]:
+            continue
+        i_v = soft_info.att_vert[i_a]
+        i_l = soft_info.att_link[i_a]
+        k = soft_info.att_stiffness[i_a]
+        kappa = soft_info.att_damping[i_a] / mochi_state.dt_stage[i_b]
+        K = k + kappa
+        rho = gu.qd_transform_by_quat(soft_info.att_pos_local[i_a], dyn_state.links.quat[i_l, i_b])
+        c = soft_state.verts_pos[i_v, i_b] - dyn_state.links.pos[i_l, i_b] - rho
+        dc = c - soft_state.att_c_start[i_a, i_b]
+        g = k * c + kappa * dc
+        is_dynamic = soft_info.att_link_is_dynamic[i_a] != 0
+        if qd.static(assem_obj):
+            qd.atomic_add(mochi_state.obj[i_b], 0.5 * k * c.dot(c) + 0.5 * kappa * dc.dot(dc))
+        if qd.static(assem_res):
+            func_add_soft_vec(mochi_state.res, i_v, i_b, g, soft_info)
+            if is_dynamic:
+                torque = rho.cross(g)
+                for kk in qd.static(range(3)):
+                    qd.atomic_add(mochi_state.links_res[i_l, i_b][kk], -g[kk])
+                    qd.atomic_add(mochi_state.links_res[i_l, i_b][3 + kk], -torque[kk])
+        if assem_dres:
+            qd.atomic_add(soft_state.verts_H_diag[i_v, i_b], K * qd.Matrix.identity(gs.qd_float, 3))
+            if is_dynamic:
+                S = skew(rho)
+                SS = -K * (S @ S)
+                I3 = qd.Matrix.identity(gs.qd_float, 3)
+                for kk, ll in qd.static(qd.ndrange(3, 3)):
+                    qd.atomic_add(mochi_state.H_diag[i_l, i_b][kk, ll], K * I3[kk, ll])
+                    qd.atomic_add(mochi_state.H_diag[i_l, i_b][kk, 3 + ll], -K * S[kk, ll])
+                    qd.atomic_add(mochi_state.H_diag[i_l, i_b][3 + kk, ll], K * S[kk, ll])
+                    qd.atomic_add(mochi_state.H_diag[i_l, i_b][3 + kk, 3 + ll], SS[kk, ll])
+
+
+@qd.kernel
+def kernel_assemble_attachments(
+    dyn_state: array_class.DynState,
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    assem_obj: qd.template(),
+    assem_res: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
+):
+    func_assemble_attachments(
+        0,
+        False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
+        dyn_state,
+        mochi_state,
+        soft_info,
+        soft_state,
+        rigid_config,
+        assem_obj,
+        assem_res,
+        assem_dres,
+        skip_ls_done,
+    )
+
+
+@qd.func
 def func_soft_matvec(
     i_b_env,
     per_env: qd.template(),
@@ -1553,6 +1680,28 @@ def func_soft_matvec(
             func_soft_point_force_add(i_la, i_b, r_a, -(D @ dp_b), dst, dyn_state, dyn_info, rigid_config)
         if not soft_state.verts_is_fixed[i_vb, i_b]:
             func_add_soft_vec(dst, i_vb, i_b, -g, soft_info)
+
+    n_att = soft_info.att_vert.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_a, i_slot in qd.ndrange(n_att, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_att, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+        if not mochi_state.pcg_is_active[i_b] or i_a >= soft_info.n_attachments[None]:
+            continue
+        i_v = soft_info.att_vert[i_a]
+        i_l = soft_info.att_link[i_a]
+        K = soft_info.att_stiffness[i_a] + soft_info.att_damping[i_a] / mochi_state.dt_stage[i_b]
+        is_fixed = soft_state.verts_is_fixed[i_v, i_b]
+        dp = qd.Vector.zero(gs.qd_float, 3)
+        if not is_fixed:
+            dp = func_read_soft_vec(src, i_v, i_b, soft_info)
+        if soft_info.att_link_is_dynamic[i_a] != 0:
+            rho = gu.qd_transform_by_quat(soft_info.att_pos_local[i_a], dyn_state.links.quat[i_l, i_b])
+            g_soft = K * dp
+            dp -= func_soft_point_displacement(i_l, i_b, rho, src, dyn_state, dyn_info, rigid_config)
+            # The rigid-rigid part J^T K J is already in the link block; only the coupling remains.
+            func_soft_point_force_add(i_l, i_b, rho, -g_soft, dst, dyn_state, dyn_info, rigid_config)
+        if not is_fixed:
+            func_add_soft_vec(dst, i_v, i_b, K * dp, soft_info)
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_v, i_slot in qd.ndrange(n_verts, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
@@ -1776,6 +1925,33 @@ def func_soft_condense_dense(
                             qd.atomic_add(mochi_state.H_dense[i_b, b_d + r, k_d], column[r])
                             qd.atomic_add(mochi_state.H_dense[i_b, k_d, b_d + r], column[r])
                     i_anc = dyn_info.links.parent_idx[I_anc]
+
+    n_att = soft_info.att_vert.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_a, i_slot in qd.ndrange(n_att, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_att, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+        if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or i_a >= soft_info.n_attachments[None]:
+            continue
+        i_v = soft_info.att_vert[i_a]
+        if soft_state.verts_is_fixed[i_v, i_b]:
+            continue
+        K = soft_info.att_stiffness[i_a] + soft_info.att_damping[i_a] / mochi_state.dt_stage[i_b]
+        b_d = func_soft_dof(i_v, 0, soft_info)
+        for r in qd.static(range(3)):
+            qd.atomic_add(mochi_state.H_dense[i_b, b_d + r, b_d + r], K)
+        if soft_info.att_link_is_dynamic[i_a] != 0:
+            i_la = soft_info.att_link[i_a]
+            rho = gu.qd_transform_by_quat(soft_info.att_pos_local[i_a], dyn_state.links.quat[i_la, i_b])
+            i_anc = i_la
+            while i_anc != -1:
+                I_anc = [i_anc, i_b] if qd.static(rigid_config.batch_links_info) else i_anc
+                for k_d in range(dyn_info.links.dof_start[I_anc], dyn_info.links.dof_end[I_anc]):
+                    vel, ang = func_link_dof_jacobian(i_la, k_d, i_b, dyn_state)
+                    column = -K * (vel + ang.cross(rho))
+                    for r in qd.static(range(3)):
+                        qd.atomic_add(mochi_state.H_dense[i_b, b_d + r, k_d], column[r])
+                        qd.atomic_add(mochi_state.H_dense[i_b, k_d, b_d + r], column[r])
+                i_anc = dyn_info.links.parent_idx[I_anc]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_v, i_slot in qd.ndrange(n_verts, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
@@ -2044,7 +2220,10 @@ def kernel_rod_init_render(
 def kernel_soft_get_state_render(
     vverts_render: qd.Tensor,
     vverts_vert_idx: qd.Tensor,
+    vverts_elem: qd.Tensor,
+    vverts_bary: qd.Tensor,
     envs_offset: qd.types.ndarray(),
+    soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
 ):
@@ -2052,15 +2231,34 @@ def kernel_soft_get_state_render(
     _B = soft_state.verts_pos.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_vv, i_b in qd.ndrange(n_vverts, _B):
-        pos = soft_state.verts_pos[vverts_vert_idx[i_vv], i_b]
+        pos = qd.Vector.zero(gs.qd_float, 3)
+        i_el = vverts_elem[i_vv]
+        if i_el >= 0:
+            # An embedded render vertex follows the barycentric combination of its element's nodes.
+            v = soft_info.elems_v[i_el]
+            bary = vverts_bary[i_vv]
+            for k in qd.static(range(4)):
+                pos += bary[k] * soft_state.verts_pos[v[k], i_b]
+        else:
+            pos = soft_state.verts_pos[vverts_vert_idx[i_vv], i_b]
         for k in qd.static(range(3)):
             vverts_render[i_vv, i_b][k] = qd.cast(pos[k] + envs_offset[i_b, k], qd.f32)
 
 
 @qd.kernel
-def kernel_soft_init_render(vert_idx: qd.types.ndarray(), vverts_vert_idx: qd.Tensor):
+def kernel_soft_init_render(
+    vert_idx: qd.types.ndarray(),
+    elems_idx: qd.types.ndarray(),
+    bary: qd.types.ndarray(),
+    vverts_vert_idx: qd.Tensor,
+    vverts_elem: qd.Tensor,
+    vverts_bary: qd.Tensor,
+):
     for i_vv in range(vert_idx.shape[0]):
         vverts_vert_idx[i_vv] = vert_idx[i_vv]
+        vverts_elem[i_vv] = elems_idx[i_vv]
+        for k in qd.static(range(4)):
+            vverts_bary[i_vv][k] = bary[i_vv, k]
 
 
 @qd.kernel
