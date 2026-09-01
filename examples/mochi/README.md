@@ -52,18 +52,29 @@ Thin shells (`gs.materials.Mochi.Shell`) use the surface triangles of a `Mesh` (
 Saint Venant-Kirchhoff membrane on the metric of the mid-surface and a Koiter-type bending term on its discrete
 curvature, both thickness-integrated from `E`, `nu`, `rho` and `thickness` (each stiffness can be overridden). Shell
 samples carry no orientation (the contact normal comes from the collider, so both sides collide), and shells act as
-colliders through spheres of radius `collider_radius` placed at their vertices (`collider_type="point_cloud"`); a shell
-never collides with itself. Consistently wound meshes are required. Light cloth has little inertia: use a lower
+colliders through spheres of radius `collider_radius` placed at their vertices (`collider_type="point_cloud"`). As in
+mochi, the spheres only collide with the samples of other point-cloud entities (cloths and rods) or of the same body
+under self-contact — rigid bodies and solids interact with a shell through the shell's own samples instead; a shell
+never collides with itself unless `self_contact=True`. Consistently wound meshes are required. Light cloth has little inertia: use a lower
 `penalty_coefficient` (1e7 Pa/m) or a larger `explosion_rel_tol` so that the sudden contact residual of an impact is
 not mistaken for a divergence.
+
+Contact is sampled: a collider is only felt at the boundary quadrature points of the cloth (three per triangle by
+default), so a sharp edge visibly pokes through the flat triangles between samples when the cloth mesh is coarse
+relative to the collider — a 12-cell 0.8 m sheet draped over a 0.3 m box shows the box edge 5-8 mm proud of the cloth
+surface, and the original mochi produces the same picture at the same magnitude (verified side by side at both 1e7 and
+1e9 Pa/m). It is a discretization artifact, not a solver defect; what reduces it is a finer cloth mesh (shorter chords
+across the edge), more samples per triangle (`boundary_element_type="P1Q6"` on `MochiOptions`), or a larger
+`penalty_threshold` on the rigid material so contact engages above the surface and the cloth floats clear of the edge.
 
 Rods (`gs.morphs.Rod` polyline + `gs.materials.Mochi.Rod`) are discrete elastic rods: stretching of the segments,
 bending and twisting at the interior nodes, with one twist angle per segment as an extra unknown and the material
 frames carried along as parallel-transported state (a Kirchhoff rod, no shear). The stiffnesses derive from `E`, `nu`,
 `rho` and the radius (`E A`, `E I`, `G J`, `rho A`, `rho J`) and can be overridden; clamp a rod by fixing its first two
 nodes. Rods collide through samples on their centerline (no radius offset on the colliding side) and act as
-colliders through spheres of the rod radius carried by their nodes (`collider_type="auto"`), so a rigid body resting on
-a rope sits one rod radius above the centerline.
+colliders through spheres of the rod radius carried by their nodes (`collider_type="auto"`); as for shells, the
+spheres only collide with other point-cloud entities or the rod itself under self-contact, so a rod lying on another
+rod sits one rod radius above its centerline while a rigid body touches the centerline samples directly.
 
 Velocities are recovered by finite differences over the step as in mochi: `get_dofs_velocity()` returns
 `sin(dq)/dt` for revolute joints and the sine-based angular velocity `vee(((R - R_prev)/dt) R^T)` for spherical and
@@ -75,7 +86,13 @@ to record a video):
 - `rigid_bodies.py`: a sphere and a cube dropped onto a table standing on the ground.
 - `articulated_arm.py`: a Franka Panda arm grasping and lifting a soft box under PD joint control.
 - `loop_closure.py`: a four-bar linkage closed by a connect equality constraint, next to two welded boxes.
+- `bolt_nut_self_screw.py`: a nut screwing itself down a fixed bolt through non-convex thread contact (the
+  mochi counterpart of `examples/rigid/bolt_nut_self_screw.py`), at plain 60 Hz steps with no substeps;
+  `--torque 1.0` unscrews it back up, and the self-locking thread holds the nut once the torque is released.
 - `cloth.py`: a sheet draped over a rigid box, and a ball caught by a sheet whose held corners then sway.
+- `cloth_p1q6.py`: the drape of `cloth.py` with six contact samples per triangle (`-q P1Q3` for the default
+  three), printing how deep the box edge shows through the cloth surface — an A/B of the sampled-contact edge
+  artifact described above.
 - `rods.py`: a rope clamped at both ends, a stiff cantilever, and a loose rope dropped onto the ground.
 - `soft_bodies.py`: a soft sphere and cube dropped onto the ground, and a rigid box landing on a soft slab.
 - `finray_gripper.py`: a Schunk WSG-50 gripper with deformable FinRay fingers attached to its finger links and

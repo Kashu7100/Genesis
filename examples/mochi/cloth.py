@@ -5,8 +5,8 @@ Light cloth carries little inertia, so the default contact stiffness of 1e9 Pa/m
 magnitude when it lands on an edge and trips the divergence check; 1e7 Pa/m keeps the contact stiff enough for cloth.
 
 The shell membrane and bending terms, the rigid bodies and the penalty contact enter one implicit Newton solve. Shell
-samples collide against the rigid colliders from both sides, and the rigid ball collides against the spheres placed at
-the cloth vertices (point-cloud collider).
+samples collide against the rigid colliders from both sides (this is also how the net catches the ball); the spheres
+placed at the cloth vertices (point-cloud collider) only act against other cloths and rods.
 """
 
 import argparse
