@@ -69,9 +69,27 @@ Velocities are recovered by finite differences over the step as in mochi: `get_d
 `sin(dq)/dt` for revolute joints and the sine-based angular velocity `vee(((R - R_prev)/dt) R^T)` for spherical and
 free joints, which differ from `dq/dt` by a factor `1 - (dq)^2/6`.
 
-- `rigid_bodies.py`: sphere and cube dropped onto a table.
-- `finray_gripper.py`: a Schunk WSG-50 gripper with deformable FinRay fingers attached to its finger links,
-  closing on a box (requires the LBM eval models, see the example).
+Examples in this directory (every one takes `-v` for the viewer, `-g` for the GPU, `-n` for the step count and `-r`
+to record a video):
+
+- `rigid_bodies.py`: a sphere and a cube dropped onto a table standing on the ground.
+- `articulated_arm.py`: a Franka Panda arm grasping and lifting a soft box under PD joint control.
+- `loop_closure.py`: a four-bar linkage closed by a connect equality constraint, next to two welded boxes.
+- `cloth.py`: a sheet draped over a rigid box, and a ball caught by a sheet whose held corners then sway.
+- `rods.py`: a rope clamped at both ends, a stiff cantilever, and a loose rope dropped onto the ground.
+- `soft_bodies.py`: a soft sphere and cube dropped onto the ground, and a rigid box landing on a soft slab.
+- `finray_gripper.py`: a Schunk WSG-50 gripper with deformable FinRay fingers attached to its finger links and
+  skinned visual meshes, closing on a box (requires the LBM eval models, see the example).
+- `soft_duck.py`: the mochi duck (1899 nodes, 8608 tetrahedra) dropped onto the ground (`soft_duck` benchmark scene).
+- `cloth_tshirt.py`: the mochi t-shirt (3593 nodes, self-contact) falling onto the ground (`cloth_tshirt` benchmark
+  scene).
+- `rod_helix.py`: a helical spring hanging from its first node (`rod_helix` benchmark scene).
+- `cloth_arm.py`: a Franka arm pressing a 31x31 self-colliding cloth on the ground (`cloth_arm` benchmark scene).
+- `rope_arm.py`: a Franka arm pressing the middle of a 64-node rope on the ground (`rope_arm` benchmark scene).
+
+The benchmark-scene examples reproduce the acceptance scenes of `tests/mochi/benchmark` (same meshes, materials and
+Newton budgets; the duck, t-shirt and helix assets are converted from the original mochi engine's examples) and read
+those meshes from `tests/mochi/benchmark/assets/`.
 
 Contact points are read back with `get_contacts()` on rigid and deformable entities alike (`with_entity` filters a
 pair). Every record carries the scene entities, links and geoms of both sides (-1 where a side is deformable), the
