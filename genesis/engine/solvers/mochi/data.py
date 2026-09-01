@@ -658,6 +658,7 @@ class MochiSoftInfo:
     rod_stencils_csr: qd.Tensor
     dofs_band_row: qd.Tensor
     band_rows_dof: qd.Tensor
+    band_rows_entity: qd.Tensor
     entities_band_start: qd.Tensor
     entities_band_n: qd.Tensor
     entities_rod_elem_start: qd.Tensor
@@ -790,6 +791,7 @@ def get_mochi_soft_info(solver):
         rod_stencils_csr=V(dtype=gs.qd_int, shape=(n_rs_, 121)),
         dofs_band_row=V(dtype=gs.qd_int, shape=(solver.n_dofs_total_,)),
         band_rows_dof=V(dtype=gs.qd_int, shape=(solver.n_band_rows_,)),
+        band_rows_entity=V(dtype=gs.qd_int, shape=(solver.n_band_rows_,)),
         entities_band_start=V(dtype=gs.qd_int, shape=(n_se_,)),
         entities_band_n=V(dtype=gs.qd_int, shape=(n_se_,)),
         entities_rod_elem_start=V(dtype=gs.qd_int, shape=(n_se_,)),

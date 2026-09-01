@@ -911,6 +911,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                     getattr(self.soft_info, field).from_numpy(csr[name])
         if len(band["rows_dof"]) > 0:
             self.soft_info.band_rows_dof.from_numpy(band["rows_dof"])
+            self.soft_info.band_rows_entity.from_numpy(band["rows_entity"])
         if self.n_soft_entities > 0:
             for name in (
                 "band_start",
@@ -1195,6 +1196,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         n_entities = self.n_soft_entities
         dofs_row = np.full(self.n_dofs_total_, -1, dtype=gs.np_int)
         rows_dof = []
+        rows_entity = []
         band = {
             name: np.zeros(max(1, n_entities), dtype=gs.np_int)
             for name in (
@@ -1223,11 +1225,13 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                     if i_n < n_elems:
                         rows_dof.append(self.n_dofs + 3 * self.n_soft_verts + elem_offset + i_n)
                 band["band_n"][i_e] = len(rows_dof) - band["band_start"][i_e]
+                rows_entity.extend([i_e] * band["band_n"][i_e])
             elem_offset += n_elems
             stencil_offset += n_stencils
         rows_dof = np.array(rows_dof, dtype=gs.np_int)
         dofs_row[rows_dof] = np.arange(len(rows_dof), dtype=gs.np_int)
         band["rows_dof"] = rows_dof
+        band["rows_entity"] = np.array(rows_entity, dtype=gs.np_int)
         band["dofs_row"] = dofs_row
         return band
 
