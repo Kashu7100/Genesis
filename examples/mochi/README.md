@@ -59,6 +59,14 @@ never collides with itself unless `self_contact=True`. Consistently wound meshes
 `penalty_coefficient` (1e7 Pa/m) or a larger `explosion_rel_tol` so that the sudden contact residual of an impact is
 not mistaken for a divergence.
 
+Contact is sampled: a collider is only felt at the boundary quadrature points of the cloth (three per triangle by
+default), so a sharp edge visibly pokes through the flat triangles between samples when the cloth mesh is coarse
+relative to the collider — a 12-cell 0.8 m sheet draped over a 0.3 m box shows the box edge 5-8 mm proud of the cloth
+surface, and the original mochi produces the same picture at the same magnitude (verified side by side at both 1e7 and
+1e9 Pa/m). It is a discretization artifact, not a solver defect; what reduces it is a finer cloth mesh (shorter chords
+across the edge), more samples per triangle (`boundary_element_type="P1Q6"` on `MochiOptions`), or a larger
+`penalty_threshold` on the rigid material so contact engages above the surface and the cloth floats clear of the edge.
+
 Rods (`gs.morphs.Rod` polyline + `gs.materials.Mochi.Rod`) are discrete elastic rods: stretching of the segments,
 bending and twisting at the interior nodes, with one twist angle per segment as an extra unknown and the material
 frames carried along as parallel-transported state (a Kirchhoff rod, no shear). The stiffnesses derive from `E`, `nu`,
