@@ -418,7 +418,14 @@ def func_pcg_init(
         rigid_config,
         mochi_config,
     )
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    qd.loop_config(
+        # A per-environment scalar accumulation contends on one cache line per environment: keep it
+        # serial on the CPU backend unless environments themselves are the parallel axis.
+        serialize=qd.static(
+            rigid_config.para_level < gs.PARA_LEVEL.PARTIAL
+            or (rigid_config.backend == gs.cpu and rigid_config.para_level < gs.PARA_LEVEL.ALL)
+        )
+    )
     for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if mochi_state.pcg_is_active[i_b]:
@@ -514,7 +521,7 @@ def func_pcg_iter(
         mochi_state.pcg_pTAp[i_b] = 0.0
     n_env_tiles = (n_envs[None] + REDUCE_LANES - 1) // REDUCE_LANES
     n_dof_tiles = (n_dofs + REDUCE_TILE - 1) // REDUCE_TILE
-    if qd.static(not per_env and rigid_config.para_level >= gs.PARA_LEVEL.PARTIAL):
+    if qd.static(not per_env and rigid_config.para_level >= gs.PARA_LEVEL.PARTIAL and rigid_config.backend != gs.cpu):
         qd.loop_config(block_dim=REDUCE_BLOCK)
         for i_flat in range(n_env_tiles * n_dof_tiles * REDUCE_BLOCK):
             tid = i_flat % REDUCE_BLOCK
@@ -543,7 +550,14 @@ def func_pcg_iter(
                     total += sh[lane + REDUCE_LANES * c]
                 qd.atomic_add(mochi_state.pcg_pTAp[i_b], total)
     else:
-        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        qd.loop_config(
+            # A per-environment scalar accumulation contends on one cache line per environment: keep it
+            # serial on the CPU backend unless environments themselves are the parallel axis.
+            serialize=qd.static(
+                rigid_config.para_level < gs.PARA_LEVEL.PARTIAL
+                or (rigid_config.backend == gs.cpu and rigid_config.para_level < gs.PARA_LEVEL.ALL)
+            )
+        )
         for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
             i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
             if mochi_state.pcg_is_active[i_b]:
@@ -559,7 +573,7 @@ def func_pcg_iter(
             mochi_state.pcg_rTz_new[i_b] = 0.0
             mochi_state.pcg_rTz_cross[i_b] = 0.0
             mochi_state.pcg_zTz[i_b] = 0.0
-    if qd.static(not per_env and rigid_config.para_level >= gs.PARA_LEVEL.PARTIAL):
+    if qd.static(not per_env and rigid_config.para_level >= gs.PARA_LEVEL.PARTIAL and rigid_config.backend != gs.cpu):
         qd.loop_config(block_dim=REDUCE_BLOCK)
         for i_flat in range(n_env_tiles * n_dof_tiles * REDUCE_BLOCK):
             tid = i_flat % REDUCE_BLOCK
@@ -594,7 +608,14 @@ def func_pcg_iter(
                     total += sh[lane + REDUCE_LANES * c]
                 qd.atomic_add(mochi_state.pcg_rTz_cross[i_b], total)
     else:
-        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        qd.loop_config(
+            # A per-environment scalar accumulation contends on one cache line per environment: keep it
+            # serial on the CPU backend unless environments themselves are the parallel axis.
+            serialize=qd.static(
+                rigid_config.para_level < gs.PARA_LEVEL.PARTIAL
+                or (rigid_config.backend == gs.cpu and rigid_config.para_level < gs.PARA_LEVEL.ALL)
+            )
+        )
         for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
             i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
             if mochi_state.pcg_is_active[i_b]:
@@ -619,7 +640,7 @@ def func_pcg_iter(
         rigid_config,
         mochi_config,
     )
-    if qd.static(not per_env and rigid_config.para_level >= gs.PARA_LEVEL.PARTIAL):
+    if qd.static(not per_env and rigid_config.para_level >= gs.PARA_LEVEL.PARTIAL and rigid_config.backend != gs.cpu):
         qd.loop_config(block_dim=REDUCE_BLOCK)
         for i_flat in range(n_env_tiles * n_dof_tiles * REDUCE_BLOCK):
             tid = i_flat % REDUCE_BLOCK
@@ -656,7 +677,14 @@ def func_pcg_iter(
                 qd.atomic_add(mochi_state.pcg_rTz_new[i_b], total_rz)
                 qd.atomic_add(mochi_state.pcg_zTz[i_b], total_zz)
     else:
-        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        qd.loop_config(
+            # A per-environment scalar accumulation contends on one cache line per environment: keep it
+            # serial on the CPU backend unless environments themselves are the parallel axis.
+            serialize=qd.static(
+                rigid_config.para_level < gs.PARA_LEVEL.PARTIAL
+                or (rigid_config.backend == gs.cpu and rigid_config.para_level < gs.PARA_LEVEL.ALL)
+            )
+        )
         for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
             i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
             if mochi_state.pcg_is_active[i_b]:
