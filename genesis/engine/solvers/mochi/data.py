@@ -409,6 +409,7 @@ class MochiState:
     pcg_rTz_new: qd.Tensor
     pcg_rTz_cross: qd.Tensor
     pcg_pTAp: qd.Tensor
+    pcg_beta: qd.Tensor
     pcg_zTz: qd.Tensor
     pcg_zTz0: qd.Tensor
     pcg_is_active: qd.Tensor
@@ -486,6 +487,7 @@ def get_mochi_state(solver, max_pairs, has_dense):
         pcg_rTz_new=V(dtype=gs.qd_float, shape=(_B,)),
         pcg_rTz_cross=V(dtype=gs.qd_float, shape=(_B,)),
         pcg_pTAp=V(dtype=gs.qd_float, shape=(_B,)),
+        pcg_beta=V(dtype=gs.qd_float, shape=(_B,)),
         pcg_zTz=V(dtype=gs.qd_float, shape=(_B,)),
         pcg_zTz0=V(dtype=gs.qd_float, shape=(_B,)),
         pcg_is_active=V(dtype=gs.qd_bool, shape=(_B,)),

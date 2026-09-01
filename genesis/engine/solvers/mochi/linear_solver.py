@@ -220,8 +220,13 @@ def func_matvec(
     eq_state: MochiEqualitiesState,
     rigid_config: qd.template(),
     mochi_config: qd.template(),
+    update_p: qd.template(),
 ):
-    """dst = H src for the running conjugate gradient environments, applying the projected blocks on the fly."""
+    """dst = H src for the running conjugate gradient environments, applying the projected blocks on the fly.
+
+    With `update_p` the conjugate-gradient direction update p = z + beta p is fused into the initialization pass
+    (src must be pcg_p): the previous iteration computed z and beta, and updating the direction here saves the
+    standalone pass and skips it entirely in converged environments."""
     n_dofs = mochi_state.res.shape[0]
     n_links = mochi_state.H_diag.shape[0]
     max_pairs = contact_state.pair_link_a.shape[0]
@@ -231,42 +236,45 @@ def func_matvec(
     for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if mochi_state.pcg_is_active[i_b]:
-            dst[i_d, i_b] = mochi_state.dofs_H_diag[i_d, i_b] * src[i_d, i_b]
+            x = src[i_d, i_b]
+            if qd.static(update_p):
+                x = mochi_state.pcg_z[i_d, i_b] + mochi_state.pcg_beta[i_b] * x
+                src[i_d, i_b] = x
+            dst[i_d, i_b] = mochi_state.dofs_H_diag[i_d, i_b] * x
 
+    # One segmented pass covers the link blocks, the contact pair couplings and the equality couplings: they are
+    # independent atomic accumulations into dst, and each offloaded loop costs a fixed launch on the device.
+    n_eq = eq_info.eq_type.shape[0] if qd.static(mochi_config.has_equalities) else 0
+    n_rigid_items = n_links + max_pairs + n_eq
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_l, i_slot in qd.ndrange(n_links, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_links, 1):
+    for i_x, i_slot in (
+        qd.ndrange(n_rigid_items, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_rigid_items, 1)
+    ):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if mochi_state.pcg_is_active[i_b] and mochi_info.links.is_dynamic[i_l]:
-            v = func_jacobian_times_dofs(i_l, i_b, src, dyn_state, dyn_info, rigid_config)
-            func_jacobian_transpose_add(
-                i_l, i_b, mochi_state.H_diag[i_l, i_b] @ v, dst, dyn_state, dyn_info, rigid_config
-            )
-
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_p, i_slot in qd.ndrange(max_pairs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(max_pairs, 1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if not mochi_state.pcg_is_active[i_b] or i_p >= contact_state.n_pairs[i_b]:
+        if not mochi_state.pcg_is_active[i_b]:
             continue
-        if contact_state.n_hits[i_p, i_b] == 0:
-            continue
-        i_la = contact_state.pair_link_a[i_p, i_b]
-        i_lb = contact_state.pair_link_b[i_p, i_b]
-        if not (mochi_info.links.is_dynamic[i_la] and mochi_info.links.is_dynamic[i_lb]):
-            continue
-        H_off = mochi_state.H_off[i_p, i_b]
-        v_a = func_jacobian_times_dofs(i_la, i_b, src, dyn_state, dyn_info, rigid_config)
-        v_b = func_jacobian_times_dofs(i_lb, i_b, src, dyn_state, dyn_info, rigid_config)
-        func_jacobian_transpose_add(i_la, i_b, H_off @ v_b, dst, dyn_state, dyn_info, rigid_config)
-        func_jacobian_transpose_add(i_lb, i_b, H_off.transpose() @ v_a, dst, dyn_state, dyn_info, rigid_config)
-
-    if qd.static(mochi_config.has_equalities):
-        n_eq = eq_info.eq_type.shape[0]
-        _B_eq = mochi_state.is_active.shape[0]
-        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-        for i_eq, i_slot in qd.ndrange(n_eq, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_eq, 1):
-            i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-            if not mochi_state.pcg_is_active[i_b]:
-                continue
+        if i_x < n_links:
+            i_l = i_x
+            if mochi_info.links.is_dynamic[i_l]:
+                v = func_jacobian_times_dofs(i_l, i_b, src, dyn_state, dyn_info, rigid_config)
+                func_jacobian_transpose_add(
+                    i_l, i_b, mochi_state.H_diag[i_l, i_b] @ v, dst, dyn_state, dyn_info, rigid_config
+                )
+        elif i_x < n_links + max_pairs:
+            i_p = i_x - n_links
+            if i_p < contact_state.n_pairs[i_b] and contact_state.n_hits[i_p, i_b] != 0:
+                i_la = contact_state.pair_link_a[i_p, i_b]
+                i_lb = contact_state.pair_link_b[i_p, i_b]
+                if mochi_info.links.is_dynamic[i_la] and mochi_info.links.is_dynamic[i_lb]:
+                    H_off = mochi_state.H_off[i_p, i_b]
+                    v_a = func_jacobian_times_dofs(i_la, i_b, src, dyn_state, dyn_info, rigid_config)
+                    v_b = func_jacobian_times_dofs(i_lb, i_b, src, dyn_state, dyn_info, rigid_config)
+                    func_jacobian_transpose_add(i_la, i_b, H_off @ v_b, dst, dyn_state, dyn_info, rigid_config)
+                    func_jacobian_transpose_add(
+                        i_lb, i_b, H_off.transpose() @ v_a, dst, dyn_state, dyn_info, rigid_config
+                    )
+        elif qd.static(mochi_config.has_equalities):
+            i_eq = i_x - n_links - max_pairs
             if eq_info.eq_type[i_eq] == gs.EQUALITY_TYPE.JOINT:
                 h12 = eq_state.joint_h12[i_eq, i_b]
                 if h12 != 0.0:
@@ -327,18 +335,17 @@ def func_apply_preconditioner(
     n_dofs = mochi_state.res.shape[0]
     _B = mochi_state.is_active.shape[0]
     EPS = mochi_info.EPS[None]
-    # The deformable dofs are all written by the deformable preconditioner below (vertex blocks, rod band, twist
-    # diagonal): the scalar Jacobi pass covers the rigid dofs only.
-    n_jacobi = soft_info.dof_start[None] if qd.static(mochi_config.has_soft) else n_dofs
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_slot in qd.ndrange(n_jacobi, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_jacobi, 1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if mochi_state.pcg_is_active[i_b]:
-            z[i_d, i_b] = r[i_d, i_b] / qd.max(mochi_state.pcg_diag[i_d, i_b], EPS)
     if qd.static(mochi_config.has_soft):
+        # The deformable preconditioner covers the rigid dofs in its segmented pass as well.
         func_soft_precondition(
             i_b_env, per_env, envs, n_envs, r, z, mochi_state, soft_info, soft_state, rigid_config, EPS
         )
+    else:
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
+            i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+            if mochi_state.pcg_is_active[i_b]:
+                z[i_d, i_b] = r[i_d, i_b] / qd.max(mochi_state.pcg_diag[i_d, i_b], EPS)
 
 
 @qd.func
@@ -438,6 +445,8 @@ def func_pcg_init(
     for i_slot in range(n_envs[None]) if qd.static(not per_env) else range(1):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         mochi_state.pcg_zTz0[i_b] = mochi_state.pcg_zTz[i_b]
+        mochi_state.pcg_beta[i_b] = 0.0
+        mochi_state.pcg_pTAp[i_b] = 0.0
         # An environment whose right-hand side vanishes takes no iteration at all; the negated comparison also drops
         # a non-finite norm.
         if not (mochi_state.pcg_zTz[i_b] > 0.0):
@@ -513,12 +522,9 @@ def func_pcg_iter(
         eq_state,
         rigid_config,
         mochi_config,
+        True,
     )
 
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_slot in range(n_envs[None]) if qd.static(not per_env) else range(1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        mochi_state.pcg_pTAp[i_b] = 0.0
     n_env_tiles = (n_envs[None] + REDUCE_LANES - 1) // REDUCE_LANES
     n_dof_tiles = (n_dofs + REDUCE_TILE - 1) // REDUCE_TILE
     if qd.static(not per_env and rigid_config.para_level >= gs.PARA_LEVEL.PARTIAL and rigid_config.backend != gs.cpu):
@@ -703,14 +709,8 @@ def func_pcg_iter(
                 mochi_state.pcg_is_active[i_b] = False
             beta = (mochi_state.pcg_rTz_new[i_b] - mochi_state.pcg_rTz_cross[i_b]) / mochi_state.pcg_rTz[i_b]
             mochi_state.pcg_rTz[i_b] = mochi_state.pcg_rTz_new[i_b]
-            mochi_state.pcg_pTAp[i_b] = beta
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if mochi_state.pcg_is_active[i_b]:
-            mochi_state.pcg_p[i_d, i_b] = (
-                mochi_state.pcg_z[i_d, i_b] + mochi_state.pcg_pTAp[i_b] * mochi_state.pcg_p[i_d, i_b]
-            )
+            mochi_state.pcg_beta[i_b] = beta
+            mochi_state.pcg_pTAp[i_b] = 0.0
 
 
 @qd.kernel
