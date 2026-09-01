@@ -193,7 +193,7 @@ def test_double_pendulum_matches_mochi(double_pendulum_urdf_path, show_viewer):
     )
     scene.build()
     assert scene.mochi_solver.n_dofs == 2
-    assert_allclose([link.inertial_mass for link in pendulum.links[1:]], 1.0, tol=1e-9)
+    assert_allclose([link.desc.mass for link in pendulum.links[1:]], 1.0, tol=1e-9)
 
     pendulum.set_dofs_position([0.6, -0.3])
     angles, velocities = [], []

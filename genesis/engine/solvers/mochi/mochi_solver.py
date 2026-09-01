@@ -20,7 +20,7 @@ from genesis.utils import array_class
 from genesis.utils.misc import fits_in_gpu_shared_memory, qd_to_numpy, qd_to_torch, tensor_to_array
 from genesis.utils.sdf import SDF
 
-from ..base_solver import StateChange, Subscriber
+from ..base_solver import GravityMixin, StateChange, Subscriber, TimeBasedMixin
 from ..kinematic_solver import KinematicSolver
 from ..rigid.abd.accessor import (
     kernel_control_dofs_force,
@@ -198,7 +198,7 @@ def _next_power_of_two(n):
     return 1 << max(0, int(n) - 1).bit_length()
 
 
-class MochiSolver(KinematicSolver):
+class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     """
     Fully-implicit multi-physics solver with smooth penalty contact.
 
@@ -450,10 +450,10 @@ class MochiSolver(KinematicSolver):
             np.array(geoms_center, dtype=gs.np_float),
             np.array([geom.init_quat for geom in geoms], dtype=gs.np_float),
             np.array([geom.type for geom in geoms], dtype=gs.np_int),
-            np.array([geom.friction for geom in geoms], dtype=gs.np_float),
-            np.array([geom.friction_torsional for geom in geoms], dtype=gs.np_float),
-            np.array([geom.friction_rolling for geom in geoms], dtype=gs.np_float),
-            np.array([geom.sol_params for geom in geoms], dtype=gs.np_float),
+            np.array([geom.desc.friction for geom in geoms], dtype=gs.np_float),
+            np.array([geom.desc.friction_torsional for geom in geoms], dtype=gs.np_float),
+            np.array([geom.desc.friction_rolling for geom in geoms], dtype=gs.np_float),
+            np.array([geom.desc.sol_params for geom in geoms], dtype=gs.np_float),
             np.array([geom.data for geom in geoms], dtype=gs.np_float),
             np.array([geom.is_convex for geom in geoms], dtype=gs.np_bool),
             np.array([geom.needs_coup for geom in geoms], dtype=gs.np_int),
@@ -505,7 +505,7 @@ class MochiSolver(KinematicSolver):
         self._equalities = [equality for entity in self._entities for equality in entity.equalities]
         dofs_entity_mass = np.zeros(self.n_dofs_total_, dtype=gs.np_float)
         for entity in self._entities:
-            dofs_entity_mass[entity.dof_start : entity.dof_end] = sum(link.inertial_mass for link in entity.links)
+            dofs_entity_mass[entity.dof_start : entity.dof_end] = sum(link.desc.mass for link in entity.links)
         for entity in self._soft_entities:
             dof_start = self.n_dofs + 3 * entity.v_start
             dofs_entity_mass[dof_start : dof_start + entity.n_dofs] = entity.mass
@@ -525,7 +525,7 @@ class MochiSolver(KinematicSolver):
                     geom.entity.material.penalty_coefficient,
                     geom.entity.material.penalty_smoothing_half_distance,
                     geom.entity.material.penalty_threshold,
-                    geom.friction,
+                    geom.desc.friction,
                     geom.entity.material.friction_falloff_vel,
                     geom.entity.material.viscous_friction,
                     geom.entity.material.normal_viscous_damping,
@@ -662,6 +662,7 @@ class MochiSolver(KinematicSolver):
             has_attachments=self.n_attachments > 0,
         )
         self.mochi_info = get_mochi_info(self)
+        self._build_gravity(self.mochi_info.gravity)
         self.mochi_state = get_mochi_state(self, self._max_pairs, has_dense)
         self.mochi_state.all_envs.from_numpy(np.arange(self._B, dtype=gs.np_int))
         self.contact_state = get_mochi_contact_state(self, self._max_pairs)
@@ -671,8 +672,8 @@ class MochiSolver(KinematicSolver):
         kernel_init_mochi_fields(
             np.array([not link.is_fixed for link in links], dtype=gs.np_bool),
             np.array([link.entity.material.has_gravity for link in links], dtype=gs.np_bool),
-            np.array([link.inertial_mass for link in links], dtype=gs.np_float),
-            np.array([link.inertial_i for link in links], dtype=gs.np_float).reshape((-1, 3, 3)),
+            np.array([link.desc.mass for link in links], dtype=gs.np_float),
+            np.array([link.desc.inertia for link in links], dtype=gs.np_float).reshape((-1, 3, 3)),
             np.zeros(self.n_links, dtype=gs.np_float),
             np.array([self._layers.index(link.entity.material.contact_layer) for link in links], dtype=gs.np_int),
             links_sample_start,
@@ -688,7 +689,7 @@ class MochiSolver(KinematicSolver):
             samples_geom_idx,
             self._compute_links_pair_enabled(),
             dofs_entity_mass,
-            np.tile(np.asarray(self._init_gravity, dtype=gs.np_float), (self._B, 1)),
+            np.tile(np.asarray(self._options.gravity, dtype=gs.np_float), (self._B, 1)),
             self.mochi_info,
             self.rigid_config,
         )
@@ -2116,7 +2117,6 @@ class MochiSolver(KinematicSolver):
             return self._queried_states[s_global][0]
         state = MochiSolverState(self._scene, s_global)
         kernel_get_kinematic_state(
-            state.i_pos_shift,
             state.qpos,
             state.dofs_vel,
             state.links_pos,
@@ -2519,6 +2519,47 @@ class MochiSolver(KinematicSolver):
             values = qd_to_numpy(field)
             values[geoms_idx] = value
             field.from_numpy(values)
+
+    @property
+    def is_links_info_batched(self) -> bool:
+        """Whether the inertial properties of a link are stored per environment rather than shared by the batch."""
+        return self._options.batch_links_info
+
+    def get_links_mass(self, links_idx=None, envs_idx=None):
+        """The mass of each link, as the solver currently uses it."""
+        if not self._options.batch_links_info and envs_idx is not None:
+            gs.raise_exception("`envs_idx` cannot be specified for non-batched links info.")
+        tensor = qd_to_torch(self.dyn_info.links.inertial_mass, envs_idx, links_idx, transpose=True, copy=True)
+        return tensor[0] if self.n_envs == 0 and self._options.batch_links_info else tensor
+
+    def get_links_inertia(self, links_idx=None, envs_idx=None):
+        """The inertia matrix of each link, in its inertial frame, as the solver currently uses it."""
+        if not self._options.batch_links_info and envs_idx is not None:
+            gs.raise_exception("`envs_idx` cannot be specified for non-batched links info.")
+        tensor = qd_to_torch(self.dyn_info.links.inertial_i, envs_idx, links_idx, transpose=True, copy=True)
+        return tensor[0] if self.n_envs == 0 and self._options.batch_links_info else tensor
+
+    def get_links_COM(self, links_idx=None, envs_idx=None):
+        """The center of mass (COM) of each link, as an offset from the origin of its local frame."""
+        if not self._options.batch_links_info and envs_idx is not None:
+            gs.raise_exception("`envs_idx` cannot be specified for non-batched links info.")
+        tensor = qd_to_torch(self.dyn_info.links.inertial_pos, envs_idx, links_idx, transpose=True, copy=True)
+        return tensor[0] if self.n_envs == 0 and self._options.batch_links_info else tensor
+
+    def get_links_invweight(self, links_idx=None, envs_idx=None):
+        if not self._options.batch_links_info and envs_idx is not None:
+            gs.raise_exception("`envs_idx` cannot be specified for non-batched links info.")
+        tensor = qd_to_torch(self.dyn_info.links.invweight, envs_idx, links_idx, transpose=True, copy=True)
+        return tensor[0] if self.n_envs == 0 and self._options.batch_links_info else tensor
+
+    def set_links_mass(self, mass, links_idx=None, envs_idx=None, scale_inertia=False):
+        gs.raise_exception("`set_links_mass` is not supported by the MochiSolver: link masses are fixed at build.")
+
+    def set_links_inertia(self, inertia, links_idx=None, envs_idx=None):
+        gs.raise_exception("`set_links_inertia` is not supported by the MochiSolver: link inertias are fixed at build.")
+
+    def set_links_COM(self, com, links_idx=None, envs_idx=None):
+        gs.raise_exception("`set_links_COM` is not supported by the MochiSolver: link inertials are fixed at build.")
 
     def set_links_has_gravity(self, links_idx, has_gravity):
         links_idx = tensor_to_array(links_idx).reshape((-1,))
