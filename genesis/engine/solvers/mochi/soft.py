@@ -587,30 +587,36 @@ def func_soft_zero_assembly(
             soft_state.n_soft_hits[i_b] = 0
             soft_state.n_sc_hits[i_b] = 0
             soft_state.n_pc_hits[i_b] = 0
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_v, i_slot in qd.ndrange(n_verts, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if func_is_env_active(i_b, mochi_state, skip_ls_done):
-            if assem_dres:
-                soft_state.verts_H_diag[i_v, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
-            if qd.static(record):
-                soft_state.verts_contact_force[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
-    # The Hessian is zeroed on full assemblies only. The runtime flag is tested inside the loops: a loop nested under a
-    # runtime condition is not offloaded as a parallel task and would run serially on one thread.
-    n_csr = soft_state.csr_values.shape[0]
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for j, i_slot in qd.ndrange(n_csr, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_csr, 1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if assem_dres and func_is_env_active(i_b, mochi_state, skip_ls_done):
-            soft_state.csr_values[j, i_b] = 0.0
-    # The rod blocks kept for the banded preconditioner are overwritten by the assembly kernels (padding elements
-    # keep their zero allocation); only the accumulated twist diagonal needs zeroing.
-    n_rod_elems = soft_state.rod_elems_H.shape[0]
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_r, i_slot in qd.ndrange(n_rod_elems, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_rod_elems, 1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if assem_dres and func_is_env_active(i_b, mochi_state, skip_ls_done):
-            soft_state.rod_elems_twist_pcg[i_r, i_b] = 0.0
+    if qd.static((not isinstance(assem_dres, (bool, int)) or bool(assem_dres)) or record):
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_v, i_slot in qd.ndrange(n_verts, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
+            i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+            if func_is_env_active(i_b, mochi_state, skip_ls_done):
+                if assem_dres:
+                    soft_state.verts_H_diag[i_v, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
+                if qd.static(record):
+                    soft_state.verts_contact_force[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
+    # The Hessian is zeroed on full assemblies only. When the caller binds the flag to a compile-time constant (the
+    # pipeline's zeroing kernel), the residual-only variant compiles these loops out entirely; the monolith and graph
+    # step kernels bind a runtime flag and keep the loops, testing the flag per element (a loop nested under a runtime
+    # condition is not offloaded as a parallel task and would run serially on one thread).
+    if qd.static(not isinstance(assem_dres, (bool, int)) or bool(assem_dres)):
+        n_csr = soft_state.csr_values.shape[0]
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for j, i_slot in qd.ndrange(n_csr, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_csr, 1):
+            i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+            if assem_dres and func_is_env_active(i_b, mochi_state, skip_ls_done):
+                soft_state.csr_values[j, i_b] = 0.0
+        # The rod blocks kept for the banded preconditioner are overwritten by the assembly kernels (padding elements
+        # keep their zero allocation); only the accumulated twist diagonal needs zeroing.
+        n_rod_elems = soft_state.rod_elems_H.shape[0]
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_r, i_slot in (
+            qd.ndrange(n_rod_elems, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_rod_elems, 1)
+        ):
+            i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+            if assem_dres and func_is_env_active(i_b, mochi_state, skip_ls_done):
+                soft_state.rod_elems_twist_pcg[i_r, i_b] = 0.0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_p, i_slot in qd.ndrange(max_pairs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(max_pairs, 1):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
@@ -629,7 +635,7 @@ def kernel_soft_zero_assembly(
     mochi_state: MochiState,
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
-    assem_dres: qd.i32,
+    assem_dres: qd.template(),
     skip_ls_done: qd.i32,
     record: qd.template(),
 ):

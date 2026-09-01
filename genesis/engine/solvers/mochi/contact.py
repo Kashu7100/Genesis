@@ -250,7 +250,7 @@ def kernel_zero_assembly(
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.i32,
+    assem_dres: qd.template(),
     skip_ls_done: qd.i32,
     record: qd.template(),
 ):
