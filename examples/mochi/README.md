@@ -87,6 +87,9 @@ to record a video):
 - `articulated_arm.py`: a Franka Panda arm grasping and lifting a soft box under PD joint control.
 - `loop_closure.py`: a four-bar linkage closed by a connect equality constraint, next to two welded boxes.
 - `cloth.py`: a sheet draped over a rigid box, and a ball caught by a sheet whose held corners then sway.
+- `cloth_p1q6.py`: the drape of `cloth.py` with six contact samples per triangle (`-q P1Q3` for the default
+  three), printing how deep the box edge shows through the cloth surface — an A/B of the sampled-contact edge
+  artifact described above.
 - `rods.py`: a rope clamped at both ends, a stiff cantilever, and a loose rope dropped onto the ground.
 - `soft_bodies.py`: a soft sphere and cube dropped onto the ground, and a rigid box landing on a soft slab.
 - `finray_gripper.py`: a Schunk WSG-50 gripper with deformable FinRay fingers attached to its finger links and
