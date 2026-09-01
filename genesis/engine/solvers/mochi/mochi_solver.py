@@ -966,15 +966,46 @@ class MochiSolver(KinematicSolver):
                 self.rigid_config,
             )
 
-        # Render geometry of the deformable surfaces.
+        # Render geometry of the deformable surfaces. The render-vertex offsets are renormalized here because an
+        # entity's visual geoms may have been replaced after later entities were added (`set_visual_mesh`).
+        vvert_start, vface_start = 0, 0
+        for entity in entities:
+            entity._vvert_start, entity._vface_start = vvert_start, vface_start
+            for vgeom in entity.vgeoms:
+                vgeom._vvert_start, vgeom._vface_start = vvert_start, vface_start
+                vvert_start += vgeom.n_vverts
+                vface_start += vgeom.n_vfaces
         n_soft_vverts_ = max(1, self.n_soft_vverts)
         self._soft_vverts_render = array_class.V_VEC(3, dtype=qd.f32, shape=(n_soft_vverts_, _B))
         self._soft_vverts_vert_idx = array_class.V(dtype=gs.qd_int, shape=(n_soft_vverts_,))
+        self._soft_vverts_elem = array_class.V(dtype=gs.qd_int, shape=(n_soft_vverts_,))
+        self._soft_vverts_bary = array_class.V_VEC(4, dtype=gs.qd_float, shape=(n_soft_vverts_,))
         if self.n_soft_vverts > 0:
-            vert_idx = np.concatenate(
-                [vgeom.sim_verts_idx + entity.v_start for entity in entities for vgeom in entity.vgeoms]
-            ).astype(gs.np_int)
-            kernel_soft_init_render(vert_idx, self._soft_vverts_vert_idx)
+            # Global tetrahedron offset of every solid entity, in the concatenation order of the element tables.
+            tet_start, n_tets = {}, 0
+            for entity in entities:
+                if not (entity.is_shell or entity.is_rod):
+                    tet_start[entity.idx_in_solver] = n_tets
+                    n_tets += entity.n_elements
+            vert_idx, elems_idx, bary = [], [], []
+            for entity in entities:
+                for vgeom in entity.vgeoms:
+                    if vgeom.elems_idx is not None:
+                        vert_idx.append(np.zeros(vgeom.n_vverts, dtype=gs.np_int))
+                        elems_idx.append(vgeom.elems_idx + tet_start[entity.idx_in_solver])
+                        bary.append(vgeom.bary)
+                    else:
+                        vert_idx.append(vgeom.sim_verts_idx + entity.v_start)
+                        elems_idx.append(np.full(vgeom.n_vverts, -1, dtype=gs.np_int))
+                        bary.append(np.zeros((vgeom.n_vverts, 4), dtype=gs.np_float))
+            kernel_soft_init_render(
+                np.concatenate(vert_idx).astype(gs.np_int),
+                np.concatenate(elems_idx).astype(gs.np_int),
+                np.concatenate(bary).astype(gs.np_float),
+                self._soft_vverts_vert_idx,
+                self._soft_vverts_elem,
+                self._soft_vverts_bary,
+            )
         rods = [entity for entity in entities if entity.is_rod]
         self._n_rod_vverts = sum(entity.n_vverts for entity in rods)
         n_rod_vverts_ = max(1, self._n_rod_vverts)
@@ -2052,7 +2083,14 @@ class MochiSolver(KinematicSolver):
         if not self.has_soft or self.n_soft_vverts == 0:
             return None, None, None
         kernel_soft_get_state_render(
-            self._soft_vverts_render, self._soft_vverts_vert_idx, self._envs_offset, self.soft_state, self.rigid_config
+            self._soft_vverts_render,
+            self._soft_vverts_vert_idx,
+            self._soft_vverts_elem,
+            self._soft_vverts_bary,
+            self._envs_offset,
+            self.soft_info,
+            self.soft_state,
+            self.rigid_config,
         )
         if self._n_rod_vverts > 0:
             kernel_rod_get_state_render(

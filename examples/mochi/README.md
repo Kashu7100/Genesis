@@ -41,7 +41,11 @@ Vertices of a deformable body can be rigidly attached to a link of a rigid or ar
 each attached vertex is tied by a stiff penalty `1/2 k |c|^2` (plus an optional damping on the violation rate) to the
 point of the link it coincides with at build time, inside the same implicit solve - forces act on both sides and the
 coupled bodies form one simulation island. This is how a robot gets soft parts, e.g. compliant fingertips mounted on
-a gripper (`finray_gripper.py`). Tetrahedral simulation meshes can also be read from legacy ASCII VTK unstructured
+a gripper (`finray_gripper.py`). A solid can carry a detailed visual mesh skinned by its simulation tetrahedra
+(`entity.set_visual_mesh(file, pos=..., euler=..., scale=...)`, placed in the frame of the simulation mesh file):
+every render vertex is embedded barycentrically in the tetrahedron it falls in (vertices outside the coarse mesh
+extrapolate linearly from the nearest one) and follows the deformation - the usual pairing of a fine render mesh
+with a coarse collision mesh. Tetrahedral simulation meshes can also be read from legacy ASCII VTK unstructured
 grids (`gs.morphs.Mesh(file="....vtk")`), the format Drake ships its deformable meshes in.
 
 Thin shells (`gs.materials.Mochi.Shell`) use the surface triangles of a `Mesh` (or primitive) morph as elements: a

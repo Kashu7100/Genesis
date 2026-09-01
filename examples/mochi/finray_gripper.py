@@ -2,7 +2,8 @@
 
 The gripper URDF is loaded as an articulated rigid body with the finger geometry stripped; each finger is a
 tetrahedral mesh (the `.vtk` deformable meshes shipped with the model) whose base vertices are rigidly attached to
-the corresponding prismatic finger link (`MochiSoftEntity.attach_to_link`). The prismatic drive, the mimic joint
+the corresponding prismatic finger link (`MochiSoftEntity.attach_to_link`), and is rendered through the model's
+detailed `.gltf` visual mesh skinned by the simulation tetrahedra (`MochiSoftEntity.set_visual_mesh`). The prismatic drive, the mimic joint
 coupling, the finite elements, the attachments and the contact all enter one implicit Newton solve, so closing the
 compliant fingers on the box makes them wrap around it.
 
@@ -22,6 +23,7 @@ from genesis.engine.entities.mochi_entity.mochi_soft_entity import load_vtk_tet_
 
 FINGER_LINKS = ("finray_finger_L", "finray_finger_R")
 FINGER_MESH = "finray_finger_MA-049-PT-0005_MA-049-PT-0006_2024_07_23_{side}_low.vtk"
+FINGER_VISUAL_MESH = "finray_finger_MA-049-PT-0005_MA-049-PT-0006_2024_07_23_{side}.gltf"
 # Recentered prismatic coordinates: q = 0 is the open gripper (+-0.045 m from the nominal finger pose), positive
 # q closes. The mimic coupling q2 = -q1 keeps the fingers symmetric in the shifted coordinates as well.
 OPEN_SHIFT = 0.045
@@ -126,6 +128,12 @@ def main():
             ),
             material=gs.materials.Mochi.Elastic(E=3e7, nu=0.4, rho=1200.0, friction=1.5, viscous_friction=1.0),
             surface=gs.surfaces.Default(color=(50 / 256, 168 / 256, 85 / 256)),
+        )
+        # The detailed visual mesh of the model, skinned by the simulation tetrahedra; the URDF's visual tag
+        # rotates it by 90 degrees about x into the frame of the collision (simulation) mesh.
+        finger.set_visual_mesh(
+            file=os.path.join(args.asset_dir, "assets", FINGER_VISUAL_MESH.format(side=side)),
+            euler=(90.0, 0.0, 0.0),
         )
         # The finger mounts at its base plane (link-frame z = 0, the highest vertices under the downward tool axis).
         base_verts = np.where(finger.init_positions[:, 2] > link_pos[2] - 0.004)[0]

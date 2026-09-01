@@ -108,6 +108,31 @@ def load_vtk_tet_files(path):
     return verts, tets
 
 
+def embed_in_tets(points, verts, tets):
+    """Element index and barycentric coordinates of every point in the tetrahedral mesh (verts, tets): each point
+    takes the tetrahedron whose barycentric coordinates are least negative, so points inside a tetrahedron are exact
+    and points outside the coarse mesh extrapolate linearly from the nearest one."""
+    points = np.asarray(points, dtype=np.float64)
+    verts = np.asarray(verts, dtype=np.float64)
+    tets = np.asarray(tets, dtype=np.int64)
+    x3 = verts[tets[:, 3]]
+    Dm = np.stack([verts[tets[:, k]] - x3 for k in range(3)], axis=-1)
+    Dm_inv = np.linalg.inv(Dm)
+    elems_idx = np.empty(len(points), dtype=gs.np_int)
+    bary = np.empty((len(points), 4), dtype=gs.np_float)
+    chunk = max(1, int(2e7) // max(1, len(tets)))
+    for start in range(0, len(points), chunk):
+        block = points[start : start + chunk]
+        # b[i, t, :] barycentric coordinates of point i in tetrahedron t
+        b123 = np.einsum("tjk,itk->itj", Dm_inv, block[:, None, :] - x3[None, :, :])
+        b = np.concatenate([b123, 1.0 - b123.sum(axis=-1, keepdims=True)], axis=-1)
+        best = b.min(axis=-1).argmax(axis=-1)
+        rows = np.arange(len(block))
+        elems_idx[start : start + chunk] = best
+        bary[start : start + chunk] = b[rows, best]
+    return elems_idx, bary
+
+
 class MochiSoftEntity(Entity):
     """
     Deformable body simulated by the MochiSolver: a tetrahedral mesh (`gs.materials.Mochi.Elastic`) or a thin shell
@@ -329,6 +354,7 @@ class MochiSoftEntity(Entity):
         elems = np.asarray(elems, dtype=gs.np_int)
         if len(verts) == 0 or len(elems) == 0:
             gs.raise_exception("Entity has no tetrahedra.")
+        self._instantiate_verts_COM = verts.mean(axis=0)
         morph_quat = np.array(self._morph.quat, dtype=gs.np_float)
         init_quat = gu.transform_quat_by_quat(np.array(self._morph.offset_quat, dtype=gs.np_float), morph_quat)
         R = gu.quat_to_R(init_quat)
@@ -393,6 +419,52 @@ class MochiSoftEntity(Entity):
     def attachments(self):
         """Rigid-link attachment registrations of this entity."""
         return self._attachments
+
+    def set_visual_mesh(self, file, pos=(0.0, 0.0, 0.0), euler=(0.0, 0.0, 0.0), scale=1.0):
+        """Replace the render mesh of this solid by a detailed visual mesh skinned by the simulation tetrahedra.
+
+        Every vertex of the visual mesh is embedded in the tetrahedron whose barycentric coordinates it takes (points
+        outside the coarse simulation mesh extrapolate linearly from the nearest one), so the visual surface follows
+        the deformation of the simulation mesh - the usual pairing of a fine render mesh with a coarse collision
+        mesh. `pos`, `euler` (degrees) and `scale` place the visual mesh in the frame of the simulation mesh file;
+        the entity's morph transform then applies to both. Must be called before the scene is built.
+        """
+        if self.is_built:
+            gs.raise_exception("The visual mesh must be set before the scene is built.")
+        if self._is_shell or self._is_rod:
+            gs.raise_exception("Only solid (tetrahedral) entities can carry an embedded visual mesh.")
+        visual_trimesh = trimesh.load(file, force="mesh", process=False)
+        quat = gu.xyz_to_quat(np.asarray(euler, dtype=np.float64), rpy=True, degrees=True)
+        verts = visual_trimesh.vertices * float(scale) @ gu.quat_to_R(quat).T + np.asarray(pos, dtype=np.float64)
+        # Mirror the placement of the simulation mesh: the pre-rotation transform of `sample` (the morph scale and
+        # position for file meshes), then the morph rotation about the simulation mesh's centroid of `instantiate`.
+        morph = self._morph
+        if isinstance(morph, gs.morphs.Mesh):
+            verts = verts * np.asarray(morph.scale, dtype=np.float64)
+        verts = verts + np.asarray(morph.pos, dtype=np.float64)
+        morph_quat = np.array(morph.quat, dtype=gs.np_float)
+        init_quat = gu.transform_quat_by_quat(np.array(morph.offset_quat, dtype=gs.np_float), morph_quat)
+        com = self._instantiate_verts_COM
+        verts = (verts - com) @ gu.quat_to_R(init_quat).T + com
+        verts = verts + gu.transform_by_quat(np.array(morph.offset_pos, dtype=gs.np_float), morph_quat)
+        elems_idx, bary = embed_in_tets(verts, self.init_positions, self.elems)
+        # Keep the loaded mesh's UVs and material; only the vertex positions move into the simulation frame.
+        visual_trimesh = visual_trimesh.copy()
+        visual_trimesh.vertices = verts
+        vmesh = gs.Mesh.from_trimesh(visual_trimesh, surface=self._surface)
+        self._vgeoms = gs.List(
+            [
+                FEMVisGeom(
+                    entity=self,
+                    vvert_start=self._vvert_start,
+                    vface_start=self._vface_start,
+                    vmesh=vmesh,
+                    sim_verts_idx=None,
+                    elems_idx=elems_idx,
+                    bary=bary,
+                )
+            ]
+        )
 
     def get_vertices_position(self, envs_idx=None):
         """World positions of the vertices, shape (n_vertices, 3) or (n_envs, n_vertices, 3)."""

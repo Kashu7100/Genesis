@@ -2220,7 +2220,10 @@ def kernel_rod_init_render(
 def kernel_soft_get_state_render(
     vverts_render: qd.Tensor,
     vverts_vert_idx: qd.Tensor,
+    vverts_elem: qd.Tensor,
+    vverts_bary: qd.Tensor,
     envs_offset: qd.types.ndarray(),
+    soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
 ):
@@ -2228,15 +2231,34 @@ def kernel_soft_get_state_render(
     _B = soft_state.verts_pos.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_vv, i_b in qd.ndrange(n_vverts, _B):
-        pos = soft_state.verts_pos[vverts_vert_idx[i_vv], i_b]
+        pos = qd.Vector.zero(gs.qd_float, 3)
+        i_el = vverts_elem[i_vv]
+        if i_el >= 0:
+            # An embedded render vertex follows the barycentric combination of its element's nodes.
+            v = soft_info.elems_v[i_el]
+            bary = vverts_bary[i_vv]
+            for k in qd.static(range(4)):
+                pos += bary[k] * soft_state.verts_pos[v[k], i_b]
+        else:
+            pos = soft_state.verts_pos[vverts_vert_idx[i_vv], i_b]
         for k in qd.static(range(3)):
             vverts_render[i_vv, i_b][k] = qd.cast(pos[k] + envs_offset[i_b, k], qd.f32)
 
 
 @qd.kernel
-def kernel_soft_init_render(vert_idx: qd.types.ndarray(), vverts_vert_idx: qd.Tensor):
+def kernel_soft_init_render(
+    vert_idx: qd.types.ndarray(),
+    elems_idx: qd.types.ndarray(),
+    bary: qd.types.ndarray(),
+    vverts_vert_idx: qd.Tensor,
+    vverts_elem: qd.Tensor,
+    vverts_bary: qd.Tensor,
+):
     for i_vv in range(vert_idx.shape[0]):
         vverts_vert_idx[i_vv] = vert_idx[i_vv]
+        vverts_elem[i_vv] = elems_idx[i_vv]
+        for k in qd.static(range(4)):
+            vverts_bary[i_vv][k] = bary[i_vv, k]
 
 
 @qd.kernel
