@@ -4,8 +4,7 @@ This is the `rope_arm` benchmark scene (the reinforcement-learning shaped accept
 `tests/mochi/benchmark`) run as a standalone demo: the hand descends onto the rope under PD joint control while the
 fingertips press with 1 N each, pinning the rope against the ground. The discrete elastic rod (stretching, bending,
 twisting), the articulated arm and the penalty contact enter one implicit Newton solve (mochi's default budget of 4
-iterations per step); the rope collides through its centerline samples and carries collider spheres of its radius at
-the nodes.
+iterations per step); the rope collides with the ground and the fingertips through its centerline samples.
 """
 
 import argparse

@@ -387,7 +387,8 @@ def func_broadphase_pairs(
         i_lb = dyn_info.geoms.link_idx[i_gb]
         if i_lb == i_la:
             continue
-        if not (mochi_info.links.is_dynamic[i_la] or mochi_info.links.is_dynamic[i_lb]):
+        # A static body is only a collider: its samples never collide (mochi's rule); the collider may be static.
+        if not mochi_info.links.is_dynamic[i_la]:
             continue
         if not mochi_info.links_pair_enabled[i_la, i_lb]:
             continue

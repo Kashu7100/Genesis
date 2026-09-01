@@ -2569,9 +2569,12 @@ def func_soft_collider_eval(
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
-        # A deformable sample whose entity has no tetrahedral collider to hit never queries.
+        # A deformable sample whose entity has no tetrahedral collider to hit never queries; a static body is only a
+        # collider: its samples never collide (mochi's rule).
         n_rigid = soft_info.n_rigid_queries[None]
         if i_q >= n_rigid and soft_info.entities_queries_tets[soft_info.samples_entity_idx[i_q - n_rigid]] == 0:
+            continue
+        if i_q < n_rigid and not mochi_info.links.is_dynamic[mochi_info.samples.link_idx[i_q]]:
             continue
         kind_a, i_la, e_a, i_sample, pos, pos_start, normal_a0, w, k_a, falloff_a, mu_a, c_visc_a, c_ndamp_a = (
             func_query_point(i_q, i_b, dyn_state, mochi_info, mochi_state, soft_info, soft_state, EPS)
@@ -3721,26 +3724,30 @@ def func_pc_collider_eval(
     record: qd.template(),
     errno: qd.Tensor,
 ):
-    """Evaluate every sample point against the collider spheres of the vertices found in the 27 hash cells around it:
-    signed distance |p - x_b| - r with radial gradient, contact stiffness scaled by the nodal area over r^2, response on
-    the sample and on the vertex."""
+    """Evaluate the sample points of the point-cloud entities against the collider spheres of the vertices found in
+    the 27 hash cells around them: signed distance |p - x_b| - r with radial gradient, contact stiffness scaled by the
+    nodal area over r^2, response on the sample and on the vertex. Rigid samples never query the spheres (mochi's
+    rule: point-cloud colliders only collide with each other)."""
     n_bins = soft_state.pc_hash_heads.shape[0]
     n_verts = soft_state.verts_pos.shape[0]
     _B = soft_state.verts_pos.shape[1]
     max_hits = soft_state.pc_hit_kind_a.shape[0]
     EPS = mochi_info.EPS[None]
     inv_cell = 1.0 / soft_info.pc_hash_cell[None]
-    n_queries = soft_info.n_queries[None]
+    n_rigid = soft_info.n_rigid_queries[None]
+    n_soft_queries = soft_info.n_queries[None] - n_rigid
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_q, i_slot in qd.ndrange(n_queries, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_queries, 1):
+    for i_q_soft, i_slot in (
+        qd.ndrange(n_soft_queries, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_soft_queries, 1)
+    ):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
         # A deformable sample whose entity has no sphere collider to hit never queries.
-        n_rigid = soft_info.n_rigid_queries[None]
-        if i_q >= n_rigid and soft_info.entities_queries_spheres[soft_info.samples_entity_idx[i_q - n_rigid]] == 0:
+        if soft_info.entities_queries_spheres[soft_info.samples_entity_idx[i_q_soft]] == 0:
             continue
+        i_q = n_rigid + i_q_soft
         kind_a, i_la, e_a, i_sample, pos, pos_start, normal_a0, w, k_a, falloff_a, mu_a, c_visc_a, c_ndamp_a = (
             func_query_point(i_q, i_b, dyn_state, mochi_info, mochi_state, soft_info, soft_state, EPS)
         )

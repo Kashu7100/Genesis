@@ -52,8 +52,10 @@ Thin shells (`gs.materials.Mochi.Shell`) use the surface triangles of a `Mesh` (
 Saint Venant-Kirchhoff membrane on the metric of the mid-surface and a Koiter-type bending term on its discrete
 curvature, both thickness-integrated from `E`, `nu`, `rho` and `thickness` (each stiffness can be overridden). Shell
 samples carry no orientation (the contact normal comes from the collider, so both sides collide), and shells act as
-colliders through spheres of radius `collider_radius` placed at their vertices (`collider_type="point_cloud"`); a shell
-never collides with itself. Consistently wound meshes are required. Light cloth has little inertia: use a lower
+colliders through spheres of radius `collider_radius` placed at their vertices (`collider_type="point_cloud"`). As in
+mochi, the spheres only collide with the samples of other point-cloud entities (cloths and rods) or of the same body
+under self-contact — rigid bodies and solids interact with a shell through the shell's own samples instead; a shell
+never collides with itself unless `self_contact=True`. Consistently wound meshes are required. Light cloth has little inertia: use a lower
 `penalty_coefficient` (1e7 Pa/m) or a larger `explosion_rel_tol` so that the sudden contact residual of an impact is
 not mistaken for a divergence.
 
@@ -62,8 +64,9 @@ bending and twisting at the interior nodes, with one twist angle per segment as 
 frames carried along as parallel-transported state (a Kirchhoff rod, no shear). The stiffnesses derive from `E`, `nu`,
 `rho` and the radius (`E A`, `E I`, `G J`, `rho A`, `rho J`) and can be overridden; clamp a rod by fixing its first two
 nodes. Rods collide through samples on their centerline (no radius offset on the colliding side) and act as
-colliders through spheres of the rod radius carried by their nodes (`collider_type="auto"`), so a rigid body resting on
-a rope sits one rod radius above the centerline.
+colliders through spheres of the rod radius carried by their nodes (`collider_type="auto"`); as for shells, the
+spheres only collide with other point-cloud entities or the rod itself under self-contact, so a rod lying on another
+rod sits one rod radius above its centerline while a rigid body touches the centerline samples directly.
 
 Velocities are recovered by finite differences over the step as in mochi: `get_dofs_velocity()` returns
 `sin(dq)/dt` for revolute joints and the sine-based angular velocity `vee(((R - R_prev)/dt) R^T)` for spherical and

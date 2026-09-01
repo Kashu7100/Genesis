@@ -844,8 +844,9 @@ class MochiSolver(KinematicSolver):
         self._n_soft_sdf_voxels = len(sdf_values)
         self.n_soft_sdf_voxels_ = max(1, len(sdf_values))
 
-        # Deformable colliders: every rigid and deformable sample point is located in the collider spheres / deformed
-        # tetrahedra through a spatial hash rebuilt at every assembly (the flags are resolved in `_init_mochi`).
+        # Deformable colliders: the query list holds the rigid samples (dynamic links query the deformed tetrahedra
+        # only) followed by the deformable samples (tetrahedra of other entities; spheres for point-cloud entities),
+        # located through structures rebuilt at every assembly (the flags are resolved in `_init_mochi`).
         self._n_soft_queries = self.n_samples + n_samples
         self._max_sc_hits = (
             max(1, options.max_deformable_collider_hits_per_query * self._n_soft_queries)
@@ -853,16 +854,12 @@ class MochiSolver(KinematicSolver):
             else 1
         )
         # A deformable sample under self-contact sees the spheres of the opposing layer of its own body (up to
-        # about a dozen within the contact range), a rigid sample the spheres of the deformable it touches.
+        # about a dozen within the contact range); only point-cloud entities query spheres.
         has_self_contact = any((e.is_shell or e.is_rod) and e.material.self_contact for e in entities)
         pc_hits_per_query = options.max_point_cloud_hits_per_query
         if pc_hits_per_query is None:
             pc_hits_per_query = 8 if has_self_contact else 2
-        self._max_pc_hits = (
-            max(1, pc_hits_per_query * n_samples + options.max_soft_hits_per_sample * self.n_samples)
-            if self._has_pc_colliders
-            else 1
-        )
+        self._max_pc_hits = max(1, pc_hits_per_query * n_samples) if self._has_pc_colliders else 1
         bins_per_item = options.spatial_hash_bins_per_item
         # every item occupies up to eight entries (the cells its bounds overlap)
         self.n_pc_bins_ = _next_power_of_two(bins_per_item * 8 * self.n_soft_verts) if self._has_pc_colliders else 1
@@ -932,8 +929,9 @@ class MochiSolver(KinematicSolver):
             self.soft_state,
             self.rigid_config,
         )
-        # A sample only queries the colliders it can hit: the tetrahedra of other entities, the spheres of other
-        # entities or of its own body under self-contact.
+        # A sample only queries the colliders it can hit: the tetrahedra of other entities, and, for point-cloud
+        # entities only, the spheres of other point-cloud entities or of its own body under self-contact (mochi's
+        # rule: point-cloud colliders only collide with each other, never with rigid bodies or solids).
         kinds = [self._soft_collider_kind(entity) for entity in entities]
         queries_tets = np.zeros((self.n_soft_entities_,), dtype=gs.np_int)
         queries_spheres = np.zeros((self.n_soft_entities_,), dtype=gs.np_int)
@@ -941,11 +939,10 @@ class MochiSolver(KinematicSolver):
             others = [kind for j, kind in enumerate(kinds) if j != i]
             queries_tets[i] = int(any(kind == COLLIDER_TYPE.GRID for kind in others))
             queries_spheres[i] = int(
-                any(kind == COLLIDER_TYPE.POINT_CLOUD for kind in others)
-                or (
-                    kinds[i] == COLLIDER_TYPE.POINT_CLOUD
-                    and (entity.is_shell or entity.is_rod)
-                    and entity.material.self_contact
+                kinds[i] == COLLIDER_TYPE.POINT_CLOUD
+                and (
+                    any(kind == COLLIDER_TYPE.POINT_CLOUD for kind in others)
+                    or ((entity.is_shell or entity.is_rod) and entity.material.self_contact)
                 )
             )
         self.soft_info.entities_queries_tets.from_numpy(queries_tets)
@@ -1357,16 +1354,17 @@ class MochiSolver(KinematicSolver):
         return COLLIDER_TYPE.GRID
 
     def _resolve_soft_collider_flags(self):
-        """Whether the scene has deformable colliders that something can query: rigid samples, another deformable
-        entity, or the entity's own samples under self-contact."""
+        """Whether the scene has deformable colliders that something can query. Tetrahedral colliders are queried by
+        the samples of dynamic rigid links and of other deformable entities; point-cloud colliders only collide with
+        each other (mochi's rule): they are queried solely by the samples of other point-cloud entities, or by their
+        own under self-contact, never by rigid bodies or solids."""
         entities = self._soft_entities
         kinds = [self._soft_collider_kind(entity) for entity in entities]
         has_self_contact = any((e.is_shell or e.is_rod) and e.material.self_contact for e in entities)
         has_queries = self.n_samples > 0 or len(entities) > 1
         self._has_soft_colliders = has_queries and any(kind == COLLIDER_TYPE.GRID for kind in kinds)
-        self._has_pc_colliders = (has_queries or has_self_contact) and any(
-            kind == COLLIDER_TYPE.POINT_CLOUD for kind in kinds
-        )
+        n_pc = sum(1 for kind in kinds if kind == COLLIDER_TYPE.POINT_CLOUD)
+        self._has_pc_colliders = n_pc > 1 or (n_pc > 0 and has_self_contact)
         self._build_tet_tree(kinds)
 
     def _build_tet_tree(self, kinds):
