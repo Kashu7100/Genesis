@@ -127,7 +127,8 @@ def main():
                 euler=(180.0, 0.0, 0.0),
             ),
             material=gs.materials.Mochi.Elastic(E=3e7, nu=0.4, rho=1200.0, friction=1.5, viscous_friction=1.0),
-            surface=gs.surfaces.Default(color=(50 / 256, 168 / 256, 85 / 256)),
+            # No color: the visual mesh keeps the base-color texture of the model's gltf.
+            surface=gs.surfaces.Default(),
         )
         # The detailed visual mesh of the model, skinned by the simulation tetrahedra; the URDF's visual tag
         # rotates it by 90 degrees about x into the frame of the collision (simulation) mesh.
