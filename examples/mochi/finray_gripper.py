@@ -71,7 +71,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", "--vis", action="store_true", help="Show visualization GUI")
     parser.add_argument("-g", "--gpu", action="store_true", help="Run on GPU instead of CPU")
-    parser.add_argument("-n", "--n_steps", type=int, default=300, help="Number of simulation steps")
+    parser.add_argument("-n", "--n_steps", type=int, default=800, help="Number of simulation steps")
     parser.add_argument("-r", "--record", action="store_true", help="Record video")
     parser.add_argument(
         "--asset-dir",
@@ -125,7 +125,7 @@ def main():
                 euler=(180.0, 0.0, 0.0),
             ),
             material=gs.materials.Mochi.Elastic(E=3e7, nu=0.4, rho=1200.0, friction=1.5, viscous_friction=1.0),
-            surface=gs.surfaces.Default(color=(0.2, 0.2, 0.25)),
+            surface=gs.surfaces.Default(color=(50 / 256, 168 / 256, 85 / 256)),
         )
         # The finger mounts at its base plane (link-frame z = 0, the highest vertices under the downward tool axis).
         base_verts = np.where(finger.init_positions[:, 2] > link_pos[2] - 0.004)[0]
@@ -149,7 +149,7 @@ def main():
         cam.start_recording(save_to_filename="finray_gripper.mp4", fps=30)
 
     for i_step in range(args.n_steps):
-        if 60 <= i_step < 120:
+        if 60 <= i_step < 200:
             # Close onto the box over one second: the commanded opening (2.4 cm) is narrower than the box, so the
             # compliant fingers deform around it.
             gripper.control_dofs_position(np.array([0.025 * (i_step - 59) / 60.0]), np.array([0]))
