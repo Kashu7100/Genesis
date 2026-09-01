@@ -92,6 +92,8 @@ class MochiStaticConfig(metaclass=AutoInitMeta):
     # rigid-deformable vertex attachments present (their assembly is compiled only then)
     has_attachments: bool
     has_pc_colliders: bool
+    # any open rod present (the banded rod preconditioner and its contact scatter are compiled only then)
+    has_rod_band: bool
     has_soft_colliders: bool
     # levels of the bounding-box hierarchy of the collider tetrahedra (the refit runs one task per level)
     tet_tree_levels: int

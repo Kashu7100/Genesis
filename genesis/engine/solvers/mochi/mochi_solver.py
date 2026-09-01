@@ -664,6 +664,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             has_soft=self.has_soft,
             has_tets=self.n_soft_elems > 0,
             has_pc_colliders=self._has_pc_colliders,
+            has_rod_band=any(e.is_rod and not e.morph.is_closed_loop for e in self._soft_entities),
             has_soft_colliders=self._has_soft_colliders,
             tet_tree_levels=self.n_tet_levels,
             has_equalities=len(self._equalities) > 0,

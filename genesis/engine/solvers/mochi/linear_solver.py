@@ -378,7 +378,7 @@ def func_pcg_init(
         mochi_state.pcg_is_active[i_b] = mochi_state.is_active[i_b] and not island_state.uses_dense[i_b]
         mochi_state.pcg_rTz[i_b] = 0.0
         mochi_state.pcg_zTz[i_b] = 0.0
-    if qd.static(mochi_config.has_soft):
+    if qd.static(mochi_config.has_soft and mochi_config.has_rod_band):
         func_rod_band_factor(
             i_b_env,
             per_env,
