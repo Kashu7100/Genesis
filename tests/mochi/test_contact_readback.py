@@ -138,8 +138,12 @@ def test_soft_on_soft_contacts(show_viewer):
 
 @pytest.mark.precision("64")
 def test_point_cloud_contacts(tmp_path, show_viewer):
+    # A rigid ball and a small cloth patch rest on a corner-held net: the ball is carried by the net's samples
+    # colliding against its sphere collider (point-cloud colliders never collide with rigid bodies, as mochi), the
+    # patch by the point-cloud contact between the two cloths.
     radius, collider_radius, n_cells, size = 0.05, 0.02, 10, 0.5
     obj_path = _sheet_obj(tmp_path / "sheet.obj", n_cells, size)
+    patch_path = _sheet_obj(tmp_path / "patch.obj", 4, 0.15)
     scene = _mochi_scene(show_viewer, 1.0 / 60.0, n_newton_iterations=8)
     cloth = scene.add_entity(
         gs.morphs.Mesh(file=obj_path, pos=(0.0, 0.0, 0.5)),
@@ -147,8 +151,14 @@ def test_point_cloud_contacts(tmp_path, show_viewer):
             E=1e6, nu=0.3, rho=1000.0, thickness=2e-3, collider_radius=collider_radius, mass_damping=2.0
         ),
     )
+    patch = scene.add_entity(
+        gs.morphs.Mesh(file=patch_path, pos=(0.15, 0.15, 0.55)),
+        material=gs.materials.Mochi.Shell(
+            E=1e6, nu=0.3, rho=1000.0, thickness=2e-3, collider_radius=collider_radius, mass_damping=2.0
+        ),
+    )
     ball = scene.add_entity(
-        gs.morphs.Sphere(radius=radius, pos=(0.0, 0.0, 0.5 + radius + collider_radius + 0.01)),
+        gs.morphs.Sphere(radius=radius, pos=(0.0, 0.0, 0.5 + radius + 0.01)),
         material=gs.materials.Mochi.Rigid(rho=500.0),
     )
     scene.build()
@@ -159,31 +169,46 @@ def test_point_cloud_contacts(tmp_path, show_viewer):
     cloth.set_vertices_fixed(corners)
     for _ in range(240):
         scene.step()
+    # The ball's contacts are shell samples of the net against its sphere collider.
     contacts = _as_arrays(ball.get_contacts())
     n_contacts = len(contacts["entity_a"])
     assert n_contacts > 0
-    assert np.all(contacts["entity_a"] == ball.idx)
-    assert np.all(contacts["entity_b"] == cloth.idx)
-    assert np.all(contacts["link_a"] == ball.base_link.idx)
-    assert np.all(contacts["geom_a"] == ball.geoms[0].idx)
-    assert np.all(contacts["link_b"] == -1)
-    assert np.all(contacts["geom_b"] == -1)
-    assert np.all(contacts["verts_a"] == -1)
-    assert np.all((contacts["verts_b"][:, 0] >= 0) & (contacts["verts_b"][:, 0] < cloth.n_vertices))
-    assert np.all(contacts["verts_b"][:, 1:] == -1)
-    assert_allclose(contacts["bary_b"], np.tile((1.0, 0.0, 0.0, 0.0), (n_contacts, 1)), tol=0.0)
-    # Records cover the smoothing band of the penalty (threshold plus twice the half distance).
-    assert np.all(contacts["distance"] < 1.1e-2)
-    assert np.all(contacts["normal"][:, 2] > 0.0)
+    assert np.all(contacts["entity_a"] == cloth.idx)
+    assert np.all(contacts["entity_b"] == ball.idx)
+    assert np.all(contacts["link_a"] == -1)
+    assert np.all(contacts["geom_a"] == -1)
+    assert np.all(contacts["link_b"] == ball.base_link.idx)
+    assert np.all(contacts["geom_b"] == ball.geoms[0].idx)
+    assert np.all((contacts["verts_a"] >= 0) & (contacts["verts_a"] < cloth.n_vertices))
+    assert_allclose(contacts["bary_a"].sum(axis=1), 1.0, tol=1e-12)
+    assert np.all(contacts["verts_b"] == -1)
+    # Records cover the contact range of the penalty (the threshold).
+    assert np.all(contacts["distance"] < 1.1e-3)
+    # The collider gradient points away from the ball at every contact.
+    ball_pos = tensor_to_array(ball.get_pos())
+    assert np.all(np.einsum("ij,ij->i", contacts["normal"], contacts["position"] - ball_pos) > 0.0)
     # Records are consistent with the per-body readbacks: net force on the ball, force on the cloth vertices.
     ball_force = tensor_to_array(ball.get_links_net_contact_force())[0]
-    assert_allclose(contacts["force_a"].sum(axis=0), ball_force, atol=1e-9)
+    assert_allclose(-contacts["force_a"].sum(axis=0), ball_force, atol=1e-9)
     # The ball still rolls slowly in the sag of the net: only the vertical balance is tight.
     assert_allclose(ball_force[2], float(tensor_to_array(ball.get_mass())) * 9.8, atol=1e-2)
     assert np.linalg.norm(ball_force[:2]) < 0.05
+    assert len(cloth.get_contacts(with_entity=ball)["entity_a"]) == n_contacts
+    # The patch rests on the net through point-cloud contacts: single-vertex collider records between the two cloths.
+    pc_contacts = _as_arrays(patch.get_contacts(with_entity=cloth))
+    n_pc = len(pc_contacts["entity_a"])
+    assert n_pc > 0
+    assert set(np.unique(pc_contacts["entity_a"])) | set(np.unique(pc_contacts["entity_b"])) == {cloth.idx, patch.idx}
+    assert np.all(pc_contacts["link_a"] == -1)
+    assert np.all(pc_contacts["link_b"] == -1)
+    assert np.all(pc_contacts["verts_b"][:, 0] >= 0)
+    assert np.all(pc_contacts["verts_b"][:, 1:] == -1)
+    assert_allclose(pc_contacts["bary_b"], np.tile((1.0, 0.0, 0.0, 0.0), (n_pc, 1)), tol=0.0)
+    # All records involving the cloth scattered onto its vertices match the vertex force readback.
+    cloth_contacts = _as_arrays(cloth.get_contacts())
     assert_allclose(
-        _scatter(contacts, "b", cloth.n_vertices, cloth.idx),
+        _scatter(cloth_contacts, "a", cloth.n_vertices, cloth.idx)
+        + _scatter(cloth_contacts, "b", cloth.n_vertices, cloth.idx),
         tensor_to_array(cloth.get_vertices_contact_force()),
         atol=1e-9,
     )
-    assert len(cloth.get_contacts(with_entity=ball)["entity_a"]) == n_contacts
