@@ -12,6 +12,19 @@ from .data import FRICTION_MODEL
 
 
 @qd.func
+def func_mat3_to_sym6(m):
+    """Upper triangle of a symmetric 3x3 as (m00, m11, m22, m01, m02, m12): the contact tangent dforce and the
+    accumulated D and S D S sums are symmetric, so six floats carry them exactly."""
+    return qd.Vector([m[0, 0], m[1, 1], m[2, 2], m[0, 1], m[0, 2], m[1, 2]])
+
+
+@qd.func
+def func_sym6_to_mat3(s):
+    """The symmetric 3x3 stored by func_mat3_to_sym6."""
+    return qd.Matrix([[s[0], s[3], s[4]], [s[3], s[1], s[5]], [s[4], s[5], s[2]]])
+
+
+@qd.func
 def polyrelu(x, t, shift):
     """C2 smoothing of max(0, x - shift) over (shift - t, shift + t): value, first and second derivative."""
     x = x - shift

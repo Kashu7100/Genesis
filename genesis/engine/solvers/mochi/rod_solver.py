@@ -11,6 +11,7 @@ import quadrants as qd
 
 import genesis as gs
 
+from .contact_utils import func_sym6_to_mat3
 from .data import ROD_BAND, MochiSoftInfo, MochiSoftState, MochiState
 
 
@@ -108,7 +109,7 @@ def func_rod_band_factor(
         i_s = soft_state.hit_sample[i_h, i_b]
         tri = soft_info.samples_tri[i_s]
         bary = soft_info.samples_bary[i_s]
-        D = soft_state.hit_D[i_h, i_b]
+        D = func_sym6_to_mat3(soft_state.hit_D[i_h, i_b])
         for i in qd.static(range(3)):
             for j in qd.static(range(3)):
                 func_rod_band_add_vertex_block(tri[i], tri[j], bary[i] * bary[j], D, i_b, soft_info, soft_state)
@@ -126,7 +127,7 @@ def func_rod_band_factor(
             i_s = soft_state.sc_hit_sample_a[i_h, i_b]
             tri = soft_info.samples_tri[i_s]
             bary = soft_info.samples_bary[i_s]
-            D = soft_state.sc_hit_D[i_h, i_b]
+            D = func_sym6_to_mat3(soft_state.sc_hit_D[i_h, i_b])
             for i in qd.static(range(3)):
                 for j in qd.static(range(3)):
                     func_rod_band_add_vertex_block(tri[i], tri[j], bary[i] * bary[j], D, i_b, soft_info, soft_state)
@@ -139,7 +140,7 @@ def func_rod_band_factor(
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not mochi_state.pcg_is_active[i_b] or i_h >= soft_state.n_pc_hits[i_b]:
             continue
-        D = soft_state.pc_hit_D[i_h, i_b]
+        D = func_sym6_to_mat3(soft_state.pc_hit_D[i_h, i_b])
         i_vb = soft_state.pc_hit_vert_b[i_h, i_b]
         func_rod_band_add_vertex_block(i_vb, i_vb, 1.0, D, i_b, soft_info, soft_state)
         if soft_state.pc_hit_kind_a[i_h, i_b] == 1:

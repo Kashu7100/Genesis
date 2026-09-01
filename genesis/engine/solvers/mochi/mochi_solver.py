@@ -867,7 +867,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         has_self_contact = any((e.is_shell or e.is_rod) and e.material.self_contact for e in entities)
         pc_hits_per_query = options.max_point_cloud_hits_per_query
         if pc_hits_per_query is None:
-            pc_hits_per_query = 8 if has_self_contact else 2
+            pc_hits_per_query = 4 if has_self_contact else 2
         self._max_pc_hits = max(1, pc_hits_per_query * n_samples) if self._has_pc_colliders else 1
         bins_per_item = options.spatial_hash_bins_per_item
         # every item occupies up to eight entries (the cells its bounds overlap)

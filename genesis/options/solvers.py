@@ -1061,9 +1061,10 @@ class MochiOptions(GravityMixin, TimeBasedMixin):
         deformable solid colliders, per sample point. Defaults to 2.
     max_point_cloud_hits_per_query : int, optional
         Capacity of the list of contacts between deformable samples and the collider spheres of shells and rods,
-        per deformable sample (rigid samples get `max_soft_hits_per_sample` slots each). If None, 8 when a shell or
-        rod has self-contact (a sample then sees the spheres of the opposing layer of its own body) and 2 otherwise.
-        Defaults to None.
+        per deformable sample (rigid samples get `max_soft_hits_per_sample` slots each). If None, 4 when a shell or
+        rod has self-contact (a sample then sees the spheres of the opposing layer of its own body) and 2 otherwise;
+        the capacity is a per-sample average over a shared list, and exceeding it halts with an error naming this
+        option. Defaults to None.
     record_contacts : bool, optional
         Whether individual contact points can be read back through `entity.get_contacts()`; their buffers are
         allocated at the first readback. Defaults to True.

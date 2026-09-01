@@ -20,7 +20,7 @@ from genesis.utils import array_class
 from .articulated import func_jacobian_times_dofs, func_jacobian_transpose_add, func_link_dof_jacobian
 from .colliders import query_collider
 from .contact import CONSERVATIVE_MAX_ACCEL, CONSERVATIVE_SPEED_SCALE
-from .contact_utils import collision_response
+from .contact_utils import collision_response, func_mat3_to_sym6, func_sym6_to_mat3
 from .data import (
     COLLIDER_TYPE,
     INTEGRATOR,
@@ -623,9 +623,9 @@ def func_soft_zero_assembly(
         if func_is_env_active(i_b, mochi_state, skip_ls_done) and i_p < soft_state.n_pairs[i_b]:
             soft_state.acc_f[i_p, i_b] = qd.Vector.zero(gs.qd_float, 3)
             soft_state.acc_q[i_p, i_b] = qd.Vector.zero(gs.qd_float, 3)
-            soft_state.acc_D[i_p, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
+            soft_state.acc_D[i_p, i_b] = qd.Vector.zero(gs.qd_float, 6)
             soft_state.acc_SD[i_p, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
-            soft_state.acc_SDS[i_p, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
+            soft_state.acc_SDS[i_p, i_b] = qd.Vector.zero(gs.qd_float, 6)
             soft_state.acc_obj[i_p, i_b] = 0.0
             soft_state.n_hits[i_p, i_b] = 0
 
@@ -1164,9 +1164,9 @@ def func_soft_contact_eval(
         # The three per-pair Hessian sums are read by kernel_soft_pairs_to_blocks under the same flag, and they carry
         # most of the atomic traffic of this kernel: the line search re-evaluates contact for the residual alone.
         if assem_dres:
-            qd.atomic_add(soft_state.acc_D[i_p, i_b], D)
+            qd.atomic_add(soft_state.acc_D[i_p, i_b], func_mat3_to_sym6(D))
             qd.atomic_add(soft_state.acc_SD[i_p, i_b], S_b @ D)
-            qd.atomic_add(soft_state.acc_SDS[i_p, i_b], S_b @ D @ S_b)
+            qd.atomic_add(soft_state.acc_SDS[i_p, i_b], func_mat3_to_sym6(S_b @ D @ S_b))
             for i in qd.static(range(3)):
                 qd.atomic_add(soft_state.verts_H_diag[tri[i], i_b], (bary[i] * bary[i]) * D)
         if assem_dres or record:
@@ -1175,7 +1175,7 @@ def func_soft_contact_eval(
                 soft_state.hit_sample[i_h, i_b] = i_s
                 soft_state.hit_link_b[i_h, i_b] = -1 if is_static_b else i_lb
                 soft_state.hit_r_b[i_h, i_b] = r_b
-                soft_state.hit_D[i_h, i_b] = D
+                soft_state.hit_D[i_h, i_b] = func_mat3_to_sym6(D)
                 if qd.static(record):
                     hit_readback.soft_hit_geom_b[i_h, i_b] = soft_state.pair_geom_b[i_p, i_b]
                     hit_readback.soft_hit_force[i_h, i_b] = w * force
@@ -1272,9 +1272,9 @@ def func_soft_pairs_to_blocks(
                 qd.atomic_add(mochi_state.links_res[i_lb, i_b][k], F[k])
                 qd.atomic_add(mochi_state.links_res[i_lb, i_b][3 + k], Q[k])
         if assem_dres:
-            Dbar = soft_state.acc_D[i_p, i_b]
+            Dbar = func_sym6_to_mat3(soft_state.acc_D[i_p, i_b])
             Sh = soft_state.acc_SD[i_p, i_b]
-            Sh2 = soft_state.acc_SDS[i_p, i_b]
+            Sh2 = func_sym6_to_mat3(soft_state.acc_SDS[i_p, i_b])
             ShT = Sh.transpose()
             for k in qd.static(range(3)):
                 for l in qd.static(range(3)):
@@ -1598,7 +1598,7 @@ def func_soft_matvec(
                 i_s = soft_state.hit_sample[i_h, i_b]
                 tri = soft_info.samples_tri[i_s]
                 bary = soft_info.samples_bary[i_s]
-                D = soft_state.hit_D[i_h, i_b]
+                D = func_sym6_to_mat3(soft_state.hit_D[i_h, i_b])
                 i_lb = soft_state.hit_link_b[i_h, i_b]
                 # Relative displacement of the sample against the collider point.
                 dp = qd.Vector.zero(gs.qd_float, 3)
@@ -1622,7 +1622,7 @@ def func_soft_matvec(
         elif i_x < n_h_soft + n_h_sc:
             i_h = i_x - n_h_soft
             if i_h < soft_state.n_sc_hits[i_b]:
-                D = soft_state.sc_hit_D[i_h, i_b]
+                D = func_sym6_to_mat3(soft_state.sc_hit_D[i_h, i_b])
                 kind_a = soft_state.sc_hit_kind_a[i_h, i_b]
                 i_la = soft_state.sc_hit_link_a[i_h, i_b]
                 r_a = soft_state.sc_hit_r_a[i_h, i_b]
@@ -1657,7 +1657,7 @@ def func_soft_matvec(
         elif i_x < n_h_soft + n_h_sc + n_h_pc:
             i_h = i_x - n_h_soft - n_h_sc
             if i_h < soft_state.n_pc_hits[i_b]:
-                D = soft_state.pc_hit_D[i_h, i_b]
+                D = func_sym6_to_mat3(soft_state.pc_hit_D[i_h, i_b])
                 kind_a = soft_state.pc_hit_kind_a[i_h, i_b]
                 i_la = soft_state.pc_hit_link_a[i_h, i_b]
                 r_a = soft_state.pc_hit_r_a[i_h, i_b]
@@ -1808,7 +1808,7 @@ def func_soft_condense_dense(
         i_s = soft_state.hit_sample[i_h, i_b]
         tri = soft_info.samples_tri[i_s]
         bary = soft_info.samples_bary[i_s]
-        D = soft_state.hit_D[i_h, i_b]
+        D = func_sym6_to_mat3(soft_state.hit_D[i_h, i_b])
         for i in qd.static(range(3)):
             for j in qd.static(range(3)):
                 i_d = func_soft_dof(tri[i], 0, soft_info)
@@ -1841,7 +1841,7 @@ def func_soft_condense_dense(
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or i_h >= soft_state.n_sc_hits[i_b]:
             continue
-        D = soft_state.sc_hit_D[i_h, i_b]
+        D = func_sym6_to_mat3(soft_state.sc_hit_D[i_h, i_b])
         kind_a = soft_state.sc_hit_kind_a[i_h, i_b]
         v_b = soft_info.elems_v[soft_state.sc_hit_elem_b[i_h, i_b]]
         bary_b = soft_state.sc_hit_bary_b[i_h, i_b]
@@ -1894,7 +1894,7 @@ def func_soft_condense_dense(
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or i_h >= soft_state.n_pc_hits[i_b]:
             continue
-        D = soft_state.pc_hit_D[i_h, i_b]
+        D = func_sym6_to_mat3(soft_state.pc_hit_D[i_h, i_b])
         kind_a = soft_state.pc_hit_kind_a[i_h, i_b]
         i_vb = soft_state.pc_hit_vert_b[i_h, i_b]
         b_d = func_soft_dof(i_vb, 0, soft_info)
@@ -2726,7 +2726,7 @@ def func_soft_collider_eval(
                                 soft_state.sc_hit_r_a[i_h, i_b] = r_a
                                 soft_state.sc_hit_elem_b[i_h, i_b] = i_el_cur
                                 soft_state.sc_hit_bary_b[i_h, i_b] = bary_b
-                                soft_state.sc_hit_D[i_h, i_b] = D
+                                soft_state.sc_hit_D[i_h, i_b] = func_mat3_to_sym6(D)
                                 if qd.static(record):
                                     hit_readback.sc_hit_force[i_h, i_b] = wf
                                     hit_readback.sc_hit_pos[i_h, i_b] = pos
@@ -3889,7 +3889,7 @@ def func_pc_collider_eval(
                     soft_state.pc_hit_link_a[i_h, i_b] = i_la if (kind_a == 0 and is_dynamic_a) else -1
                     soft_state.pc_hit_r_a[i_h, i_b] = r_a
                     soft_state.pc_hit_vert_b[i_h, i_b] = i_vb
-                    soft_state.pc_hit_D[i_h, i_b] = D
+                    soft_state.pc_hit_D[i_h, i_b] = func_mat3_to_sym6(D)
                     if qd.static(record):
                         hit_readback.pc_hit_force[i_h, i_b] = wf
                         hit_readback.pc_hit_pos[i_h, i_b] = pos
