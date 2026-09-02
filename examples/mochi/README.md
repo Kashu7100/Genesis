@@ -89,6 +89,10 @@ to record a video):
 - `bolt_nut_self_screw.py`: a nut screwing itself down a fixed bolt through non-convex thread contact (the
   mochi counterpart of `examples/rigid/bolt_nut_self_screw.py`), at plain 60 Hz steps with no substeps;
   `--torque 1.0` unscrews it back up, and the self-locking thread holds the nut once the torque is released.
+- `newton_cradle.py`: Newton's five-ball cradle, an elastic impact chain (each pendulum its own entity, since
+  the links of one entity never collide). The penalty contact is elastic by default; with BDF2 and 0.33 ms
+  substeps ~97% of the swing reaches the last ball, while backward Euler at plain 60 Hz steps damps it to ~20%
+  (`--substeps`, `--integrator` compare the schemes).
 - `cloth.py`: a sheet draped over a rigid box, and a ball caught by a sheet whose held corners then sway.
 - `cloth_p1q6.py`: the drape of `cloth.py` with six contact samples per triangle (`-q P1Q3` for the default
   three), printing how deep the box edge shows through the cloth surface — an A/B of the sampled-contact edge
