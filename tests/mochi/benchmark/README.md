@@ -370,3 +370,50 @@ scatter-transpose atomics.
 
 Measurement note: the batched GPU numbers of this table were taken while the machine was otherwise idle; a
 concurrent GPU job inflates them 20-40% (best-of-3-windows does not filter a sustained co-tenant).
+
+## Plan 4: contact cache (2026-09-02)
+
+The contact narrow phase used to run at every assembly of the Newton solve: one residual+Hessian pass plus up to four
+line-search trials per iteration, i.e. up to 20 searches per step (sample-hierarchy descents against the signed
+distance fields, the flat loop of every deformable sample against the rigid colliders, the point-cloud hash rebuild
+and walk, the tetrahedron-hierarchy refit and descent). Borrowing the conservative displacement bound of offset
+geometric contact as an exactness certificate (not as a step limit), a search now records the candidate pairs within
+the contact range widened by `contact_candidate_margin` together with the link poses and vertex positions it ran at;
+while no link (origin shift plus rotation angle times its bound radius) and no vertex has moved more than half the
+margin since, every pair a new search could find is already a candidate, and the assembly re-evaluates the candidates
+at the current iterate instead. The evaluation is the unchanged per-pair code, so the contacts, forces and Newton
+iteration counts are those of a search at every assembly (`tests/mochi/test_contact_cache.py`; trajectories differ
+only in the summation order of the atomics). Options: `contact_cache` (default True), `contact_candidate_margin`
+(None: 2 mm, or 0 on the GPU when a deformable solid is a collider, see below), and four candidate capacities
+(`max_contact_candidates_per_sample`, `max_soft_candidates_per_sample`,
+`max_deformable_collider_candidates_per_query`, `max_point_cloud_candidates_per_query`; `get_contact_capacity_usage()`
+reports the live counts, `get_convergence_info()["n_detections"]` the searches per step).
+
+What the measurements taught (gripper = 16k rigid samples against a 4263-tet cube; all numbers on an idle machine):
+
+- Every loop over a bounded list must use the live count, never the capacity: the first version iterated the whole
+  candidate capacity at every assembly and made the tiny rigid scenes 10-33% slower (franka CPU: 32k slots for 85
+  live candidates).
+- The fp32 certificate must not use `acos` of the quaternion dot product (one ulp reads as ~0.7 mrad, which times a
+  0.5 m link radius eats a third of a 1 mm bound); it uses `4 asin(|q -+ q_det| / 2)`.
+- A candidate cache pays only when the widened search costs about as much as the exact one. The tetrahedron
+  hierarchy is the exception: inflating its boxes by 2 mm (a third of a tet) multiplies the visited nodes 4-5x, and
+  in the grasp phase the fp32 line search moves the bodies more than 1 mm at 6-9 of the ~17 assemblies per step, so
+  the widened searches cost more than they save (B=1024: 651 -> 630 ms). With a zero margin the cache still skips the
+  assemblies where nothing moved (the Hessian pass after an accepted trial; 15 of 20 searches remain) at no extra
+  search cost. On the CPU (fp64, 2 searches per step at 2 mm) the widened search wins: 69.4 -> 57.7 ms against 61.7
+  at zero margin; hence the backend-dependent default.
+- Four tetrahedra per leaf (`tet_tree.LEAF_SIZE`, was one) cut the near-field descents on their own: gripper GPU
+  fp32 B=1024 651 -> 504 ms with the exact search at every assembly; leaves of eight are equal within noise.
+
+| scene | config | Round 3 | contact cache | searches/step | note |
+|---|---|---|---|---|---|
+| soft_gripper | GPU fp32 B=1024 | 651.3 | 503.9 (-23%) | 15-17 (margin 0) | 3.88 -> 4.80 MiB/env; 2 mm margin: 554 |
+| soft_gripper | GPU fp32 B=256 | 137.6 | 127.1 (-8%) | 13-17 | |
+| soft_gripper | GPU fp32 B=1 | 39.5 | 25.6 (-35%) | 15 | 2 mm margin: 26.6 |
+| soft_gripper | CPU fp64 B=1 | 69.4 | 57.7 (-17%) | 2 (2 mm) | margin 0: 61.7 |
+| cloth_tshirt | GPU fp32 B=256 | 272.0 | 216.9 (-20%) | 4-7 | 9.99 -> 11.98 MiB/env; 7.0k point-cloud candidates for 2.3k hits |
+| cloth_tshirt | CPU fp64 B=1 | 90.4 | 89.9 (0%) | 5 | the falling shirt moves > 1 mm between trials |
+| cloth_arm | GPU fp32 B=1024 | 323.6 | 309.0 (-4.5%) | 1 | contact was a small share here; 2.63 -> 3.38 MiB/env |
+| soft_duck | CPU fp64 B=1 | 70.3 | 69.0 | 2 | plane only |
+| cloth_arm / rope_arm | CPU fp64 B=1 (at rest, newton 0) | 5.09 / 0.354 | 5.04 / 0.382 | 1 | one assembly per step: the collect+evaluate split costs slightly more than one fused search |

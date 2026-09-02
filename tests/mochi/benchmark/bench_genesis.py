@@ -178,6 +178,8 @@ def main():
         "newton_iterations_max": int(info["n_iter"].max()),
         "pcg_iterations_last": int(info["n_pcg_iter"][0]),
         "pcg_iterations_max": int(info["n_pcg_iter"].max()),
+        "detections_last": int(info["n_detections"][0]),
+        "detections_max": int(info["n_detections"].max()),
         "mem_mib_total": memory["total_bytes"] / MIB,
         "mem_mib_per_env": mem_per_env,
         "mem_mib_static": memory["static_bytes"] / MIB if memory["static_bytes"] is not None else None,

@@ -1068,6 +1068,33 @@ class MochiOptions(GravityMixin, TimeBasedMixin):
     record_contacts : bool, optional
         Whether individual contact points can be read back through `entity.get_contacts()`; their buffers are
         allocated at the first readback. Defaults to True.
+    contact_cache : bool, optional
+        Whether the contact search is skipped while its result is provably unchanged. The search for the sample points
+        within the contact range of every collider then runs only when the cache is invalid: at the start of a step,
+        and whenever a link or a deformable vertex has moved more than half of `contact_candidate_margin` since the
+        last search. The candidates that search recorded (the pairs within the range widened by the margin) are
+        re-evaluated at the current iterate instead, which yields exactly the contacts a new search would find. When
+        False, every assembly of the Newton solve searches again. Defaults to True.
+    contact_candidate_margin : float, optional
+        Widening of the contact range, in meters, within which a contact search records candidate pairs. Half of it
+        bounds the motion after which the search is repeated: a larger margin means fewer searches and more candidates
+        per search. Clamped for grid colliders whose padding is too small for the widened range. If None, 2e-3, or 0
+        on the GPU when a deformable solid is a collider: its tetrahedron search cannot be widened cheaply, so the
+        cache then only skips the assemblies where nothing moved (the Hessian pass after an accepted line-search
+        trial). Defaults to None.
+    max_contact_candidates_per_sample : int, optional
+        Capacity of the candidate list of the rigid contact samples (pairs of a sample and a collider within the
+        widened contact range), per sample. Exceeding it halts the simulation with an error. Defaults to 2.
+    max_soft_candidates_per_sample : int, optional
+        Capacity of the candidate list of the deformable boundary samples against the rigid colliders, per sample.
+        Defaults to 4.
+    max_deformable_collider_candidates_per_query : int, optional
+        Capacity of the candidate list of the sample points (rigid or deformable) against the tetrahedra of the
+        deformable solid colliders (a tetrahedron whose bounds, inflated by the margin, contain the sample), per
+        sample point. Defaults to 4.
+    max_point_cloud_candidates_per_query : int, optional
+        Capacity of the candidate list of the deformable samples against the collider spheres of shells and rods, per
+        deformable sample. If None, 8 when a shell or rod has self-contact and 4 otherwise. Defaults to None.
     step_kernel : str, optional
         How a step is executed: "monolith" runs the whole step of every environment in one kernel (one thread per
         environment, one launch per step, no host round trips), "pipeline" runs each stage as its own kernel with the
@@ -1135,6 +1162,12 @@ class MochiOptions(GravityMixin, TimeBasedMixin):
     max_point_cloud_hits_per_query: PositiveInt | None = None
     broadphase_margin: NonNegativeFloat = 0.01
     record_contacts: StrictBool = True
+    contact_cache: StrictBool = True
+    contact_candidate_margin: NonNegativeFloat | None = None
+    max_contact_candidates_per_sample: PositiveInt = 2
+    max_soft_candidates_per_sample: PositiveInt = 4
+    max_deformable_collider_candidates_per_query: PositiveInt = 4
+    max_point_cloud_candidates_per_query: PositiveInt | None = None
     step_kernel: Literal["auto", "monolith", "pipeline", "graph"] = "auto"
     graph_pcg_unroll: PositiveInt = 1
     joint_limit_stiffness: PositiveFloat = 1e4
