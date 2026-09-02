@@ -328,3 +328,45 @@ GPU fp32: gripper B=1024 568 -> 549 ms/step, duck B=1024 577 -> 554, cloth + arm
 Gripper profile at B=256 after the hierarchy: tetrahedral contact query 23% (was 48%), conjugate gradient 37% (the
 CSR matvec at ~75% of the card's bandwidth, the vector passes limited by per-environment atomics), tetrahedron assembly
 13% (12x12 element tangents; Phase K1).
+
+## Plan 3: single-environment teleoperation speed, CPU threads, batched memory (2026-09-01)
+
+Round-3 goals: (1) one-environment step time within 1-2x of single-threaded mochi on the best backend per scene, for
+responsive teleoperation of deformable scenes; (2) faster and smaller batched simulation. Changes, each measured on an
+idle machine right before and after (`perf/mochi-round3`):
+
+- The residual-only zeroing variant compiles without the Hessian loops (the line-search trials no longer dispatch the
+  full `csr_values` walk): t-shirt GPU fp32 B=256 228.9 -> 223.4 ms/step.
+- Opt-in CPU multithreading: `gs.init(cpu_threads=N)` (or QD_NUM_THREADS) raises the solver's own parallelization
+  level, and the auto rule runs large deformable scenes through the pipeline so their element and contact loops
+  parallelize. The per-environment scalar reductions stay serial on the CPU (a parallel reduction into one
+  accumulator measured 10x slower at one environment), and the GPU-shaped blocked reductions are gated off x64.
+- The rod band preconditioner now includes the contact and attachment blocks on banded vertices: it was the exact
+  inverse only while the rod was free, and a rod pressed into a collider cost 3-5 conjugate-gradient iterations per
+  Newton solve instead of 1 (helix: pcg 95 -> 20 per step, 5.32 -> 4.70 ms). Compiled only for scenes with open rods
+  (a first ungated version cost the rod-less gripper ~15-20% at B=1024).
+- The conjugate-gradient passes are fused into segmented loops (~21 -> ~11 offloaded tasks per iteration; the
+  direction update rides in the matvec initialization and skips converged environments): duck GPU fp32 B=1
+  21.1 -> 16.9 ms, t-shirt 21.4 -> 17.3; t-shirt CPU fp64 at 8 threads 71.4 -> 56.7 ms.
+- The symmetric contact matrices (`hit_D`, `sc_hit_D`, `pc_hit_D`, `acc_D`, `acc_SDS`) are stored as six floats, and
+  the self-contact hit capacity default halves: t-shirt 16.63 -> 9.99 MiB/env, cloth + arm 4.32 -> 2.63, gripper
+  4.38 -> 3.88, at unchanged step times.
+
+One environment against single-threaded mochi fp64 (best backend per scene; mochi 12.4 / 32.2 / 2.28 ms):
+
+| scene | best backend | ms/step | x mochi | CPU fp64 1 thread | CPU fp64 8 threads |
+|---|---|---|---|---|---|
+| soft duck | GPU fp32 | 16.9 | 1.4x | 64.5 (5.2x) | monolith kept (pipeline pays no dividend below ~3k vertices) |
+| cloth t-shirt | GPU fp32 | 17.3 | 0.54x | 86.7 (2.7x) | 56.7 (1.8x) |
+| rod helix | CPU fp64 | 4.70 | 2.1x | 4.70 (2.1x) | monolith kept |
+
+The teleoperation examples take `--cpu-threads`; `finray_gripper.py` runs at ~5.5 ms/step warm (CPU fp64, one
+thread). Batched fp32 speed is within a few percent of Plan 2 (the cloth scenes gain ~4%, the tet scenes are
+bandwidth- and contact-bound); memory per environment fell 40-65% (above). The dominant batched cost is now the
+tetrahedral contact query, re-detected at all five assemblies of every Newton iteration (46.7% of the gripper step
+at B=1024): the next lever is mochi's pass structure (a Hessian-only pass from stored hit records, cutting the
+detection count per iteration), followed by the symmetric-CSR storage if the matvec gains outweigh its
+scatter-transpose atomics.
+
+Measurement note: the batched GPU numbers of this table were taken while the machine was otherwise idle; a
+concurrent GPU job inflates them 20-40% (best-of-3-windows does not filter a sustained co-tenant).

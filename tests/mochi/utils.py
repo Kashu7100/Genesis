@@ -37,6 +37,7 @@ def make_static_config(**overrides):
         "has_equalities": False,
         "has_attachments": False,
         "has_pc_colliders": False,
+        "has_rod_band": False,
         "has_soft_colliders": False,
         "tet_tree_levels": 0,
     }
