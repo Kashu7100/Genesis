@@ -406,14 +406,27 @@ What the measurements taught (gripper = 16k rigid samples against a 4263-tet cub
 - Four tetrahedra per leaf (`tet_tree.LEAF_SIZE`, was one) cut the near-field descents on their own: gripper GPU
   fp32 B=1024 651 -> 504 ms with the exact search at every assembly; leaves of eight are equal within noise.
 
+- The bookkeeping (certificate, candidate lists, reference poses) costs a few microseconds per assembly, which the
+  50-100 us steps of the small rigid scenes notice (rigid +12%, articulated +20% with a few thousand samples). The
+  cache is therefore enabled by default only for scenes with deformable bodies or at least 4096 rigid samples
+  (`contact_cache=None`); the franka scene (16k samples) gains 26% on the CPU.
+
+Round 3 (`e75b4083`) against the contact cache at its defaults, ms/step, best of three 30-step windows:
+
 | scene | config | Round 3 | contact cache | searches/step | note |
 |---|---|---|---|---|---|
-| soft_gripper | GPU fp32 B=1024 | 651.3 | 503.9 (-23%) | 15-17 (margin 0) | 3.88 -> 4.80 MiB/env; 2 mm margin: 554 |
-| soft_gripper | GPU fp32 B=256 | 137.6 | 127.1 (-8%) | 13-17 | |
+| soft_gripper | GPU fp32 B=1024 | 651.3 | 504.5 (-22.5%) | 17 (margin 0) | 3.88 -> 4.68 MiB/env; 2 mm margin: 554 |
+| soft_gripper | GPU fp32 B=256 | 137.6 | 129.1 (-6%) | 13-17 | |
 | soft_gripper | GPU fp32 B=1 | 39.5 | 25.6 (-35%) | 15 | 2 mm margin: 26.6 |
-| soft_gripper | CPU fp64 B=1 | 69.4 | 57.7 (-17%) | 2 (2 mm) | margin 0: 61.7 |
+| soft_gripper | CPU fp64 B=1 | 69.4 | 57.7 / 63.3 (-17 / -9%) | 2 (2 mm) | two runs; margin 0: 61.7 |
 | cloth_tshirt | GPU fp32 B=256 | 272.0 | 216.9 (-20%) | 4-7 | 9.99 -> 11.98 MiB/env; 7.0k point-cloud candidates for 2.3k hits |
 | cloth_tshirt | CPU fp64 B=1 | 90.4 | 89.9 (0%) | 5 | the falling shirt moves > 1 mm between trials |
 | cloth_arm | GPU fp32 B=1024 | 323.6 | 309.0 (-4.5%) | 1 | contact was a small share here; 2.63 -> 3.38 MiB/env |
-| soft_duck | CPU fp64 B=1 | 70.3 | 69.0 | 2 | plane only |
+| soft_duck | CPU fp64 B=1 / GPU fp32 B=1 | 70.3 / 16.9 | 69.3 / 16.7 | 2 | plane only |
+| franka | CPU fp64 B=1 | 0.097 | 0.072 (-26%) | 5 | 16k samples, 9 Newton iterations |
+| rigid / articulated / equalities | CPU fp64 B=1 | 0.050 / 0.088 / 0.055 | 0.050 / 0.085 / 0.055 | - | cache off by default (few samples) |
 | cloth_arm / rope_arm | CPU fp64 B=1 (at rest, newton 0) | 5.09 / 0.354 | 5.04 / 0.382 | 1 | one assembly per step: the collect+evaluate split costs slightly more than one fused search |
+
+Trajectories: the fp64 probes of every scene are unchanged except the gripper (0.043267 -> 0.043247 after 95 steps
+of a stiff grasp: the candidate lists sum the same terms in a different order); the fp32 t-shirt probe moved
+0.2224 -> 0.2250 and stays within the mochi fp32 floor of `test_fp32_parity.py`.

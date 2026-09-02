@@ -196,6 +196,8 @@ SOFT_SDF_CELL_RATIO = 0.25
 SOFT_SDF_PADDING = 5e-3
 # bound radius of a link carrying an unbounded collider (a plane): any rotation invalidates the contact cache
 UNBOUNDED_RADIUS = 1e30
+# rigid contact samples from which the contact cache is enabled by default in scenes without deformable bodies
+CONTACT_CACHE_MIN_SAMPLES = 4096
 SOFT_SDF_MIN_RES = 6
 
 _AUTO_COLLIDER_TYPE_BY_GEOM_TYPE = {
@@ -522,7 +524,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         assemblies where nothing moved). A sample outside the grid of a grid
         collider is not a candidate, so the grid padding must cover the widened range (scaled by the grid's Lipschitz
         bound): the margin is clamped to the smallest padding."""
-        if not self._options.contact_cache:
+        if not self._contact_cache:
             return 0.0
         margin = self._options.contact_candidate_margin
         if margin is None:
@@ -667,6 +669,11 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             self._max_pairs = max(1, n_links_with_samples * n_collider_geoms)
         self._max_hits = max(1, 2 * n_samples) if options.record_contacts else 1
         self._max_cand = max(1, options.max_contact_candidates_per_sample * n_samples)
+        # The cache trades a few bookkeeping passes for the skipped searches: worth it for deformable bodies or a
+        # large sample cloud, not for a handful of rigid samples whose hierarchy descent is already cheap.
+        self._contact_cache = options.contact_cache
+        if self._contact_cache is None:
+            self._contact_cache = self.has_soft or n_samples >= CONTACT_CACHE_MIN_SAMPLES
 
         # The dense matrix is allocated for systems up to `dense_matrix_max_dofs`; an environment is solved directly,
         # island by island, when its largest island fits `dense_solver_max_dofs` (every island under "ldlt").
@@ -725,7 +732,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             tet_tree_levels=self.n_tet_levels,
             has_equalities=len(self._equalities) > 0,
             has_attachments=self.n_attachments > 0,
-            contact_cache=options.contact_cache,
+            contact_cache=self._contact_cache,
         )
         self.mochi_info = get_mochi_info(self)
         self._build_gravity(self.mochi_info.gravity)

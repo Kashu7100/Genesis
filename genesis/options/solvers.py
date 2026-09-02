@@ -1074,7 +1074,9 @@ class MochiOptions(GravityMixin, TimeBasedMixin):
         and whenever a link or a deformable vertex has moved more than half of `contact_candidate_margin` since the
         last search. The candidates that search recorded (the pairs within the range widened by the margin) are
         re-evaluated at the current iterate instead, which yields exactly the contacts a new search would find. When
-        False, every assembly of the Newton solve searches again. Defaults to True.
+        False, every assembly of the Newton solve searches again. If None, enabled for scenes with deformable bodies
+        or at least 4096 rigid contact samples (searching a small sample cloud costs less than the cache's
+        bookkeeping). Defaults to None.
     contact_candidate_margin : float, optional
         Widening of the contact range, in meters, within which a contact search records candidate pairs. Half of it
         bounds the motion after which the search is repeated: a larger margin means fewer searches and more candidates
@@ -1162,7 +1164,7 @@ class MochiOptions(GravityMixin, TimeBasedMixin):
     max_point_cloud_hits_per_query: PositiveInt | None = None
     broadphase_margin: NonNegativeFloat = 0.01
     record_contacts: StrictBool = True
-    contact_cache: StrictBool = True
+    contact_cache: StrictBool | None = None
     contact_candidate_margin: NonNegativeFloat | None = None
     max_contact_candidates_per_sample: PositiveInt = 2
     max_soft_candidates_per_sample: PositiveInt = 4
