@@ -92,6 +92,8 @@ class MochiStaticConfig(metaclass=AutoInitMeta):
     # rigid-deformable vertex attachments present (their assembly is compiled only then)
     has_attachments: bool
     has_pc_colliders: bool
+    # any open rod present (the banded rod preconditioner and its contact scatter are compiled only then)
+    has_rod_band: bool
     has_soft_colliders: bool
     # levels of the bounding-box hierarchy of the collider tetrahedra (the refit runs one task per level)
     tet_tree_levels: int
@@ -409,6 +411,7 @@ class MochiState:
     pcg_rTz_new: qd.Tensor
     pcg_rTz_cross: qd.Tensor
     pcg_pTAp: qd.Tensor
+    pcg_beta: qd.Tensor
     pcg_zTz: qd.Tensor
     pcg_zTz0: qd.Tensor
     pcg_is_active: qd.Tensor
@@ -486,6 +489,7 @@ def get_mochi_state(solver, max_pairs, has_dense):
         pcg_rTz_new=V(dtype=gs.qd_float, shape=(_B,)),
         pcg_rTz_cross=V(dtype=gs.qd_float, shape=(_B,)),
         pcg_pTAp=V(dtype=gs.qd_float, shape=(_B,)),
+        pcg_beta=V(dtype=gs.qd_float, shape=(_B,)),
         pcg_zTz=V(dtype=gs.qd_float, shape=(_B,)),
         pcg_zTz0=V(dtype=gs.qd_float, shape=(_B,)),
         pcg_is_active=V(dtype=gs.qd_bool, shape=(_B,)),
@@ -524,9 +528,9 @@ def get_mochi_contact_state(solver, max_pairs):
         pair_geom_b=V(dtype=gs.qd_int, shape=(max_pairs, _B)),
         acc_f=V(dtype=gs.qd_vec3, shape=(max_pairs, _B)),
         acc_q=V(dtype=gs.qd_vec3, shape=(max_pairs, _B)),
-        acc_D=V(dtype=gs.qd_mat3, shape=(max_pairs, _B)),
+        acc_D=V(dtype=gs.qd_vec6, shape=(max_pairs, _B)),
         acc_SD=V(dtype=gs.qd_mat3, shape=(max_pairs, _B)),
-        acc_SDS=V(dtype=gs.qd_mat3, shape=(max_pairs, _B)),
+        acc_SDS=V(dtype=gs.qd_vec6, shape=(max_pairs, _B)),
         acc_obj=V(dtype=gs.qd_float, shape=(max_pairs, _B)),
         n_hits=V(dtype=gs.qd_int, shape=(max_pairs, _B)),
         links_step_aabb_min=V(dtype=gs.qd_vec3, shape=(n_links_, _B)),
@@ -658,6 +662,7 @@ class MochiSoftInfo:
     rod_stencils_csr: qd.Tensor
     dofs_band_row: qd.Tensor
     band_rows_dof: qd.Tensor
+    band_rows_entity: qd.Tensor
     entities_band_start: qd.Tensor
     entities_band_n: qd.Tensor
     entities_rod_elem_start: qd.Tensor
@@ -790,6 +795,7 @@ def get_mochi_soft_info(solver):
         rod_stencils_csr=V(dtype=gs.qd_int, shape=(n_rs_, 121)),
         dofs_band_row=V(dtype=gs.qd_int, shape=(solver.n_dofs_total_,)),
         band_rows_dof=V(dtype=gs.qd_int, shape=(solver.n_band_rows_,)),
+        band_rows_entity=V(dtype=gs.qd_int, shape=(solver.n_band_rows_,)),
         entities_band_start=V(dtype=gs.qd_int, shape=(n_se_,)),
         entities_band_n=V(dtype=gs.qd_int, shape=(n_se_,)),
         entities_rod_elem_start=V(dtype=gs.qd_int, shape=(n_se_,)),
@@ -1016,9 +1022,9 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         pair_geom_b=V(dtype=gs.qd_int, shape=(max_soft_pairs, _B)),
         acc_f=V(dtype=gs.qd_vec3, shape=(max_soft_pairs, _B)),
         acc_q=V(dtype=gs.qd_vec3, shape=(max_soft_pairs, _B)),
-        acc_D=V(dtype=gs.qd_mat3, shape=(max_soft_pairs, _B)),
+        acc_D=V(dtype=gs.qd_vec6, shape=(max_soft_pairs, _B)),
         acc_SD=V(dtype=gs.qd_mat3, shape=(max_soft_pairs, _B)),
-        acc_SDS=V(dtype=gs.qd_mat3, shape=(max_soft_pairs, _B)),
+        acc_SDS=V(dtype=gs.qd_vec6, shape=(max_soft_pairs, _B)),
         acc_obj=V(dtype=gs.qd_float, shape=(max_soft_pairs, _B)),
         n_hits=V(dtype=gs.qd_int, shape=(max_soft_pairs, _B)),
         n_soft_hits=V(dtype=gs.qd_int, shape=(_B,)),
@@ -1026,7 +1032,7 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         hit_sample=V(dtype=gs.qd_int, shape=(max_soft_hits, _B)),
         hit_link_b=V(dtype=gs.qd_int, shape=(max_soft_hits, _B)),
         hit_r_b=V(dtype=gs.qd_vec3, shape=(max_soft_hits, _B)),
-        hit_D=V(dtype=gs.qd_mat3, shape=(max_soft_hits, _B)),
+        hit_D=V(dtype=gs.qd_vec6, shape=(max_soft_hits, _B)),
         n_sc_hits=V(dtype=gs.qd_int, shape=(_B,)),
         n_sc_hits_max=_scalar(gs.qd_int, 0),
         sc_hit_kind_a=V(dtype=gs.qd_int, shape=(max_sc_hits, _B)),
@@ -1035,7 +1041,7 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         sc_hit_r_a=V(dtype=gs.qd_vec3, shape=(max_sc_hits, _B)),
         sc_hit_elem_b=V(dtype=gs.qd_int, shape=(max_sc_hits, _B)),
         sc_hit_bary_b=V(dtype=gs.qd_vec4, shape=(max_sc_hits, _B)),
-        sc_hit_D=V(dtype=gs.qd_mat3, shape=(max_sc_hits, _B)),
+        sc_hit_D=V(dtype=gs.qd_vec6, shape=(max_sc_hits, _B)),
         n_pc_hits=V(dtype=gs.qd_int, shape=(_B,)),
         n_pc_hits_max=_scalar(gs.qd_int, 0),
         pc_hit_kind_a=V(dtype=gs.qd_int, shape=(max_pc_hits, _B)),
@@ -1043,7 +1049,7 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         pc_hit_link_a=V(dtype=gs.qd_int, shape=(max_pc_hits, _B)),
         pc_hit_r_a=V(dtype=gs.qd_vec3, shape=(max_pc_hits, _B)),
         pc_hit_vert_b=V(dtype=gs.qd_int, shape=(max_pc_hits, _B)),
-        pc_hit_D=V(dtype=gs.qd_mat3, shape=(max_pc_hits, _B)),
+        pc_hit_D=V(dtype=gs.qd_vec6, shape=(max_pc_hits, _B)),
         pc_hash_heads=V(dtype=gs.qd_int, shape=(solver.n_pc_bins_, _B)),
         pc_hash_next=V(dtype=gs.qd_int, shape=(8 * n_sv_, _B)),
         tet_tree_min=V(dtype=gs.qd_vec3, shape=(solver.n_tet_nodes_, _B)),

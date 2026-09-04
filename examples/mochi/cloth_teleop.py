@@ -54,9 +54,15 @@ def sheet_mesh(path, n_cells, size):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-g", "--gpu", action="store_true", help="Run on GPU instead of CPU")
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=1,
+        help="Quadrants CPU threads; more than 1 parallelizes the solver loops of large deformable scenes",
+    )
     args = parser.parse_args()
 
-    gs.init(backend=gs.gpu if args.gpu else gs.cpu, precision="64")
+    gs.init(backend=gs.gpu if args.gpu else gs.cpu, precision="64", cpu_threads=args.cpu_threads)
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=0.02, gravity=(0.0, 0.0, -9.8)),

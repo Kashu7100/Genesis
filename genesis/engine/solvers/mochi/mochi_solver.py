@@ -308,6 +308,14 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         """Number of rigid-deformable vertex attachments registered on the deformable entities."""
         return sum(len(att["verts_idx"]) for entity in self._soft_entities for att in entity.attachments)
 
+    def _resolve_para_level(self):
+        # On a CPU backend initialized with more than one quadrants thread (`gs.init(cpu_threads=...)` or
+        # QD_NUM_THREADS), the solver's item loops run in parallel even at one environment. The scene-global level
+        # and the other solvers are unaffected: this solver builds its own static configs.
+        if gs.backend == gs.cpu and gs.cpu_threads_effective > 1:
+            return max(self.sim._para_level, gs.PARA_LEVEL.PARTIAL)
+        return self.sim._para_level
+
     def build(self):
         self._n_geoms = self.n_geoms
         self._n_cells = self.n_cells
@@ -630,7 +638,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self._resolve_soft_collider_flags()
         self.mochi_config = MochiStaticConfig(
             backend=gs.backend,
-            para_level=self.sim._para_level,
+            para_level=self._resolve_para_level(),
             integrator=INTEGRATOR.BDF2 if options.integrator == "bdf2" else INTEGRATOR.BACKWARD_EULER,
             use_newton_euler_inertia=options.use_newton_euler_inertia,
             friction_model=FRICTION_MODEL.CINF if options.friction_model == "cinf" else FRICTION_MODEL.C1,
@@ -656,6 +664,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             has_soft=self.has_soft,
             has_tets=self.n_soft_elems > 0,
             has_pc_colliders=self._has_pc_colliders,
+            has_rod_band=any(e.is_rod and not e.morph.is_closed_loop for e in self._soft_entities),
             has_soft_colliders=self._has_soft_colliders,
             tet_tree_levels=self.n_tet_levels,
             has_equalities=len(self._equalities) > 0,
@@ -859,7 +868,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         has_self_contact = any((e.is_shell or e.is_rod) and e.material.self_contact for e in entities)
         pc_hits_per_query = options.max_point_cloud_hits_per_query
         if pc_hits_per_query is None:
-            pc_hits_per_query = 8 if has_self_contact else 2
+            pc_hits_per_query = 4 if has_self_contact else 2
         self._max_pc_hits = max(1, pc_hits_per_query * n_samples) if self._has_pc_colliders else 1
         bins_per_item = options.spatial_hash_bins_per_item
         # every item occupies up to eight entries (the cells its bounds overlap)
@@ -903,6 +912,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                     getattr(self.soft_info, field).from_numpy(csr[name])
         if len(band["rows_dof"]) > 0:
             self.soft_info.band_rows_dof.from_numpy(band["rows_dof"])
+            self.soft_info.band_rows_entity.from_numpy(band["rows_entity"])
         if self.n_soft_entities > 0:
             for name in (
                 "band_start",
@@ -1187,6 +1197,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         n_entities = self.n_soft_entities
         dofs_row = np.full(self.n_dofs_total_, -1, dtype=gs.np_int)
         rows_dof = []
+        rows_entity = []
         band = {
             name: np.zeros(max(1, n_entities), dtype=gs.np_int)
             for name in (
@@ -1215,11 +1226,13 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                     if i_n < n_elems:
                         rows_dof.append(self.n_dofs + 3 * self.n_soft_verts + elem_offset + i_n)
                 band["band_n"][i_e] = len(rows_dof) - band["band_start"][i_e]
+                rows_entity.extend([i_e] * band["band_n"][i_e])
             elem_offset += n_elems
             stencil_offset += n_stencils
         rows_dof = np.array(rows_dof, dtype=gs.np_int)
         dofs_row[rows_dof] = np.arange(len(rows_dof), dtype=gs.np_int)
         band["rows_dof"] = rows_dof
+        band["rows_entity"] = np.array(rows_entity, dtype=gs.np_int)
         band["dofs_row"] = dofs_row
         return band
 
@@ -1504,6 +1517,13 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if step_kernel != "auto":
             return step_kernel
         if gs.backend == gs.cpu:
+            # With several quadrants CPU threads, a deformable scene with enough work per loop runs the pipeline so
+            # its element and contact loops parallelize. The threshold is empirical: each offloaded task costs
+            # ~15-70 us of fork/join on the CPU pool, so a scene whose conjugate-gradient iteration does less serial
+            # work than that overhead (the duck: 0.21 ms across ~20 tasks) is faster in the single-launch monolith,
+            # while a larger cloth (the t-shirt: 0.71 ms per iteration) gains ~1.2x.
+            if gs.cpu_threads_effective > 1 and self.has_soft and self.n_soft_verts >= 3000:
+                return "pipeline"
             return "monolith"
         if self.n_dofs_total <= 64 and not self.has_soft:
             return "monolith"
