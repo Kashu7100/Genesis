@@ -48,6 +48,8 @@ def func_reset_newton(
         mochi_state.status[i_b] = SOLVE_STATUS.RUNNING
         mochi_state.n_iter[i_b] = 0
         mochi_state.n_pcg_iter[i_b] = 0
+        mochi_state.needs_detect[i_b] = 1
+        mochi_state.n_detections[i_b] = 0
         mochi_state.ls_alpha[i_b] = 1.0
         mochi_state.ls_is_done[i_b] = False
         mochi_state.res_norm0[i_b] = 0.0

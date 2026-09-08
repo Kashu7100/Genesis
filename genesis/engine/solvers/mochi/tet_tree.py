@@ -19,8 +19,9 @@ import numpy as np
 
 import genesis as gs
 
-# Tetrahedra per leaf: one keeps the box test as tight as the tetrahedron's own bounds.
-LEAF_SIZE = 1
+# Tetrahedra per leaf. One keeps the box test as tight as the tetrahedron's own bounds, but the descent then visits
+# about as many nodes as leaves; four cuts the node count and the near-field descents (gripper GPU B=1024: -23 %).
+LEAF_SIZE = 4
 
 
 def build_tet_tree(aabb_min, aabb_max, leaf_size=LEAF_SIZE):
