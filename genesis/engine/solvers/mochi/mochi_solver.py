@@ -13,6 +13,7 @@ import torch
 
 import genesis as gs
 import genesis.utils.geom as gu
+from genesis.constants import link_ref_frame
 from genesis.engine.entities.mochi_entity import MochiEntity, MochiSoftEntity
 from genesis.engine.states.solvers import MochiSolverState
 from genesis.options.solvers import MochiOptions
@@ -2493,6 +2494,50 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
     def set_dofs_limit(self, lower, upper, dofs_idx=None, envs_idx=None):
         self._set_dofs_info([lower, upper], dofs_idx, "limit", envs_idx)
+
+    @staticmethod
+    def _sanitize_ref_frame(ref: link_ref_frame, *, has_root_COM: bool = True) -> int:
+        """Check that a reference frame is supported and return it as a plain int (as ``RigidSolver`` does)."""
+        frames = tuple(link_ref_frame) if has_root_COM else (link_ref_frame.link_origin, link_ref_frame.link_COM)
+        if not isinstance(ref, link_ref_frame) or ref not in frames:
+            refs = ", ".join(f"'gs.link_ref_frame.{frame.name}'" for frame in frames)
+            gs.raise_exception(f"'ref' must be one of {refs}.")
+        return int(ref)
+
+    def get_links_pos(
+        self,
+        links_idx=None,
+        envs_idx=None,
+        *,
+        ref: link_ref_frame = link_ref_frame.link_origin,
+        relative=False,
+    ):
+        """Link positions in the requested reference frame, as ``RigidSolver.get_links_pos``.
+
+        ``KinematicSolver``'s own getter knows only the link origin; the inertial frames the other references name
+        are maintained by this solver as well, so the whole ``ref`` vocabulary is answered here.
+        """
+        ref_frame = self._sanitize_ref_frame(ref)
+        if ref_frame == link_ref_frame.root_COM:
+            tensor = qd_to_torch(self.dyn_state.links.root_COM, envs_idx, links_idx, transpose=True, copy=True)
+        elif ref_frame == link_ref_frame.link_COM:
+            i_pos = qd_to_torch(self.dyn_state.links.i_pos, envs_idx, links_idx, transpose=True)
+            root_COM = qd_to_torch(self.dyn_state.links.root_COM, envs_idx, links_idx, transpose=True)
+            tensor = i_pos + root_COM
+        else:
+            return super().get_links_pos(links_idx, envs_idx, relative=relative)
+        return tensor[0] if self.n_envs == 0 else tensor
+
+    def get_links_vel(self, links_idx=None, envs_idx=None, *, ref: link_ref_frame = link_ref_frame.link_origin):
+        """Link velocities in the requested reference frame, as ``RigidSolver.get_links_vel``."""
+        ref_frame = self._sanitize_ref_frame(ref, has_root_COM=False)
+        if ref_frame == link_ref_frame.link_origin:
+            return super().get_links_vel(links_idx, envs_idx)
+        cd_vel = qd_to_torch(self.dyn_state.links.cd_vel, envs_idx, links_idx, transpose=True, copy=True)
+        cd_ang = qd_to_torch(self.dyn_state.links.cd_ang, envs_idx, links_idx, transpose=True)
+        i_pos = qd_to_torch(self.dyn_state.links.i_pos, envs_idx, links_idx, transpose=True)
+        tensor = cd_vel + cd_ang.cross(i_pos, dim=-1)
+        return tensor[0] if self.n_envs == 0 else tensor
 
     def _get_dofs_info(self, field, dofs_idx=None, envs_idx=None):
         """Read one per-DOF info field, honoring the same batching rule as the setters."""
