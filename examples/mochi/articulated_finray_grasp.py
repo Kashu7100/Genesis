@@ -30,8 +30,13 @@ from genesis.utils.misc import tensor_to_array
 
 BOX_SIZE = 0.03
 BOX_XY = (0.45, 0.0)
-# Height of the flange above the ground at the grasp: it puts the box between the finger tips, where the angled
-# FinRay pads close tightest, and leaves the tips a few millimeters clear of the ground.
+# Standoff of the gripper mount frame from the flange along the tool axis. The URDF carries the mount frame at the
+# center of the Schunk body, so bolting the body onto the flange face takes half its depth of clearance.
+MOUNT_OFFSET = 0.03625
+# Roll of the gripper about the tool axis, turning the finger separation axis a quarter turn off the flange x axis.
+MOUNT_EULER = (0.0, 0.0, 90.0)
+# Height of the gripper mount frame above the ground at the grasp: it puts the box between the finger tips, where
+# the angled FinRay pads close tightest, and leaves the tips a few millimeters clear of the ground.
 GRASP_HEIGHT = 0.16
 LIFT_HEIGHT = 0.40
 # Prismatic target closing the fingers onto the box: the angled pads meet closer than the box is wide, so the box
@@ -40,7 +45,7 @@ CLOSE_STROKE = 0.03
 # Elbow-up seed of the inverse-kinematics solves, the neutral configuration of the parsed model being a singular
 # straight-up posture outside the elbow joint limit.
 SEED_QPOS = (0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785)
-# Tool orientation of both waypoints: the tool axis points down and the fingers separate along the world x axis.
+# Tool orientation of both waypoints: the tool axis points down and the fingers separate along the world y axis.
 TOOL_QUAT = (0.0, 1.0, 0.0, 0.0)
 
 
@@ -95,9 +100,14 @@ def main():
         ),
         material=gs.materials.Mochi.Rigid(friction=1.5, viscous_friction=1.0),
     )
-    # The gripper mount frame is welded onto the flange frame of the arm, the mount rotation that turns the Schunk
-    # body along the tool axis being baked into the URDF.
-    gripper.attach(franka, "attachment")
+    # The gripper mount frame is welded onto the flange of the arm, standing the body clear of the wrist and rolled
+    # about the tool axis. The mount rotation that turns the Schunk body along the tool axis is baked into the URDF.
+    gripper.attach(
+        franka,
+        "attachment",
+        pos=(0.0, 0.0, MOUNT_OFFSET),
+        quat=gu.xyz_to_quat(np.array(MOUNT_EULER), rpy=True, degrees=True),
+    )
     fingers, fingers_link, fingers_verts_local = [], [], []
     for side in ("L", "R"):
         link = gripper.get_link(f"finray_finger_{side}")
@@ -142,24 +152,28 @@ def main():
         cam = scene.add_camera(res=(640, 360), pos=(1.1, -1.1, 0.8), lookat=(0.35, 0.0, 0.3))
     scene.build()
 
-    # The gripper body overlaps the flange it is welded to, and the fingers overlap the gripper body near their
-    # mounts and each other when closed: contact acts only against the box and the ground.
+    # The gripper body abuts the flange it is welded to, and the fingers overlap the gripper body near their mounts
+    # and each other when closed: contact acts only against the box and the ground.
     scene.mochi_solver.enable_entity_contact(gripper, franka, False)
     scene.mochi_solver.enable_entity_contact(fingers[0], fingers[1], False)
     for finger in fingers:
         scene.mochi_solver.enable_entity_contact(finger, gripper, False)
 
+    # Both waypoints place the gripper mount frame, which the standoff carries ahead of the flange the solve steers.
     flange = franka.get_link("attachment")
+    tool = gripper.get_link("mount_base")
     qpos_grasp = franka.inverse_kinematics(
         link=flange,
         pos=(*BOX_XY, GRASP_HEIGHT),
         quat=TOOL_QUAT,
+        local_point=(0.0, 0.0, MOUNT_OFFSET),
         init_qpos=SEED_QPOS,
     )
     qpos_lift = franka.inverse_kinematics(
         link=flange,
         pos=(*BOX_XY, LIFT_HEIGHT),
         quat=TOOL_QUAT,
+        local_point=(0.0, 0.0, MOUNT_OFFSET),
         init_qpos=qpos_grasp,
     )
     franka.set_qpos(qpos_grasp)
@@ -187,7 +201,7 @@ def main():
             info = scene.mochi_solver.get_convergence_info()
             grip_force = np.linalg.norm(tensor_to_array(fingers[0].get_vertices_contact_force()).sum(axis=0))
             print(
-                f"step {i_step:4d}: box z={box.get_pos()[2]:.4f} flange z={flange.get_pos()[2]:.4f} "
+                f"step {i_step:4d}: box z={box.get_pos()[2]:.4f} tool z={tool.get_pos()[2]:.4f} "
                 f"grip force={grip_force:6.3f} N newton iterations={info['n_iter'][0]}"
             )
         if args.record:
