@@ -99,7 +99,6 @@ from .abd.forward_kinematics import (
     kernel_update_vgeoms,
 )
 from .abd.forward_dynamics import (
-    func_actuation,
     func_bias_force,
     func_compute_mass_matrix,
     func_compute_qacc,
@@ -1584,7 +1583,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         kernel_forward_kinematics_replay(
             envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=True
         )
-        kernel_COM_links_replay(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=True)
+        kernel_COM_links_replay(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config)
         kernel_update_geoms_replay(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=True)
         kernel_forward_velocity(
             envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=True
@@ -1593,9 +1592,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         # Reverse the stages: velocity first, forward kinematics last. COM and geoms both consume only FK
         # outputs, so their mutual order is free.
         kernel_manual_forward_velocity_bw(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config)
-        kernel_COM_links_replay.grad(
-            self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=True
-        )
+        kernel_COM_links_replay.grad(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config)
         kernel_update_geoms_replay.grad(
             self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=True
         )
@@ -3027,6 +3024,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         tensor = qd_to_torch(self.dyn_state.dofs.force, envs_idx, dofs_idx, transpose=True, copy=True)
         return tensor[0] if self.n_envs == 0 else tensor
 
+    def get_dofs_acc(self, dofs_idx=None, envs_idx=None):
+        tensor = qd_to_torch(self.dyn_state.dofs.acc, envs_idx, dofs_idx, transpose=True, copy=True)
+        return tensor[0] if self.n_envs == 0 else tensor
+
     def get_dofs_kp(self, dofs_idx=None, envs_idx=None):
         if not self._options.batch_dofs_info and envs_idx is not None:
             gs.raise_exception("`envs_idx` cannot be specified for non-batched dofs info.")
@@ -3282,13 +3283,13 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         return aabb[0] if self.n_envs == 0 else aabb
 
     def set_geom_friction(self, friction, geoms_idx):
-        kernel_set_geom_friction(geoms_idx, self.dyn_info, friction)
+        kernel_set_geom_friction(geoms_idx, friction, self.dyn_info)
 
     def set_geom_friction_torsional(self, friction_torsional, geoms_idx):
-        kernel_set_geom_friction_torsional(geoms_idx, self.dyn_info, friction_torsional)
+        kernel_set_geom_friction_torsional(geoms_idx, friction_torsional, self.dyn_info)
 
     def set_geom_friction_rolling(self, friction_rolling, geoms_idx):
-        kernel_set_geom_friction_rolling(geoms_idx, self.dyn_info, friction_rolling)
+        kernel_set_geom_friction_rolling(geoms_idx, friction_rolling, self.dyn_info)
 
     def set_geoms_friction(self, friction, geoms_idx=None):
         friction, geoms_idx, _ = self._sanitize_io_variables(
