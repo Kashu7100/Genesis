@@ -1,13 +1,14 @@
+import atexit
+import gc
 import io
+import logging as _logging
 import os
 import sys
-import atexit
-import logging as _logging
 import traceback
 import weakref
+from contextlib import redirect_stdout
 from typing import Callable
 from warnings import warn
-from contextlib import redirect_stdout
 
 # Import quadrants while collecting its output without printing directly
 _qd_outputs = io.StringIO()
@@ -466,67 +467,77 @@ sys.excepthook = _custom_excepthook
 
 ########################## shortcut imports for users ##########################
 
-from .ext import _trimesh_patch
-from .utils.misc import get_src_dir as _get_src_dir
-from .utils.misc import clear_caches as _clear_caches
+# Every full garbage collection scans all the objects tracked so far, while the imports below create hundreds of
+# thousands of long-lived objects (modules, classes, kernels). Pausing collection until they all exist, then moving
+# everything to the permanent generation, avoids repeated full scans during import and shortens every later one.
+_is_gc_enabled = gc.isenabled()
+gc.disable()
+try:
+    from .ext import _trimesh_patch
+    from .utils.misc import get_src_dir as _get_src_dir
+    from .utils.misc import clear_caches as _clear_caches
 
-# Eagerly load native extensions under redirected stderr to silence dlopen-time noise (e.g. macOS
-# objc duplicate-class warnings when several libraries ship their own copy of GLFW).
-with open(os.devnull, "w") as stderr, redirect_libc_stderr(stderr):
-    try:
-        from pygel3d import graph, hmesh
-    except OSError as e:
-        # Import may fail because of missing system dependencies (libGLU.so.1).
-        # This is not blocking because it is only an issue for hybrid entities.
-        pass
+    # Eagerly load native extensions under redirected stderr to silence dlopen-time noise (e.g. macOS
+    # objc duplicate-class warnings when several libraries ship their own copy of GLFW).
+    with open(os.devnull, "w") as stderr, redirect_libc_stderr(stderr):
+        try:
+            from pygel3d import graph, hmesh
+        except OSError as e:
+            # Import may fail because of missing system dependencies (libGLU.so.1).
+            # This is not blocking because it is only an issue for hybrid entities.
+            pass
 
-    try:
-        import imgui_bundle  # noqa: F401
-    except ImportError:
-        pass
+        try:
+            import imgui_bundle  # noqa: F401
+        except ImportError:
+            pass
 
-    try:
-        sys.path.append(os.path.join(_get_src_dir(), "ext/LuisaRender/build/bin"))
-        import LuisaRenderPy as _LuisaRenderPy
-    except ImportError:
-        pass
+        try:
+            sys.path.append(os.path.join(_get_src_dir(), "ext/LuisaRender/build/bin"))
+            import LuisaRenderPy as _LuisaRenderPy
+        except ImportError:
+            pass
 
-from .constants import (
-    IntEnum,
-    JOINT_TYPE,
-    GEOM_TYPE,
-    EQUALITY_TYPE,
-    CTRL_MODE,
-    PARA_LEVEL,
-    ACTIVE,
-    INACTIVE,
-    integrator,
-    constraint_solver,
-    friction_cone,
-    contact_resolution,
-    broadphase_traversal,
-    link_ref_frame,
-)
+    from .constants import (
+        IntEnum,
+        JOINT_TYPE,
+        GEOM_TYPE,
+        EQUALITY_TYPE,
+        CTRL_MODE,
+        PARA_LEVEL,
+        ACTIVE,
+        INACTIVE,
+        integrator,
+        constraint_solver,
+        friction_cone,
+        contact_resolution,
+        broadphase_traversal,
+        link_ref_frame,
+    )
 
-from .utils.uid import UID
-from .utils import tools
-from .utils.geom import *
-from .utils.misc import assert_built, assert_unbuilt, assert_initialized, raise_exception, raise_exception_from
+    from .utils.uid import UID
+    from .utils import tools
+    from .utils.geom import *
+    from .utils.misc import assert_built, assert_unbuilt, assert_initialized, raise_exception, raise_exception_from
 
-from .options import morphs
-from .options import sensors
-from .options import renderers
-from .options import surfaces
-from .options import textures
+    from .options import morphs
+    from .options import sensors
+    from .options import renderers
+    from .options import surfaces
+    from .options import textures
 
-from .datatypes import List
-from .grad.creation_ops import *
+    from .datatypes import List
+    from .grad.creation_ops import *
 
-from .engine import states, materials, force_fields
-from .engine.mesh import Mesh
-from .engine.scene import Scene
+    from .engine import states, materials, force_fields
+    from .engine.mesh import Mesh
+    from .engine.scene import Scene
 
-from . import recorders
+    from . import recorders
+finally:
+    gc.freeze()
+    if _is_gc_enabled:
+        gc.enable()
 
 for name, member in _gs_backend.__members__.items():
     globals()[name] = member
