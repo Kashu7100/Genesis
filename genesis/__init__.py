@@ -91,19 +91,23 @@ def init(
         logging_level = _logging.DEBUG if debug else _logging.INFO
     logger = Logger(logging_level, logger_verbose_time)
 
-    try:
-        columns, _lines = os.get_terminal_size()
-    except OSError:
-        columns = 80
-    wave_width = (columns - logger.INFO_length - 11) // 2
-    if wave_width % 2 == 0:
-        wave_width -= 1
-    wave_width = max(0, min(38, wave_width))
-    bar_width = wave_width * 2 + 9
-    wave = ("┈┉" * wave_width)[:wave_width]
-    logger.info(f"~<╭{'─' * (bar_width)}╮>~")
-    logger.info(f"~<│{wave}>~ ~~~~<Genesis>~~~~ ~<{wave}│>~")
-    logger.info(f"~<╰{'─' * (bar_width)}╯>~")
+    # The greeting banner and the emojis decorating the messages below are pure decoration, which the "dumb" theme
+    # drops for consumers that read the raw text.
+    is_decorated = theme != "dumb"
+    if is_decorated:
+        try:
+            columns, _lines = os.get_terminal_size()
+        except OSError:
+            columns = 80
+        wave_width = (columns - logger.INFO_length - 11) // 2
+        if wave_width % 2 == 0:
+            wave_width -= 1
+        wave_width = max(0, min(38, wave_width))
+        bar_width = wave_width * 2 + 9
+        wave = ("┈┉" * wave_width)[:wave_width]
+        logger.info(f"~<╭{'─' * (bar_width)}╮>~")
+        logger.info(f"~<│{wave}>~ ~~~~<Genesis>~~~~ ~<{wave}│>~")
+        logger.info(f"~<╰{'─' * (bar_width)}╯>~")
 
     # Get device and backend
     global device
@@ -329,18 +333,18 @@ def init(
         )
 
     msg_options = ", ".join(
-        f"{name}: ~~<{val}>~~"
-        for name, val in (
-            ("🔖 version", __version__),
-            ("🎨 theme", theme),
-            ("🌱 seed", seed),
-            ("🐛 debug", bool(debug)),
-            ("📏 precision", precision),
-            ("🔥 performance", bool(performance_mode)),
-            ("💬 verbose", _logging.getLevelName(logger.level)),
+        f"{f'{emoji} ' if is_decorated else ''}{name}: ~~<{val}>~~"
+        for emoji, name, val in (
+            ("🔖", "version", __version__),
+            ("🎨", "theme", theme),
+            ("🌱", "seed", seed),
+            ("🐛", "debug", bool(debug)),
+            ("📏", "precision", precision),
+            ("🔥", "performance", bool(performance_mode)),
+            ("💬", "verbose", _logging.getLevelName(logger.level)),
         )
     )
-    logger.info(f"🚀 Genesis initialized. {msg_options}")
+    logger.info(f"{'🚀 ' if is_decorated else ''}Genesis initialized. {msg_options}")
 
     if _use_zerocopy is None:
         logger.warning(
@@ -379,9 +383,10 @@ def destroy():
     atexit.unregister(destroy)
 
     # Display any buffered error message if logger is configured
-    global logger
+    global logger, _theme
     if logger:
-        logger.info("💤 Exiting Genesis and caching compiled kernels...")
+        # See the decoration of the messages of 'init'.
+        logger.info(f"{'💤 ' if _theme != 'dumb' else ''}Exiting Genesis and caching compiled kernels...")
 
     # Destroy all scenes. A weakref that no longer resolves means the scene was already garbage-collected (and its
     # resources released), so there is nothing left to destroy - skip it rather than asserting.
@@ -418,7 +423,7 @@ def destroy():
     logger = None
 
     # Clear global state
-    global _theme, device, backend, EPS
+    global device, backend, EPS
     _theme = None
     device = None
     backend = None

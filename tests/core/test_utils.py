@@ -1,4 +1,5 @@
 import math
+import re
 from functools import partial
 from unittest.mock import patch
 
@@ -946,6 +947,29 @@ def test_fps_tracker():
     fps = tracker.step(current_time=10.45)
     # num envs * [num steps] / (delta time)
     assert math.isclose(fps, n_envs * 4 / 0.14)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [None])
+def test_logger_dumb_theme_plain_text(capsys):
+    gs.init(backend=gs.cpu, theme="dumb", logging_level="info")
+    try:
+        scene = gs.Scene(show_viewer=False)
+        scene.add_entity(
+            gs.morphs.Box(
+                size=(0.1, 0.1, 0.1),
+            ),
+            name="box",
+        )
+        gs.logger.warning("Watch ~<this>~.")
+    finally:
+        gs.destroy()
+    out = capsys.readouterr().out
+    assert out.isascii() and "\x1b" not in out
+    lines = out.splitlines()
+    assert all(re.match(r"\[Genesis \d{2}:\d{2}:\d{2}( [A-Z]+)?\] ", line) for line in lines)
+    assert any(re.fullmatch(r"\[Genesis \d{2}:\d{2}:\d{2} WARNING\] Watch this\.", line) for line in lines)
+    assert any(re.search(r"\] Adding RigidEntity 'box'\. idx: 0, ", line) for line in lines)
 
 
 @pytest.mark.required

@@ -3,6 +3,7 @@ import logging
 import threading
 from contextlib import contextmanager
 
+import genesis as gs
 from genesis.styles import colors, formats
 
 from .time_elapser import TimeElapser
@@ -39,6 +40,14 @@ class GenesisFormatter(logging.Formatter):
         self.last_color = color
         return f"{color}[Genesis] [{self.TIME}] [{self.LEVEL}] {self.MESSAGE}{formats.RESET}"
 
+    def plain_fmt(self, levelno):
+        # The "dumb" theme targets consumers that read the raw text, e.g. log files and coding agents. Almost every
+        # record is INFO, so only the other levels are named.
+        self.last_color = ""
+        if levelno == logging.INFO:
+            return f"[Genesis {self.TIME}] {self.MESSAGE}"
+        return f"[Genesis {self.TIME} {self.LEVEL}] {self.MESSAGE}"
+
     def extra_fmt(self, msg):
         msg = msg.replace("~~~~<", colors.MINT + formats.BOLD + formats.ITALIC)
         msg = msg.replace("~~~<", colors.MINT + formats.ITALIC)
@@ -53,7 +62,10 @@ class GenesisFormatter(logging.Formatter):
         return msg
 
     def format(self, record):
-        log_fmt = self.colored_fmt(self.mapping.get(record.levelno))
+        if gs._theme == "dumb":
+            log_fmt = self.plain_fmt(record.levelno)
+        else:
+            log_fmt = self.colored_fmt(self.mapping.get(record.levelno))
         formatter = logging.Formatter(log_fmt, datefmt=self.DATE_FORMAT)
         msg = self.extra_fmt(formatter.format(record))
         self.last_output = msg
