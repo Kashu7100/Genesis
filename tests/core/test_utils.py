@@ -1,3 +1,5 @@
+import logging
+import logging.handlers
 import math
 from functools import partial
 from unittest.mock import patch
@@ -946,6 +948,17 @@ def test_fps_tracker():
     fps = tracker.step(current_time=10.45)
     # num envs * [num steps] / (delta time)
     assert math.isclose(fps, n_envs * 4 / 0.14)
+
+
+@pytest.mark.required
+def test_logger_skips_root_handlers():
+    root_handler = logging.handlers.BufferingHandler(capacity=10)
+    logging.getLogger().addHandler(root_handler)
+    try:
+        gs.logger.warning("Genesis warning")
+    finally:
+        logging.getLogger().removeHandler(root_handler)
+    assert not root_handler.buffer
 
 
 @pytest.mark.required
