@@ -600,7 +600,7 @@ class Simulator(RBC):
         Environments are stepped and reset independently, so simulated time is per environment, and this is where it
         is read from.
         """
-        time = self._steps[indices_to_mask(envs_idx)] * self._dt
+        time = self._steps[indices_to_mask(envs_idx)].to(dtype=gs.tc_float) * self._dt
         return time[0] if self.n_envs == 0 else time
 
     @property

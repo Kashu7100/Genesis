@@ -1162,8 +1162,7 @@ def assign_indexed_tensor(
         if len(axes) == 1:
             axis = axes[0]
             index = indices[axis]
-            # The in-place fills take the index on the device of the buffer only, while advanced indexing takes any.
-            if isinstance(index, torch.Tensor) and index.device == tensor.device:
+            if isinstance(index, torch.Tensor):
                 if index.dtype == torch.bool:
                     spread = [1] * tensor.ndim
                     spread[axis] = -1

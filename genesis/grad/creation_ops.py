@@ -7,8 +7,8 @@ import genesis as gs
 
 from .tensor import Tensor
 
-# Ops given 'device=gs.device', so that they allocate there directly and random ones draw from its generator. The other
-# ops allocate on the device of their input.
+# Ops given the requested dtype and 'device=gs.device', so that they allocate there directly and random ones draw from
+# its generator at that precision. The other ops follow the device of their input.
 _torch_factory_ops = (
     torch.tensor,
     torch.asarray,
@@ -56,7 +56,7 @@ def torch_op_wrapper(torch_op):
         elif torch_op is torch.tensor:
             torch_tensor = torch_op(*args, dtype=dtype, requires_grad=requires_grad, device=gs.device)
         elif torch_op in _torch_factory_ops:
-            torch_tensor = torch_op(*args, device=gs.device, **kwargs)
+            torch_tensor = torch_op(*args, dtype=dtype, device=gs.device, **kwargs)
         else:
             torch_tensor = torch_op(*args, **kwargs)
 

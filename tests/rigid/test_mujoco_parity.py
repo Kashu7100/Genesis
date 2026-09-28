@@ -212,7 +212,7 @@ def test_walker(gs_sim, mj_sim, gjk_collision, tol):
     qpos = gs_robot.get_dofs_position()
     gs_robot.set_dofs_position(qpos)
     assert_allclose(gs_robot.get_dofs_position(), qpos, tol=gs.EPS)
-    qpos = torch.rand(gs_robot.n_dofs).clip(*gs_robot.get_dofs_limit())
+    qpos = torch.rand(gs_robot.n_dofs, dtype=gs.tc_float).clip(*gs_robot.get_dofs_limit())
     gs_robot.set_dofs_position(qpos)
     assert_allclose(gs_robot.get_dofs_position(), qpos, tol=gs.EPS)
 
@@ -243,7 +243,7 @@ def test_rope_ball(gs_sim, mj_sim, gs_solver, tol):
     qpos = gs_sim.rigid_solver.get_dofs_position()
     gs_sim.rigid_solver.set_dofs_position(qpos)
     assert_allclose(gs_sim.rigid_solver.get_dofs_position(), qpos, tol=gs.EPS)
-    qpos = torch.rand(gs_sim.rigid_solver.n_dofs).clip(*gs_sim.rigid_solver.get_dofs_limit())
+    qpos = torch.rand(gs_sim.rigid_solver.n_dofs, dtype=gs.tc_float).clip(*gs_sim.rigid_solver.get_dofs_limit())
     gs_sim.rigid_solver.set_dofs_position(qpos)
     assert_allclose(gs_sim.rigid_solver.get_dofs_position(), qpos, tol=gs.EPS)
 
