@@ -535,8 +535,8 @@ def test_parsing_inertia_defaults(
         assert_allclose(entity_chain.get_dofs_velocity(), entity_chain_ref.get_dofs_velocity(), tol=max(tol, 5e-7))
         assert_allclose(entity_chain.get_quat(), entity_chain_ref.get_quat(), tol=max(tol, 5e-7))
         assert_allclose(
-            entity_chain.get_pos() - torch.tensor(entity_chain.morph.pos),
-            entity_chain_ref.get_pos() - torch.tensor(entity_chain_ref.morph.pos),
+            entity_chain.get_pos() - torch.tensor(entity_chain.morph.pos, device=gs.device),
+            entity_chain_ref.get_pos() - torch.tensor(entity_chain_ref.morph.pos, device=gs.device),
             tol=max(tol, 5e-7),
         )
 
