@@ -67,8 +67,8 @@ class Logger:
 
         self._logger = logging.getLogger("genesis")
         self._logger.setLevel(logging_level)
-        # Genesis prints through its own handler below, so a record reaching the handlers of the application's root
-        # logger as well would be printed a second time, without the Genesis formatting.
+        # Records are already printed by the handler added below. Propagating them to the root logger would print them
+        # a second time, unformatted, whenever the application configures root logging (e.g. 'logging.basicConfig').
         self._logger.propagate = False
 
         self._formatter = GenesisFormatter(verbose_time)

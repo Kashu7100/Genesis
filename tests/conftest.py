@@ -751,15 +751,6 @@ def use_deterministic_algorithms(request):
     return use_deterministic_algorithms
 
 
-@pytest.fixture
-def caplog(caplog):
-    # pytest attaches its capture handler to the root logger, and the "genesis" logger stops propagation before it.
-    genesis_logger = logging.getLogger("genesis")
-    genesis_logger.addHandler(caplog.handler)
-    yield caplog
-    genesis_logger.removeHandler(caplog.handler)
-
-
 @pytest.fixture(scope="function", autouse=True)
 def initialize_genesis(
     request, monkeypatch, tmp_path, backend, precision, performance_mode, debug, cache, use_deterministic_algorithms

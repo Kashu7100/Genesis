@@ -1,24 +1,25 @@
-import logging
-import logging.handlers
 import math
+import subprocess
+import sys
 from functools import partial
 from unittest.mock import patch
 
+import numpy as np
+import torch
+
 import igl
 import pytest
-import torch
 import trimesh
-import numpy as np
 from scipy.linalg import polar as scipy_polar
 from scipy.spatial.transform import Rotation as R, Slerp
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.utils.tools import FPSTracker
-from genesis.utils.misc import tensor_to_array
 from genesis.utils import warnings as warnings_mod
-from genesis.utils.warnings import warn_once
+from genesis.utils.misc import tensor_to_array
+from genesis.utils.tools import FPSTracker
 from genesis.utils.urdf import compose_inertial_properties
+from genesis.utils.warnings import warn_once
 
 from ..utils.assertions import assert_allclose
 from ..utils.assets import get_hf_dataset
@@ -951,14 +952,15 @@ def test_fps_tracker():
 
 
 @pytest.mark.required
-def test_logger_skips_root_handlers():
-    root_handler = logging.handlers.BufferingHandler(capacity=10)
-    logging.getLogger().addHandler(root_handler)
-    try:
-        gs.logger.warning("Genesis warning")
-    finally:
-        logging.getLogger().removeHandler(root_handler)
-    assert not root_handler.buffer
+@pytest.mark.parametrize("backend", [None])
+def test_logger_prints_once_with_root_logging(backend):
+    script = (
+        "import logging; logging.basicConfig(level=logging.INFO); "
+        "import genesis as gs; gs.init(backend=gs.cpu); gs.logger.warning('Genesis warning')"
+    )
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, encoding="utf-8")
+    assert proc.returncode == 0, proc.stderr
+    assert (proc.stdout + proc.stderr).count("Genesis warning") == 1
 
 
 @pytest.mark.required
