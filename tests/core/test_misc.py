@@ -342,6 +342,13 @@ def test_indices_to_mask_selects_the_cross_product(as_boolean):
 
 
 @pytest.mark.required
+def test_init_preserves_torch_default_device():
+    assert torch.get_default_device() == torch.device("cpu")
+    for tensor in (gs.tensor((1.0, 2.0)), gs.zeros(3), gs.arange(3), gs.rand(3), gs.zeros_like(gs.zeros(3))):
+        assert tensor.device.type == gs.device.type
+
+
+@pytest.mark.required
 def test_fps_algorithm_core():
     # Shape, dtype, determinism, anchor-on-no-seed, and invalid n_samples all in one test.
     points = np.random.default_rng(1).random((50, 3))

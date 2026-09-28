@@ -213,8 +213,9 @@ def init(
     qd_ivec3 = qd.types.vector(3, qd_int)
     qd_ivec4 = qd.types.vector(4, qd_int)
 
-    # Update torch default dtype and device, just in case
-    torch.set_default_device(device)
+    # Update torch default dtype, just in case. A torch default device would route every torch call, tensor methods
+    # and operators included, through a Python dispatch hook, so every tensor Genesis allocates passes
+    # 'device=gs.device' explicitly instead.
     torch.set_default_dtype(tc_float)
 
     # Define smallest float that is considered non-zero

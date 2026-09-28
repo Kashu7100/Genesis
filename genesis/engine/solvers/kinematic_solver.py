@@ -1025,6 +1025,10 @@ class KinematicSolver(Solver):
 
     @mutates(StateChange.GEOMETRY, links=MutatedLinks.ARTICULATED)
     def set_qpos(self, qpos, qs_idx=None, envs_idx=None, *, skip_forward=False):
+        # The zero-copy fast paths of the setters use a tensor 'envs_idx' as is, in operators that take it on the
+        # device of the state only.
+        if isinstance(envs_idx, torch.Tensor):
+            envs_idx = envs_idx.to(device=gs.device)
         if gs.use_zerocopy:
             data = qd_to_torch(self.rigid_info.qpos, transpose=True, copy=False)
             qs_mask = indices_to_mask(qs_idx)
@@ -1071,6 +1075,9 @@ class KinematicSolver(Solver):
 
     @mutates(StateChange.DYNAMICS, links=MutatedLinks.ARTICULATED)
     def set_dofs_velocity(self, velocity, dofs_idx=None, envs_idx=None, *, skip_forward=False):
+        # See 'KinematicSolver.set_qpos'.
+        if isinstance(envs_idx, torch.Tensor):
+            envs_idx = envs_idx.to(device=gs.device)
         if gs.use_zerocopy:
             vel = qd_to_torch(self.dyn_state.dofs.vel, transpose=True, copy=False)
             dofs_mask = indices_to_mask(dofs_idx)
@@ -1352,6 +1359,10 @@ class KinematicSolver(Solver):
             self.update_vverts_for_vgeoms(vgeoms_idx)
             return
 
+        # See 'KinematicSolver.set_qpos'.
+        if isinstance(envs_idx, torch.Tensor):
+            envs_idx = envs_idx.to(device=gs.device)
+
         if gs.use_zerocopy:
             data = qd_to_torch(self.dyn_state.vverts.pos, transpose=True, copy=False)
             if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
@@ -1411,7 +1422,7 @@ class KinematicSolver(Solver):
         (n_envs, n_links, 4), without the batch dimension when the scene is not batched.
         """
         if self.n_envs == 0:
-            envs_idx = torch.zeros(1, dtype=gs.tc_int)
+            envs_idx = torch.zeros(1, dtype=gs.tc_int, device=gs.device)
         else:
             envs_idx = self._scene._sanitize_envs_idx(envs_idx)
         qpos = broadcast_tensor(qpos, gs.tc_float, (len(envs_idx), entity.n_qs), ("envs_idx", "qs_idx")).contiguous()

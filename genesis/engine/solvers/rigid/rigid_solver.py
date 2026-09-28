@@ -1733,6 +1733,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if not self.is_active:
             return
 
+        # See 'KinematicSolver.set_qpos'.
+        if isinstance(envs_idx, torch.Tensor):
+            envs_idx = envs_idx.to(device=gs.device)
+
         if partial:
             self.collider.reset(envs_idx)
             self.constraint_solver.reset(envs_idx)
@@ -1953,6 +1957,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
     @mutates(StateChange.GEOMETRY, links="links_idx")
     def set_base_links_pos(self, pos, links_idx=None, envs_idx=None, *, relative=False, skip_forward=False):
+        # See 'KinematicSolver.set_qpos'.
+        if isinstance(envs_idx, torch.Tensor):
+            envs_idx = envs_idx.to(device=gs.device)
         if links_idx is None:
             links_idx = self._base_links_idx
 
@@ -2077,6 +2084,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
     @mutates(StateChange.GEOMETRY, links="links_idx")
     def set_base_links_quat(self, quat, links_idx=None, envs_idx=None, *, relative=False, skip_forward=False):
+        # See 'KinematicSolver.set_qpos'.
+        if isinstance(envs_idx, torch.Tensor):
+            envs_idx = envs_idx.to(device=gs.device)
         if links_idx is None:
             links_idx = self._base_links_idx
 
@@ -2388,6 +2398,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
     @mutates(StateChange.GEOMETRY, links=MutatedLinks.ARTICULATED)
     def set_qpos(self, qpos, qs_idx=None, envs_idx=None, *, skip_forward=False):
+        # See 'KinematicSolver.set_qpos'.
+        if isinstance(envs_idx, torch.Tensor):
+            envs_idx = envs_idx.to(device=gs.device)
         if self.collider is not None:
             self.collider.reset(envs_idx)
         if self.constraint_solver is not None:

@@ -186,18 +186,20 @@ def test_hits(show_viewer, n_envs, enable_mujoco_compatibility):
 
         # Check hits
         grid_sensor_origin = grid_sensor.get_pos()
-        x = torch.linspace(-0.5, 0.5, NUM_RAYS_XY[0]) * RAYCAST_GRID_SIZE_X + grid_sensor_origin[..., [0]]
-        y = torch.linspace(-0.5, 0.5, NUM_RAYS_XY[1]) * grid_size_y + grid_sensor_origin[..., [1]]
+        x = grid_sensor_origin[..., [0]] + RAYCAST_GRID_SIZE_X * torch.linspace(
+            -0.5, 0.5, NUM_RAYS_XY[0], device=gs.device
+        )
+        y = torch.linspace(-0.5, 0.5, NUM_RAYS_XY[1], device=gs.device) * grid_size_y + grid_sensor_origin[..., [1]]
         # xg, yg = torch.meshgrid(x, y, indexing="ij")
         xg = x.unsqueeze(-1).expand((*batch_shape, -1, NUM_RAYS_XY[1]))
         yg = y.unsqueeze(-2).expand((*batch_shape, NUM_RAYS_XY[0], -1))
-        zg = torch.zeros((*batch_shape, *NUM_RAYS_XY))
+        zg = torch.zeros((*batch_shape, *NUM_RAYS_XY), device=gs.device)
         zg[(..., *hit_ij)] = obstacle_pos[..., 2] + 0.5 * BOX_SIZE
         grid_hits_ref = torch.stack([xg, yg, zg], dim=-1)
         assert_allclose(grid_hits, grid_hits_ref, tol=gs.EPS)
 
         # Check distances
-        grid_distances_ref = torch.full((*batch_shape, *NUM_RAYS_XY), RAYCAST_HEIGHT)
+        grid_distances_ref = torch.full((*batch_shape, *NUM_RAYS_XY), RAYCAST_HEIGHT, device=gs.device)
         grid_distances_ref[(..., *hit_ij)] = RAYCAST_HEIGHT - obstacle_pos[..., 2] - 0.5 * BOX_SIZE
         assert_allclose(grid_distances, grid_distances_ref, tol=gs.EPS)
 
@@ -248,7 +250,7 @@ def test_hits(show_viewer, n_envs, enable_mujoco_compatibility):
         scene.visualizer.update(force=True)
 
     grid_distances = grid_raycaster.read().distances
-    grid_distances_ref = torch.full((*batch_shape, *NUM_RAYS_XY), RAYCAST_HEIGHT)
+    grid_distances_ref = torch.full((*batch_shape, *NUM_RAYS_XY), RAYCAST_HEIGHT, device=gs.device)
     grid_distances_ref[(..., -1, -2)] = RAYCAST_HEIGHT - BOX_SIZE
     grid_distances_ref[(..., *hit_ij)] = RAYCAST_HEIGHT - BOX_SIZE
     grid_distances_ref += offset[..., 2].reshape((*(-1 for e in batch_shape), 1, 1))
