@@ -213,14 +213,15 @@ def test_hits(show_viewer, n_envs, enable_mujoco_compatibility, tol):
     # Note that the tolerance must be large because the sphere geometry is discretized
     assert_allclose(spherical_distances, RAYCAST_HEIGHT, tol=5e-3)
     # The horizontal scan lines of a full rotation are evenly spaced, the gap between the last and the first included
-    spherical_azimuths = torch.deg2rad(torch.linspace(-180.0, 180.0, NUM_RAYS_XY[0] + 1)[:-1])
+    spherical_azimuths = torch.deg2rad(torch.linspace(-180.0, 180.0, NUM_RAYS_XY[0] + 1, dtype=gs.tc_float)[:-1])
     spherical_dirs_xy = torch.nn.functional.normalize(spherical_raycaster.read().points[..., :2], dim=-1)
     assert_allclose(spherical_dirs_xy[..., 0], spherical_azimuths.cos()[:, None], tol=tol)
     assert_allclose(spherical_dirs_xy[..., 1], spherical_azimuths.sin()[:, None], tol=tol)
     # Same for a full rotation on either axis, vertical included
     full_rotation_angles = gs.sensors.raycaster.SphericalPattern(fov=(360.0, 360.0), n_points=NUM_RAYS_XY).angles
     for angles, n_points in zip(full_rotation_angles, NUM_RAYS_XY):
-        assert_allclose(angles, torch.deg2rad(torch.linspace(-180.0, 180.0, n_points + 1)[:-1]), tol=tol)
+        angles_ref = torch.deg2rad(torch.linspace(-180.0, 180.0, n_points + 1, dtype=gs.tc_float)[:-1])
+        assert_allclose(angles, angles_ref, tol=tol)
 
     # Check that we can read image from depth camera
     assert_equal(depth_camera.read_image().shape, batch_shape + NUM_RAYS_XY)

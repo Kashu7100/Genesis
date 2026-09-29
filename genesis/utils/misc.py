@@ -794,7 +794,7 @@ def qd_to_torch(
         # advanced masking, which would spare computation later on if expected from the user.
         if copy is False:
             gs.raise_exception("Specifying 'copy=False' is not supported by this method if 'gs.use_zerocopy=False'.")
-        tensor = _maybe_transpose(value.to_torch(), value, transpose)
+        tensor = _maybe_transpose(value.to_torch(device=gs.device), value, transpose)
         is_copy = True
     else:
         try:
@@ -806,7 +806,7 @@ def qd_to_torch(
             except (ValueError, RuntimeError, TypeError):
                 if copy is False:
                     raise
-                tensor = _maybe_transpose(value.to_torch(), value, transpose)
+                tensor = _maybe_transpose(value.to_torch(device=gs.device), value, transpose)
                 is_copy = True
             else:
                 value._tc = tc
