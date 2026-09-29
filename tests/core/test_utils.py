@@ -951,8 +951,8 @@ def test_fps_tracker():
 
 @pytest.mark.required
 @pytest.mark.parametrize("backend", [None])
-def test_logger_dumb_theme_plain_text(capsys):
-    gs.init(backend=gs.cpu, theme="dumb", logging_level="info")
+def test_logger_raw_theme_plain_text(capsys):
+    gs.init(backend=gs.cpu, theme="raw", logging_level="info")
     try:
         scene = gs.Scene(show_viewer=False)
         scene.add_entity(

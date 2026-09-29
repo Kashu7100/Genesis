@@ -77,7 +77,7 @@ def init(
 
     # Update theme if valid
     global _theme
-    if theme not in ("dark", "light", "dumb"):
+    if theme not in ("dark", "light", "raw"):
         raise_exception(f"Unsupported theme: ~~<{theme}>~~")
     _theme = theme
 
@@ -91,9 +91,9 @@ def init(
         logging_level = _logging.DEBUG if debug else _logging.INFO
     logger = Logger(logging_level, logger_verbose_time)
 
-    # The greeting banner and the emojis decorating the messages below are pure decoration, which the "dumb" theme
-    # drops for consumers that read the raw text.
-    is_decorated = theme != "dumb"
+    # The greeting banner and the emojis decorating the messages below are pure decoration, which the "raw" theme
+    # drops for consumers that read the plain text.
+    is_decorated = theme != "raw"
     if is_decorated:
         try:
             columns, _lines = os.get_terminal_size()
@@ -386,7 +386,7 @@ def destroy():
     global logger, _theme
     if logger:
         # See the decoration of the messages of 'init'.
-        logger.info(f"{'💤 ' if _theme != 'dumb' else ''}Exiting Genesis and caching compiled kernels...")
+        logger.info(f"{'💤 ' if _theme != 'raw' else ''}Exiting Genesis and caching compiled kernels...")
 
     # Destroy all scenes. A weakref that no longer resolves means the scene was already garbage-collected (and its
     # resources released), so there is nothing left to destroy - skip it rather than asserting.

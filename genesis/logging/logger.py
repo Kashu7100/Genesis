@@ -41,7 +41,7 @@ class GenesisFormatter(logging.Formatter):
         return f"{color}[Genesis] [{self.TIME}] [{self.LEVEL}] {self.MESSAGE}{formats.RESET}"
 
     def plain_fmt(self, levelno):
-        # The "dumb" theme targets consumers that read the raw text, e.g. log files and coding agents. Almost every
+        # The "raw" theme targets consumers that read the plain text, e.g. log files and coding agents. Almost every
         # record is INFO, so only the other levels are named.
         self.last_color = ""
         if levelno == logging.INFO:
@@ -62,7 +62,7 @@ class GenesisFormatter(logging.Formatter):
         return msg
 
     def format(self, record):
-        if gs._theme == "dumb":
+        if gs._theme == "raw":
             log_fmt = self.plain_fmt(record.levelno)
         else:
             log_fmt = self.colored_fmt(self.mapping.get(record.levelno))

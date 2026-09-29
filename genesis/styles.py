@@ -16,7 +16,7 @@ class COLORS:
             return "\x1b[38;5;119m"
         elif gs._theme == "light":
             return "\x1b[38;5;2m"
-        elif gs._theme == "dumb":
+        elif gs._theme == "raw":
             return ""
 
     @property
@@ -25,7 +25,7 @@ class COLORS:
             return "\x1b[38;5;159m"
         elif gs._theme == "light":
             return "\x1b[38;5;17m"
-        elif gs._theme == "dumb":
+        elif gs._theme == "raw":
             return ""
 
     @property
@@ -34,7 +34,7 @@ class COLORS:
             return "\x1b[38;5;226m"
         elif gs._theme == "light":
             return "\x1b[38;5;3m"
-        elif gs._theme == "dumb":
+        elif gs._theme == "raw":
             return ""
 
     @property
@@ -43,7 +43,7 @@ class COLORS:
             return "\x1b[38;5;9m"
         elif gs._theme == "light":
             return "\x1b[38;5;1m"
-        elif gs._theme == "dumb":
+        elif gs._theme == "raw":
             return ""
 
     @property
@@ -52,7 +52,7 @@ class COLORS:
             return "\x1b[38;5;11m"
         elif gs._theme == "light":
             return "\x1b[38;5;178m"
-        elif gs._theme == "dumb":
+        elif gs._theme == "raw":
             return ""
 
     @property
@@ -61,7 +61,7 @@ class COLORS:
             return "\x1b[38;5;247m"
         elif gs._theme == "light":
             return "\x1b[38;5;239m"
-        elif gs._theme == "dumb":
+        elif gs._theme == "raw":
             return ""
 
     @property
@@ -70,7 +70,7 @@ class COLORS:
             return "\x1b[38;5;121m"
         elif gs._theme == "light":
             return "\x1b[38;5;23m"
-        elif gs._theme == "dumb":
+        elif gs._theme == "raw":
             return ""
 
 
@@ -80,28 +80,28 @@ class FORMATS:
 
     @property
     def BOLD(self):
-        if gs._theme == "dumb":
+        if gs._theme == "raw":
             return ""
         else:
             return "\x1b[1m"
 
     @property
     def ITALIC(self):
-        if gs._theme == "dumb":
+        if gs._theme == "raw":
             return ""
         else:
             return "\x1b[3m"
 
     @property
     def UNDERLINE(self):
-        if gs._theme == "dumb":
+        if gs._theme == "raw":
             return ""
         else:
             return "\x1b[4m"
 
     @property
     def RESET(self):
-        if gs._theme == "dumb":
+        if gs._theme == "raw":
             return ""
         else:
             return "\x1b[0m"
