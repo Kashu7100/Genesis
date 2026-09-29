@@ -72,7 +72,7 @@ def func_collision_clear(
         func_collider_clear_env(i_b, dyn_state, collider_state, dyn_info, rigid_info, rigid_config)
 
 
-@qd.kernel(fastcache=True)
+@qd.func
 def _func_broad_phase_sap(
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
@@ -331,7 +331,7 @@ def _func_broad_phase_sap(
         collider_state.n_broad_pairs[i_b] = n_broad
 
 
-@qd.kernel(fastcache=True)
+@qd.func
 def _func_broad_phase_all_vs_all(
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
@@ -358,7 +358,7 @@ def _func_broad_phase_all_vs_all(
         collider_state.n_broad_pairs[i_b] = 0
 
     n_valid_pairs = collider_info.n_valid_pairs[None]
-    qd.loop_config(name="traverse_valid")
+    qd.loop_config(name="traverse_valid", serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
     for i_vp, i_b in qd.ndrange(n_valid_pairs, _B):
         pair = collider_info.valid_collision_pairs[i_vp]
         i_ga = pair[0]
@@ -386,19 +386,20 @@ def _func_broad_phase_all_vs_all(
             errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_CANDIDATE_CONTACTS
 
 
+@qd.func
 def func_broad_phase(
-    dyn_state,
-    collider_state,
-    constraint_state,
-    dyn_info,
-    rigid_info,
-    collider_info,
-    rigid_config,
-    collider_static_config,
-    errno,
+    dyn_state: array_class.DynState,
+    collider_state: array_class.ColliderState,
+    constraint_state: array_class.ConstraintState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    collider_info: array_class.ColliderInfo,
+    rigid_config: qd.template(),
+    collider_static_config: qd.template(),
+    errno: qd.Tensor,
 ):
-    """Dispatch to the appropriate broad-phase kernel based on config."""
-    if rigid_config.broadphase_traversal == gs.broadphase_traversal.ALL_VS_ALL:
+    """Run the broad phase with the traversal the rigid config selects."""
+    if qd.static(rigid_config.broadphase_traversal == gs.broadphase_traversal.ALL_VS_ALL):
         _func_broad_phase_all_vs_all(
             dyn_state,
             collider_state,

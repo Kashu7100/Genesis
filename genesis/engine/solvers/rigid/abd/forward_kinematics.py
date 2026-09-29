@@ -34,6 +34,7 @@ def kernel_forward_kinematics_links_geoms(
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
 ):
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_r, i_b_ in qd.ndrange(rigid_info.roots_link_idx.shape[0], envs_idx.shape[0]):
         i_b = qd.cast(envs_idx[i_b_], qd.i32)
         i_l_root = rigid_info.roots_link_idx[i_r]
@@ -59,6 +60,7 @@ def kernel_masked_forward_kinematics_links_geoms(
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
 ):
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_r, i_b in qd.ndrange(rigid_info.roots_link_idx.shape[0], envs_mask.shape[0]):
         if envs_mask[i_b]:
             i_l_root = rigid_info.roots_link_idx[i_r]
@@ -84,6 +86,7 @@ def kernel_forward_kinematics(
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
 ):
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_r, i_b_ in qd.ndrange(rigid_info.roots_link_idx.shape[0], envs_idx.shape[0]):
         i_b = qd.cast(envs_idx[i_b_], qd.i32)
         i_l_root = rigid_info.roots_link_idx[i_r]
@@ -98,6 +101,7 @@ def kernel_masked_forward_kinematics(
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
 ):
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_r, i_b in qd.ndrange(rigid_info.roots_link_idx.shape[0], envs_mask.shape[0]):
         if envs_mask[i_b]:
             i_l_root = rigid_info.roots_link_idx[i_r]
@@ -113,6 +117,7 @@ def kernel_forward_velocity(
     rigid_config: qd.template(),
     is_backward: qd.template(),
 ):
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_r, i_b_ in qd.ndrange(rigid_info.roots_link_idx.shape[0], envs_idx.shape[0]):
         i_b = qd.cast(envs_idx[i_b_], qd.i32)
         i_l_root = rigid_info.roots_link_idx[i_r]
@@ -128,6 +133,7 @@ def kernel_masked_forward_velocity(
     rigid_config: qd.template(),
     is_backward: qd.template(),
 ):
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_r, i_b in qd.ndrange(rigid_info.roots_link_idx.shape[0], envs_mask.shape[0]):
         if envs_mask[i_b]:
             i_l_root = rigid_info.roots_link_idx[i_r]
@@ -554,6 +560,7 @@ def kernel_update_geoms(
     rigid_config: qd.template(),
     force_update_all_geoms: qd.template(),
 ):
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_r, i_b_ in qd.ndrange(rigid_info.roots_link_idx.shape[0], envs_idx.shape[0]):
         i_b = qd.cast(envs_idx[i_b_], qd.i32)
         func_update_geoms_root(
@@ -775,8 +782,8 @@ def kernel_update_all_verts(
     func_update_all_verts(dyn_state, dyn_info, rigid_config)
 
 
-@qd.kernel(fastcache=True)
-def kernel_update_geom_aabbs(
+@qd.func
+def func_update_geom_aabbs(
     geoms_init_AABB: array_class.GeomsInitAABB, dyn_state: array_class.DynState, rigid_config: qd.template()
 ):
     n_geoms = dyn_state.geoms.pos.shape[0]
@@ -987,6 +994,7 @@ def kernel_forward_kinematics_replay(
     is_backward: qd.template(),
 ):
     # No link sleeps under gradients, so the walk of every root covers every link
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_r, i_b_ in qd.ndrange(rigid_info.roots_link_idx.shape[0], envs_idx.shape[0]):
         i_b = qd.cast(envs_idx[i_b_], qd.i32)
         i_l_root = rigid_info.roots_link_idx[i_r]
@@ -1015,6 +1023,7 @@ def kernel_COM_links_replay(
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
 ):
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_r, i_b in qd.ndrange(rigid_info.roots_link_idx.shape[0], dyn_state.links.pos.shape[1]):
         i_l_root = rigid_info.roots_link_idx[i_r]
         func_COM_root(i_l_root, i_b, dyn_state, dyn_info, rigid_info, rigid_config)

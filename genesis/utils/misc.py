@@ -442,11 +442,17 @@ def tensor_to_array(x: torch.Tensor, dtype: type[np.generic] | None = None) -> n
 
 
 def data_to_array(data):
-    """Recursively move any GPU tensor nested in ``data`` to a CPU numpy array, preserving container structure."""
+    """Recursively move any GPU tensor nested in ``data`` to a CPU numpy array, preserving container structure.
+
+    A named tuple, such as the reading of a sensor with several outputs, becomes a dict mapping its field names to their
+    values, which is the form recorders label their data by.
+    """
     if isinstance(data, torch.Tensor):
         return tensor_to_array(data)
     if isinstance(data, np.ndarray):
         return data
+    if isinstance(data, tuple) and (data_asdict := getattr(data, "_asdict", None)) is not None:
+        return {k: data_to_array(v) for k, v in data_asdict().items()}
     if isinstance(data, Mapping):
         return {k: data_to_array(v) for k, v in data.items()}
     if is_sequence(data):
