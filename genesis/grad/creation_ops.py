@@ -7,33 +7,38 @@ import genesis as gs
 
 from .tensor import Tensor
 
-_torch_ops = (
+# Ops given the requested dtype and 'device=gs.device', so that they allocate there directly and random ones draw from
+# its generator at that precision. The other ops follow the device of their input.
+_torch_factory_ops = (
     torch.tensor,
     torch.asarray,
     torch.as_tensor,
-    torch.as_strided,
-    torch.from_numpy,
     torch.zeros,
-    torch.zeros_like,
     torch.ones,
-    torch.ones_like,
     torch.arange,
     torch.range,
     torch.linspace,
     torch.logspace,
     torch.eye,
     torch.empty,
-    torch.empty_like,
     torch.empty_strided,
     torch.full,
-    torch.full_like,
     torch.rand,
-    torch.rand_like,
     torch.randn,
-    torch.randn_like,
     torch.randint,
-    torch.randint_like,
     torch.randperm,
+)
+_torch_ops = (
+    *_torch_factory_ops,
+    torch.as_strided,
+    torch.from_numpy,
+    torch.zeros_like,
+    torch.ones_like,
+    torch.empty_like,
+    torch.full_like,
+    torch.rand_like,
+    torch.randn_like,
+    torch.randint_like,
 )
 
 
@@ -49,7 +54,9 @@ def torch_op_wrapper(torch_op):
         if torch_op is torch.from_numpy:
             torch_tensor = torch_op(*args)
         elif torch_op is torch.tensor:
-            torch_tensor = torch_op(*args, dtype=dtype, requires_grad=requires_grad)
+            torch_tensor = torch_op(*args, dtype=dtype, requires_grad=requires_grad, device=gs.device)
+        elif torch_op in _torch_factory_ops:
+            torch_tensor = torch_op(*args, dtype=dtype, device=gs.device, **kwargs)
         else:
             torch_tensor = torch_op(*args, **kwargs)
 

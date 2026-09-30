@@ -16,7 +16,7 @@ from ..utils.assertions import assert_allclose, assert_equal
 # solver relies on redoing that itself, geoms included, so the arm below pins that a raycaster leaves the physics
 # alone - obstacle_1 falls onto the ground plane and the grid rays must still find its top face where it rests.
 @pytest.mark.parametrize("n_envs, enable_mujoco_compatibility", [(0, False), (2, True)])
-def test_hits(show_viewer, n_envs, enable_mujoco_compatibility):
+def test_hits(show_viewer, n_envs, enable_mujoco_compatibility, tol):
     NUM_RAYS_XY = (3, 5)
     SPHERE_POS = (2.5, 0.5, 1.0)
     BOX_SIZE = 0.05
@@ -186,18 +186,22 @@ def test_hits(show_viewer, n_envs, enable_mujoco_compatibility):
 
         # Check hits
         grid_sensor_origin = grid_sensor.get_pos()
-        x = torch.linspace(-0.5, 0.5, NUM_RAYS_XY[0]) * RAYCAST_GRID_SIZE_X + grid_sensor_origin[..., [0]]
-        y = torch.linspace(-0.5, 0.5, NUM_RAYS_XY[1]) * grid_size_y + grid_sensor_origin[..., [1]]
+        x_rel = torch.linspace(-0.5, 0.5, NUM_RAYS_XY[0], dtype=gs.tc_float, device=gs.device)
+        y_rel = torch.linspace(-0.5, 0.5, NUM_RAYS_XY[1], dtype=gs.tc_float, device=gs.device)
+        x = x_rel * RAYCAST_GRID_SIZE_X + grid_sensor_origin[..., [0]]
+        y = y_rel * grid_size_y + grid_sensor_origin[..., [1]]
         # xg, yg = torch.meshgrid(x, y, indexing="ij")
         xg = x.unsqueeze(-1).expand((*batch_shape, -1, NUM_RAYS_XY[1]))
         yg = y.unsqueeze(-2).expand((*batch_shape, NUM_RAYS_XY[0], -1))
-        zg = torch.zeros((*batch_shape, *NUM_RAYS_XY))
+        zg = torch.zeros((*batch_shape, *NUM_RAYS_XY), dtype=gs.tc_float, device=gs.device)
         zg[(..., *hit_ij)] = obstacle_pos[..., 2] + 0.5 * BOX_SIZE
         grid_hits_ref = torch.stack([xg, yg, zg], dim=-1)
         assert_allclose(grid_hits, grid_hits_ref, tol=gs.EPS)
 
         # Check distances
-        grid_distances_ref = torch.full((*batch_shape, *NUM_RAYS_XY), RAYCAST_HEIGHT)
+        grid_distances_ref = torch.full(
+            (*batch_shape, *NUM_RAYS_XY), RAYCAST_HEIGHT, dtype=gs.tc_float, device=gs.device
+        )
         grid_distances_ref[(..., *hit_ij)] = RAYCAST_HEIGHT - obstacle_pos[..., 2] - 0.5 * BOX_SIZE
         assert_allclose(grid_distances, grid_distances_ref, tol=gs.EPS)
 
@@ -208,6 +212,16 @@ def test_hits(show_viewer, n_envs, enable_mujoco_compatibility):
     assert spherical_distances.shape == (*batch_shape, *NUM_RAYS_XY)
     # Note that the tolerance must be large because the sphere geometry is discretized
     assert_allclose(spherical_distances, RAYCAST_HEIGHT, tol=5e-3)
+    # The horizontal scan lines of a full rotation are evenly spaced, the gap between the last and the first included
+    spherical_azimuths = torch.deg2rad(torch.linspace(-180.0, 180.0, NUM_RAYS_XY[0] + 1, dtype=gs.tc_float)[:-1])
+    spherical_dirs_xy = torch.nn.functional.normalize(spherical_raycaster.read().points[..., :2], dim=-1)
+    assert_allclose(spherical_dirs_xy[..., 0], spherical_azimuths.cos()[:, None], tol=tol)
+    assert_allclose(spherical_dirs_xy[..., 1], spherical_azimuths.sin()[:, None], tol=tol)
+    # Same for a full rotation on either axis, vertical included
+    full_rotation_angles = gs.sensors.raycaster.SphericalPattern(fov=(360.0, 360.0), n_points=NUM_RAYS_XY).angles
+    for angles, n_points in zip(full_rotation_angles, NUM_RAYS_XY):
+        angles_ref = torch.deg2rad(torch.linspace(-180.0, 180.0, n_points + 1, dtype=gs.tc_float)[:-1])
+        assert_allclose(angles, angles_ref, tol=tol)
 
     # Check that we can read image from depth camera
     assert_equal(depth_camera.read_image().shape, batch_shape + NUM_RAYS_XY)
@@ -248,7 +262,7 @@ def test_hits(show_viewer, n_envs, enable_mujoco_compatibility):
         scene.visualizer.update(force=True)
 
     grid_distances = grid_raycaster.read().distances
-    grid_distances_ref = torch.full((*batch_shape, *NUM_RAYS_XY), RAYCAST_HEIGHT)
+    grid_distances_ref = torch.full((*batch_shape, *NUM_RAYS_XY), RAYCAST_HEIGHT, dtype=gs.tc_float, device=gs.device)
     grid_distances_ref[(..., -1, -2)] = RAYCAST_HEIGHT - BOX_SIZE
     grid_distances_ref[(..., *hit_ij)] = RAYCAST_HEIGHT - BOX_SIZE
     grid_distances_ref += offset[..., 2].reshape((*(-1 for e in batch_shape), 1, 1))

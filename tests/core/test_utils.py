@@ -1,25 +1,29 @@
 import math
 import re
+import subprocess
+import sys
 from functools import partial
 from unittest.mock import patch
 
+import numpy as np
+import torch
+
 import igl
 import pytest
-import torch
 import trimesh
-import numpy as np
 from scipy.linalg import polar as scipy_polar
 from scipy.spatial.transform import Rotation as R, Slerp
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.utils.tools import FPSTracker
-from genesis.utils.misc import tensor_to_array
 from genesis.utils import warnings as warnings_mod
-from genesis.utils.warnings import warn_once
+from genesis.utils.image_exporter import as_grayscale_image
+from genesis.utils.misc import tensor_to_array
+from genesis.utils.tools import FPSTracker
 from genesis.utils.urdf import compose_inertial_properties
+from genesis.utils.warnings import warn_once
 
-from ..utils.assertions import assert_allclose
+from ..utils.assertions import assert_allclose, assert_equal
 from ..utils.assets import get_hf_dataset
 from ..utils.collision import display_collision_pairs, get_genuine_interpenetration
 
@@ -749,7 +753,13 @@ def test_genuine_interpenetration(show_viewer):
     # Real-asset cases, both representations (watertight wraps and convex decompositions) built as separate
     # entities of a single scene, all placements done by rigid-transforming the extracted geoms. Real meshes
     # have no analytical truth: bounds only, to catch garbage estimates.
-    scene = gs.Scene()
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            # Collision disabled to not overflow the contact budget on the step taken by the build.
+            # This test is not stepping physics.
+            enable_collision=False,
+        ),
+    )
     asset_entities = {
         convexify: [
             scene.add_entity(
@@ -923,6 +933,16 @@ def test_genuine_interpenetration(show_viewer):
 
 
 @pytest.mark.required
+@pytest.mark.parametrize("backend", [None])
+def test_as_grayscale_image():
+    for batch_shape in ((), (2,)):
+        depth = np.broadcast_to(array=[[1.0, 3.0, 7.0]], shape=(*batch_shape, 1, 3))
+        for is_black_to_white, depth_expected in ((False, [[255, 127, 0]]), (True, [[0, 127, 255]])):
+            depth_image = as_grayscale_image(depth, enable_log_scale=True, black_to_white=is_black_to_white)
+            assert_equal(depth_image, depth_expected)
+
+
+@pytest.mark.required
 def test_fps_tracker():
     n_envs = 23
     tracker = FPSTracker(alpha=0.0, minimum_interval_seconds=0.1, n_envs=n_envs)
@@ -947,6 +967,18 @@ def test_fps_tracker():
     fps = tracker.step(current_time=10.45)
     # num envs * [num steps] / (delta time)
     assert math.isclose(fps, n_envs * 4 / 0.14)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [None])
+def test_logger_prints_once_with_root_logging(backend):
+    script = (
+        "import logging; logging.basicConfig(level=logging.INFO); "
+        "import genesis as gs; gs.init(backend=gs.cpu); gs.logger.warning('Genesis warning')"
+    )
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, encoding="utf-8")
+    assert proc.returncode == 0, proc.stderr
+    assert (proc.stdout + proc.stderr).count("Genesis warning") == 1
 
 
 @pytest.mark.required

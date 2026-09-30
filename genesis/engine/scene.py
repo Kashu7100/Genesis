@@ -295,6 +295,9 @@ class Scene(RBC):
                 self._sim.destroy()
                 self._sim = None
 
+            # The viewer plugins stopped by the visualizer still require a built scene
+            self._is_built = False
+
     @overload
     def add_entity(
         self,
@@ -875,6 +878,12 @@ class Scene(RBC):
 
         with gs.logger.timer("Compiling simulation kernels..."):
             self._sim.step()
+            if self._sim.rigid_solver.is_active:
+                try:
+                    self._sim.rigid_solver.check_errno()
+                except gs.GenesisException:
+                    self.destroy()
+                    raise
             self._reset()
 
         # visualizer

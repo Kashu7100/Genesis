@@ -349,6 +349,19 @@ class KinematicSolver(Solver):
         self._n_trees = np.unique(links_tree_root_idx[links_tree_root_idx >= 0]).size
         self.n_trees_ = max(1, self._n_trees)
 
+        # The level of a link in its root and in its tree is its number of ancestors below the root link of either (see
+        # trees_levels_links_idx in array_class.py). Each pass moves every link one ancestor up, so the depth of a link
+        # is the number of passes it takes to run out of parents.
+        links_depth = np.zeros(self.n_links, dtype=gs.np_int)
+        links_ancestor_idx = self._links_parent_idx
+        while (links_ancestor_idx >= 0).any():
+            has_ancestor = links_ancestor_idx >= 0
+            links_depth += has_ancestor
+            links_ancestor_idx = np.where(has_ancestor, self._links_parent_idx[links_ancestor_idx], -1)
+        self._links_root_idx = np.array([link.root_idx for link in self.links], dtype=gs.np_int)
+        self._links_root_level = links_depth - links_depth[self._links_root_idx]
+        self._links_tree_level = np.where(links_tree_root_idx >= 0, links_depth - links_depth[links_tree_root_idx], -1)
+
         # batch_links_info is required when heterogeneous simulation is used.
         # We must update options because get_links_info reads from solver._options.batch_links_info.
         if self._enable_heterogeneous:
@@ -476,8 +489,7 @@ class KinematicSolver(Solver):
         # trees_root_idx in array_class.py)
         links_tree_idx = np.full(self.n_links_, -1, dtype=gs.np_int)
         if self._n_roots:
-            links_root_idx = np.array([link.root_idx for link in self.links], dtype=gs.np_int)
-            roots_link_idx, links_root_rank = np.unique(links_root_idx, return_inverse=True)
+            roots_link_idx, links_root_rank = np.unique(self._links_root_idx, return_inverse=True)
             roots_link_end = np.zeros(self._n_roots, dtype=gs.np_int)
             np.maximum.at(roots_link_end, links_root_rank, np.arange(1, self.n_links + 1, dtype=gs.np_int))
             self.rigid_info.roots_link_idx.from_numpy(roots_link_idx)
@@ -515,6 +527,82 @@ class KinematicSolver(Solver):
             self.rigid_info.trees_root_idx.fill(0)
             self.rigid_info.trees_link_end.fill(0)
         self.rigid_info.links_tree_idx.from_numpy(links_tree_idx)
+
+        # Fill the level tables of every tree and root for the level sweep (see trees_levels_links_idx in
+        # array_class.py). A scene without any tree keeps its padded tree slot at zero levels.
+        if self._n_roots and self.rigid_config.enable_level_sweep:
+            for links_group_idx, links_group_level, n_groups, groups_fields in (
+                (
+                    links_tree_idx,
+                    self._links_tree_level,
+                    self.n_trees_,
+                    (
+                        self.rigid_info.trees_level_start,
+                        self.rigid_info.trees_n_levels,
+                        self.rigid_info.trees_levels_links_idx,
+                        None,
+                        self.rigid_info.trees_levels_links_end,
+                    ),
+                ),
+                (
+                    links_root_rank,
+                    self._links_root_level,
+                    self._n_roots,
+                    (
+                        self.rigid_info.roots_level_start,
+                        self.rigid_info.roots_n_levels,
+                        self.rigid_info.roots_levels_links_idx,
+                        self.rigid_info.roots_levels_links_start,
+                        self.rigid_info.roots_levels_links_end,
+                    ),
+                ),
+            ):
+                group_links = np.arange(self.n_links, dtype=gs.np_int)[links_group_idx >= 0]
+                links_group = links_group_idx[group_links]
+                links_level = links_group_level[group_links]
+                groups_n_levels = np.zeros(n_groups, dtype=gs.np_int)
+                np.maximum.at(groups_n_levels, links_group, links_level + 1)
+                groups_level_start = np.zeros(n_groups, dtype=gs.np_int)
+                np.cumsum(np.bincount(links_group, minlength=n_groups)[:-1], out=groups_level_start[1:])
+                # The links of every group, group after group, level after level, and each level in ascending order
+                entries_order = np.lexsort((group_links, links_level, links_group))
+                groups_levels_links_idx = group_links[entries_order]
+                entries_group = links_group[entries_order]
+                entries_level = links_level[entries_order]
+                entries_idx = np.arange(len(groups_levels_links_idx), dtype=gs.np_int)
+                # An entry ends its level where the next entry starts another level or another group
+                is_level_last = np.ones(len(groups_levels_links_idx), dtype=bool)
+                is_level_last[:-1] = (np.diff(entries_group) != 0) | (np.diff(entries_level) != 0)
+                levels_last_entry = entries_idx[is_level_last]
+                groups_levels_links_end = levels_last_entry[np.searchsorted(levels_last_entry, entries_idx)] + 1
+                is_level_first = np.ones(len(groups_levels_links_idx), dtype=bool)
+                is_level_first[1:] = is_level_last[:-1]
+                levels_first_entry = entries_idx[is_level_first]
+                groups_levels_links_start = levels_first_entry[
+                    np.searchsorted(levels_first_entry, entries_idx, side="right") - 1
+                ]
+                for field, value in zip(
+                    groups_fields,
+                    (
+                        groups_level_start,
+                        groups_n_levels,
+                        groups_levels_links_idx,
+                        groups_levels_links_start,
+                        groups_levels_links_end,
+                    ),
+                ):
+                    if field is not None and len(value):
+                        field.from_numpy(value)
+            child_links = np.arange(self.n_links, dtype=gs.np_int)[self._links_parent_idx >= 0]
+            links_child_start = np.zeros(self.n_links_ + 1, dtype=gs.np_int)
+            np.cumsum(
+                np.bincount(self._links_parent_idx[child_links], minlength=self.n_links_), out=links_child_start[1:]
+            )
+            self.rigid_info.links_child_start.from_numpy(links_child_start)
+            if len(child_links):
+                self.rigid_info.links_child_idx.from_numpy(
+                    child_links[np.lexsort((-child_links, self._links_parent_idx[child_links]))]
+                )
 
     def _init_link_fields(self):
         if self.links:
@@ -1410,10 +1498,7 @@ class KinematicSolver(Solver):
         hold, and restores the one it does. Returns positions (n_envs, n_links, 3) and orientations
         (n_envs, n_links, 4), without the batch dimension when the scene is not batched.
         """
-        if self.n_envs == 0:
-            envs_idx = torch.zeros(1, dtype=gs.tc_int)
-        else:
-            envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
         qpos = broadcast_tensor(qpos, gs.tc_float, (len(envs_idx), entity.n_qs), ("envs_idx", "qs_idx")).contiguous()
 
         qs_idx = torch.arange(entity._q_start, entity._q_start + entity.n_qs, dtype=gs.tc_int, device=gs.device)

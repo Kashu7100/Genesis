@@ -504,7 +504,8 @@ class Trajectory:
     def time(self, index: int) -> np.ndarray:
         """The simulated time of each environment at frame 'index', in seconds, as 'Scene.get_time' reports it."""
         # Multiplied as the simulator multiplies its own clock, so the two agree to the bit.
-        return tensor_to_array(torch.as_tensor(self.frame(index)[STEPS_FIELD], device="cpu") * self._manifest["dt"])
+        steps = torch.as_tensor(self.frame(index)[STEPS_FIELD], dtype=gs.tc_float, device="cpu")
+        return tensor_to_array(steps * self._manifest["dt"])
 
     def seek(self, index: int) -> None:
         """Put the scene in the state of frame 'index', counted from the end when negative.

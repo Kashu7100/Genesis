@@ -829,14 +829,18 @@ def test_elliptic_cone_push_isotropy(contact_resolution, is_box_mesh, scale, pre
     )
     scene.build(n_envs=N_ENVS, env_spacing=(0.3 * scale, 0.3 * scale))
 
-    yaw = 2.0 * torch.pi * torch.arange(N_ENVS, device=gs.device) / N_ENVS
+    yaw = 2.0 * torch.pi * torch.arange(N_ENVS, dtype=gs.tc_float, device=gs.device) / N_ENVS
     yaw_euler = torch.stack((torch.zeros_like(yaw), torch.zeros_like(yaw), yaw), dim=1)
     box_quat = gu.xyz_to_quat(yaw_euler, rpy=True)
     box.set_quat(box_quat)
 
     # Rotate the local pusher path into each env's world frame by the box yaw, and PD-control the pusher's full pose.
-    push_start = gu.transform_by_quat(torch.tensor(PUSH_START_LOCAL, device=gs.device).repeat(N_ENVS, 1), box_quat)
-    push_end = gu.transform_by_quat(torch.tensor(PUSH_END_LOCAL, device=gs.device).repeat(N_ENVS, 1), box_quat)
+    push_start = gu.transform_by_quat(
+        torch.tensor(PUSH_START_LOCAL, dtype=gs.tc_float, device=gs.device).repeat(N_ENVS, 1), box_quat
+    )
+    push_end = gu.transform_by_quat(
+        torch.tensor(PUSH_END_LOCAL, dtype=gs.tc_float, device=gs.device).repeat(N_ENVS, 1), box_quat
+    )
     pusher.set_pos(push_start)
     pusher.set_quat(box_quat)
     # Quoted per unit mass, the linear gains are accelerations per unit error, fixed so the pusher tracks the same
@@ -980,7 +984,9 @@ def test_elliptic_cone_push_isotropy(contact_resolution, is_box_mesh, scale, pre
     )
 
     # The final box pose in its own initial frame is identical across every initial yaw.
-    rel_pos = gu.transform_by_quat(box.get_pos() - torch.tensor(BOX_POS, device=gs.device), gu.inv_quat(box_quat))
+    rel_pos = gu.transform_by_quat(
+        box.get_pos() - torch.tensor(BOX_POS, dtype=gs.tc_float, device=gs.device), gu.inv_quat(box_quat)
+    )
     rel_yaw = gu.quat_to_xyz(gu.transform_quat_by_quat(box.get_quat(), gu.inv_quat(box_quat)), rpy=True)[:, 2]
     # A push that moved the box hardly at all would satisfy the comparison below without exercising anything.
     assert (rel_pos[:, 0] > 0.01 * scale).all() and (rel_yaw.abs() > 0.05).all()

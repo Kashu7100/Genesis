@@ -96,7 +96,7 @@ def test_link_velocity(gs_sim, tol):
         if writing == "mass":
             solver.set_links_mass([1.0, 3.0])
         else:
-            solver.set_links_COM(solver.get_links_COM() + torch.tensor([0.05, -0.02, 0.0]))
+            solver.set_links_COM(solver.get_links_COM() + torch.tensor([0.05, -0.02, 0.0], device=gs.device))
 
         masses = tensor_to_array(solver.get_links_mass())
         centers = tensor_to_array(solver.get_links_pos(ref=gs.link_ref_frame.link_COM))
