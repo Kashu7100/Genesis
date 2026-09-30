@@ -553,7 +553,7 @@ class RRT(PathPlanner):
         gs.logger.debug("Start RRT planning...")
         time_start = time.time()
         for i_n in range(self._rrt_max_nodes):
-            if self._rrt_is_active.to_torch().any():
+            if self._rrt_is_active.to_torch(device=gs.device).any():
                 self._kernel_rrt_step1(
                     envs_idx,
                     q_limit_lower,
@@ -963,7 +963,7 @@ class RRTConnect(PathPlanner):
             )
             forward_pass = not forward_pass
 
-            if not self._rrt_is_active.to_torch().any():
+            if not self._rrt_is_active.to_torch(device=gs.device).any():
                 break
             if timeout is not None:
                 if time.time() - time_start > timeout:
