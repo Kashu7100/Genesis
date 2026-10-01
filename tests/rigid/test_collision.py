@@ -17,7 +17,6 @@ import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.collider.constants import RETURN_CODE
 from genesis.engine.solvers.rigid.collider.epa import func_safe_epa_witness
-from genesis.engine.solvers.rigid.collider.gjk import GJK
 from genesis.utils.misc import qd_to_numpy, tensor_to_array
 
 from ..utils.assertions import assert_allclose, assert_equal
@@ -502,7 +501,7 @@ def test_convex_collision_across_geom_scales(gjk_collision, show_viewer, tol):
 def test_epa_witness_on_sliver_face():
     # The vertices are collinear in decimal, and their single-precision rounding alone makes the face a sliver that the
     # polytope accepts, but whose affine coordinates divide by zero.
-    VERTS = ((0.448, -0.2, 0.05), (-0.002, 0.0, 0.0), (-0.452, 0.2, -0.05))
+    VERTS = np.array(((0.448, -0.2, 0.05), (-0.002, 0.0, 0.0), (-0.452, 0.2, -0.05)), dtype=gs.np_float)
 
     scene = gs.Scene()
     scene.add_entity(
@@ -511,8 +510,8 @@ def test_epa_witness_on_sliver_face():
         ),
     )
     scene.build()
-    gjk = GJK(scene.rigid_solver)
-    gjk.activate()
+    collider = scene.rigid_solver.collider
+    collider.gjk.activate()
 
     @qd.kernel
     def kernel_sliver_face_witness(
@@ -527,14 +526,12 @@ def test_epa_witness_on_sliver_face():
                 vert = gs.qd_vec3(verts[i_v, 0], verts[i_v, 1], verts[i_v, 2])
                 gjk_state.polytope_verts.mink[i_b, i_v] = vert
                 gjk_state.polytope_verts.obj1[i_b, i_v] = vert
-            gjk_state.polytope_faces.verts_idx[i_b, 0] = qd.Vector([0, 1, 2], dt=gs.qd_int)
+            gjk_state.polytope_faces.verts_idx[i_b, 0] = gs.qd_ivec3(0, 1, 2)
             flags[i_b] = func_safe_epa_witness(0, 0, i_b, 0, gjk_state, collider_info)
 
     flags = np.empty(1, dtype=gs.np_int)
-    kernel_sliver_face_witness(
-        np.array(VERTS, dtype=gs.np_float), flags, gjk.gjk_state, scene.rigid_solver.collider.collider_info
-    )
-    witness = qd_to_numpy(gjk.gjk_state.witness.point_obj1)[0, 0]
+    kernel_sliver_face_witness(VERTS, flags, collider.gjk.gjk_state, collider.collider_info)
+    witness = qd_to_numpy(collider.gjk.gjk_state.witness.point_obj1, 0, 0, keepdim=False)
     assert flags[0] != RETURN_CODE.SUCCESS or np.isfinite(witness).all()
 
 
