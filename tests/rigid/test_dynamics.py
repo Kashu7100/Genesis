@@ -1,4 +1,5 @@
 import math
+from contextlib import nullcontext
 
 import numpy as np
 import pytest
@@ -7,6 +8,7 @@ from quadrants.lang._perf_dispatch import PerformanceDispatcher
 
 import genesis as gs
 import genesis.utils.geom as gu
+from genesis.engine.simulator import RATE_CHECK_ERRNO
 from genesis.engine.solvers.rigid.constraint import solver as constraint_solver
 from genesis.utils.misc import qd_to_numpy, tensor_to_array
 
@@ -112,6 +114,55 @@ def test_all_fixed(show_viewer):
     assert_allclose(cube.get_vel(), 0, tol=gs.EPS)
     assert_allclose(cube.get_ang(), 0, tol=gs.EPS)
     assert_allclose(scene.rigid_solver.get_links_acc(), 0, tol=gs.EPS)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("raise_on_nan", [True, False])
+def test_nan_reset(raise_on_nan, show_viewer, tol):
+    dt, g = 0.01, 9.81
+    n_steps = RATE_CHECK_ERRNO + 1
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=dt,
+            gravity=(0.0, 0.0, -g),
+        ),
+        rigid_options=gs.options.RigidOptions(
+            raise_on_nan=raise_on_nan,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(3.0, 1.0, 1.5),
+            camera_lookat=(0.0, 0.0, 0.5),
+        ),
+        show_viewer=show_viewer,
+    )
+    box = scene.add_entity(
+        gs.morphs.Box(
+            size=(0.1, 0.1, 0.1),
+            pos=(0.0, 0.0, 1.0),
+        ),
+    )
+    scene.build(n_envs=2)
+
+    box.control_dofs_force(float("nan"), envs_idx=[1])
+    with pytest.raises(gs.GenesisException, match="nan") if raise_on_nan else nullcontext():
+        for _ in range(n_steps):
+            scene.step()
+    if raise_on_nan:
+        return
+
+    # The faulty environment stays flagged while the other one keeps falling freely: semi-implicit time integration
+    # puts it at z0 - g * dt^2 * n * (n + 1) / 2 after n steps.
+    assert_equal(scene.rigid_solver.get_error_envs_mask(), (False, True))
+    assert_allclose(box.get_pos()[0], (0.0, 0.0, 1.0 - g * dt**2 * n_steps * (n_steps + 1) / 2), tol=tol)
+
+    box.control_dofs_force(0.0, envs_idx=[1])
+    scene.reset(envs_idx=[1])
+    for _ in range(n_steps):
+        scene.step()
+    assert_equal(scene.rigid_solver.get_error_envs_mask(), (False, False))
+    z_ref = [1.0 - g * dt**2 * n * (n + 1) / 2 for n in (2 * n_steps, n_steps)]
+    assert_allclose(box.get_pos()[:, 2], z_ref, tol=tol)
 
 
 @pytest.mark.required

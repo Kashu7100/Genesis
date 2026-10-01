@@ -475,6 +475,13 @@ class RigidOptions(GravityMixin, TimeBasedMixin):
     IK_max_targets : int, optional
         Maximum number of IK targets. Increasing this doesn't affect IK solving speed, but will increase memory usage.
         Defaults to 6.
+    raise_on_nan : bool, optional
+        Whether a non-finite value (NaN or infinity) arising in any environment halts the whole simulation with an
+        error, which surfaces the failure at the step it occurs. Disable it to keep simulating the other parallel
+        environments, as reinforcement learning does: the faulty environments are then flagged by
+        'scene.rigid_solver.get_error_envs_mask()' and their state is meaningless until the caller resets them through
+        'scene.reset', 'set_qpos' or 'set_dofs_position', so a caller that never checks the flags trains or evaluates
+        on corrupt data. Defaults to True.
     batch_links_info : bool, optional
         Whether the model parameters of a link, such as its mass or its inertia, are stored per environment rather
         than shared by the whole batch. Storing them per environment is what lets each environment carry its own
@@ -601,6 +608,7 @@ class RigidOptions(GravityMixin, TimeBasedMixin):
     multiplier_collision_broad_phase: PositiveInt = 8
     integrator: gs.integrator = gs.integrator.approximate_implicitfast
     IK_max_targets: PositiveInt = 6
+    raise_on_nan: StrictBool = True
 
     # batching info
     batch_links_info: StrictBool = False

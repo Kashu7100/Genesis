@@ -1465,28 +1465,6 @@ def test_gpu_simulation_determinism(prefer_decomposed_solver, contact_pruning_to
 
 
 @pytest.mark.required
-@pytest.mark.xfail(reason="No reliable way to generate nan...")
-@pytest.mark.parametrize("mode", [3])
-@pytest.mark.parametrize("model_name", ["collision_edge_cases"])
-@pytest.mark.parametrize("gs_solver", [gs.constraint_solver.CG])
-@pytest.mark.parametrize("gs_integrator", [gs.integrator.Euler])
-def test_nan_reset(gs_sim, mode):
-    for _ in range(200):
-        gs_sim.scene.step()
-        qvel = gs_sim.rigid_solver.get_dofs_velocity()
-        if torch.isnan(qvel).any():
-            break
-    else:
-        raise AssertionError
-
-    gs_sim.scene.reset()
-    for _ in range(5):
-        gs_sim.scene.step()
-    qvel = gs_sim.rigid_solver.get_dofs_velocity()
-    assert not torch.isnan(qvel).any()
-
-
-@pytest.mark.required
 def test_neutral_self_collision_masks_across_merged_entities(merged_overlapping_models, show_viewer):
     # attach() merges the hand into the arm's kinematic tree, and self-collision masking (adjacency and neutral overlap)
     # keys on root_idx, so it must span the merge boundary. The palm geom overlaps the non-adjacent a2 link at the
