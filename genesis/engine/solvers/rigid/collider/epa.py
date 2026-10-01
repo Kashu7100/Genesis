@@ -210,9 +210,15 @@ def func_epa(
     if nearest_i_f != -1:
         # Nearest face found
         dist2 = gjk_state.polytope_faces.dist2[i_b, nearest_i_f]
-        func_epa_witness(i_ga, i_gb, i_b, nearest_i_f, gjk_state)
-        gjk_state.n_witness[i_b] = 1
-        gjk_state.distance[i_b] = -qd.sqrt(dist2)
+        flag = func_epa_witness(i_ga, i_gb, i_b, nearest_i_f, gjk_state)
+        if flag == RETURN_CODE.SUCCESS:
+            gjk_state.n_witness[i_b] = 1
+            gjk_state.distance[i_b] = -qd.sqrt(dist2)
+        else:
+            # Failed to compute witness points, so the objects are not colliding
+            gjk_state.n_witness[i_b] = 0
+            gjk_state.distance[i_b] = 0
+            nearest_i_f = -1
     else:
         # No face found, so the objects are not colliding
         gjk_state.n_witness[i_b] = 0
@@ -225,6 +231,8 @@ def func_epa(
 def func_epa_witness(i_ga: int, i_gb: int, i_b: int, i_f: int, gjk_state: array_class.GJKState):
     """
     Compute the witness points from the geometries for the face i_f of the polytope.
+
+    Returns FAIL, leaving the witness points untouched, when the affine coordinates of the face are non-finite.
     """
     # Find the affine coordinates of the origin's projection on the face i_f
     face_iv1 = gjk_state.polytope_faces.verts_idx[i_b, i_f][0]
@@ -237,20 +245,28 @@ def func_epa_witness(i_ga: int, i_gb: int, i_b: int, i_f: int, gjk_state: array_
 
     _lambda = func_triangle_affine_coords(face_normal, face_v1, face_v2, face_v3)
 
-    # Point on geom 1
-    v1 = gjk_state.polytope_verts.obj1[i_b, face_iv1]
-    v2 = gjk_state.polytope_verts.obj1[i_b, face_iv2]
-    v3 = gjk_state.polytope_verts.obj1[i_b, face_iv3]
-    witness1 = v1 * _lambda[0] + v2 * _lambda[1] + v3 * _lambda[2]
+    # The affine coordinates of a sliver face can be non-finite (see func_safe_epa_witness)
+    flag = RETURN_CODE.SUCCESS
+    if not (qd.abs(_lambda[0] + _lambda[1] + _lambda[2]) < qd.math.inf):
+        flag = RETURN_CODE.FAIL
 
-    # Point on geom 2
-    v1 = gjk_state.polytope_verts.obj2[i_b, face_iv1]
-    v2 = gjk_state.polytope_verts.obj2[i_b, face_iv2]
-    v3 = gjk_state.polytope_verts.obj2[i_b, face_iv3]
-    witness2 = v1 * _lambda[0] + v2 * _lambda[1] + v3 * _lambda[2]
+    if flag == RETURN_CODE.SUCCESS:
+        # Point on geom 1
+        v1 = gjk_state.polytope_verts.obj1[i_b, face_iv1]
+        v2 = gjk_state.polytope_verts.obj1[i_b, face_iv2]
+        v3 = gjk_state.polytope_verts.obj1[i_b, face_iv3]
+        witness1 = v1 * _lambda[0] + v2 * _lambda[1] + v3 * _lambda[2]
 
-    gjk_state.witness.point_obj1[i_b, 0] = witness1
-    gjk_state.witness.point_obj2[i_b, 0] = witness2
+        # Point on geom 2
+        v1 = gjk_state.polytope_verts.obj2[i_b, face_iv1]
+        v2 = gjk_state.polytope_verts.obj2[i_b, face_iv2]
+        v3 = gjk_state.polytope_verts.obj2[i_b, face_iv3]
+        witness2 = v1 * _lambda[0] + v2 * _lambda[1] + v3 * _lambda[2]
+
+        gjk_state.witness.point_obj1[i_b, 0] = witness1
+        gjk_state.witness.point_obj2[i_b, 0] = witness2
+
+    return flag
 
 
 @qd.func
