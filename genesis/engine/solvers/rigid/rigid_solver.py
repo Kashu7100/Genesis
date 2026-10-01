@@ -1393,9 +1393,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     def get_error_envs_mask(self):
         """Return which environments hit a solver error since they were last reset.
 
-        An environment stays flagged until 'scene.reset', 'set_qpos' or 'set_dofs_position' resets it. A flagged
-        environment halts the simulation unless the rigid option 'raise_on_nan' is disabled, in which case the caller
-        polls this mask to reset the faulty environments.
+        An environment stays flagged until 'scene.reset', 'set_state', 'set_qpos' or 'set_dofs_position' targets it,
+        the latter two leaving its velocities and control commands untouched. Unless the rigid option 'raise_on_nan'
+        is disabled, a flagged environment halts the simulation at the next error check.
         """
         return qd_to_torch(self._errno) > 0
 
@@ -1423,8 +1423,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 f"Exceeding max number of post-pruning contact points ({max_contacts}) supported by the constraint "
                 "solver. Please increase the value of RigidSolver's option 'max_contacts'."
             )
-        # A non-finite value stays confined to the environment it arises in, which a reset recovers. A capacity overflow
-        # leaves a finite but wrong state that recurs after a reset, so it raises regardless of 'raise_on_nan'.
+        # A non-finite value leaves the other environments' state intact (only the batch-wide early exit of the
+        # constraint solver waits on the faulty one), and a reset recovers it. A capacity overflow leaves a finite but
+        # wrong state that recurs after a reset, so it raises regardless of 'raise_on_nan'.
         if self._options.raise_on_nan:
             if errno & array_class.ErrorCode.INVALID_CONTACT_NAN:
                 gs.raise_exception(

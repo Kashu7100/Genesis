@@ -144,7 +144,7 @@ def test_nan_reset(raise_on_nan, show_viewer, tol):
     )
     scene.build(n_envs=2)
 
-    box.control_dofs_force(float("nan"), envs_idx=[1])
+    box.control_dofs_force(math.nan, envs_idx=[1])
     with pytest.raises(gs.GenesisException, match="nan") if raise_on_nan else nullcontext():
         for _ in range(n_steps):
             scene.step()
@@ -156,7 +156,6 @@ def test_nan_reset(raise_on_nan, show_viewer, tol):
     assert_equal(scene.rigid_solver.get_error_envs_mask(), (False, True))
     assert_allclose(box.get_pos()[0], (0.0, 0.0, 1.0 - g * dt**2 * n_steps * (n_steps + 1) / 2), tol=tol)
 
-    box.control_dofs_force(0.0, envs_idx=[1])
     scene.reset(envs_idx=[1])
     for _ in range(n_steps):
         scene.step()

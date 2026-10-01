@@ -32,14 +32,15 @@ def func_copy_next_to_curr(
 
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
-        # Prevent nan propagation
+        # A non-finite update is rejected so the faulty environment keeps its last finite state, which collision
+        # detection keeps consuming. The magnitude test catches 'inf' and 'nan' at once (see func_set_contact).
         is_valid = True
         for i_d in range(n_dofs):
             e = dyn_state.dofs.vel_next[i_d, i_b]
-            is_valid &= not qd.math.isnan(e)
+            is_valid &= qd.abs(e) < qd.math.inf
         for i_q in range(n_qs):
             e = rigid_info.qpos_next[i_q, i_b]
-            is_valid &= not qd.math.isnan(e)
+            is_valid &= qd.abs(e) < qd.math.inf
 
         if is_valid:
             for i_d in range(n_dofs):
