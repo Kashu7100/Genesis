@@ -1172,7 +1172,12 @@ def func_safe_epa_witness(
     # For smooth geometries (e.g. spheres), polytope faces become extremely small near convergence,
     # which amplifies the relative reprojection error even when the absolute error is negligible.
     # To avoid false rejections, we check both relative and absolute reprojection errors.
-    if (
+    # The minors of the affine coordinates are computed from absolute vertex coordinates, so they can cancel to zero in
+    # single precision on a sliver face, which makes the reprojection error non-finite. Every comparison against 'nan'
+    # is false, so the magnitude test catches it ahead of the tolerance test (see func_set_contact).
+    if not (reprojection_error < qd.math.inf):
+        flag = RETURN_CODE.FAIL
+    elif (
         rel_reprojection_error > collider_info.gjk.polytope_max_rel_reprojection_error[None]
         and reprojection_error > collider_info.gjk.polytope_max_abs_reprojection_error[None]
     ):

@@ -10,9 +10,15 @@ import trimesh
 from scipy.spatial import ConvexHull
 from scipy.spatial.qhull import QhullError
 
+import quadrants as qd
+
 import genesis as gs
+import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
-from genesis.utils.misc import tensor_to_array
+from genesis.engine.solvers.rigid.collider.constants import RETURN_CODE
+from genesis.engine.solvers.rigid.collider.epa import func_safe_epa_witness
+from genesis.engine.solvers.rigid.collider.gjk import GJK
+from genesis.utils.misc import qd_to_numpy, tensor_to_array
 
 from ..utils.assertions import assert_allclose, assert_equal
 from ..utils.assets import get_hf_dataset
@@ -489,6 +495,47 @@ def test_convex_collision_across_geom_scales(gjk_collision, show_viewer, tol):
     assert (contacts["penetration"][~is_pressed] <= GEOM_SIZE).all()
     offset = (geom_grazing.get_pos() - box.get_pos()) @ face_normal
     assert face_offset - tol <= offset <= face_offset + GEOM_SIZE
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["32"])
+def test_epa_witness_on_sliver_face():
+    # The vertices are collinear in decimal, and their single-precision rounding alone makes the face a sliver that the
+    # polytope accepts, but whose affine coordinates divide by zero.
+    VERTS = ((0.448, -0.2, 0.05), (-0.002, 0.0, 0.0), (-0.452, 0.2, -0.05))
+
+    scene = gs.Scene()
+    scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.1, 0.1, 0.1),
+        ),
+    )
+    scene.build()
+    gjk = GJK(scene.rigid_solver)
+    gjk.activate()
+
+    @qd.kernel
+    def kernel_sliver_face_witness(
+        verts: qd.types.ndarray(),
+        flags: qd.types.ndarray(),
+        gjk_state: array_class.GJKState,
+        collider_info: array_class.ColliderInfo,
+    ):
+        # The origin projection breaks out of its loop, which quadrants rejects at the top level of a kernel
+        for i_b in range(1):
+            for i_v in qd.static(range(3)):
+                vert = gs.qd_vec3(verts[i_v, 0], verts[i_v, 1], verts[i_v, 2])
+                gjk_state.polytope_verts.mink[i_b, i_v] = vert
+                gjk_state.polytope_verts.obj1[i_b, i_v] = vert
+            gjk_state.polytope_faces.verts_idx[i_b, 0] = qd.Vector([0, 1, 2], dt=gs.qd_int)
+            flags[i_b] = func_safe_epa_witness(0, 0, i_b, 0, gjk_state, collider_info)
+
+    flags = np.empty(1, dtype=gs.np_int)
+    kernel_sliver_face_witness(
+        np.array(VERTS, dtype=gs.np_float), flags, gjk.gjk_state, scene.rigid_solver.collider.collider_info
+    )
+    witness = qd_to_numpy(gjk.gjk_state.witness.point_obj1)[0, 0]
+    assert flags[0] != RETURN_CODE.SUCCESS or np.isfinite(witness).all()
 
 
 @pytest.mark.slow  # ~200s
