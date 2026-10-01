@@ -246,11 +246,10 @@ def func_epa_witness(i_ga: int, i_gb: int, i_b: int, i_f: int, gjk_state: array_
     _lambda = func_triangle_affine_coords(face_normal, face_v1, face_v2, face_v3)
 
     # The affine coordinates of a sliver face can be non-finite (see func_safe_epa_witness)
-    flag = RETURN_CODE.SUCCESS
-    if not (qd.abs(_lambda[0] + _lambda[1] + _lambda[2]) < qd.math.inf):
-        flag = RETURN_CODE.FAIL
+    flag = RETURN_CODE.FAIL
+    if qd.abs(_lambda[0] + _lambda[1] + _lambda[2]) < qd.math.inf:
+        flag = RETURN_CODE.SUCCESS
 
-    if flag == RETURN_CODE.SUCCESS:
         # Point on geom 1
         v1 = gjk_state.polytope_verts.obj1[i_b, face_iv1]
         v2 = gjk_state.polytope_verts.obj1[i_b, face_iv2]
