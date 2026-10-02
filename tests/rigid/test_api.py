@@ -399,7 +399,8 @@ def test_data_accessor(n_envs, batched, tol):
             gs_s.control_dofs_velocity(dofs_vel, dofs_idx, envs_idx)
 
     # A boolean mask of environments must write exactly what the equivalent environment indices write, whether the value
-    # holds one row per environment or one row per selected environment, for any selection of columns.
+    # holds one row per environment or one row per selected environment, for any selection of columns, a single column
+    # also taking one entry per environment or per selected environment. A mask of the wrong length is rejected.
     if n_envs > 0:
         envs_mask = torch.arange(n_envs, device=gs.device) % 2 == 0
         envs_idx = torch.where(envs_mask)[0]
@@ -408,10 +409,13 @@ def test_data_accessor(n_envs, batched, tol):
             (gs_robot.get_dofs_position, gs_robot.set_dofs_position),
             (gs_robot.get_dofs_velocity, gs_robot.set_dofs_velocity),
         ):
-            for cols_idx in (None, slice(2, 9), torch.tensor([0, 7, 12], device=gs.device)):
+            for cols_idx in (None, slice(2, 9), torch.tensor([0, 7, 12], device=gs.device), [3]):
                 values_init = getter()
                 values = getter(cols_idx) + 0.1 * torch.arange(1, n_envs + 1, device=gs.device)[:, None]
-                for value in (values, values[envs_mask]):
+                value_forms = (values, values[envs_mask])
+                if values.shape[-1] == 1:
+                    value_forms = (*value_forms, values[:, 0], values[envs_mask][:, 0])
+                for value in value_forms:
                     setter(values_init)
                     setter(value, cols_idx, envs_mask)
                     masked_datas = (getter(), gs_robot.get_qpos(), gs_robot.get_links_pos())
@@ -420,6 +424,8 @@ def test_data_accessor(n_envs, batched, tol):
                     indexed_datas = (getter(), gs_robot.get_qpos(), gs_robot.get_links_pos())
                     for masked_data, indexed_data in zip(masked_datas, indexed_datas):
                         assert_allclose(masked_data, indexed_data, tol=gs.EPS)
+            with pytest.raises(gs.GenesisException):
+                setter(values_init, None, envs_mask[:1])
 
     # Must be tested independently because of non-trival return type
     gs_robot.get_contacts()

@@ -1243,7 +1243,7 @@ def assign_indexed_tensor(
                 if index.dtype == torch.bool:
                     spread = [1] * tensor.ndim
                     spread[axis] = -1
-                    tensor.masked_fill_(index.view(spread), value)
+                    tensor.masked_fill_(index.to(device=tensor.device).view(spread), value)
                     return
                 if index.ndim == 1 and index.dtype == torch.int64:
                     tensor.index_fill_(axis, index, value)
@@ -1267,24 +1267,34 @@ def assign_masked_tensor(
     'tensor' is batched over environments along its first axis, 'envs_mask' selects among them, and 'indices' selects
     along the following axes, as returned by 'indices_to_mask'. 'value' either spans every environment, in which case
     the environments left out by the mask keep their current value, or holds one entry per selected environment in
-    increasing order. Indexing with the mask instead would convert it to indices, which counts its selected entries on
-    the device and reads that count back.
+    increasing order. A value without the environment axis that broadcasts over the selected entries applies to every
+    selected environment, and otherwise holds one entry per environment along its first axis.
+
+    The number of entries per selected environment is trusted: counting the selected environments would read that count
+    back from the device, which stalls it, so a value with extra entries writes its leading ones and a value with too few
+    reads past its end. Indexing with the mask would convert it to indices, which reads that same count back.
     """
     data_idx = (slice(None), *indices)
     data = tensor[data_idx]
-    envs_mask_ = envs_mask.view((-1, *((1,) * (data.ndim - 1))))
+    if envs_mask.shape != (len(data),):
+        gs.raise_exception(f"Boolean masks for `envs_idx` must have shape ({len(data)},).")
+    envs_mask_ = envs_mask.to(device=data.device).view((-1, *((1,) * (data.ndim - 1))))
     if isinstance(value, (int, float)):
         data.masked_fill_(envs_mask_, value)
     else:
         value = torch.as_tensor(value, dtype=tensor.dtype, device=gs.device)
+        entry_shape = data.shape[1:]
+        if value.ndim < data.ndim and not all(
+            dim in (1, size) for dim, size in zip(value.shape[::-1], entry_shape[::-1])
+        ):
+            value = value.reshape((len(value), *((1,) * (data.ndim - value.ndim)), *value.shape[1:]))
         if value.ndim == data.ndim and len(value) not in (1, len(data)):
             # A fresh source view is needed because masked_scatter_ may reshape it in-place. Metal mis-scatters a
             # stride-0 broadcast mask, so it must be materialized to a dense full-shape mask there.
             if gs.backend == gs.metal:
                 envs_mask_ = envs_mask_.expand_as(data).contiguous()
-            data.masked_scatter_(envs_mask_, value.view_as(value))
+            data.masked_scatter_(envs_mask_, value.expand((len(value), *entry_shape)))
         else:
-            value = broadcast_tensor(value, tensor.dtype, data.shape)
             torch.where(envs_mask_, value, data, out=data)
     # Advanced indexing along the following axes extracts a copy rather than a view, which must be written back
     if any(isinstance(index, torch.Tensor) for index in indices):

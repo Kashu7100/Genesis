@@ -1117,7 +1117,7 @@ class KinematicSolver(Solver):
         if gs.use_zerocopy:
             data = qd_to_torch(self.rigid_info.qpos, transpose=True, copy=False)
             qs_mask = indices_to_mask(qs_idx)
-            if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
+            if self.n_envs > 0 and isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
                 assign_masked_tensor(data, envs_idx, qs_mask, qpos)
             else:
                 mask = (0, *qs_mask) if self.n_envs == 0 else indices_to_mask(envs_idx, *qs_mask)
@@ -1153,11 +1153,12 @@ class KinematicSolver(Solver):
         if gs.use_zerocopy:
             vel = qd_to_torch(self.dyn_state.dofs.vel, transpose=True, copy=False)
             dofs_mask = indices_to_mask(dofs_idx)
-            if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
+            if self.n_envs > 0 and isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
                 assign_masked_tensor(vel, envs_idx, dofs_mask, 0.0 if velocity is None else velocity)
             elif (
                 velocity is None
                 and isinstance(envs_idx, torch.Tensor)
+                and envs_idx.dtype != torch.bool
                 and not IS_OLD_TORCH
                 and (not dofs_mask or isinstance(dofs_mask[0], slice))
             ):
@@ -1421,7 +1422,7 @@ class KinematicSolver(Solver):
         if gs.use_zerocopy:
             data = qd_to_torch(self.dyn_state.vverts.pos, transpose=True, copy=False)
             vverts_mask = indices_to_mask(slice(custom_vvert_start, custom_vvert_end))
-            if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
+            if self.n_envs > 0 and isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
                 assign_masked_tensor(data, envs_idx, vverts_mask, vverts)
             else:
                 pos_mask = (0, *vverts_mask) if self.n_envs == 0 else indices_to_mask(envs_idx, *vverts_mask)

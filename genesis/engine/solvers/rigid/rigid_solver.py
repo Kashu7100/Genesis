@@ -2065,8 +2065,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             else:
                 data = qd_to_torch(self.rigid_info.qpos, transpose=True, copy=False)
                 target = data[:, link.q_start : link.q_start + 3]
-            if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
-                assign_masked_tensor(target, envs_idx, (), pos)
+            if self.n_envs > 0 and isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
+                assign_masked_tensor(target, envs_idx, indices=(), value=pos)
             else:
                 # Fixed links with at least one geom and non-batched vertices cannot take env-specific positions
                 if link.is_fixed and link.geoms and not link.entity._batch_fixed_verts:
@@ -2182,8 +2182,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             else:
                 data = qd_to_torch(self.rigid_info.qpos, transpose=True, copy=False)
                 target = data[:, link.q_start + 3 : link.q_start + 7]
-            if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
-                assign_masked_tensor(target, envs_idx, (), quat)
+            if self.n_envs > 0 and isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
+                assign_masked_tensor(target, envs_idx, indices=(), value=quat)
             else:
                 # Fixed links with at least one geom and non-batched vertices cannot take env-specific orientations
                 if link.is_fixed and link.geoms and not link.entity._batch_fixed_verts:
@@ -2459,9 +2459,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             data = qd_to_torch(self.rigid_info.qpos, transpose=True, copy=False)
             errno = qd_to_torch(self._errno, copy=False)
             qs_mask = indices_to_mask(qs_idx)
-            if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
+            if self.n_envs > 0 and isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
                 assign_masked_tensor(data, envs_idx, qs_mask, qpos)
-                errno.masked_fill_(envs_idx, 0)
+                assign_masked_tensor(errno, envs_idx, indices=(), value=0)
             else:
                 mask = (0, *qs_mask) if self.n_envs == 0 else indices_to_mask(envs_idx, *qs_mask)
                 assign_indexed_tensor(data, mask, qpos)
@@ -2689,7 +2689,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self.constraint_solver.reset(envs_idx)
 
         # The kernel path converts a boolean mask to environment indices, which waking up hibernated entities requires
-        # and which rejects any selection of environments in a scene without parallel environments.
         if (
             gs.use_zerocopy
             and self.n_envs > 0
@@ -2698,15 +2697,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             and not self._use_hibernation
         ):
             dofs_pos = qd_to_torch(self.dyn_state.dofs.pos, transpose=True, copy=False)
-            errno = qd_to_torch(self._errno, copy=False)
             assign_masked_tensor(dofs_pos, envs_idx, indices_to_mask(dofs_idx), position)
-            errno.masked_fill_(envs_idx, 0)
             if gs.backend == gs.metal:
                 torch.mps.synchronize()
             kernel_masked_update_qpos_from_dofs_pos(
-                envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
-            )
-            kernel_masked_forward_kinematics_links_geoms(
                 envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
             )
         else:
@@ -2722,17 +2716,22 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 dofs_idx, envs_idx, position, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
             )
 
-            if gs.use_zerocopy:
-                errno = qd_to_torch(self._errno, copy=False)
-                errno[envs_idx] = 0
-                if gs.backend == gs.metal:
-                    torch.mps.synchronize()
+        if gs.use_zerocopy:
+            errno = qd_to_torch(self._errno, copy=False)
+            if envs_idx.dtype == torch.bool:
+                assign_masked_tensor(errno, envs_idx, indices=(), value=0)
             else:
-                kernel_set_zero(envs_idx, self._errno)
+                errno[envs_idx] = 0
+            if gs.backend == gs.metal:
+                torch.mps.synchronize()
+        else:
+            kernel_set_zero(envs_idx, self._errno)
 
-            kernel_forward_kinematics_links_geoms(
-                envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
-            )
+        if envs_idx.dtype == torch.bool:
+            fn = kernel_masked_forward_kinematics_links_geoms
+        else:
+            fn = kernel_forward_kinematics_links_geoms
+        fn(envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config)
         self._is_forward_pos_updated = True
         self._is_forward_vel_updated = True
 
