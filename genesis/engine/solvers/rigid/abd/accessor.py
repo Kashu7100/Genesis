@@ -899,32 +899,19 @@ def kernel_set_dofs_zero_velocity(
         dyn_state.dofs.vel[dofs_idx[i_d_], envs_idx[i_b_]] = 0.0
 
 
-@qd.kernel(fastcache=True)
-def kernel_set_dofs_position(
-    dofs_idx: qd.types.ndarray(),
-    envs_idx: qd.types.ndarray(),
-    position: qd.types.ndarray(),
+@qd.func
+def func_update_entity_qpos_from_dofs_pos(
+    i_e: int,
+    i_b: int,
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
 ):
-    n_entities = dyn_info.entities.link_start.shape[0]
-
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d_, i_b_ in qd.ndrange(dofs_idx.shape[0], envs_idx.shape[0]):
-        dyn_state.dofs.pos[dofs_idx[i_d_], envs_idx[i_b_]] = position[i_b_, i_d_]
-
-    # Note that qpos must be updated, as dofs_state.pos is not used for actual IK.
-    # TODO: Make this more efficient by only taking care of releavant qs/dofs.
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_e, i_b_ in qd.ndrange(n_entities, envs_idx.shape[0]):
-        i_b = envs_idx[i_b_]
-        for i_l in range(dyn_info.entities.link_start[i_e], dyn_info.entities.link_end[i_e]):
-            I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
-            if dyn_info.links.n_dofs[I_l] == 0:
-                continue
-
+    """Set the qpos of every joint of one entity from the position of its dofs."""
+    for i_l in range(dyn_info.entities.link_start[i_e], dyn_info.entities.link_end[i_e]):
+        I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
+        if dyn_info.links.n_dofs[I_l] > 0:
             dof_start = dyn_info.links.dof_start[I_l]
             q_start = dyn_info.links.q_start[I_l]
 
@@ -968,6 +955,46 @@ def kernel_set_dofs_position(
                     i_q = q_start + i_d_
                     i_d = dof_start + i_d_
                     rigid_info.qpos[i_q, i_b] = rigid_info.qpos0[i_q, i_b] + dyn_state.dofs.pos[i_d, i_b]
+
+
+@qd.kernel(fastcache=True)
+def kernel_set_dofs_position(
+    dofs_idx: qd.types.ndarray(),
+    envs_idx: qd.types.ndarray(),
+    position: qd.types.ndarray(),
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    rigid_config: qd.template(),
+):
+    n_entities = dyn_info.entities.link_start.shape[0]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_d_, i_b_ in qd.ndrange(dofs_idx.shape[0], envs_idx.shape[0]):
+        dyn_state.dofs.pos[dofs_idx[i_d_], envs_idx[i_b_]] = position[i_b_, i_d_]
+
+    # Note that qpos must be updated, as dofs_state.pos is not used for actual IK.
+    # TODO: Make this more efficient by only taking care of releavant qs/dofs.
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_e, i_b_ in qd.ndrange(n_entities, envs_idx.shape[0]):
+        i_b = envs_idx[i_b_]
+        func_update_entity_qpos_from_dofs_pos(i_e, i_b, dyn_state, dyn_info, rigid_info, rigid_config)
+
+
+@qd.kernel(fastcache=True)
+def kernel_masked_update_qpos_from_dofs_pos(
+    envs_mask: qd.types.ndarray(),
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    rigid_config: qd.template(),
+):
+    n_entities = dyn_info.entities.link_start.shape[0]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_e, i_b in qd.ndrange(n_entities, envs_mask.shape[0]):
+        if envs_mask[i_b]:
+            func_update_entity_qpos_from_dofs_pos(i_e, i_b, dyn_state, dyn_info, rigid_info, rigid_config)
 
 
 @qd.kernel(fastcache=True)

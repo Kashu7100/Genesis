@@ -18,6 +18,7 @@ from genesis.options.solvers import RigidOptions
 from genesis.utils.misc import (
     DeprecationError,
     assign_indexed_tensor,
+    assign_masked_tensor,
     broadcast_tensor,
     get_gpu_core_count,
     get_gpu_shared_tile_sizes,
@@ -46,6 +47,7 @@ from .abd.accessor import (
     kernel_get_links_acc,
     kernel_get_links_vel,
     kernel_get_state,
+    kernel_masked_update_qpos_from_dofs_pos,
     kernel_set_dofs_act_bias,
     kernel_set_dofs_act_gain,
     kernel_set_dofs_armature,
@@ -2064,16 +2066,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 data = qd_to_torch(self.rigid_info.qpos, transpose=True, copy=False)
                 target = data[:, link.q_start : link.q_start + 3]
             if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
-                if pos.ndim == 2 and len(pos) not in (1, len(target)):
-                    # A fresh source view is needed because masked_scatter_ may reshape it in-place. Metal
-                    # mis-scatters a stride-0 broadcast mask, so it must be materialized to a dense mask there.
-                    envs_mask = envs_idx[:, None]
-                    if gs.backend == gs.metal:
-                        envs_mask = envs_mask.expand_as(target).contiguous()
-                    target.masked_scatter_(envs_mask, pos.view_as(pos))
-                else:
-                    pos = broadcast_tensor(pos, gs.tc_float, target.shape)
-                    torch.where(envs_idx[:, None], pos, target, out=target)
+                assign_masked_tensor(target, envs_idx, (), pos)
             else:
                 # Fixed links with at least one geom and non-batched vertices cannot take env-specific positions
                 if link.is_fixed and link.geoms and not link.entity._batch_fixed_verts:
@@ -2190,16 +2183,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 data = qd_to_torch(self.rigid_info.qpos, transpose=True, copy=False)
                 target = data[:, link.q_start + 3 : link.q_start + 7]
             if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
-                if quat.ndim == 2 and len(quat) not in (1, len(target)):
-                    # A fresh source view is needed because masked_scatter_ may reshape it in-place. Metal
-                    # mis-scatters a stride-0 broadcast mask, so it must be materialized to a dense mask there.
-                    envs_mask = envs_idx[:, None]
-                    if gs.backend == gs.metal:
-                        envs_mask = envs_mask.expand_as(target).contiguous()
-                    target.masked_scatter_(envs_mask, quat.view_as(quat))
-                else:
-                    quat = broadcast_tensor(quat, gs.tc_float, target.shape)
-                    torch.where(envs_idx[:, None], quat, target, out=target)
+                assign_masked_tensor(target, envs_idx, (), quat)
             else:
                 # Fixed links with at least one geom and non-batched vertices cannot take env-specific orientations
                 if link.is_fixed and link.geoms and not link.entity._batch_fixed_verts:
@@ -2475,25 +2459,11 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             data = qd_to_torch(self.rigid_info.qpos, transpose=True, copy=False)
             errno = qd_to_torch(self._errno, copy=False)
             qs_mask = indices_to_mask(qs_idx)
-            if (
-                (not qs_mask or isinstance(qs_mask[0], slice))
-                and isinstance(envs_idx, torch.Tensor)
-                and envs_idx.dtype == torch.bool
-            ):
-                qs_data = data[(slice(None), *qs_mask)]
-                if qpos.ndim == 2 and len(qpos) not in (1, len(qs_data)):
-                    # A fresh source view is needed because masked_scatter_ may reshape it in-place. Metal mis-scatters
-                    # a stride-0 broadcast mask, so it must be materialized to a dense full-shape mask there.
-                    envs_mask = envs_idx[:, None]
-                    if gs.backend == gs.metal:
-                        envs_mask = envs_mask.expand_as(qs_data).contiguous()
-                    qs_data.masked_scatter_(envs_mask, qpos.view_as(qpos))
-                else:
-                    qpos = broadcast_tensor(qpos, gs.tc_float, qs_data.shape)
-                    torch.where(envs_idx[:, None], qpos, qs_data, out=qs_data)
-                errno.masked_fill_(envs_idx, 0.0)
+            if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
+                assign_masked_tensor(data, envs_idx, qs_mask, qpos)
+                errno.masked_fill_(envs_idx, 0)
             else:
-                mask = (0, *qs_mask) if self.n_envs == 0 else indices_to_mask(envs_idx, *qs_mask, boolean_mask=False)
+                mask = (0, *qs_mask) if self.n_envs == 0 else indices_to_mask(envs_idx, *qs_mask)
                 assign_indexed_tensor(data, mask, qpos)
                 errno[envs_idx] = 0
                 if mask and isinstance(mask[0], torch.Tensor):
@@ -2718,29 +2688,51 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self.collider.reset(envs_idx)
         self.constraint_solver.reset(envs_idx)
 
-        position, dofs_idx, envs_idx = self._sanitize_io_variables(
-            position, dofs_idx, self.n_dofs, "dofs_idx", envs_idx, skip_allocation=True
-        )
-        if self.n_envs == 0:
-            position = position[None]
-
-        self._wake_dofs(dofs_idx, envs_idx)
-
-        kernel_set_dofs_position(
-            dofs_idx, envs_idx, position, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
-        )
-
-        if gs.use_zerocopy:
+        # The kernel path converts a boolean mask to environment indices, which waking up hibernated entities requires
+        # and which rejects any selection of environments in a scene without parallel environments.
+        if (
+            gs.use_zerocopy
+            and self.n_envs > 0
+            and isinstance(envs_idx, torch.Tensor)
+            and envs_idx.dtype == torch.bool
+            and not self._use_hibernation
+        ):
+            dofs_pos = qd_to_torch(self.dyn_state.dofs.pos, transpose=True, copy=False)
             errno = qd_to_torch(self._errno, copy=False)
-            errno[envs_idx] = 0
+            assign_masked_tensor(dofs_pos, envs_idx, indices_to_mask(dofs_idx), position)
+            errno.masked_fill_(envs_idx, 0)
             if gs.backend == gs.metal:
                 torch.mps.synchronize()
+            kernel_masked_update_qpos_from_dofs_pos(
+                envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
+            )
+            kernel_masked_forward_kinematics_links_geoms(
+                envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
+            )
         else:
-            kernel_set_zero(envs_idx, self._errno)
+            position, dofs_idx, envs_idx = self._sanitize_io_variables(
+                position, dofs_idx, self.n_dofs, "dofs_idx", envs_idx, skip_allocation=True
+            )
+            if self.n_envs == 0:
+                position = position[None]
 
-        kernel_forward_kinematics_links_geoms(
-            envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
-        )
+            self._wake_dofs(dofs_idx, envs_idx)
+
+            kernel_set_dofs_position(
+                dofs_idx, envs_idx, position, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
+            )
+
+            if gs.use_zerocopy:
+                errno = qd_to_torch(self._errno, copy=False)
+                errno[envs_idx] = 0
+                if gs.backend == gs.metal:
+                    torch.mps.synchronize()
+            else:
+                kernel_set_zero(envs_idx, self._errno)
+
+            kernel_forward_kinematics_links_geoms(
+                envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
+            )
         self._is_forward_pos_updated = True
         self._is_forward_vel_updated = True
 

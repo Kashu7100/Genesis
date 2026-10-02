@@ -130,9 +130,14 @@ def test_data_accessor(n_envs, batched, tol):
     # * Call 'Get' -> Call 'Set' with 'Get' output -> Call 'Get'
     # * Compare first 'Get' output with last 'Get' output
     # * Compare last 'Get' output with corresponding slice of non-masking 'Get' output
-    def get_all_supported_masks(i, max_length):
+    def get_all_supported_masks(i, max_length, *, with_boolean=False):
         if max_length <= 0 or i > max_length - 1:
             return (None,)
+        boolean_masks = ()
+        if with_boolean:
+            boolean_mask = torch.zeros((max_length,), dtype=torch.bool, device=gs.device)
+            boolean_mask[i : i + 2] = True
+            boolean_masks = (boolean_mask,)
         if i == max_length - 1:
             return (
                 i,
@@ -142,6 +147,7 @@ def test_data_accessor(n_envs, batched, tol):
                 np.array([i], dtype=np.int32),
                 torch.tensor([i], dtype=torch.int64),
                 torch.tensor([i], dtype=gs.tc_int, device=gs.device),
+                *boolean_masks,
             )
         return (
             [i, i + 1],
@@ -150,6 +156,7 @@ def test_data_accessor(n_envs, batched, tol):
             np.array([i, i + 1], dtype=np.int32),
             torch.tensor([i, i + 1], dtype=torch.int64),
             torch.tensor([i, i + 1], dtype=gs.tc_int, device=gs.device),
+            *boolean_masks,
         )
 
     # Link, joint and DOF info only carries an environment dimension when batched, which decides whether their
@@ -329,7 +336,7 @@ def test_data_accessor(n_envs, batched, tol):
                 for j in range(max(arg2_max, 1)) if arg2_max >= 0 else (None,):
                     if j is not None:
                         mask_j = [j, j + 1] if j < arg2_max - 1 else [j]
-                    for arg2 in get_all_supported_masks(j, arg2_max):
+                    for arg2 in get_all_supported_masks(j, arg2_max, with_boolean=True):
                         if arg1 is None and arg2 is not None:
                             if getter is not None:
                                 data = deepcopy(getter(arg2))
@@ -390,6 +397,29 @@ def test_data_accessor(n_envs, batched, tol):
             dofs_vel = gs_s.get_dofs_velocity(dofs_idx, envs_idx)
             gs_s.control_dofs_position(dofs_pos, dofs_idx, envs_idx)
             gs_s.control_dofs_velocity(dofs_vel, dofs_idx, envs_idx)
+
+    # A boolean mask of environments must write exactly what the equivalent environment indices write, whether the value
+    # holds one row per environment or one row per selected environment, for any selection of columns.
+    if n_envs > 0:
+        envs_mask = torch.arange(n_envs, device=gs.device) % 2 == 0
+        envs_idx = torch.where(envs_mask)[0]
+        for getter, setter in (
+            (gs_robot.get_qpos, gs_robot.set_qpos),
+            (gs_robot.get_dofs_position, gs_robot.set_dofs_position),
+            (gs_robot.get_dofs_velocity, gs_robot.set_dofs_velocity),
+        ):
+            for cols_idx in (None, slice(2, 9), torch.tensor([0, 7, 12], device=gs.device)):
+                values_init = getter()
+                values = getter(cols_idx) + 0.1 * torch.arange(1, n_envs + 1, device=gs.device)[:, None]
+                for value in (values, values[envs_mask]):
+                    setter(values_init)
+                    setter(value, cols_idx, envs_mask)
+                    masked_datas = (getter(), gs_robot.get_qpos(), gs_robot.get_links_pos())
+                    setter(values_init)
+                    setter(values[envs_mask], cols_idx, envs_idx)
+                    indexed_datas = (getter(), gs_robot.get_qpos(), gs_robot.get_links_pos())
+                    for masked_data, indexed_data in zip(masked_datas, indexed_datas):
+                        assert_allclose(masked_data, indexed_data, tol=gs.EPS)
 
     # Must be tested independently because of non-trival return type
     gs_robot.get_contacts()

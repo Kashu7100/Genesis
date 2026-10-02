@@ -1254,3 +1254,38 @@ def assign_indexed_tensor(
         # Try extended broadcasting as a fallback to avoid slowing down the hot path
         indexed_shape = get_indexed_shape(tensor.shape, indices) if indices else tensor.shape
         tensor[indices] = broadcast_tensor(value, tensor.dtype, indexed_shape, dim_names)
+
+
+def assign_masked_tensor(
+    tensor: torch.Tensor,
+    envs_mask: torch.Tensor,
+    indices: tuple[slice | torch.Tensor, ...],
+    value: "np.typing.ArrayLike",
+) -> None:
+    """Write a value over the environments selected by a boolean mask without synchronizing the device.
+
+    'tensor' is batched over environments along its first axis, 'envs_mask' selects among them, and 'indices' selects
+    along the following axes, as returned by 'indices_to_mask'. 'value' either spans every environment, in which case
+    the environments left out by the mask keep their current value, or holds one entry per selected environment in
+    increasing order. Indexing with the mask instead would convert it to indices, which counts its selected entries on
+    the device and reads that count back.
+    """
+    data_idx = (slice(None), *indices)
+    data = tensor[data_idx]
+    envs_mask_ = envs_mask.view((-1, *((1,) * (data.ndim - 1))))
+    if isinstance(value, (int, float)):
+        data.masked_fill_(envs_mask_, value)
+    else:
+        value = torch.as_tensor(value, dtype=tensor.dtype, device=gs.device)
+        if value.ndim == data.ndim and len(value) not in (1, len(data)):
+            # A fresh source view is needed because masked_scatter_ may reshape it in-place. Metal mis-scatters a
+            # stride-0 broadcast mask, so it must be materialized to a dense full-shape mask there.
+            if gs.backend == gs.metal:
+                envs_mask_ = envs_mask_.expand_as(data).contiguous()
+            data.masked_scatter_(envs_mask_, value.view_as(value))
+        else:
+            value = broadcast_tensor(value, tensor.dtype, data.shape)
+            torch.where(envs_mask_, value, data, out=data)
+    # Advanced indexing along the following axes extracts a copy rather than a view, which must be written back
+    if any(isinstance(index, torch.Tensor) for index in indices):
+        tensor[data_idx] = data

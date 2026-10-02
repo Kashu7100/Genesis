@@ -21,6 +21,7 @@ from genesis.options.morphs import Morph
 from genesis.options.solvers import KinematicOptions
 from genesis.utils.misc import (
     assign_indexed_tensor,
+    assign_masked_tensor,
     broadcast_tensor,
     indices_to_mask,
     qd_to_torch,
@@ -1116,20 +1117,10 @@ class KinematicSolver(Solver):
         if gs.use_zerocopy:
             data = qd_to_torch(self.rigid_info.qpos, transpose=True, copy=False)
             qs_mask = indices_to_mask(qs_idx)
-            if (
-                (not qs_mask or isinstance(qs_mask[0], slice))
-                and isinstance(envs_idx, torch.Tensor)
-                and envs_idx.dtype == torch.bool
-            ):
-                qs_data = data[(slice(None), *qs_mask)]
-                if qpos.ndim == 2 and len(qpos) != len(qs_data):
-                    # Note that it is necessary to create a new temporary view because it will be reshaped in-place
-                    qs_data.masked_scatter_(envs_idx[:, None], qpos.view_as(qpos))
-                else:
-                    qpos = broadcast_tensor(qpos, gs.tc_float, qs_data.shape)
-                    torch.where(envs_idx[:, None], qpos, qs_data, out=qs_data)
+            if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
+                assign_masked_tensor(data, envs_idx, qs_mask, qpos)
             else:
-                mask = (0, *qs_mask) if self.n_envs == 0 else indices_to_mask(envs_idx, *qs_mask, boolean_mask=False)
+                mask = (0, *qs_mask) if self.n_envs == 0 else indices_to_mask(envs_idx, *qs_mask)
                 assign_indexed_tensor(data, mask, qpos)
                 if mask and isinstance(mask[0], torch.Tensor):
                     envs_idx = mask[0].reshape((-1,))
@@ -1162,31 +1153,18 @@ class KinematicSolver(Solver):
         if gs.use_zerocopy:
             vel = qd_to_torch(self.dyn_state.dofs.vel, transpose=True, copy=False)
             dofs_mask = indices_to_mask(dofs_idx)
-            if (
-                (not dofs_mask or isinstance(dofs_mask[0], slice))
+            if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
+                assign_masked_tensor(vel, envs_idx, dofs_mask, 0.0 if velocity is None else velocity)
+            elif (
+                velocity is None
                 and isinstance(envs_idx, torch.Tensor)
-                and (
-                    (velocity is None and (not IS_OLD_TORCH or envs_idx.dtype == torch.bool))
-                    or (velocity is not None and velocity.ndim == 2 and envs_idx.dtype == torch.bool)
-                )
+                and not IS_OLD_TORCH
+                and (not dofs_mask or isinstance(dofs_mask[0], slice))
             ):
                 dofs_vel = vel[(slice(None), *dofs_mask)]
-                if velocity is None:
-                    if envs_idx.dtype == torch.bool:
-                        dofs_vel.masked_fill_(envs_idx[:, None], 0.0)
-                    else:
-                        dofs_vel.scatter_(0, envs_idx[:, None].expand((-1, dofs_vel.shape[1])), 0.0)
-                else:
-                    if velocity.ndim == 2 and len(dofs_vel) != len(velocity):
-                        # Note that it is necessary to create a new temporary view because it will be reshaped in-place
-                        dofs_vel.masked_scatter_(envs_idx[:, None], velocity.view_as(velocity))
-                    else:
-                        velocity = broadcast_tensor(velocity, gs.tc_float, dofs_vel.shape)
-                        torch.where(envs_idx[:, None], velocity, dofs_vel, out=dofs_vel)
+                dofs_vel.scatter_(0, envs_idx[:, None].expand((-1, dofs_vel.shape[1])), 0.0)
             else:
-                mask = (
-                    (0, *dofs_mask) if self.n_envs == 0 else indices_to_mask(envs_idx, *dofs_mask, boolean_mask=False)
-                )
+                mask = (0, *dofs_mask) if self.n_envs == 0 else indices_to_mask(envs_idx, *dofs_mask)
                 if velocity is None:
                     vel[mask] = 0.0
                 else:
@@ -1442,15 +1420,10 @@ class KinematicSolver(Solver):
 
         if gs.use_zerocopy:
             data = qd_to_torch(self.dyn_state.vverts.pos, transpose=True, copy=False)
+            vverts_mask = indices_to_mask(slice(custom_vvert_start, custom_vvert_end))
             if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
-                pos_slice = data[:, custom_vvert_start:custom_vvert_end]
-                if vverts.ndim == 3 and len(vverts) != len(pos_slice):
-                    pos_slice.masked_scatter_(envs_idx[:, None, None], vverts.view_as(vverts))
-                else:
-                    vverts_b = broadcast_tensor(vverts, gs.tc_float, pos_slice.shape)
-                    torch.where(envs_idx[:, None, None], vverts_b, pos_slice, out=pos_slice)
+                assign_masked_tensor(data, envs_idx, vverts_mask, vverts)
             else:
-                vverts_mask = indices_to_mask(slice(custom_vvert_start, custom_vvert_end))
                 pos_mask = (0, *vverts_mask) if self.n_envs == 0 else indices_to_mask(envs_idx, *vverts_mask)
                 assign_indexed_tensor(data, pos_mask, vverts)
             return
