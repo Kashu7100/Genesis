@@ -295,6 +295,41 @@ class PBDSolverState:
         return self._free
 
 
+class ShellSolverState:
+    """
+    Dynamic state queried from a ShellSolver, topology included, every tensor having the environments first (see
+    ShellState in array_class.py for the meaning of each one).
+    """
+
+    def __init__(
+        self,
+        scene,
+        verts_pos,
+        verts_vel,
+        verts_origin,
+        verts_is_fixed,
+        corners_vert,
+        entities_n_verts,
+        faces_plastic,
+        faces_thickness,
+        hinges_plastic_angle,
+    ):
+        self._scene = scene
+        self.verts_pos = verts_pos
+        self.verts_vel = verts_vel
+        self.verts_origin = verts_origin
+        self.verts_is_fixed = verts_is_fixed
+        self.corners_vert = corners_vert
+        self.entities_n_verts = entities_n_verts
+        self.faces_plastic = faces_plastic
+        self.faces_thickness = faces_thickness
+        self.hinges_plastic_angle = hinges_plastic_angle
+
+    @property
+    def scene(self):
+        return self._scene
+
+
 class FEMSolverState:
     def __init__(self, scene):
         self._scene = scene

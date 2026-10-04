@@ -188,6 +188,7 @@ class RasterizerContext:
         self.on_sph()
         self.on_pbd()
         self.on_fem()
+        self.on_shell()
 
         # segmentation mapping
         self.seg_color_map.generate_seg_colors()
@@ -966,6 +967,48 @@ class RasterizerContext:
                         if normal_data is not None:
                             self.jit.update_buffer(node, "normal", normal_data)
 
+    def on_shell(self):
+        # A shell is drawn as one triangle per face, its corners unwelded, so that the cracks fracture opens show
+        # without changing the mesh topology the renderer holds.
+        if self.sim.shell_solver.is_active:
+            self.sim.shell_solver.update_render_fields()
+            shell_scratch = self.sim.shell_solver.shell_scratch
+            corners_pos = qd_to_numpy(shell_scratch.corners_render_pos, self.rendered_envs_idx, transpose=True)
+            corners_normal = qd_to_numpy(shell_scratch.corners_render_normal, self.rendered_envs_idx, transpose=True)
+            for shell_entity in self.sim.shell_solver.entities:
+                corners = slice(3 * shell_entity.face_start, 3 * (shell_entity.face_start + shell_entity.n_faces))
+                faces = np.arange(3 * shell_entity.n_faces, dtype=np.int32).reshape((shell_entity.n_faces, 3))
+                visual = mu.surface_uvs_to_trimesh_visual(shell_entity.surface, n_verts=3 * shell_entity.n_faces)
+                for env_i, i_b in enumerate(self.rendered_envs_idx):
+                    mesh = trimesh.Trimesh(
+                        corners_pos[env_i, corners],
+                        faces,
+                        vertex_normals=corners_normal[env_i, corners],
+                        process=False,
+                    )
+                    mesh.visual = visual
+                    node = pyrender.Mesh.from_trimesh(
+                        mesh, smooth=True, double_sided=shell_entity.surface.double_sided, envs=env_i
+                    )
+                    static_node = self.add_node(node)
+                    self.static_nodes[(i_b, shell_entity.uid)] = static_node
+                    self.create_node_seg(shell_entity.idx, static_node)
+
+    def update_shell(self):
+        if self.sim.shell_solver.is_active:
+            self.sim.shell_solver.update_render_fields()
+            shell_scratch = self.sim.shell_solver.shell_scratch
+            corners_pos = qd_to_numpy(shell_scratch.corners_render_pos, self.rendered_envs_idx, transpose=True)
+            corners_normal = qd_to_numpy(shell_scratch.corners_render_normal, self.rendered_envs_idx, transpose=True)
+            for shell_entity in self.sim.shell_solver.entities:
+                corners = slice(3 * shell_entity.face_start, 3 * (shell_entity.face_start + shell_entity.n_faces))
+                for env_i, i_b in enumerate(self.rendered_envs_idx):
+                    node = self.static_nodes[(i_b, shell_entity.uid)]
+                    pos = corners_pos[env_i, corners].astype(np.float32, copy=False)
+                    normal = corners_normal[env_i, corners].astype(np.float32, copy=False)
+                    self.jit.update_buffer(node, "pos", self._scene.reorder_vertices(node, pos))
+                    self.jit.update_buffer(node, "normal", self._scene.reorder_vertices(node, normal))
+
     def update_sensors(self):
         self.sim._sensor_manager.draw_debug(self)
 
@@ -1216,6 +1259,7 @@ class RasterizerContext:
             self.update_sph()
             self.update_pbd()
             self.update_fem()
+            self.update_shell()
             self.update_sensors()
 
             # Update camera fructum

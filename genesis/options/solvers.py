@@ -108,6 +108,8 @@ class LegacyCouplerOptions(BaseCouplerOptions):
         Whether to enable coupling between FEM and MPM solvers. Defaults to True.
     fem_sph : bool, optional
         Whether to enable coupling between FEM and SPH solvers. Defaults to True.
+    rigid_shell : bool, optional
+        Whether to enable coupling between rigid and shell solvers. Defaults to True.
     """
 
     rigid_mpm: StrictBool = True
@@ -118,6 +120,7 @@ class LegacyCouplerOptions(BaseCouplerOptions):
     mpm_pbd: StrictBool = True
     fem_mpm: StrictBool = True
     fem_sph: StrictBool = True
+    rigid_shell: StrictBool = True
 
 
 class SAPCouplerOptions(BaseCouplerOptions):
@@ -934,6 +937,32 @@ class FEMOptions(GravityMixin, TimeBasedMixin):
     damping_alpha: NonNegativeFloat = 0.5
     damping_beta: NonNegativeFloat = 5e-4
     enable_vertex_constraints: StrictBool = False
+
+
+class ShellOptions(GravityMixin, TimeBasedMixin):
+    """
+    Options configuring the ShellSolver, which simulates thin sheets that stretch, bend, yield and fracture.
+
+    Each substep integrates the sheets implicitly, solving a linear system whose accuracy the iterative solver below
+    trades for speed.
+
+    Parameters
+    ----------
+    n_pcg_iterations : int, optional
+        Maximum number of iterations of the linear solve of each substep. More iterations resolve stiff sheets
+        (metal, glass, paper) more accurately, while fewer make them softer and more damped than their material says,
+        at a lower runtime cost. Defaults to 50.
+    pcg_threshold : float, optional
+        Residual of the linear solve, relative to its initial value, at which an environment stops iterating. A lower
+        value is more accurate and slower. Defaults to 1e-4.
+    fracture_capacity : float, optional
+        Number of vertices a fracturable sheet can create by splitting, as a fraction of its own vertex count. Each one
+        costs memory in every environment. Fracture stops in an environment that exhausted it. Defaults to 1.0.
+    """
+
+    n_pcg_iterations: PositiveInt = 50
+    pcg_threshold: PositiveFloat = 1e-4
+    fracture_capacity: NonNegativeFloat = 1.0
 
 
 class SFOptions(TimeBasedMixin):

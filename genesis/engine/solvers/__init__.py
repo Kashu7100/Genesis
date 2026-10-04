@@ -4,5 +4,6 @@ from .mpm_solver import MPMSolver
 from .pbd_solver import PBDSolver
 from .rigid.rigid_solver import RigidSolver
 from .sf_solver import SFSolver
+from .shell_solver import ShellSolver
 from .sph_solver import SPHSolver
 from .tool_solver import ToolSolver

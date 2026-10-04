@@ -39,6 +39,7 @@ class LegacyCoupler(RBC):
         self.pbd_solver = self.sim.pbd_solver
         self.fem_solver = self.sim.fem_solver
         self.sf_solver = self.sim.sf_solver
+        self.shell_solver = self.sim.shell_solver
 
     def build(self) -> None:
         self._rigid_mpm = self.rigid_solver.is_active and self.mpm_solver.is_active and self.options.rigid_mpm
@@ -49,8 +50,9 @@ class LegacyCoupler(RBC):
         self._mpm_pbd = self.mpm_solver.is_active and self.pbd_solver.is_active and self.options.mpm_pbd
         self._fem_mpm = self.fem_solver.is_active and self.mpm_solver.is_active and self.options.fem_mpm
         self._fem_sph = self.fem_solver.is_active and self.sph_solver.is_active and self.options.fem_sph
+        self._rigid_shell = self.rigid_solver.is_active and self.shell_solver.is_active and self.options.rigid_shell
 
-        if (self._rigid_mpm or self._rigid_sph or self._rigid_pbd or self._rigid_fem) and any(
+        if (self._rigid_mpm or self._rigid_sph or self._rigid_pbd or self._rigid_fem or self._rigid_shell) and any(
             geom.needs_coup for geom in self.rigid_solver.geoms
         ):
             self.rigid_solver.collider._sdf.activate()
@@ -871,6 +873,48 @@ class LegacyCoupler(RBC):
 
         return new_pos, new_vel, contact_normal
 
+    @qd.kernel
+    def kernel_shell_rigid_collide(
+        self,
+        shell_state: array_class.ShellState,
+        shell_scratch: array_class.ShellScratch,
+        shell_info: array_class.ShellInfo,
+        geoms_state: array_class.GeomsState,
+        geoms_info: array_class.GeomsInfo,
+        links_state: array_class.LinksState,
+        rigid_info: array_class.RigidInfo,
+        sdf_info: array_class.SDFInfo,
+        collider_static_config: qd.template(),
+    ):
+        """Correct the velocity of every free shell vertex against the rigid geoms, pushing the reaction on their links.
+
+        The vertices carry the velocity the shell solver just solved for, at their position before the substep. A vertex
+        lies on the mid-surface of its sheet, so the contact starts half a thickness away from the geom surface.
+        """
+        for i_v, i_b in qd.ndrange(shell_state.verts_pos.shape[0], shell_state.verts_pos.shape[1]):
+            i_o = shell_state.verts_origin[i_v, i_b]
+            if i_o >= 0 and not shell_state.verts_is_fixed[i_v, i_b]:
+                i_j = shell_info.verts_fan_start[i_o]
+                i_c = shell_info.fans_corner[i_j]
+                half_thickness = 0.5 * shell_state.faces_thickness[i_c // 3, i_b]
+                pos = shell_state.verts_pos[i_v, i_b]
+                vel = shell_state.verts_vel[i_v, i_b]
+                mass = shell_scratch.verts_mass[i_v, i_b]
+                for i_g in range(geoms_info.needs_coup.shape[0]):
+                    if geoms_info.needs_coup[i_g]:
+                        signed_dist = sdf.sdf_func_world(i_g, i_b, pos, geoms_state, geoms_info, sdf_info)
+                        influence = qd.min(
+                            qd.exp(-(signed_dist - half_thickness) / max(1e-10, geoms_info.coup_softness[i_g])), 1
+                        )
+                        if influence > 0.1:
+                            normal_rigid = sdf.sdf_func_normal_world(
+                                i_g, i_b, pos, geoms_state, geoms_info, rigid_info, sdf_info, collider_static_config
+                            )
+                            vel = self._func_collide_in_rigid_geom(
+                                pos, vel, mass, normal_rigid, influence, i_g, i_b, geoms_info, links_state, rigid_info
+                            )
+                shell_state.verts_vel[i_v, i_b] = vel
+
     def preprocess(self, f):
         # preprocess for MPM CPIC
         if self._rigid_mpm and self.mpm_solver.enable_CPIC:
@@ -937,6 +981,20 @@ class LegacyCoupler(RBC):
                 self.rigid_solver.collider.collider_config,
             )
             self.fem_rigid_link_constraints()
+
+        # Shell <-> Rigid
+        if self._rigid_shell:
+            self.kernel_shell_rigid_collide(
+                self.shell_solver.shell_state,
+                self.shell_solver.shell_scratch,
+                self.shell_solver.shell_info,
+                self.rigid_solver.dyn_state.geoms,
+                self.rigid_solver.dyn_info.geoms,
+                self.rigid_solver.dyn_state.links,
+                self.rigid_solver.rigid_info,
+                self.rigid_solver.collider._sdf._sdf_info,
+                self.rigid_solver.collider.collider_config,
+            )
 
     def couple_grad(self, f):
         if self.fem_solver.is_active:

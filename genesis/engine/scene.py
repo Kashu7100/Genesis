@@ -35,6 +35,7 @@ from genesis.options import (
     ProfilingOptions,
     RigidOptions,
     SFOptions,
+    ShellOptions,
     SimOptions,
     SPHOptions,
     ToolOptions,
@@ -158,6 +159,8 @@ class Scene(RBC):
         The options configuring the sf_solver (``scene.sim.SFSolver``).
     pbd_options : gs.options.PBDOptions
         The options configuring the pbd_solver (``scene.sim.PBDSolver``).
+    shell_options : gs.options.ShellOptions
+        The options configuring the shell_solver (``scene.sim.ShellSolver``).
     coupler_options : gs.options.CouplerOptions
         The options configuring the `coupler` between different solvers.
     vis_options : gs.options.VisOptions
@@ -186,6 +189,7 @@ class Scene(RBC):
         fem_options: FEMOptions | None = None,
         sf_options: SFOptions | None = None,
         pbd_options: PBDOptions | None = None,
+        shell_options: ShellOptions | None = None,
         coupler_options: BaseCouplerOptions | None = None,
         vis_options: VisOptions | None = None,
         viewer_options: ViewerOptions | None = None,
@@ -208,6 +212,7 @@ class Scene(RBC):
             fem_options,
             sf_options,
             pbd_options,
+            shell_options,
             coupler_options,
             vis_options,
             viewer_options,
@@ -229,6 +234,7 @@ class Scene(RBC):
                 fem=fem_options,
                 sf=sf_options,
                 pbd=pbd_options,
+                shell=shell_options,
                 coupler=coupler_options,
                 vis=vis_options,
                 viewer=viewer_options,
@@ -377,7 +383,9 @@ class Scene(RBC):
             surface.smooth = False
 
         if surface.double_sided is None:
-            surface.double_sided = isinstance(material, (gs.materials.PBD.Cloth, gs.materials.FEM.Cloth))
+            surface.double_sided = isinstance(
+                material, (gs.materials.PBD.Cloth, gs.materials.FEM.Cloth, gs.materials.Shell)
+            )
 
         if vis_mode is not None:
             surface.vis_mode = vis_mode
@@ -429,7 +437,7 @@ class Scene(RBC):
                     f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['visual', 'particle', 'recon']."
                 )
 
-        elif isinstance(material, gs.materials.FEM.Base):
+        elif isinstance(material, (gs.materials.FEM.Base, gs.materials.Shell)):
             if surface.vis_mode is None:
                 surface.vis_mode = "visual"
 
@@ -2030,6 +2038,11 @@ class Scene(RBC):
     def pbd_solver(self):
         """The scene's `pbd_solver`, managing all the `PBDEntity` in the scene."""
         return self._sim.pbd_solver
+
+    @property
+    def shell_solver(self):
+        """The scene's `shell_solver`, managing all the `ShellEntity` in the scene."""
+        return self._sim.shell_solver
 
     @property
     def segmentation_idx_dict(self):
