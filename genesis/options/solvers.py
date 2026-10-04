@@ -411,6 +411,11 @@ class KinematicOptions(Options):
     IK_max_targets : int, optional
         Maximum number of IK targets. Increasing this doesn't affect IK solving speed, but will increase memory usage.
         Defaults to 6.
+    coarse_update_interval : int, optional
+        Number of substeps between two updates of the coarse correction above, which then lags behind the deformation
+        of the sheets. Updating it less often saves the cost of rebuilding it, which grows with the square of the
+        number of patches times the number of triangles, at the cost of more iterations for sheets that rotate or tear
+        quickly. Defaults to 10.
     """
 
     batch_links_info: StrictBool = False
@@ -958,11 +963,25 @@ class ShellOptions(GravityMixin, TimeBasedMixin):
     fracture_capacity : float, optional
         Number of vertices a fracturable sheet can create by splitting, as a fraction of its own vertex count. Each one
         costs memory in every environment. Fracture stops in an environment that exhausted it. Defaults to 1.0.
+    n_coarse_patches : int, optional
+        Maximum number of patches each sheet is split into to accelerate the linear solve, each one moving as a whole
+        in a coarse correction of every iteration. Stiff sheets (paper, plastic, metal, glass) converge in several
+        times fewer iterations with it, at a memory cost growing with the square of the number of patches in every
+        environment, and a dense factorization of that size per substep. More patches converge faster on large
+        meshes. 0 disables it, which suits soft sheets (cloth, rubber) whose solve converges quickly anyway.
+        Defaults to 6.
+    coarse_update_interval : int, optional
+        Number of substeps between two updates of the coarse correction above, which then lags behind the deformation
+        of the sheets. Updating it less often saves the cost of rebuilding it, which grows with the square of the
+        number of patches times the number of triangles, at the cost of more iterations for sheets that rotate or tear
+        quickly. Defaults to 10.
     """
 
     n_pcg_iterations: PositiveInt = 50
     pcg_threshold: PositiveFloat = 1e-4
     fracture_capacity: NonNegativeFloat = 1.0
+    n_coarse_patches: NonNegativeInt = 6
+    coarse_update_interval: PositiveInt = 10
 
 
 class SFOptions(TimeBasedMixin):

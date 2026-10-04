@@ -3411,6 +3411,11 @@ class ShellStaticConfig(metaclass=AutoInitMeta):
     has_fracture: bool
     # Whether any shell entity yields plastically, compiling the plastic flow pass in
     has_plasticity: bool
+    # Whether the linear solve adds the coarse correction of the vertex patches to its preconditioner
+    has_coarse_space: bool
+    # Lanes cooperating on the dense coarse algebra of one entity in one environment: a warp on GPU, 1 on CPU where
+    # the lanes of a block would run one after the other
+    coarse_block_dim: int
 
 
 @dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
@@ -3425,6 +3430,10 @@ class ShellInfo:
     fans_next_hinge[j]. The fan of a closed (interior) vertex wraps around, its last entry sharing a hinge with the
     first. A hinge joins the two faces of an interior edge, (c0a, c0b) and (c1a, c1b) being the corners of its two
     endpoints in either face, so that it stays intact as long as both pairs point at the same vertices.
+
+    The coarse space of the linear solve gives every patch of vertices 9 degrees of freedom, a displacement affine in
+    the shape functions verts_coarse_phi of its vertices, starting at verts_coarse_dof. An entity holds its own dense
+    coarse matrix, of size entities_coarse_dim, stored row-major from entities_coarse_matrix_start.
     """
 
     kind: ClassVar[DataKind] = DataKind.CONSTANT
@@ -3440,6 +3449,10 @@ class ShellInfo:
     entities_yield_curvature: qd.Tensor
     entities_vert_start: qd.Tensor
     entities_vert_end: qd.Tensor
+    entities_coarse_dof_start: qd.Tensor
+    entities_coarse_dim: qd.Tensor
+    entities_coarse_matrix_start: qd.Tensor
+    coarse_dofs_entity: qd.Tensor
     faces_entity: qd.Tensor
     faces_mass: qd.Tensor
     faces_rest_area: qd.Tensor
@@ -3453,6 +3466,8 @@ class ShellInfo:
     hinges_rest_angle: qd.Tensor
     hinges_rest_len: qd.Tensor
     hinges_rest_area: qd.Tensor
+    verts_coarse_dof: qd.Tensor
+    verts_coarse_phi: qd.Tensor
     verts_fan_start: qd.Tensor
     verts_fan_len: qd.Tensor
     verts_is_fan_closed: qd.Tensor
@@ -3460,7 +3475,7 @@ class ShellInfo:
     fans_next_hinge: qd.Tensor
 
 
-def get_shell_info(n_entities, n_verts, n_faces, n_hinges):
+def get_shell_info(n_entities, n_verts, n_faces, n_hinges, n_coarse_dofs):
     return ShellInfo(
         entities_stretching_modulus=V(dtype=gs.qd_float, shape=(n_entities,)),
         entities_nu=V(dtype=gs.qd_float, shape=(n_entities,)),
@@ -3473,6 +3488,10 @@ def get_shell_info(n_entities, n_verts, n_faces, n_hinges):
         entities_yield_curvature=V(dtype=gs.qd_float, shape=(n_entities,)),
         entities_vert_start=V(dtype=gs.qd_int, shape=(n_entities,)),
         entities_vert_end=V(dtype=gs.qd_int, shape=(n_entities,)),
+        entities_coarse_dof_start=V(dtype=gs.qd_int, shape=(n_entities,)),
+        entities_coarse_dim=V(dtype=gs.qd_int, shape=(n_entities,)),
+        entities_coarse_matrix_start=V(dtype=gs.qd_int, shape=(n_entities,)),
+        coarse_dofs_entity=V(dtype=gs.qd_int, shape=(max(n_coarse_dofs, 1),)),
         faces_entity=V(dtype=gs.qd_int, shape=(n_faces,)),
         faces_mass=V(dtype=gs.qd_float, shape=(n_faces,)),
         faces_rest_area=V(dtype=gs.qd_float, shape=(n_faces,)),
@@ -3486,6 +3505,8 @@ def get_shell_info(n_entities, n_verts, n_faces, n_hinges):
         hinges_rest_angle=V(dtype=gs.qd_float, shape=(max(n_hinges, 1),)),
         hinges_rest_len=V(dtype=gs.qd_float, shape=(max(n_hinges, 1),)),
         hinges_rest_area=V(dtype=gs.qd_float, shape=(max(n_hinges, 1),)),
+        verts_coarse_dof=V(dtype=gs.qd_int, shape=(n_verts,)),
+        verts_coarse_phi=V(dtype=gs.qd_vec3, shape=(n_verts,)),
         verts_fan_start=V(dtype=gs.qd_int, shape=(n_verts,)),
         verts_fan_len=V(dtype=gs.qd_int, shape=(n_verts,)),
         verts_is_fan_closed=V(dtype=gs.qd_bool, shape=(n_verts,)),
@@ -3498,6 +3519,9 @@ def get_shell_info(n_entities, n_verts, n_faces, n_hinges):
 class ShellState:
     """The state of the shell entities in every environment, topology included (see ShellInfo).
 
+    verts_pos is the position of every vertex in the world, which the solver also holds as an integer cell of a fine
+    grid plus a small offset (verts_pos_cell, verts_pos_offset), since the strain of a stiff sheet is the relative
+    change of its edge lengths, which positions held far from the origin in single precision cannot resolve.
     verts_origin is the original vertex a pool slot descends from, or -1 for a slot fracture has not filled yet, and
     entities_n_verts the number of filled slots of each entity. faces_plastic maps the rest frame of a face to its
     plastic rest frame, which faces_thickness thins accordingly, and hinges_plastic_angle offsets the rest dihedral
@@ -3507,6 +3531,8 @@ class ShellState:
     kind: ClassVar[DataKind] = DataKind.STATE
 
     verts_pos: qd.Tensor
+    verts_pos_cell: qd.Tensor
+    verts_pos_offset: qd.Tensor
     verts_vel: qd.Tensor
     verts_origin: qd.Tensor
     verts_is_fixed: qd.Tensor
@@ -3520,6 +3546,8 @@ class ShellState:
 def get_shell_state(n_entities, n_verts, n_faces, n_hinges, B):
     return ShellState(
         verts_pos=V(dtype=gs.qd_vec3, shape=(n_verts, B)),
+        verts_pos_cell=V(dtype=gs.qd_ivec3, shape=(n_verts, B)),
+        verts_pos_offset=V(dtype=gs.qd_vec3, shape=(n_verts, B)),
         verts_vel=V(dtype=gs.qd_vec3, shape=(n_verts, B)),
         verts_origin=V(dtype=gs.qd_int, shape=(n_verts, B)),
         verts_is_fixed=V(dtype=gs.qd_bool, shape=(n_verts, B)),
@@ -3538,7 +3566,10 @@ class ShellScratch:
     The implicit integration solves (M + K) dv = b by preconditioned conjugate gradient (PCG), K summing the stiffness
     of every face and hinge scaled by dt * (dt + damping). A face stores its elastic deformation gradient and the
     positive part of its stress, which the stiffness products read, and a hinge the gradient of its dihedral angle
-    and its scaled stiffness, zero while it is broken.
+    and its scaled stiffness, zero while it is broken. coarse_assembly holds the lower triangle of the coarse matrix of
+    every entity, coarse_matrix a copy of it per environment, then its Cholesky factor, then its inverse,
+    coarse_factor_inv the inverse of the Cholesky factor,
+    coarse_vec the restricted residual and coarse_sol the coarse correction.
     """
 
     kind: ClassVar[DataKind] = DataKind.SCRATCH
@@ -3562,6 +3593,11 @@ class ShellScratch:
     hinges_stiffness: qd.Tensor
     corners_render_pos: qd.Tensor
     corners_render_normal: qd.Tensor
+    coarse_assembly: qd.Tensor
+    coarse_matrix: qd.Tensor
+    coarse_factor_inv: qd.Tensor
+    coarse_vec: qd.Tensor
+    coarse_sol: qd.Tensor
     envs_rz: qd.Tensor
     envs_rz_new: qd.Tensor
     envs_rz_threshold: qd.Tensor
@@ -3569,7 +3605,7 @@ class ShellScratch:
     envs_is_solving: qd.Tensor
 
 
-def get_shell_scratch(n_verts, n_faces, n_hinges, B, has_fracture):
+def get_shell_scratch(n_verts, n_faces, n_hinges, n_coarse_dofs, n_coarse_entries, B, has_fracture):
     return ShellScratch(
         verts_mass=V(dtype=gs.qd_float, shape=(n_verts, B)),
         verts_rhs=V(dtype=gs.qd_vec3, shape=(n_verts, B)),
@@ -3590,6 +3626,13 @@ def get_shell_scratch(n_verts, n_faces, n_hinges, B, has_fracture):
         hinges_stiffness=V(dtype=gs.qd_float, shape=(max(n_hinges, 1), B)),
         corners_render_pos=V(dtype=gs.qd_vec3, shape=(3 * n_faces, B)),
         corners_render_normal=V(dtype=gs.qd_vec3, shape=(3 * n_faces, B)),
+        # The assembly scatters every element of every environment, whose atomic additions coalesce across environments,
+        # while the lanes factorizing the coarse matrix of one environment read its entries together, hence two layouts.
+        coarse_assembly=V(dtype=gs.qd_float, shape=maybe_shape((n_coarse_entries, B), n_coarse_entries > 0)),
+        coarse_matrix=V(dtype=gs.qd_float, shape=maybe_shape((B, n_coarse_entries), n_coarse_entries > 0)),
+        coarse_factor_inv=V(dtype=gs.qd_float, shape=maybe_shape((B, n_coarse_entries), n_coarse_entries > 0)),
+        coarse_vec=V(dtype=gs.qd_float, shape=maybe_shape((n_coarse_dofs, B), n_coarse_dofs > 0)),
+        coarse_sol=V(dtype=gs.qd_float, shape=maybe_shape((n_coarse_dofs, B), n_coarse_dofs > 0)),
         envs_rz=V(dtype=gs.qd_float, shape=(B,)),
         envs_rz_new=V(dtype=gs.qd_float, shape=(B,)),
         envs_rz_threshold=V(dtype=gs.qd_float, shape=(B,)),

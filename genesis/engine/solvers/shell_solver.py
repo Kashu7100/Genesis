@@ -19,6 +19,16 @@ if TYPE_CHECKING:
     from genesis.engine.simulator import Simulator
 
 
+# Edge of the grid the position of every vertex is anchored to, in m (see verts_pos_cell in array_class.py). A power of
+# two keeps the cells exact in floating point, and its size bounds the offsets, whose precision it sets.
+POS_GRID = 2.0**-10
+
+# Floor of the norms the shell kernels divide by, guarding degenerate geometry alone. An additive epsilon (as in
+# 'norm(gs.EPS)') would bias the edges, areas and normals of fine meshes, whose squared magnitudes approach it in single
+# precision.
+NORM_FLOOR = 1e-30
+
+
 class ShellSolver(GravityMixin, TimeBasedMixin, Solver):
     """
     Solver of thin elastoplastic sheets that tear and crack.
@@ -26,7 +36,10 @@ class ShellSolver(GravityMixin, TimeBasedMixin, Solver):
     Each substep integrates the sheets by one linearized backward Euler step: membrane stretching (Saint Venant-Kirchhoff
     on the Green strain, plane stress) and hinge bending, both with stiffness-proportional damping. The linear system
     is solved by matrix-free preconditioned conjugate gradient (PCG), every environment iterating until its own
-    residual converges. The rigid coupling then corrects the vertex velocities, before the positions advance, the
+    residual converges. The preconditioner adds to block-Jacobi a coarse correction where each patch of vertices moves
+    affinely, which resolves the stiff membranes (paper, metal, glass) whose block-Jacobi iterations would only converge
+    after hundreds of iterations. Positions are anchored to a fine grid, keeping strains precise in single precision
+    wherever the sheet is. The rigid coupling then corrects the vertex velocities, before the positions advance, the
     material yields plastically, and the vertices whose surrounding stress exceeds the tensile strength split along
     the mesh edges that relieve the most stress.
     """
@@ -39,6 +52,10 @@ class ShellSolver(GravityMixin, TimeBasedMixin, Solver):
         self._n_pcg_iterations = options.n_pcg_iterations
         self._pcg_threshold = options.pcg_threshold
         self._fracture_capacity = options.fracture_capacity
+        self._n_coarse_patches = options.n_coarse_patches
+        self._coarse_update_interval = options.coarse_update_interval
+        # Substeps run since the coarse matrices were last factorized, None forcing an update at the next one
+        self._coarse_age: int | None = None
 
         self._static_config: array_class.ShellStaticConfig | None = None
         self._shell_info: array_class.ShellInfo | None = None
@@ -74,15 +91,29 @@ class ShellSolver(GravityMixin, TimeBasedMixin, Solver):
                 has_plasticity=any(
                     material.yield_stress is not None or material.yield_curvature is not None for material in materials
                 ),
+                has_coarse_space=self._n_coarse_patches > 0,
+                coarse_block_dim=1 if gs.backend == gs.cpu else 32,
             )
+            entities_coarse_dim = [
+                9 * entity.patches.n_patches if entity.patches is not None else 0 for entity in self._entities
+            ]
+            self._entities_coarse_dof_start = np.cumsum([0, *entities_coarse_dim])[:-1]
+            self._entities_coarse_matrix_start = np.cumsum([0, *(dim**2 for dim in entities_coarse_dim)])[:-1]
+            self._entities_coarse_dim = np.array(entities_coarse_dim)
             self._shell_info = array_class.get_shell_info(
-                len(self._entities), self._n_verts, self._n_faces, self._n_hinges
+                len(self._entities), self._n_verts, self._n_faces, self._n_hinges, int(self._entities_coarse_dim.sum())
             )
             self._shell_state = array_class.get_shell_state(
                 len(self._entities), self._n_verts, self._n_faces, self._n_hinges, self._B
             )
             self._shell_scratch = array_class.get_shell_scratch(
-                self._n_verts, self._n_faces, self._n_hinges, self._B, self._static_config.has_fracture
+                self._n_verts,
+                self._n_faces,
+                self._n_hinges,
+                int(self._entities_coarse_dim.sum()),
+                int(np.square(self._entities_coarse_dim).sum()),
+                self._B,
+                self._static_config.has_fracture,
             )
             self._init_info_and_state()
 
@@ -128,6 +159,11 @@ class ShellSolver(GravityMixin, TimeBasedMixin, Solver):
         info.entities_vert_end.from_numpy(
             np.array([e.vert_start + e.n_verts_max for e in self._entities], dtype=gs.np_int)
         )
+        info.entities_coarse_dof_start.from_numpy(self._entities_coarse_dof_start.astype(gs.np_int))
+        info.entities_coarse_dim.from_numpy(self._entities_coarse_dim.astype(gs.np_int))
+        info.entities_coarse_matrix_start.from_numpy(self._entities_coarse_matrix_start.astype(gs.np_int))
+        coarse_dofs_entity = np.repeat(np.arange(len(self._entities), dtype=gs.np_int), self._entities_coarse_dim)
+        info.coarse_dofs_entity.from_numpy(coarse_dofs_entity if len(coarse_dofs_entity) else np.zeros(1, gs.np_int))
 
         faces_entity = np.zeros(n_faces, dtype=gs.np_int)
         faces_mass = np.zeros(n_faces, dtype=gs.np_float)
@@ -143,6 +179,8 @@ class ShellSolver(GravityMixin, TimeBasedMixin, Solver):
         hinges_rest_angle = np.zeros(max(n_hinges, 1), dtype=gs.np_float)
         hinges_rest_len = np.ones(max(n_hinges, 1), dtype=gs.np_float)
         hinges_rest_area = np.ones(max(n_hinges, 1), dtype=gs.np_float)
+        verts_coarse_dof = np.full(n_verts, -1, dtype=gs.np_int)
+        verts_coarse_phi = np.zeros((n_verts, 3), dtype=gs.np_float)
         verts_fan_start = np.zeros(n_verts, dtype=gs.np_int)
         verts_fan_len = np.zeros(n_verts, dtype=gs.np_int)
         verts_is_fan_closed = np.zeros(n_verts, dtype=np.bool_)
@@ -173,6 +211,9 @@ class ShellSolver(GravityMixin, TimeBasedMixin, Solver):
             hinges_rest_angle[hinges_slice] = topology.hinges_rest_angle
             hinges_rest_len[hinges_slice] = topology.hinges_rest_len
             hinges_rest_area[hinges_slice] = topology.hinges_rest_area
+            if entity.patches is not None:
+                verts_coarse_dof[verts_slice] = self._entities_coarse_dof_start[i_e] + 9 * entity.patches.verts_patch
+                verts_coarse_phi[verts_slice] = entity.patches.verts_phi
             verts_fan_start[verts_slice] = topology.verts_fan_start + 3 * f_start
             verts_fan_len[verts_slice] = topology.verts_fan_len
             verts_is_fan_closed[verts_slice] = topology.verts_is_fan_closed
@@ -198,6 +239,8 @@ class ShellSolver(GravityMixin, TimeBasedMixin, Solver):
         info.hinges_rest_angle.from_numpy(hinges_rest_angle)
         info.hinges_rest_len.from_numpy(hinges_rest_len)
         info.hinges_rest_area.from_numpy(hinges_rest_area)
+        info.verts_coarse_dof.from_numpy(verts_coarse_dof)
+        info.verts_coarse_phi.from_numpy(verts_coarse_phi)
         info.verts_fan_start.from_numpy(verts_fan_start)
         info.verts_fan_len.from_numpy(verts_fan_len)
         info.verts_is_fan_closed.from_numpy(verts_is_fan_closed)
@@ -206,6 +249,12 @@ class ShellSolver(GravityMixin, TimeBasedMixin, Solver):
 
         faces_thickness = np.array([entity.material.thickness for entity in self._entities], dtype=gs.np_float)
         state.verts_pos.from_numpy(np.ascontiguousarray(np.broadcast_to(verts_pos[:, None], (n_verts, B, 3))))
+        verts_pos_cell = np.round(verts_pos / POS_GRID).astype(gs.np_int)
+        state.verts_pos_cell.from_numpy(np.ascontiguousarray(np.broadcast_to(verts_pos_cell[:, None], (n_verts, B, 3))))
+        verts_pos_offset = (verts_pos - verts_pos_cell * POS_GRID).astype(gs.np_float)
+        state.verts_pos_offset.from_numpy(
+            np.ascontiguousarray(np.broadcast_to(verts_pos_offset[:, None], (n_verts, B, 3)))
+        )
         state.verts_vel.from_numpy(np.zeros((n_verts, B, 3), dtype=gs.np_float))
         state.verts_origin.from_numpy(np.ascontiguousarray(np.broadcast_to(verts_origin[:, None], (n_verts, B))))
         state.verts_is_fixed.from_numpy(np.zeros((n_verts, B), dtype=np.bool_))
@@ -237,12 +286,18 @@ class ShellSolver(GravityMixin, TimeBasedMixin, Solver):
         kernel_shell_compute_forces(
             self._substep_dt, self._gravity, self._shell_state, self._shell_scratch, self._shell_info
         )
-        state, scratch, info = self._shell_state, self._shell_scratch, self._shell_info
+        state, scratch, info, config = self._shell_state, self._shell_scratch, self._shell_info, self._static_config
+        if config.has_coarse_space:
+            if self._coarse_age is None or self._coarse_age >= self._coarse_update_interval:
+                kernel_shell_coarse_assemble(state, scratch, info)
+                kernel_shell_coarse_factorize(state, scratch, info, config)
+                self._coarse_age = 0
+            self._coarse_age += 1
         kernel_shell_system_product(scratch.verts_dv, scratch.verts_Ap, state, scratch, info)
-        kernel_shell_pcg_init(self._pcg_threshold, state, scratch)
+        kernel_shell_pcg_init(self._pcg_threshold, state, scratch, info, config)
         for _ in range(self._n_pcg_iterations):
             kernel_shell_system_product(scratch.verts_p, scratch.verts_Ap, state, scratch, info)
-            kernel_shell_pcg_update(state, scratch)
+            kernel_shell_pcg_update(state, scratch, info, config)
         kernel_shell_apply_dv(state, scratch)
 
     def substep_post_coupling(self, f):
@@ -286,6 +341,8 @@ class ShellSolver(GravityMixin, TimeBasedMixin, Solver):
         return ShellSolverState(
             scene=self._scene,
             verts_pos=qd_to_torch(state.verts_pos, transpose=True, copy=True),
+            verts_pos_cell=qd_to_torch(state.verts_pos_cell, transpose=True, copy=True),
+            verts_pos_offset=qd_to_torch(state.verts_pos_offset, transpose=True, copy=True),
             verts_vel=qd_to_torch(state.verts_vel, transpose=True, copy=True),
             verts_origin=qd_to_torch(state.verts_origin, transpose=True, copy=True),
             verts_is_fixed=qd_to_torch(state.verts_is_fixed, transpose=True, copy=True),
@@ -299,10 +356,13 @@ class ShellSolver(GravityMixin, TimeBasedMixin, Solver):
     def set_state(self, f, state: ShellSolverState, envs_idx=None):
         if not self.is_active:
             return
+        self._coarse_age = None
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
         kernel_shell_set_state(
             envs_idx,
             state.verts_pos[envs_idx].contiguous(),
+            state.verts_pos_cell[envs_idx].contiguous(),
+            state.verts_pos_offset[envs_idx].contiguous(),
             state.verts_vel[envs_idx].contiguous(),
             state.verts_origin[envs_idx].contiguous(),
             state.verts_is_fixed[envs_idx].contiguous(),
@@ -325,12 +385,19 @@ class ShellSolver(GravityMixin, TimeBasedMixin, Solver):
             gs.raise_exception(f"Vertex indices must lie in [0, {entity.n_verts_max}), got {verts_idx_local}.")
         return (verts_idx_local + entity.vert_start).contiguous()
 
-    def set_verts_vec(self, tensor, values, entity: ShellEntity, verts_idx_local, envs_idx):
-        """Write one 3-vector per vertex of an entity into a per-vertex state tensor."""
+    def set_verts_pos(self, pos, entity: ShellEntity, verts_idx_local, envs_idx):
+        """Set the position of some vertices of an entity."""
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
         verts_idx = self._sanitize_verts_idx(entity, verts_idx_local, envs_idx)
-        values = broadcast_tensor(values, gs.tc_float, (*verts_idx.shape, 3), ("envs_idx", "verts_idx", ""))
-        kernel_shell_set_verts_vec(verts_idx, envs_idx, values.contiguous(), tensor)
+        pos = broadcast_tensor(pos, gs.tc_float, (*verts_idx.shape, 3), ("envs_idx", "verts_idx", ""))
+        kernel_shell_set_verts_pos(verts_idx, envs_idx, pos.contiguous(), self._shell_state)
+
+    def set_verts_vel(self, vel, entity: ShellEntity, verts_idx_local, envs_idx):
+        """Set the velocity of some vertices of an entity."""
+        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+        verts_idx = self._sanitize_verts_idx(entity, verts_idx_local, envs_idx)
+        vel = broadcast_tensor(vel, gs.tc_float, (*verts_idx.shape, 3), ("envs_idx", "verts_idx", ""))
+        kernel_shell_set_verts_vel(verts_idx, envs_idx, vel.contiguous(), self._shell_state)
 
     def set_verts_fixed(self, is_fixed: bool, entity: ShellEntity, verts_idx_local, envs_idx):
         """Fix or release some vertices of an entity."""
@@ -373,6 +440,10 @@ class ShellSolver(GravityMixin, TimeBasedMixin, Solver):
         return self._fracture_capacity
 
     @property
+    def n_coarse_patches(self) -> int:
+        return self._n_coarse_patches
+
+    @property
     def shell_state(self) -> array_class.ShellState:
         return self._shell_state
 
@@ -388,6 +459,20 @@ class ShellSolver(GravityMixin, TimeBasedMixin, Solver):
 # ------------------------------------------------------------------------------------
 # ------------------------------------- helpers --------------------------------------
 # ------------------------------------------------------------------------------------
+
+
+@qd.func
+def func_vert_offset(i_v: int, i_u: int, i_b: int, shell_state: array_class.ShellState):
+    """Position of vertex i_v relative to vertex i_u, exact up to the precision of the small anchored offsets.
+
+    The difference of the integer grid cells is exact, and any reordering of the floating-point sum stays at the scale
+    of the edge rather than of the absolute position.
+    """
+    cell_v = shell_state.verts_pos_cell[i_v, i_b]
+    cell_u = shell_state.verts_pos_cell[i_u, i_b]
+    return (cell_v - cell_u).cast(gs.qd_float) * POS_GRID + (
+        shell_state.verts_pos_offset[i_v, i_b] - shell_state.verts_pos_offset[i_u, i_b]
+    )
 
 
 @qd.func
@@ -422,8 +507,9 @@ def func_face_deformation(i_f: int, i_b: int, shell_state: array_class.ShellStat
     i_v0 = shell_state.corners_vert[3 * i_f, i_b]
     i_v1 = shell_state.corners_vert[3 * i_f + 1, i_b]
     i_v2 = shell_state.corners_vert[3 * i_f + 2, i_b]
-    x0 = shell_state.verts_pos[i_v0, i_b]
-    Ds = qd.Matrix.cols([shell_state.verts_pos[i_v1, i_b] - x0, shell_state.verts_pos[i_v2, i_b] - x0])
+    Ds = qd.Matrix.cols(
+        [func_vert_offset(i_v1, i_v0, i_b, shell_state), func_vert_offset(i_v2, i_v0, i_b, shell_state)]
+    )
     Y = shell_info.faces_Dm_inv[i_f] @ shell_state.faces_plastic[i_f, i_b]
     return Ds @ Y, Y
 
@@ -456,34 +542,43 @@ def func_membrane_stiffness_product(
 
 
 @qd.func
-def func_hinge_angle(xa: qd.types.vector(3), xb: qd.types.vector(3), xc: qd.types.vector(3), xd: qd.types.vector(3)):
+def func_hinge_angle(edge_b: qd.types.vector(3), edge_c: qd.types.vector(3), edge_d: qd.types.vector(3)):
     """Signed dihedral angle of a hinge about its edge from a to b, the first face holding (a, b, c) and the second
-    (b, a, d), zero when flat."""
-    normal_0 = (xb - xa).cross(xc - xa).normalized(gs.EPS)
-    normal_1 = (xa - xb).cross(xd - xb).normalized(gs.EPS)
-    edge = (xb - xa).normalized(gs.EPS)
+    (b, a, d), zero when flat, from the positions of b, c and d relative to a."""
+    cross_0 = edge_b.cross(edge_c)
+    cross_1 = -edge_b.cross(edge_d - edge_b)
+    normal_0 = cross_0 / qd.max(cross_0.norm(), NORM_FLOOR)
+    normal_1 = cross_1 / qd.max(cross_1.norm(), NORM_FLOOR)
+    edge = edge_b / qd.max(edge_b.norm(), NORM_FLOOR)
     return qd.atan2(edge.dot(normal_0.cross(normal_1)), normal_0.dot(normal_1))
 
 
 @qd.func
-def func_hinge_angle_gradient(
-    xa: qd.types.vector(3), xb: qd.types.vector(3), xc: qd.types.vector(3), xd: qd.types.vector(3)
-):
+def func_hinge_angle_gradient(edge_b: qd.types.vector(3), edge_c: qd.types.vector(3), edge_d: qd.types.vector(3)):
     """Gradient of the dihedral angle of a hinge (see func_hinge_angle) with respect to a, b, c and d, as columns."""
-    edge = xb - xa
-    edge_len = edge.norm(gs.EPS)
-    cross_0 = edge.cross(xc - xa)
-    cross_1 = (xa - xb).cross(xd - xb)
-    double_area_0 = cross_0.norm(gs.EPS)
-    double_area_1 = cross_1.norm(gs.EPS)
+    edge_len = qd.max(edge_b.norm(), NORM_FLOOR)
+    cross_0 = edge_b.cross(edge_c)
+    cross_1 = -edge_b.cross(edge_d - edge_b)
+    double_area_0 = qd.max(cross_0.norm(), NORM_FLOOR)
+    double_area_1 = qd.max(cross_1.norm(), NORM_FLOOR)
     # The gradient at an opposite vertex is the normal of its face over its height above the edge.
     grad_c = -cross_0 / double_area_0 * (edge_len / double_area_0)
     grad_d = -cross_1 / double_area_1 * (edge_len / double_area_1)
-    s_c = (xc - xa).dot(edge) / (edge_len * edge_len)
-    s_d = (xd - xa).dot(edge) / (edge_len * edge_len)
+    s_c = edge_c.dot(edge_b) / (edge_len * edge_len)
+    s_d = edge_d.dot(edge_b) / (edge_len * edge_len)
     grad_a = -((1.0 - s_c) * grad_c + (1.0 - s_d) * grad_d)
     grad_b = -(s_c * grad_c + s_d * grad_d)
     return qd.Matrix.cols([grad_a, grad_b, grad_c, grad_d])
+
+
+@qd.func
+def func_hinge_edges(i_va: int, i_vb: int, i_vc: int, i_vd: int, i_b: int, shell_state: array_class.ShellState):
+    """Positions of the vertices b, c and d of a hinge relative to its vertex a (see func_vert_offset)."""
+    return (
+        func_vert_offset(i_vb, i_va, i_b, shell_state),
+        func_vert_offset(i_vc, i_va, i_b, shell_state),
+        func_vert_offset(i_vd, i_va, i_b, shell_state),
+    )
 
 
 @qd.func
@@ -606,12 +701,9 @@ def kernel_shell_compute_forces(
         shell_scratch.hinges_stiffness[i_h, i_b] = 0.0
         i_va, i_vb, i_vc, i_vd, is_intact = func_hinge_verts(i_h, i_b, shell_state, shell_info)
         if is_intact:
-            xa = shell_state.verts_pos[i_va, i_b]
-            xb = shell_state.verts_pos[i_vb, i_b]
-            xc = shell_state.verts_pos[i_vc, i_b]
-            xd = shell_state.verts_pos[i_vd, i_b]
-            angle = func_hinge_angle(xa, xb, xc, xd)
-            grad = func_hinge_angle_gradient(xa, xb, xc, xd)
+            edge_b, edge_c, edge_d = func_hinge_edges(i_va, i_vb, i_vc, i_vd, i_b, shell_state)
+            angle = func_hinge_angle(edge_b, edge_c, edge_d)
+            grad = func_hinge_angle_gradient(edge_b, edge_c, edge_d)
             i_e = shell_info.hinges_entity[i_h]
             k_bend = func_hinge_stiffness(i_h, i_b, shell_state, shell_info)
             rest_angle = shell_info.hinges_rest_angle[i_h] + shell_state.hinges_plastic_angle[i_h, i_b]
@@ -711,14 +803,74 @@ def kernel_shell_system_product(
             dst[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
 
 
+@qd.func
+def func_coarse_correct(
+    shell_state: array_class.ShellState, shell_scratch: array_class.ShellScratch, shell_info: array_class.ShellInfo
+):
+    """Solve the coarse system for the residual verts_r of every environment still solving, leaving the coarse
+    correction in coarse_sol (see the coarse space in kernel_shell_coarse_factorize)."""
+    n_verts, B = shell_state.verts_pos.shape[0], shell_state.verts_pos.shape[1]
+
+    for i_d, i_b in qd.ndrange(shell_scratch.coarse_vec.shape[0], B):
+        shell_scratch.coarse_vec[i_d, i_b] = 0.0
+
+    for i_v, i_b in qd.ndrange(n_verts, B):
+        if shell_scratch.envs_is_solving[i_b] and func_is_vert_free(i_v, i_b, shell_state):
+            i_o = shell_state.verts_origin[i_v, i_b]
+            i_d = shell_info.verts_coarse_dof[i_o]
+            if i_d >= 0:
+                phi = shell_info.verts_coarse_phi[i_o]
+                r = shell_scratch.verts_r[i_v, i_b]
+                for a, j in qd.static(qd.ndrange(3, 3)):
+                    shell_scratch.coarse_vec[i_d + 3 * a + j, i_b] += phi[a] * r[j]
+
+    for i_d, i_b in qd.ndrange(shell_scratch.coarse_vec.shape[0], B):
+        if shell_scratch.envs_is_solving[i_b]:
+            i_e = shell_info.coarse_dofs_entity[i_d]
+            dof_start = shell_info.entities_coarse_dof_start[i_e]
+            dim = shell_info.entities_coarse_dim[i_e]
+            row_start = shell_info.entities_coarse_matrix_start[i_e] + (i_d - dof_start) * dim
+            value = gs.qd_float(0.0)
+            for j in range(dim):
+                value += shell_scratch.coarse_matrix[i_b, row_start + j] * shell_scratch.coarse_vec[dof_start + j, i_b]
+            shell_scratch.coarse_sol[i_d, i_b] = value
+
+
+@qd.func
+def func_precondition(
+    i_v: int,
+    i_b: int,
+    shell_state: array_class.ShellState,
+    shell_scratch: array_class.ShellScratch,
+    shell_info: array_class.ShellInfo,
+    static_config: qd.template(),
+):
+    """Preconditioned residual of a vertex: its block-Jacobi part plus the prolongation of the coarse correction."""
+    z = shell_scratch.verts_prec[i_v, i_b] @ shell_scratch.verts_r[i_v, i_b]
+    if qd.static(static_config.has_coarse_space):
+        if func_is_vert_free(i_v, i_b, shell_state):
+            i_o = shell_state.verts_origin[i_v, i_b]
+            i_d = shell_info.verts_coarse_dof[i_o]
+            if i_d >= 0:
+                phi = shell_info.verts_coarse_phi[i_o]
+                for a, j in qd.static(qd.ndrange(3, 3)):
+                    z[j] += phi[a] * shell_scratch.coarse_sol[i_d + 3 * a + j, i_b]
+    return z
+
+
 @qd.kernel
 def kernel_shell_pcg_init(
-    pcg_threshold: float, shell_state: array_class.ShellState, shell_scratch: array_class.ShellScratch
+    pcg_threshold: float,
+    shell_state: array_class.ShellState,
+    shell_scratch: array_class.ShellScratch,
+    shell_info: array_class.ShellInfo,
+    static_config: qd.template(),
 ):
-    """Start the PCG solve of the velocity update with block-Jacobi preconditioning.
+    """Start the PCG solve of the velocity update.
 
     The solve starts from the velocity change of the previous substep, which the system product just mapped to
-    verts_Ap, since the acceleration of smooth motion varies little from one substep to the next.
+    verts_Ap, since the acceleration of smooth motion varies little from one substep to the next. The preconditioner
+    is block-Jacobi, plus the coarse correction of the vertex patches if enabled.
     """
     n_verts, B = shell_state.verts_pos.shape[0], shell_state.verts_pos.shape[1]
 
@@ -727,17 +879,21 @@ def kernel_shell_pcg_init(
         shell_scratch.envs_rz_threshold[i_b] = 0.0
 
     for i_v, i_b in qd.ndrange(n_verts, B):
-        r = shell_scratch.verts_rhs[i_v, i_b] - shell_scratch.verts_Ap[i_v, i_b]
-        z = shell_scratch.verts_prec[i_v, i_b] @ r
-        shell_scratch.verts_r[i_v, i_b] = r
-        shell_scratch.verts_z[i_v, i_b] = z
-        shell_scratch.verts_p[i_v, i_b] = z
-        shell_scratch.envs_rz[i_b] += r.dot(z)
+        shell_scratch.verts_r[i_v, i_b] = shell_scratch.verts_rhs[i_v, i_b] - shell_scratch.verts_Ap[i_v, i_b]
         # The threshold is relative to the norm of the preconditioned right-hand side, which a warm start leaves out of
         # the initial residual.
         shell_scratch.envs_rz_threshold[i_b] += shell_scratch.verts_rhs[i_v, i_b].dot(
             shell_scratch.verts_prec[i_v, i_b] @ shell_scratch.verts_rhs[i_v, i_b]
         )
+
+    if qd.static(static_config.has_coarse_space):
+        func_coarse_correct(shell_state, shell_scratch, shell_info)
+
+    for i_v, i_b in qd.ndrange(n_verts, B):
+        z = func_precondition(i_v, i_b, shell_state, shell_scratch, shell_info, static_config)
+        shell_scratch.verts_z[i_v, i_b] = z
+        shell_scratch.verts_p[i_v, i_b] = z
+        shell_scratch.envs_rz[i_b] += shell_scratch.verts_r[i_v, i_b].dot(z)
 
     for i_b in range(B):
         shell_scratch.envs_rz_threshold[i_b] = pcg_threshold * pcg_threshold * shell_scratch.envs_rz_threshold[i_b]
@@ -745,7 +901,12 @@ def kernel_shell_pcg_init(
 
 
 @qd.kernel
-def kernel_shell_pcg_update(shell_state: array_class.ShellState, shell_scratch: array_class.ShellScratch):
+def kernel_shell_pcg_update(
+    shell_state: array_class.ShellState,
+    shell_scratch: array_class.ShellScratch,
+    shell_info: array_class.ShellInfo,
+    static_config: qd.template(),
+):
     """Finish one PCG iteration in every environment still solving, from the system product verts_Ap of verts_p."""
     n_verts, B = shell_state.verts_pos.shape[0], shell_state.verts_pos.shape[1]
 
@@ -769,11 +930,16 @@ def kernel_shell_pcg_update(shell_state: array_class.ShellState, shell_scratch: 
         if shell_scratch.envs_is_solving[i_b]:
             alpha = shell_scratch.envs_step[i_b]
             shell_scratch.verts_dv[i_v, i_b] += alpha * shell_scratch.verts_p[i_v, i_b]
-            r = shell_scratch.verts_r[i_v, i_b] - alpha * shell_scratch.verts_Ap[i_v, i_b]
-            z = shell_scratch.verts_prec[i_v, i_b] @ r
-            shell_scratch.verts_r[i_v, i_b] = r
+            shell_scratch.verts_r[i_v, i_b] -= alpha * shell_scratch.verts_Ap[i_v, i_b]
+
+    if qd.static(static_config.has_coarse_space):
+        func_coarse_correct(shell_state, shell_scratch, shell_info)
+
+    for i_v, i_b in qd.ndrange(n_verts, B):
+        if shell_scratch.envs_is_solving[i_b]:
+            z = func_precondition(i_v, i_b, shell_state, shell_scratch, shell_info, static_config)
             shell_scratch.verts_z[i_v, i_b] = z
-            shell_scratch.envs_rz_new[i_b] += r.dot(z)
+            shell_scratch.envs_rz_new[i_b] += shell_scratch.verts_r[i_v, i_b].dot(z)
 
     for i_b in range(B):
         if shell_scratch.envs_is_solving[i_b]:
@@ -791,6 +957,303 @@ def kernel_shell_pcg_update(shell_state: array_class.ShellState, shell_scratch: 
             shell_scratch.envs_is_solving[i_b] = False
 
 
+@qd.func
+def func_select3(i: int, x0, x1, x2):
+    """Return x0, x1 or x2 by index, for indexing local values at runtime."""
+    x = x0
+    if i == 1:
+        x = x1
+    elif i == 2:
+        x = x2
+    return x
+
+
+@qd.func
+def func_coarse_add_block(
+    i_e: int,
+    i_d_row: int,
+    i_d_col: int,
+    block: qd.types.matrix(3, 3),
+    i_b: int,
+    shell_scratch: array_class.ShellScratch,
+    shell_info: array_class.ShellInfo,
+):
+    """Add a 3x3 block to the lower triangle of the coarse matrix of an entity, at global coarse rows and columns."""
+    dof_start = shell_info.entities_coarse_dof_start[i_e]
+    dim = shell_info.entities_coarse_dim[i_e]
+    matrix_start = shell_info.entities_coarse_matrix_start[i_e]
+    for j, k in qd.static(qd.ndrange(3, 3)):
+        row = i_d_row - dof_start + j
+        col = i_d_col - dof_start + k
+        if row >= col:
+            shell_scratch.coarse_assembly[matrix_start + row * dim + col, i_b] += block[j, k]
+
+
+@qd.kernel
+def kernel_shell_coarse_assemble(
+    shell_state: array_class.ShellState,
+    shell_scratch: array_class.ShellScratch,
+    shell_info: array_class.ShellInfo,
+):
+    """Assemble the coarse matrix Z^T (M + K) Z of every entity, Z spanning the displacements affine in
+    the rest coordinates of each patch of vertices.
+
+    Every patch of vertices moves by a displacement affine in the in-plane rest coordinates of its vertices, which
+    captures the smooth stretching and bending that block-Jacobi preconditioning resolves slowly in stiff sheets. The
+    stiffness of an element being bilinear in the displacement of its vertices, its coarse block for a pair of shape
+    functions is its stiffness evaluated on the sum of the vertex weights times those shape functions, per patch.
+    The Cholesky factorization drops the pivots that vanish (fixed or degenerate patches), solving the coarse system
+    on the remaining unknowns.
+    """
+    n_verts, B = shell_state.verts_pos.shape[0], shell_state.verts_pos.shape[1]
+    n_faces = shell_state.faces_thickness.shape[0]
+    n_hinges = shell_scratch.hinges_stiffness.shape[0]
+    n_entities = shell_state.entities_n_verts.shape[0]
+
+    for i_m, i_b in qd.ndrange(shell_scratch.coarse_assembly.shape[0], B):
+        shell_scratch.coarse_assembly[i_m, i_b] = 0.0
+
+    for i_v, i_b in qd.ndrange(n_verts, B):
+        if func_is_vert_free(i_v, i_b, shell_state):
+            i_o = shell_state.verts_origin[i_v, i_b]
+            i_d = shell_info.verts_coarse_dof[i_o]
+            if i_d >= 0:
+                i_e = func_vert_entity(i_v, i_b, shell_state, shell_info)
+                phi = shell_info.verts_coarse_phi[i_o]
+                mass = shell_scratch.verts_mass[i_v, i_b]
+                for a in range(3):
+                    for b in range(a + 1):
+                        coeff = mass * func_select3(a, phi[0], phi[1], phi[2]) * func_select3(b, phi[0], phi[1], phi[2])
+                        func_coarse_add_block(
+                            i_e,
+                            i_d + 3 * a,
+                            i_d + 3 * b,
+                            coeff * qd.Matrix.identity(gs.qd_float, 3),
+                            i_b,
+                            shell_scratch,
+                            shell_info,
+                        )
+
+    # Faces: the coarse block of shape functions (a of patch P, b of patch Q) evaluates the membrane stiffness on the
+    # weights W_Pa = sum over the free face vertices k of patch P of phi_k[a] * w_k, w_k mapping a displacement of
+    # vertex k to the change of deformation gradient (see func_membrane_stiffness_product).
+    for i_f, i_b in qd.ndrange(n_faces, B):
+        i_e = shell_info.faces_entity[i_f]
+        if shell_info.entities_coarse_dim[i_e] > 0:
+            nu = shell_info.entities_nu[i_e]
+            modulus = shell_info.entities_stretching_modulus[i_e] * shell_state.faces_thickness[i_f, i_b]
+            stiffness = shell_scratch.faces_stiffness[i_f, i_b]
+            F = shell_scratch.faces_F[i_f, i_b]
+            stress_pos = shell_scratch.faces_stress[i_f, i_b]
+            Y = shell_info.faces_Dm_inv[i_f] @ shell_state.faces_plastic[i_f, i_b]
+            w_1 = qd.Vector([Y[0, 0], Y[0, 1]])
+            w_2 = qd.Vector([Y[1, 0], Y[1, 1]])
+            w_0 = -(w_1 + w_2)
+            i_v0 = shell_state.corners_vert[3 * i_f, i_b]
+            i_v1 = shell_state.corners_vert[3 * i_f + 1, i_b]
+            i_v2 = shell_state.corners_vert[3 * i_f + 2, i_b]
+            is_free_0 = func_is_vert_free(i_v0, i_b, shell_state)
+            is_free_1 = func_is_vert_free(i_v1, i_b, shell_state)
+            is_free_2 = func_is_vert_free(i_v2, i_b, shell_state)
+            i_o0 = shell_state.verts_origin[i_v0, i_b]
+            i_o1 = shell_state.verts_origin[i_v1, i_b]
+            i_o2 = shell_state.verts_origin[i_v2, i_b]
+            dof_0 = shell_info.verts_coarse_dof[i_o0]
+            dof_1 = shell_info.verts_coarse_dof[i_o1]
+            dof_2 = shell_info.verts_coarse_dof[i_o2]
+            phi_0 = shell_info.verts_coarse_phi[i_o0]
+            phi_1 = shell_info.verts_coarse_phi[i_o1]
+            phi_2 = shell_info.verts_coarse_phi[i_o2]
+            for k, l, a, b in qd.ndrange(3, 3, 3, 3):
+                dof_k = func_select3(k, dof_0, dof_1, dof_2)
+                dof_l = func_select3(l, dof_0, dof_1, dof_2)
+                # Each patch of the face is handled by its first vertex, and the pair of patches once, in the lower
+                # triangle.
+                is_leader_k = k == 0 or (k == 1 and dof_1 != dof_0) or (k == 2 and dof_2 != dof_0 and dof_2 != dof_1)
+                is_leader_l = l == 0 or (l == 1 and dof_1 != dof_0) or (l == 2 and dof_2 != dof_0 and dof_2 != dof_1)
+                if is_leader_k and is_leader_l and dof_k >= dof_l:
+                    W_k = qd.Vector.zero(gs.qd_float, 2)
+                    W_l = qd.Vector.zero(gs.qd_float, 2)
+                    if is_free_0:
+                        W_k += (dof_0 == dof_k) * func_select3(a, phi_0[0], phi_0[1], phi_0[2]) * w_0
+                        W_l += (dof_0 == dof_l) * func_select3(b, phi_0[0], phi_0[1], phi_0[2]) * w_0
+                    if is_free_1:
+                        W_k += (dof_1 == dof_k) * func_select3(a, phi_1[0], phi_1[1], phi_1[2]) * w_1
+                        W_l += (dof_1 == dof_l) * func_select3(b, phi_1[0], phi_1[1], phi_1[2]) * w_1
+                    if is_free_2:
+                        W_k += (dof_2 == dof_k) * func_select3(a, phi_2[0], phi_2[1], phi_2[2]) * w_2
+                        W_l += (dof_2 == dof_l) * func_select3(b, phi_2[0], phi_2[1], phi_2[2]) * w_2
+                    M = modulus * (
+                        0.5 * (1.0 - nu) * (W_k.dot(W_l) * qd.Matrix.identity(gs.qd_float, 2) + W_l.outer_product(W_k))
+                        + nu * W_k.outer_product(W_l)
+                    )
+                    block = stiffness * (
+                        F @ M @ F.transpose() + W_k.dot(stress_pos @ W_l) * qd.Matrix.identity(gs.qd_float, 3)
+                    )
+                    if dof_k >= 0 and dof_l >= 0:
+                        func_coarse_add_block(i_e, dof_k + 3 * a, dof_l + 3 * b, block, i_b, shell_scratch, shell_info)
+
+    # Hinges: the same with the gradient of the dihedral angle, the stiffness being k * grad grad^T
+    for i_h, i_b in qd.ndrange(n_hinges, B):
+        stiffness = shell_scratch.hinges_stiffness[i_h, i_b]
+        if stiffness > 0.0:
+            i_e = shell_info.hinges_entity[i_h]
+            if shell_info.entities_coarse_dim[i_e] > 0:
+                i_va, i_vb, i_vc, i_vd, _ = func_hinge_verts(i_h, i_b, shell_state, shell_info)
+                grad = shell_scratch.hinges_grad[i_h, i_b]
+                for k, l, a, b in qd.ndrange(4, 4, 3, 3):
+                    i_vk = i_va
+                    i_vl = i_va
+                    G_k = qd.Vector.zero(gs.qd_float, 3)
+                    G_l = qd.Vector.zero(gs.qd_float, 3)
+                    is_leader_k = True
+                    is_leader_l = True
+                    dof_k = -1
+                    dof_l = -1
+                    for m in qd.static(range(4)):
+                        i_vm = i_va
+                        if qd.static(m == 1):
+                            i_vm = i_vb
+                        elif qd.static(m == 2):
+                            i_vm = i_vc
+                        elif qd.static(m == 3):
+                            i_vm = i_vd
+                        if m == k:
+                            i_vk = i_vm
+                        if m == l:
+                            i_vl = i_vm
+                    i_ok = shell_state.verts_origin[i_vk, i_b]
+                    i_ol = shell_state.verts_origin[i_vl, i_b]
+                    dof_k = shell_info.verts_coarse_dof[i_ok]
+                    dof_l = shell_info.verts_coarse_dof[i_ol]
+                    for m in qd.static(range(4)):
+                        i_vm = i_va
+                        if qd.static(m == 1):
+                            i_vm = i_vb
+                        elif qd.static(m == 2):
+                            i_vm = i_vc
+                        elif qd.static(m == 3):
+                            i_vm = i_vd
+                        i_om = shell_state.verts_origin[i_vm, i_b]
+                        dof_m = shell_info.verts_coarse_dof[i_om]
+                        if m < k and dof_m == dof_k:
+                            is_leader_k = False
+                        if m < l and dof_m == dof_l:
+                            is_leader_l = False
+                        if func_is_vert_free(i_vm, i_b, shell_state):
+                            phi_m = shell_info.verts_coarse_phi[i_om]
+                            grad_m = qd.Vector([grad[0, m], grad[1, m], grad[2, m]])
+                            if dof_m == dof_k:
+                                G_k += func_select3(a, phi_m[0], phi_m[1], phi_m[2]) * grad_m
+                            if dof_m == dof_l:
+                                G_l += func_select3(b, phi_m[0], phi_m[1], phi_m[2]) * grad_m
+                    if is_leader_k and is_leader_l and dof_k >= dof_l and dof_l >= 0:
+                        func_coarse_add_block(
+                            i_e,
+                            dof_k + 3 * a,
+                            dof_l + 3 * b,
+                            stiffness * G_k.outer_product(G_l),
+                            i_b,
+                            shell_scratch,
+                            shell_info,
+                        )
+
+
+@qd.kernel
+def kernel_shell_coarse_factorize(
+    shell_state: array_class.ShellState,
+    shell_scratch: array_class.ShellScratch,
+    shell_info: array_class.ShellInfo,
+    static_config: qd.template(),
+):
+    """Factorize and invert the coarse matrix of every entity (see kernel_shell_coarse_assemble)."""
+    B = shell_state.verts_pos.shape[1]
+    n_entities = shell_state.entities_n_verts.shape[0]
+
+    # Cholesky factorization, dropping the pivots that vanish (fixed or degenerate patches) so that the coarse system is
+    # solved on the remaining unknowns, then explicit inversion, which turns the coarse solve of every iteration into a
+    # parallel matrix-vector product. The lanes of a block share the rows of one entity in one environment.
+    _K = qd.static(static_config.coarse_block_dim)
+    if qd.static(_K > 1):
+        qd.loop_config(block_dim=_K)
+    for i_flat in range(n_entities * B * _K):
+        tid = i_flat % _K
+        i_b = (i_flat // _K) % B
+        i_e = i_flat // (_K * B)
+        dim = shell_info.entities_coarse_dim[i_e]
+        matrix_start = shell_info.entities_coarse_matrix_start[i_e]
+        for i_chunk in range((dim * dim + _K - 1) // _K):
+            i_entry = i_chunk * _K + tid
+            if i_entry < dim * dim:
+                shell_scratch.coarse_matrix[i_b, matrix_start + i_entry] = shell_scratch.coarse_assembly[
+                    matrix_start + i_entry, i_b
+                ]
+        if qd.static(_K > 1):
+            qd.simt.block.sync()
+        for j in range(dim):
+            if tid == 0:
+                diag = shell_scratch.coarse_matrix[i_b, matrix_start + j * dim + j]
+                pivot_sq = diag
+                for k in range(j):
+                    pivot_sq -= shell_scratch.coarse_matrix[i_b, matrix_start + j * dim + k] ** 2
+                pivot = gs.qd_float(0.0)
+                if pivot_sq > 1e-6 * diag:
+                    pivot = qd.sqrt(pivot_sq)
+                shell_scratch.coarse_matrix[i_b, matrix_start + j * dim + j] = pivot
+            if qd.static(_K > 1):
+                qd.simt.block.sync()
+            pivot = shell_scratch.coarse_matrix[i_b, matrix_start + j * dim + j]
+            for i_chunk in range((dim - j - 1 + _K - 1) // _K):
+                i = j + 1 + i_chunk * _K + tid
+                if i < dim:
+                    value = gs.qd_float(0.0)
+                    if pivot > 0.0:
+                        value = shell_scratch.coarse_matrix[i_b, matrix_start + i * dim + j]
+                        for k in range(j):
+                            value -= (
+                                shell_scratch.coarse_matrix[i_b, matrix_start + i * dim + k]
+                                * shell_scratch.coarse_matrix[i_b, matrix_start + j * dim + k]
+                            )
+                        value = value / pivot
+                    shell_scratch.coarse_matrix[i_b, matrix_start + i * dim + j] = value
+            if qd.static(_K > 1):
+                qd.simt.block.sync()
+
+        # Inverse of the lower triangular factor, one column per lane by forward substitution
+        for k_chunk in range((dim + _K - 1) // _K):
+            k = k_chunk * _K + tid
+            if k < dim:
+                for i in range(k, dim):
+                    value = gs.qd_float(1.0) if i == k else gs.qd_float(0.0)
+                    for m in range(k, i):
+                        value -= (
+                            shell_scratch.coarse_matrix[i_b, matrix_start + i * dim + m]
+                            * shell_scratch.coarse_factor_inv[i_b, matrix_start + m * dim + k]
+                        )
+                    pivot = shell_scratch.coarse_matrix[i_b, matrix_start + i * dim + i]
+                    shell_scratch.coarse_factor_inv[i_b, matrix_start + i * dim + k] = (
+                        value / pivot if pivot > 0.0 else 0.0
+                    )
+        if qd.static(_K > 1):
+            qd.simt.block.sync()
+
+        # Inverse of the coarse matrix, L^-T L^-1, written over the factor that is no longer needed
+        for i_chunk in range((dim * dim + _K - 1) // _K):
+            i_entry = i_chunk * _K + tid
+            if i_entry < dim * dim:
+                i = i_entry // dim
+                j = i_entry % dim
+                value = gs.qd_float(0.0)
+                for k in range(qd.max(i, j), dim):
+                    value += (
+                        shell_scratch.coarse_factor_inv[i_b, matrix_start + k * dim + i]
+                        * shell_scratch.coarse_factor_inv[i_b, matrix_start + k * dim + j]
+                    )
+                shell_scratch.coarse_matrix[i_b, matrix_start + i_entry] = value
+        if qd.static(_K > 1):
+            qd.simt.block.sync()
+
+
 @qd.kernel
 def kernel_shell_apply_dv(shell_state: array_class.ShellState, shell_scratch: array_class.ShellScratch):
     """Add the solved velocity change to the free vertices."""
@@ -801,10 +1264,19 @@ def kernel_shell_apply_dv(shell_state: array_class.ShellState, shell_scratch: ar
 
 @qd.kernel
 def kernel_shell_integrate(dt: float, shell_state: array_class.ShellState, shell_scratch: array_class.ShellScratch):
-    """Advance the position of every vertex by its velocity."""
+    """Advance the position of every vertex by its velocity, moving whole grid cells from its offset to its cell.
+
+    The offset staying below a cell, its increments keep their precision, and moving whole cells out of it is exact.
+    """
     for i_v, i_b in qd.ndrange(shell_state.verts_pos.shape[0], shell_state.verts_pos.shape[1]):
         if shell_state.verts_origin[i_v, i_b] >= 0:
-            shell_state.verts_pos[i_v, i_b] += dt * shell_state.verts_vel[i_v, i_b]
+            offset = shell_state.verts_pos_offset[i_v, i_b] + dt * shell_state.verts_vel[i_v, i_b]
+            cell_shift = qd.floor(offset / POS_GRID + 0.5).cast(gs.qd_int)
+            cell = shell_state.verts_pos_cell[i_v, i_b] + cell_shift
+            offset = offset - cell_shift.cast(gs.qd_float) * POS_GRID
+            shell_state.verts_pos_cell[i_v, i_b] = cell
+            shell_state.verts_pos_offset[i_v, i_b] = offset
+            shell_state.verts_pos[i_v, i_b] = cell.cast(gs.qd_float) * POS_GRID + offset
 
 
 # ------------------------------------------------------------------------------------
@@ -862,12 +1334,8 @@ def kernel_shell_plastic_flow(
         if yield_curvature > 0.0:
             i_va, i_vb, i_vc, i_vd, is_intact = func_hinge_verts(i_h, i_b, shell_state, shell_info)
             if is_intact:
-                angle = func_hinge_angle(
-                    shell_state.verts_pos[i_va, i_b],
-                    shell_state.verts_pos[i_vb, i_b],
-                    shell_state.verts_pos[i_vc, i_b],
-                    shell_state.verts_pos[i_vd, i_b],
-                )
+                edge_b, edge_c, edge_d = func_hinge_edges(i_va, i_vb, i_vc, i_vd, i_b, shell_state)
+                angle = func_hinge_angle(edge_b, edge_c, edge_d)
                 angle_scale = 2.0 * shell_info.hinges_rest_area[i_h] / (3.0 * shell_info.hinges_rest_len[i_h])
                 angle_elastic = angle - shell_info.hinges_rest_angle[i_h] - shell_state.hinges_plastic_angle[i_h, i_b]
                 curvature = angle_elastic / angle_scale
@@ -977,8 +1445,8 @@ def func_corner_traction(
     elif k == 2:
         edge_start = -p2
         edge_end = p1 - p2
-    edge_start = edge_start.normalized(gs.EPS)
-    edge_end = edge_end.normalized(gs.EPS)
+    edge_start = edge_start / qd.max(edge_start.norm(), NORM_FLOOR)
+    edge_end = edge_end / qd.max(edge_end.norm(), NORM_FLOOR)
     stress = shell_scratch.faces_fracture_stress[i_f, i_b]
     traction = stress @ (qd.Vector([-edge_end[1], edge_end[0]]) - qd.Vector([-edge_start[1], edge_start[0]]))
     angle = qd.acos(qd.math.clamp(edge_start.dot(edge_end), -1.0, 1.0))
@@ -990,7 +1458,8 @@ def func_split_score(traction_0: qd.types.vector(3), traction_1: qd.types.vector
     """Stress a split relieves, in N/m: the smaller of the opposing tractions its two sides pull apart with."""
     score = gs.qd_float(0.0)
     if traction_0.dot(traction_1) < 0.0:
-        mid = (traction_0 - traction_1).normalized(gs.EPS)
+        traction_diff = traction_0 - traction_1
+        mid = traction_diff / qd.max(traction_diff.norm(), NORM_FLOOR)
         score = 0.5 * qd.min(qd.abs(traction_0.dot(mid)), qd.abs(traction_1.dot(mid)))
         if is_open:
             score = 2.0 * score
@@ -1008,6 +1477,8 @@ def func_alloc_vert(
         i_new = -1
     else:
         shell_state.verts_pos[i_new, i_b] = shell_state.verts_pos[i_v, i_b]
+        shell_state.verts_pos_cell[i_new, i_b] = shell_state.verts_pos_cell[i_v, i_b]
+        shell_state.verts_pos_offset[i_new, i_b] = shell_state.verts_pos_offset[i_v, i_b]
         shell_state.verts_vel[i_new, i_b] = shell_state.verts_vel[i_v, i_b]
         shell_state.verts_origin[i_new, i_b] = shell_state.verts_origin[i_v, i_b]
         shell_state.verts_is_fixed[i_new, i_b] = shell_state.verts_is_fixed[i_v, i_b]
@@ -1061,12 +1532,8 @@ def kernel_shell_fracture(
                 if i_h >= 0:
                     i_va, i_vb, i_vc, i_vd, is_intact = func_hinge_verts(i_h, i_b, shell_state, shell_info)
                     if is_intact:
-                        angle = func_hinge_angle(
-                            shell_state.verts_pos[i_va, i_b],
-                            shell_state.verts_pos[i_vb, i_b],
-                            shell_state.verts_pos[i_vc, i_b],
-                            shell_state.verts_pos[i_vd, i_b],
-                        )
+                        edge_b, edge_c, edge_d = func_hinge_edges(i_va, i_vb, i_vc, i_vd, i_b, shell_state)
+                        angle = func_hinge_angle(edge_b, edge_c, edge_d)
                         angle_elastic = (
                             angle - shell_info.hinges_rest_angle[i_h] - shell_state.hinges_plastic_angle[i_h, i_b]
                         )
@@ -1075,7 +1542,7 @@ def kernel_shell_fracture(
                             edge = qd.Vector([Dm[0, 1] - Dm[0, 0], Dm[1, 1] - Dm[1, 0]])
                         elif k == 2:
                             edge = -qd.Vector([Dm[0, 1], Dm[1, 1]])
-                        edge_len = edge.norm(gs.EPS)
+                        edge_len = qd.max(edge.norm(), NORM_FLOOR)
                         normal = qd.Vector([-edge[1], edge[0]]) / edge_len
                         curvature += angle_elastic * edge_len * normal.outer_product(normal)
             curvature = curvature / (2.0 * shell_info.faces_rest_area[i_f])
@@ -1225,18 +1692,39 @@ def kernel_shell_update_render(
     for i_c, i_b in qd.ndrange(3 * n_faces, B):
         i_v = shell_state.corners_vert[i_c, i_b]
         shell_scratch.corners_render_pos[i_c, i_b] = shell_state.verts_pos[i_v, i_b]
-        shell_scratch.corners_render_normal[i_c, i_b] = shell_scratch.verts_normal[i_v, i_b].normalized(gs.EPS)
+        normal = shell_scratch.verts_normal[i_v, i_b]
+        shell_scratch.corners_render_normal[i_c, i_b] = normal / qd.max(normal.norm(), NORM_FLOOR)
 
 
 @qd.kernel
-def kernel_shell_set_verts_vec(
-    verts_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray(), values: qd.types.ndarray(), tensor: qd.Tensor
+def kernel_shell_set_verts_vel(
+    verts_idx: qd.types.ndarray(),
+    envs_idx: qd.types.ndarray(),
+    values: qd.types.ndarray(),
+    shell_state: array_class.ShellState,
 ):
     for i_v_, i_b_ in qd.ndrange(verts_idx.shape[1], envs_idx.shape[0]):
         i_v = verts_idx[i_b_, i_v_]
         i_b = envs_idx[i_b_]
         for j in qd.static(range(3)):
-            tensor[i_v, i_b][j] = values[i_b_, i_v_, j]
+            shell_state.verts_vel[i_v, i_b][j] = values[i_b_, i_v_, j]
+
+
+@qd.kernel
+def kernel_shell_set_verts_pos(
+    verts_idx: qd.types.ndarray(),
+    envs_idx: qd.types.ndarray(),
+    values: qd.types.ndarray(),
+    shell_state: array_class.ShellState,
+):
+    for i_v_, i_b_ in qd.ndrange(verts_idx.shape[1], envs_idx.shape[0]):
+        i_v = verts_idx[i_b_, i_v_]
+        i_b = envs_idx[i_b_]
+        pos = qd.Vector([values[i_b_, i_v_, 0], values[i_b_, i_v_, 1], values[i_b_, i_v_, 2]], dt=gs.qd_float)
+        cell = qd.floor(pos / POS_GRID + 0.5).cast(gs.qd_int)
+        shell_state.verts_pos[i_v, i_b] = pos
+        shell_state.verts_pos_cell[i_v, i_b] = cell
+        shell_state.verts_pos_offset[i_v, i_b] = pos - cell.cast(gs.qd_float) * POS_GRID
 
 
 @qd.kernel
@@ -1253,6 +1741,8 @@ def kernel_shell_set_verts_fixed(
 def kernel_shell_set_state(
     envs_idx: qd.types.ndarray(),
     verts_pos: qd.types.ndarray(),
+    verts_pos_cell: qd.types.ndarray(),
+    verts_pos_offset: qd.types.ndarray(),
     verts_vel: qd.types.ndarray(),
     verts_origin: qd.types.ndarray(),
     verts_is_fixed: qd.types.ndarray(),
@@ -1271,6 +1761,8 @@ def kernel_shell_set_state(
         i_b = envs_idx[i_b_]
         for j in qd.static(range(3)):
             shell_state.verts_pos[i_v, i_b][j] = verts_pos[i_b_, i_v, j]
+            shell_state.verts_pos_cell[i_v, i_b][j] = verts_pos_cell[i_b_, i_v, j]
+            shell_state.verts_pos_offset[i_v, i_b][j] = verts_pos_offset[i_b_, i_v, j]
             shell_state.verts_vel[i_v, i_b][j] = verts_vel[i_b_, i_v, j]
         shell_state.verts_origin[i_v, i_b] = verts_origin[i_b_, i_v]
         shell_state.verts_is_fixed[i_v, i_b] = verts_is_fixed[i_b_, i_v]

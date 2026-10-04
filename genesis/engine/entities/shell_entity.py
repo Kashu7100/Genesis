@@ -38,6 +38,48 @@ class ShellTopology(NamedTuple):
     fans_next_hinge: np.ndarray
 
 
+class ShellPatches(NamedTuple):
+    """The partition of the vertices of a shell entity into patches, each one spanning the coarse space of the linear
+    solve by the displacements affine in its two principal in-plane rest coordinates (see the coarse space in
+    shell_solver.py).
+
+    verts_patch is the patch of every vertex, local to the entity, and verts_phi its affine shape functions (1, s1, s2),
+    the rest coordinates being centered on the patch and normalized by its radius.
+    """
+
+    n_patches: int
+    verts_patch: np.ndarray
+    verts_phi: np.ndarray
+
+
+def build_shell_patches(verts: np.ndarray, n_patches: int) -> ShellPatches:
+    """Partition the rest vertices of a shell into compact patches by k-means, seeded by farthest point sampling."""
+    centers_idx = [0]
+    dist_sq = np.square(verts - verts[0]).sum(axis=1)
+    for _ in range(n_patches - 1):
+        centers_idx.append(int(np.argmax(dist_sq)))
+        dist_sq = np.minimum(dist_sq, np.square(verts - verts[centers_idx[-1]]).sum(axis=1))
+    centers = verts[centers_idx]
+    for _ in range(20):
+        verts_patch = np.argmin(np.square(verts[:, None] - centers[None]).sum(axis=-1), axis=1)
+        counts = np.bincount(verts_patch, minlength=n_patches)
+        sums = np.zeros_like(centers)
+        np.add.at(sums, verts_patch, verts)
+        centers = np.where(counts[:, None] > 0, sums / np.maximum(counts, 1)[:, None], centers)
+    # Patches left empty by the iterations are dropped, renumbering the others contiguously
+    patches_used, verts_patch = np.unique(verts_patch, return_inverse=True)
+
+    verts_phi = np.ones((len(verts), 3), dtype=gs.np_float)
+    for i_p in range(len(patches_used)):
+        verts_mask = verts_patch == i_p
+        offsets = verts[verts_mask] - verts[verts_mask].mean(axis=0)
+        _, _, axes = np.linalg.svd(offsets, full_matrices=False)
+        coords = offsets @ axes[:2].T
+        radius = np.sqrt(np.square(coords).sum(axis=1).mean())
+        verts_phi[verts_mask, 1:] = coords / max(radius, gs.EPS)
+    return ShellPatches(n_patches=len(patches_used), verts_patch=verts_patch.astype(gs.np_int), verts_phi=verts_phi)
+
+
 def build_shell_topology(verts: np.ndarray, faces: np.ndarray, rho: float, thickness: float) -> ShellTopology:
     """Compute the rest frames, hinges and vertex fans of a consistently oriented, edge- and vertex-manifold mesh.
 
@@ -204,6 +246,10 @@ class ShellEntity(Entity):
         self._init_verts = gu.transform_by_trans_quat(np.asarray(mesh.vertices, dtype=gs.np_float), pos, quat)
         self._faces = np.asarray(mesh.faces, dtype=gs.np_int)
         self._topology = build_shell_topology(self._init_verts, self._faces, material.rho, material.thickness)
+        self._patches = None
+        if solver.n_coarse_patches > 0:
+            n_patches = min(solver.n_coarse_patches, max(1, len(self._init_verts) // 32))
+            self._patches = build_shell_patches(self._init_verts, n_patches)
 
         n_verts = len(self._init_verts)
         n_split_verts = int(np.ceil(solver.fracture_capacity * n_verts)) if material.tensile_strength else 0
@@ -313,7 +359,7 @@ class ShellEntity(Entity):
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments. Defaults to None.
         """
-        self._solver.set_verts_vec(self._solver.shell_state.verts_pos, pos, self, verts_idx_local, envs_idx)
+        self._solver.set_verts_pos(pos, self, verts_idx_local, envs_idx)
 
     @gs.assert_built
     def set_verts_vel(self, vel, verts_idx_local=None, envs_idx=None):
@@ -331,7 +377,7 @@ class ShellEntity(Entity):
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments. Defaults to None.
         """
-        self._solver.set_verts_vec(self._solver.shell_state.verts_vel, vel, self, verts_idx_local, envs_idx)
+        self._solver.set_verts_vel(vel, self, verts_idx_local, envs_idx)
 
     @gs.assert_built
     def fix_verts(self, verts_idx_local=None, envs_idx=None):
@@ -379,6 +425,11 @@ class ShellEntity(Entity):
     def topology(self) -> ShellTopology:
         """The rest mesh the shell solver consumes."""
         return self._topology
+
+    @property
+    def patches(self) -> ShellPatches | None:
+        """The patches spanning the coarse space of the linear solve, None if the solver uses none."""
+        return self._patches
 
     @property
     def n_verts(self) -> int:

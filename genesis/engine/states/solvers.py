@@ -305,6 +305,8 @@ class ShellSolverState:
         self,
         scene,
         verts_pos,
+        verts_pos_cell,
+        verts_pos_offset,
         verts_vel,
         verts_origin,
         verts_is_fixed,
@@ -316,6 +318,8 @@ class ShellSolverState:
     ):
         self._scene = scene
         self.verts_pos = verts_pos
+        self.verts_pos_cell = verts_pos_cell
+        self.verts_pos_offset = verts_pos_offset
         self.verts_vel = verts_vel
         self.verts_origin = verts_origin
         self.verts_is_fixed = verts_is_fixed

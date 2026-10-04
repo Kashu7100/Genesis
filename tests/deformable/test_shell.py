@@ -83,6 +83,64 @@ def test_membrane_stretching_stiffness(n_envs, grid_sheet_path, show_viewer):
 
 
 @pytest.mark.required
+@pytest.mark.parametrize("precision", ["32"])
+def test_stiff_sheet_bending(grid_sheet_path, show_viewer):
+    # Two stiff cantilevered strips, one at the origin and one far from it, sag under their own weight. Zeroing the
+    # velocities every step relaxes them to their static deflection, the beam deflection rho * g * h * L^4 / (8 * D)
+    # of the free length L. The dihedral hinges make a strip on a structured mesh softer than the beam by about 20%,
+    # the geometric nonlinearity of a 20% deflection partly compensating. The far strip must sag exactly as much,
+    # which single precision positions far from the origin could not resolve.
+    GRAVITY, LENGTH, E, THICKNESS, RHO = 9.81, 0.4, 1e9, 2e-3, 1000.0
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.1,
+            gravity=(0.0, 0.0, -GRAVITY),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.3, -0.8, 1.2),
+            camera_lookat=(0.0, 0.0, 0.95),
+        ),
+        show_viewer=show_viewer,
+    )
+    strips = [
+        scene.add_entity(
+            morph=gs.morphs.Mesh(
+                file=grid_sheet_path(40, 10, LENGTH, 0.1),
+                pos=(pos_x, 0.0, 1.0),
+            ),
+            material=gs.materials.Shell(
+                rho=RHO,
+                E=E,
+                nu=0.0,
+                thickness=THICKNESS,
+            ),
+        )
+        for pos_x in (0.0, 100.0)
+    ]
+    scene.build()
+
+    verts_tip = []
+    for strip in strips:
+        init_verts = strip.init_verts
+        # Fixing the first two columns of vertices clamps the strip
+        strip.fix_verts(np.flatnonzero(init_verts[:, 0] < init_verts[:, 0].min() + 0.011))
+        verts_tip.append(np.flatnonzero(init_verts[:, 0] > init_verts[:, 0].max() - 1e-3))
+    for _ in range(30):
+        scene.step()
+        for strip in strips:
+            strip.set_verts_vel(0.0)
+
+    deflections = [
+        1.0 - tensor_to_array(strip.get_verts_pos())[verts, 2].mean() for strip, verts in zip(strips, verts_tip)
+    ]
+    assert_allclose(deflections[1], deflections[0], atol=1e-5)
+    free_length = LENGTH - 0.01
+    beam_deflection = RHO * GRAVITY * THICKNESS * free_length**4 / (8.0 * E * THICKNESS**3 / 12.0)
+    assert_allclose(deflections[0], 1.2 * beam_deflection, rtol=0.03)
+
+
+@pytest.mark.required
 @pytest.mark.parametrize("precision", ["64"])
 def test_tearing_at_tensile_strength(grid_sheet_path, show_viewer):
     # Two strips are pulled apart at their ends, faster in the second environment. Fracture splits a strip once its
