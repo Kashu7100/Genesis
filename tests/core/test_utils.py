@@ -312,6 +312,20 @@ def test_geom_tensor_identity(batch_shape):
 
 
 @pytest.mark.required
+@pytest.mark.parametrize("batch_shape", [(4096,), (10, 40, 25), ()])
+def test_geom_compiled_call_skips_dynamo(batch_shape):
+    """Once compiled, a geometry helper calls its kernel directly instead of dispatching through TorchDynamo again,
+    whose per-call host time leaves the GPU idle between the small kernels of a simulation step."""
+    quat = torch.nn.functional.normalize(torch.randn((*batch_shape, 4), dtype=gs.tc_float, device=gs.device), dim=-1)
+    vec = torch.randn((*batch_shape, 3), dtype=gs.tc_float, device=gs.device)
+    # The first call compiles the kernel, or runs eagerly where TorchInductor cannot target this device
+    expected = gu.transform_by_quat(vec, quat)
+    with patch("genesis.utils.misc._torch_compile_dispatch", side_effect=AssertionError("dispatched by TorchDynamo")):
+        out = gu.transform_by_quat(vec, quat)
+    assert_equal(out, expected)
+
+
+@pytest.mark.required
 @pytest.mark.parametrize("batch_shape", [(10, 40, 25), ()])
 def test_slerp(batch_shape, tol):
     INTERP_RATIO = 0.7
