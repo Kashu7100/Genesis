@@ -2,6 +2,7 @@ import math
 import re
 import subprocess
 import sys
+import threading
 from functools import partial
 from unittest.mock import patch
 
@@ -323,6 +324,31 @@ def test_geom_compiled_call_skips_dynamo(batch_shape):
     with patch("genesis.utils.misc._torch_compile_dispatch", side_effect=AssertionError("dispatched by TorchDynamo")):
         out = gu.transform_by_quat(vec, quat)
     assert_equal(out, expected)
+
+
+@pytest.mark.required
+def test_geom_compiled_call_concurrent_warmup():
+    """Threads compiling kernels for different inputs at the same time each keep the kernel of their own call."""
+    inputs = []
+    for dtype in (torch.float32, torch.float64):
+        for batch_size in (1, 4096):
+            quat = torch.nn.functional.normalize(torch.randn((batch_size, 4), dtype=dtype, device=gs.device), dim=-1)
+            inputs.append((torch.randn((batch_size, 3), dtype=dtype, device=gs.device), quat))
+    barrier = threading.Barrier(len(inputs))
+    expected = [None] * len(inputs)
+
+    def warmup(i):
+        barrier.wait()
+        expected[i] = gu.transform_by_quat(*inputs[i])
+
+    threads = [threading.Thread(target=warmup, args=(i,)) for i in range(len(inputs))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    with patch("genesis.utils.misc._torch_compile_dispatch", side_effect=AssertionError("dispatched by TorchDynamo")):
+        for i, (vec, quat) in enumerate(inputs):
+            assert_equal(gu.transform_by_quat(vec, quat), expected[i])
 
 
 @pytest.mark.required
