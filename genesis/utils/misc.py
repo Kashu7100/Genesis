@@ -535,6 +535,10 @@ def _is_torch_compile_supported(device_type: str) -> bool:
     return device_type == "mps"
 
 
+# Smallest batch for which a CPU kernel is traced apart from those of smaller batches (see 'torch_compile')
+_TORCH_COMPILE_CPU_LARGE_BATCH = 16384
+
+
 def torch_compile(*, elems_ndim: tuple[int, ...]) -> Callable[[Callable], Callable]:
     """Compile a batched torch function into fused kernels, running it eagerly where TorchInductor cannot build them.
 
@@ -551,7 +555,7 @@ def torch_compile(*, elems_ndim: tuple[int, ...]) -> Callable[[Callable], Callab
     returns the same bits on every call for the same inputs, which may differ from the eager result by rounding.
 
     Once a graph is compiled, later calls that it was compiled for skip TorchDynamo and call the TorchInductor kernel
-    directly. Dispatching through TorchDynamo runs about eighty Python frames per call (frame evaluation, configuration
+    directly. Dispatching through TorchDynamo runs about a hundred Python frames per call (frame evaluation, configuration
     patches, guards, the AOTAutograd runtime wrapper), several times the host time of the kernel launch itself. Since
     the helpers this decorates are called many times per simulation step on small batches, that host time leaves the
     GPU idle, which can make its driver lower the clock for the whole step. The inputs are already canonical by the
@@ -572,18 +576,16 @@ def torch_compile(*, elems_ndim: tuple[int, ...]) -> Callable[[Callable], Callab
         # Compiled kernels, keyed by everything their graph is specialized on, along with the position of each of their
         # inputs among the flattened tensors (-1 for the batch size).
         kernels: dict[tuple, tuple[Callable, tuple[int, ...]]] = {}
-        # The graph that TorchInductor compiled during the call in progress on each thread, if any. TorchDynamo calls the
-        # backend on the thread that makes the call, so concurrent calls never see the graph of one another.
+        # The kernel that TorchInductor compiled during the call in progress on each thread, if any. TorchDynamo calls the
+        # backend on the thread that makes the call, so concurrent calls never see the kernel of one another.
         compiling = threading.local()
 
         def backend(gm: torch.fx.GraphModule, example_inputs: list) -> Callable:
             from torch._inductor.compile_fx import compile_fx
 
-            kernel = compile_fx(gm, example_inputs, config_patches=inductor_options)
-            captures = getattr(compiling, "captures", None)
-            if captures:
-                captures[-1] = (gm, example_inputs, kernel)
-            return kernel
+            kernel_fn = compile_fx(gm, example_inputs, config_patches=inductor_options)
+            compiling.capture = (example_inputs, kernel_fn)
+            return kernel_fn
 
         fn_compiled = torch.compile(fn, fullgraph=True, dynamic=True, backend=backend)
 
@@ -630,15 +632,16 @@ def torch_compile(*, elems_ndim: tuple[int, ...]) -> Callable[[Callable], Callab
                     kernel_fn, inputs_idx = kernel
                     (out,) = kernel_fn(*[n_elems if i < 0 else tensors_flat[i] for i in inputs_idx])
                 else:
-                    captures = getattr(compiling, "captures", None)
-                    if captures is None:
-                        captures = compiling.captures = []
-                    out = _torch_compile_dispatch(fn_compiled, captures, tensors_flat, n_elems, device, args, kwargs)
-                    if key is not None and captures[-1] is not None:
-                        kernel = _torch_compile_direct_kernel(*captures[-1], tensors_flat, out)
+                    compiling.capture = None
+                    try:
+                        out = _torch_compile_dispatch(fn_compiled, tensors_flat, n_elems, device, args, kwargs)
+                        capture = compiling.capture
+                    finally:
+                        compiling.capture = None
+                    if key is not None and capture is not None:
+                        kernel = _torch_compile_direct_kernel(*capture, tensors_flat, out)
                         if kernel is not None:
                             kernels[key] = kernel
-                    captures.pop()
             if len(batch_shape) == 1:
                 return out
             return out.reshape((*batch_shape, *out.shape[1:]))
@@ -660,7 +663,7 @@ def _torch_compile_kernel_key(device, tensors_flat, n_elems, args, kwargs) -> tu
         return None
     # Graphs are specialized on empty and single-element batches. On CPU, they are also traced separately for small
     # and large batches.
-    size_class = min(n_elems, 2) if device.type != "cpu" or n_elems < 16384 else 3
+    size_class = min(n_elems, 2) if device.type != "cpu" or n_elems < _TORCH_COMPILE_CPU_LARGE_BATCH else 3
     key = (
         device,
         size_class,
@@ -675,8 +678,8 @@ def _torch_compile_kernel_key(device, tensors_flat, n_elems, args, kwargs) -> tu
     return key
 
 
-def _torch_compile_dispatch(fn_compiled, captures, tensors_flat, n_elems, device, args, kwargs):
-    """Call the compiled function through TorchDynamo, recording the graph it compiles for these inputs, if any."""
+def _torch_compile_dispatch(fn_compiled, tensors_flat, n_elems, device, args, kwargs):
+    """Call the compiled function through TorchDynamo."""
     for tensor in tensors_flat:
         # The sizes of an element are constants that let the elementwise operations unroll and vectorize. Each one is
         # marked on its own: while any thread compiles, 'torch.compiler.is_compiling' holds on every thread, and
@@ -689,45 +692,30 @@ def _torch_compile_dispatch(fn_compiled, captures, tensors_flat, n_elems, device
     # of its class. Other devices tune their kernels independently of the batch size they are traced with.
     if device.type == "cpu" and n_elems > 1:
         tensor = next(tensor for tensor in tensors_flat if tensor is not None)
-        if n_elems < 16384:
-            torch._dynamo.mark_dynamic(tensor, 0, min=2, max=16383)
+        if n_elems < _TORCH_COMPILE_CPU_LARGE_BATCH:
+            torch._dynamo.mark_dynamic(tensor, 0, min=2, max=_TORCH_COMPILE_CPU_LARGE_BATCH - 1)
         else:
-            torch._dynamo.mark_dynamic(tensor, 0, min=16384, max=sys.maxsize)
-    captures.append(None)
-    try:
-        # Non-tensor arguments are part of the key of the compiled kernels, so they are specialized rather than lifted
-        # as inputs of the graph, which leaves its batch size as its only non-tensor input.
-        with torch._dynamo.config.patch(specialize_int=True, specialize_float=True):
-            return fn_compiled(*tensors_flat, *args, **kwargs)
-    except BaseException:
-        captures.pop()
-        raise
+            torch._dynamo.mark_dynamic(tensor, 0, min=_TORCH_COMPILE_CPU_LARGE_BATCH, max=sys.maxsize)
+    # Non-tensor arguments are part of the key of the compiled kernels, so they are specialized rather than lifted as
+    # inputs of the graph, which leaves the batch size, a dynamic size of the tensors, as its only non-tensor input.
+    with torch._dynamo.config.patch(specialize_int=True, specialize_float=True):
+        return fn_compiled(*tensors_flat, *args, **kwargs)
 
 
-def _torch_compile_direct_kernel(gm, example_inputs, kernel_fn, tensors_flat, out) -> tuple | None:
-    """Map the inputs of a graph that TorchInductor compiled onto the flattened tensors, if it can be called directly.
+def _torch_compile_direct_kernel(example_inputs, kernel_fn, tensors_flat, out) -> tuple | None:
+    """Map the inputs of a kernel that TorchInductor compiled onto the flattened tensors, if it can be called directly.
 
-    The graph must take the flattened tensors themselves, in any order, and the size of their batch dimension, and it
-    must return the tensor that TorchDynamo returned. The kernel is checked against that tensor before being used.
+    The kernel must take the flattened tensors themselves, in any order, and the size of their batch dimension, and it
+    must return the tensor that TorchDynamo returned, which it is checked against before being used.
     """
-    placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
-    if len(placeholders) != len(example_inputs):
-        return None
-    batch_exprs = {
-        node.meta["example_value"].shape[0].node.expr
-        for node in placeholders
-        if isinstance(node.meta.get("example_value"), torch.Tensor)
-        and node.meta["example_value"].ndim > 0
-        and isinstance(node.meta["example_value"].shape[0], torch.SymInt)
-    }
     inputs_idx = []
-    for node, example in zip(placeholders, example_inputs):
+    for example in example_inputs:
         if isinstance(example, torch.Tensor):
             i = next((i for i, tensor in enumerate(tensors_flat) if tensor is example), None)
             if i is None:
                 return None
             inputs_idx.append(i)
-        elif isinstance(example, torch.SymInt) and example.node.expr in batch_exprs:
+        elif isinstance(example, torch.SymInt):
             inputs_idx.append(-1)
         else:
             return None
@@ -736,9 +724,7 @@ def _torch_compile_direct_kernel(gm, example_inputs, kernel_fn, tensors_flat, ou
         outs = kernel_fn(*[n_elems if i < 0 else tensors_flat[i] for i in inputs_idx])
     except Exception:
         return None
-    if len(outs) != 1 or not isinstance(outs[0], torch.Tensor) or not isinstance(out, torch.Tensor):
-        return None
-    if outs[0].shape != out.shape or outs[0].dtype != out.dtype or not torch.equal(outs[0], out):
+    if len(outs) != 1 or outs[0].dtype != out.dtype or not torch.equal(outs[0], out):
         return None
     return kernel_fn, tuple(inputs_idx)
 
