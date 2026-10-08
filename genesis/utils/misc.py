@@ -557,7 +557,8 @@ def torch_compile(*, elems_ndim: tuple[int, ...]) -> Callable[[Callable], Callab
     Once compiled, a kernel is called directly rather than through TorchDynamo, whose dispatch costs about a hundred
     Python frames per call. The inputs reaching the kernel are canonical (contiguous, one batch dimension, static
     element sizes), so its guards reduce to a key of their device, dtypes, element shapes, batch size class and other
-    arguments.
+    arguments. Calls under an outer compilation, a torch function or dispatch mode, or autocast still go through
+    TorchDynamo.
     """
 
     def decorator(fn: Callable) -> Callable:
@@ -624,8 +625,10 @@ def torch_compile(*, elems_ndim: tuple[int, ...]) -> Callable[[Callable], Callab
                     (out,) = kernel_fn(*[n_elems if i < 0 else tensors_flat[i] for i in inputs_idx])
                 else:
                     compiling.capture = None
-                    out = _torch_compile_dispatch(fn_compiled, tensors_flat, n_elems, device, args, kwargs)
-                    capture, compiling.capture = compiling.capture, None
+                    try:
+                        out = _torch_compile_dispatch(fn_compiled, tensors_flat, n_elems, device, args, kwargs)
+                    finally:
+                        capture, compiling.capture = compiling.capture, None
                     if key is not None and capture is not None:
                         example_inputs, kernel_fn = capture
                         inputs_idx = _torch_compile_kernel_inputs(example_inputs, tensors_flat)
