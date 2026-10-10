@@ -11,7 +11,7 @@ import genesis as gs
 import genesis.utils.geom as gu
 from genesis.utils import array_class
 
-from .colliders import query_collider, query_collider_lower_bound
+from .colliders import GRID_LIPSCHITZ, query_collider, query_collider_lower_bound
 from .contact_utils import collision_response, func_mat3_to_sym6, func_sym6_to_mat3
 from .data import (
     COLLIDER_TYPE,
@@ -691,6 +691,268 @@ def kernel_contact_eval(
     errno: qd.Tensor,
 ):
     func_contact_eval(
+        0,
+        False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
+        dyn_state,
+        dyn_info,
+        sdf_info,
+        mochi_info,
+        mochi_state,
+        contact_state,
+        hit_readback,
+        rigid_config,
+        mochi_config,
+        assem_dres,
+        skip_ls_done,
+        record,
+        errno,
+    )
+
+
+@qd.func
+def func_contact_collect_sample(
+    i_p,
+    i_s,
+    i_b,
+    i_la,
+    i_gb,
+    band,
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    sdf_info: array_class.SDFInfo,
+    mochi_info: MochiInfo,
+    contact_state: MochiContactState,
+    mochi_config: qd.template(),
+    errno: qd.Tensor,
+):
+    """Record one sample of a candidate pair as a contact candidate when it lies within the widened contact range of
+    the collider: the tests of func_contact_eval_sample up to the distance query, at the widened range."""
+    max_cand = contact_state.cand_pair.shape[0]
+    i_ga = mochi_info.samples.geom_idx[i_s]
+    contype_a = dyn_info.geoms.contype[i_ga]
+    conaffinity_a = dyn_info.geoms.conaffinity[i_ga]
+    contype_b = dyn_info.geoms.contype[i_gb]
+    conaffinity_b = dyn_info.geoms.conaffinity[i_gb]
+    is_cand = (contype_a & conaffinity_b) != 0 or (contype_b & conaffinity_a) != 0
+
+    pos_a = dyn_state.links.pos[i_la, i_b]
+    quat_a = dyn_state.links.quat[i_la, i_b]
+    pos = gu.qd_transform_by_trans_quat(mochi_info.samples.pos[i_s], pos_a, quat_a)
+    if is_cand and mochi_info.geoms.collider_type[i_gb] != COLLIDER_TYPE.PLANE:
+        if (pos < dyn_state.geoms.aabb_min[i_gb, i_b] - band).any():
+            is_cand = False
+        if (pos > dyn_state.geoms.aabb_max[i_gb, i_b] + band).any():
+            is_cand = False
+    if is_cand:
+        pos_g = dyn_state.geoms.pos[i_gb, i_b]
+        quat_g = dyn_state.geoms.quat[i_gb, i_b]
+        pos_geom = gu.qd_inv_transform_by_trans_quat(pos, pos_g, quat_g)
+        is_valid, d_query, grad_query = query_collider(
+            i_gb, pos_geom, dyn_info.geoms, mochi_info.geoms, sdf_info, mochi_config
+        )
+        if not is_valid or d_query > band:
+            is_cand = False
+    if is_cand:
+        i_c = qd.atomic_add(contact_state.n_cand[i_b], 1)
+        if i_c < max_cand:
+            contact_state.cand_pair[i_c, i_b] = i_p
+            contact_state.cand_sample[i_c, i_b] = i_s
+        else:
+            qd.atomic_or(errno[i_b], array_class.ErrorCode.OVERFLOW_MOCHI_CONTACT_CANDIDATES)
+
+
+@qd.func
+def func_contact_collect(
+    i_b_env,
+    per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    sdf_info: array_class.SDFInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+    skip_ls_done,
+    errno: qd.Tensor,
+):
+    """Contact search of the environments flagged by the contact cache: traverse the sample hierarchy of every
+    candidate pair as func_contact_eval does, with the contact range widened by the candidate margin, and record the
+    (pair, sample) candidates within it. The interpolated distance of a grid collider may vary faster than the true
+    one, so its margin is scaled by the grid's Lipschitz bound."""
+    max_pairs = contact_state.pair_link_a.shape[0]
+    _B = mochi_state.is_active.shape[0]
+    margin = mochi_info.contact_candidate_margin[None]
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_p, i_slot in qd.ndrange(max_pairs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(max_pairs, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+        if not func_is_env_active(i_b, mochi_state, skip_ls_done):
+            continue
+        if mochi_state.needs_detect[i_b] == 0:
+            continue
+        if i_p >= contact_state.n_pairs[i_b]:
+            continue
+        i_la = contact_state.pair_link_a[i_p, i_b]
+        i_gb = contact_state.pair_geom_b[i_p, i_b]
+        pos_a = dyn_state.links.pos[i_la, i_b]
+        quat_a = dyn_state.links.quat[i_la, i_b]
+        pos_g = dyn_state.geoms.pos[i_gb, i_b]
+        quat_g = dyn_state.geoms.quat[i_gb, i_b]
+        band = mochi_info.geoms.penalty_threshold[i_gb] + margin
+        if mochi_info.geoms.collider_type[i_gb] == COLLIDER_TYPE.GRID:
+            band = mochi_info.geoms.penalty_threshold[i_gb] + margin * GRID_LIPSCHITZ
+        i_node = mochi_info.links.tree_start[i_la]
+        i_node_end = mochi_info.links.tree_end[i_la]
+        while i_node < i_node_end:
+            center = gu.qd_transform_by_trans_quat(mochi_info.samples.tree_center[i_node], pos_a, quat_a)
+            center_geom = gu.qd_inv_transform_by_trans_quat(center, pos_g, quat_g)
+            lower = query_collider_lower_bound(
+                i_gb,
+                center_geom,
+                mochi_info.samples.tree_radius[i_node],
+                dyn_info.geoms,
+                mochi_info.geoms,
+                sdf_info,
+                mochi_config,
+            )
+            if lower > band:
+                i_node = mochi_info.samples.tree_escape[i_node]
+            else:
+                if mochi_info.samples.tree_is_leaf[i_node] != 0:
+                    i_s_start = mochi_info.samples.tree_first[i_node]
+                    for i_s in range(i_s_start, i_s_start + mochi_info.samples.tree_count[i_node]):
+                        func_contact_collect_sample(
+                            i_p,
+                            i_s,
+                            i_b,
+                            i_la,
+                            i_gb,
+                            band,
+                            dyn_state,
+                            dyn_info,
+                            sdf_info,
+                            mochi_info,
+                            contact_state,
+                            mochi_config,
+                            errno,
+                        )
+                i_node = i_node + 1
+
+
+@qd.kernel
+def kernel_contact_collect(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    sdf_info: array_class.SDFInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+    skip_ls_done: qd.i32,
+    errno: qd.Tensor,
+):
+    func_contact_collect(
+        0,
+        False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
+        dyn_state,
+        dyn_info,
+        sdf_info,
+        mochi_info,
+        mochi_state,
+        contact_state,
+        rigid_config,
+        mochi_config,
+        skip_ls_done,
+        errno,
+    )
+
+
+@qd.func
+def func_contact_eval_candidates(
+    i_b_env,
+    per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    sdf_info: array_class.SDFInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    hit_readback: MochiHitReadback,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+    assem_dres,
+    skip_ls_done,
+    record: qd.template(),
+    errno: qd.Tensor,
+):
+    """Evaluate the contact candidates of the last search at the current iterate (the same per-sample evaluation as
+    func_contact_eval, over the recorded candidates instead of the traversed hierarchy)."""
+    max_cand = contact_state.cand_pair.shape[0]
+    _B = mochi_state.is_active.shape[0]
+    n_cand_env = qd.min(contact_state.n_cand[i_b_env], max_cand)
+
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_c, i_slot in (
+        qd.ndrange(contact_state.n_cand_max[None], n_envs[None])
+        if qd.static(not per_env)
+        else qd.ndrange(n_cand_env, 1)
+    ):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+        if not func_is_env_active(i_b, mochi_state, skip_ls_done):
+            continue
+        if i_c >= contact_state.n_cand[i_b]:
+            continue
+        i_p = contact_state.cand_pair[i_c, i_b]
+        i_s = contact_state.cand_sample[i_c, i_b]
+        func_contact_eval_sample(
+            i_p,
+            i_s,
+            i_b,
+            contact_state.pair_link_a[i_p, i_b],
+            contact_state.pair_link_b[i_p, i_b],
+            contact_state.pair_geom_b[i_p, i_b],
+            dyn_state,
+            dyn_info,
+            sdf_info,
+            mochi_info,
+            mochi_state,
+            contact_state,
+            hit_readback,
+            rigid_config,
+            mochi_config,
+            assem_dres,
+            record,
+            errno,
+        )
+
+
+@qd.kernel
+def kernel_contact_eval_candidates(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    sdf_info: array_class.SDFInfo,
+    mochi_info: MochiInfo,
+    mochi_state: MochiState,
+    contact_state: MochiContactState,
+    hit_readback: MochiHitReadback,
+    rigid_config: qd.template(),
+    mochi_config: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
+    record: qd.template(),
+    errno: qd.Tensor,
+):
+    func_contact_eval_candidates(
         0,
         False,
         mochi_state.all_envs,

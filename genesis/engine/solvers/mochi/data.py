@@ -97,6 +97,8 @@ class MochiStaticConfig(metaclass=AutoInitMeta):
     has_soft_colliders: bool
     # levels of the bounding-box hierarchy of the collider tetrahedra (the refit runs one task per level)
     tet_tree_levels: int
+    # contact candidates are cached between assemblies while no link or vertex moved past the certificate bound
+    contact_cache: bool
 
 
 # =========================================== build-time info ===========================================
@@ -122,6 +124,9 @@ class MochiLinksInfo:
     # Node range of the link's contact-sample hierarchy (depth-first order, see sample_tree.py).
     tree_start: qd.Tensor
     tree_end: qd.Tensor
+    # Radius about the link origin covering its contact samples and its collider geoms (unbounded for a plane):
+    # any surface point moves at most the origin displacement plus the rotation angle times this radius.
+    bound_radius: qd.Tensor
 
 
 def get_mochi_links_info(solver):
@@ -137,6 +142,7 @@ def get_mochi_links_info(solver):
         sample_start=V(dtype=gs.qd_int, shape=(n_links_,)),
         tree_start=V(dtype=gs.qd_int, shape=(n_links_,)),
         tree_end=V(dtype=gs.qd_int, shape=(n_links_,)),
+        bound_radius=V(dtype=gs.qd_float, shape=(n_links_,)),
         sample_end=V(dtype=gs.qd_int, shape=(n_links_,)),
         samples_aabb_min=V(dtype=gs.qd_vec3, shape=(n_links_,)),
         samples_aabb_max=V(dtype=gs.qd_vec3, shape=(n_links_,)),
@@ -226,6 +232,7 @@ class MochiInfo:
     equality_damping: qd.Tensor
     gravity: qd.Tensor
     broadphase_margin: qd.Tensor
+    contact_candidate_margin: qd.Tensor
     newton_abs_tol: qd.Tensor
     newton_rel_tol: qd.Tensor
     explosion_abs_tol: qd.Tensor
@@ -253,6 +260,7 @@ def get_mochi_info(solver):
         equality_damping=_scalar(gs.qd_float, options.equality_damping),
         gravity=V(dtype=gs.qd_vec3, shape=(solver._B,)),
         broadphase_margin=_scalar(gs.qd_float, options.broadphase_margin),
+        contact_candidate_margin=_scalar(gs.qd_float, solver._contact_candidate_margin),
         newton_abs_tol=_scalar(gs.qd_float, options.newton_abs_tol),
         newton_rel_tol=_scalar(gs.qd_float, options.newton_rel_tol),
         explosion_abs_tol=_scalar(gs.qd_float, options.explosion_abs_tol if options.explosion_control else 0.0),
@@ -374,6 +382,9 @@ class MochiState:
     status: qd.Tensor
     n_iter: qd.Tensor
     n_pcg_iter: qd.Tensor
+    # Contact cache: whether the next assembly must search for contacts, and the number of searches of the step.
+    needs_detect: qd.Tensor
+    n_detections: qd.Tensor
     # every environment index in order, and the batch size: the identity environment list of the step functions
     all_envs: qd.Tensor
     n_envs_all: qd.Tensor
@@ -457,6 +468,8 @@ def get_mochi_state(solver, max_pairs, has_dense):
         status=V(dtype=gs.qd_int, shape=(_B,)),
         n_iter=V(dtype=gs.qd_int, shape=(_B,)),
         n_pcg_iter=V(dtype=gs.qd_int, shape=(_B,)),
+        needs_detect=V(dtype=gs.qd_int, shape=(_B,)),
+        n_detections=V(dtype=gs.qd_int, shape=(_B,)),
         all_envs=V(dtype=gs.qd_int, shape=(_B,)),
         n_envs_all=_scalar(gs.qd_int, _B),
         graph_is_first=_scalar(gs.qd_int, 0),
@@ -512,13 +525,21 @@ class MochiContactState:
     acc_SDS: qd.Tensor
     acc_obj: qd.Tensor
     n_hits: qd.Tensor
+    # Contact cache: the link poses of the last contact search and the (pair, sample) candidates it recorded, the
+    # samples within the contact range of their collider widened by the candidate margin.
+    links_pos_det: qd.Tensor
+    links_quat_det: qd.Tensor
+    n_cand: qd.Tensor
+    n_cand_max: qd.Tensor
+    cand_pair: qd.Tensor
+    cand_sample: qd.Tensor
     # Conservative per-step world bounds of every link's sample cloud, and the motion padding of every link.
     links_step_aabb_min: qd.Tensor
     links_step_aabb_max: qd.Tensor
     links_step_pad: qd.Tensor
 
 
-def get_mochi_contact_state(solver, max_pairs):
+def get_mochi_contact_state(solver, max_pairs, max_cand):
     _B = solver._B
     n_links_ = solver.n_links_
     return MochiContactState(
@@ -533,6 +554,12 @@ def get_mochi_contact_state(solver, max_pairs):
         acc_SDS=V(dtype=gs.qd_vec6, shape=(max_pairs, _B)),
         acc_obj=V(dtype=gs.qd_float, shape=(max_pairs, _B)),
         n_hits=V(dtype=gs.qd_int, shape=(max_pairs, _B)),
+        links_pos_det=V(dtype=gs.qd_vec3, shape=(n_links_, _B)),
+        links_quat_det=V(dtype=gs.qd_vec4, shape=(n_links_, _B)),
+        n_cand=V(dtype=gs.qd_int, shape=(_B,)),
+        n_cand_max=_scalar(gs.qd_int, 0),
+        cand_pair=V(dtype=gs.qd_int, shape=(max_cand, _B)),
+        cand_sample=V(dtype=gs.qd_int, shape=(max_cand, _B)),
         links_step_aabb_min=V(dtype=gs.qd_vec3, shape=(n_links_, _B)),
         links_step_aabb_max=V(dtype=gs.qd_vec3, shape=(n_links_, _B)),
         links_step_pad=V(dtype=gs.qd_float, shape=(n_links_, _B)),
@@ -875,6 +902,8 @@ class MochiSoftState:
     # Vertex positions (the unknowns) and finite-difference velocities, with their multistep history and the
     # step-start / stage-start references and line search reference of the current solve.
     verts_pos: qd.Tensor
+    # vertex positions of the last contact search (contact cache certificate)
+    verts_pos_det: qd.Tensor
     verts_vel: qd.Tensor
     verts_pos_prev: qd.Tensor
     verts_vel_prev: qd.Tensor
@@ -957,6 +986,20 @@ class MochiSoftState:
     # Active samples against the point-cloud colliders of the shells: colliding side as above, collider vertex.
     n_pc_hits: qd.Tensor
     n_pc_hits_max: qd.Tensor
+    # Contact cache: candidates of the last contact search (deformable sample vs rigid collider pair, query vs
+    # tetrahedron, deformable sample vs collider vertex), their per-environment counts and the largest count.
+    n_soft_cand: qd.Tensor
+    n_soft_cand_max: qd.Tensor
+    soft_cand_pair: qd.Tensor
+    soft_cand_sample: qd.Tensor
+    n_sc_cand: qd.Tensor
+    n_sc_cand_max: qd.Tensor
+    sc_cand_query: qd.Tensor
+    sc_cand_elem: qd.Tensor
+    n_pc_cand: qd.Tensor
+    n_pc_cand_max: qd.Tensor
+    pc_cand_query: qd.Tensor
+    pc_cand_vert: qd.Tensor
     pc_hit_kind_a: qd.Tensor
     pc_hit_sample_a: qd.Tensor
     pc_hit_link_a: qd.Tensor
@@ -975,13 +1018,16 @@ class MochiSoftState:
     att_c_start: qd.Tensor
 
 
-def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max_pc_hits):
+def get_mochi_soft_state(
+    solver, max_soft_pairs, max_soft_hits, max_sc_hits, max_pc_hits, max_soft_cand, max_sc_cand, max_pc_cand
+):
     _B = solver._B
     n_sv_, n_el_, n_se_ = solver.n_soft_verts_, solver.n_soft_elems_, solver.n_soft_entities_
     n_sh_ = solver.n_shell_elems_
     n_re_, n_rs_ = solver.n_rod_elems_, solver.n_rod_stencils_
     return MochiSoftState(
         verts_pos=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
+        verts_pos_det=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
         verts_vel=V(dtype=gs.qd_vec3, shape=(n_sv_, _B)),
         verts_pos_prev=V(dtype=gs.qd_vec3, shape=(N_HISTORY, n_sv_, _B)),
         verts_vel_prev=V(dtype=gs.qd_vec3, shape=(N_HISTORY, n_sv_, _B)),
@@ -1035,6 +1081,18 @@ def get_mochi_soft_state(solver, max_soft_pairs, max_soft_hits, max_sc_hits, max
         hit_D=V(dtype=gs.qd_vec6, shape=(max_soft_hits, _B)),
         n_sc_hits=V(dtype=gs.qd_int, shape=(_B,)),
         n_sc_hits_max=_scalar(gs.qd_int, 0),
+        n_soft_cand=V(dtype=gs.qd_int, shape=(_B,)),
+        n_soft_cand_max=_scalar(gs.qd_int, 0),
+        soft_cand_pair=V(dtype=gs.qd_int, shape=(max_soft_cand, _B)),
+        soft_cand_sample=V(dtype=gs.qd_int, shape=(max_soft_cand, _B)),
+        n_sc_cand=V(dtype=gs.qd_int, shape=(_B,)),
+        n_sc_cand_max=_scalar(gs.qd_int, 0),
+        sc_cand_query=V(dtype=gs.qd_int, shape=(max_sc_cand, _B)),
+        sc_cand_elem=V(dtype=gs.qd_int, shape=(max_sc_cand, _B)),
+        n_pc_cand=V(dtype=gs.qd_int, shape=(_B,)),
+        n_pc_cand_max=_scalar(gs.qd_int, 0),
+        pc_cand_query=V(dtype=gs.qd_int, shape=(max_pc_cand, _B)),
+        pc_cand_vert=V(dtype=gs.qd_int, shape=(max_pc_cand, _B)),
         sc_hit_kind_a=V(dtype=gs.qd_int, shape=(max_sc_hits, _B)),
         sc_hit_sample_a=V(dtype=gs.qd_int, shape=(max_sc_hits, _B)),
         sc_hit_link_a=V(dtype=gs.qd_int, shape=(max_sc_hits, _B)),
