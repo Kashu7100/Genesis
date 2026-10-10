@@ -245,15 +245,13 @@ class Viewer(RBC):
             now = time.perf_counter()
             period = 1.0 / self._refresh_rate
             last_update_time, self._last_update_time = self._last_update_time, now
-            last_draw_time = self._pyrender_viewer._last_draw_time
             if (
                 last_update_time is not None
                 and now - last_update_time > 2.0 * period
-                and now - last_draw_time > 2.0 * period
+                and now - self._pyrender_viewer._last_draw_time > 2.0 * period
             ):
-                deadline = now + period
-                while self._pyrender_viewer._last_draw_time == last_draw_time and time.perf_counter() < deadline:
-                    time.sleep(0.002)
+                self._pyrender_viewer._draw_event.clear()
+                self._pyrender_viewer._draw_event.wait(timeout=period)
 
         # Pace the stepping loop to real time when a factor is set (no effect once the sim falls behind). Read the
         # pacer once: the realtime_factor setter may swap it from the viewer thread between the check and the call.

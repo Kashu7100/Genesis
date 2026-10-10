@@ -118,18 +118,6 @@ def func_assemble_links(
             energy -= pos_c.dot(mg)
             g_t -= mg
 
-        # Damping of the motion over the stage
-        c = mochi_info.links.damping[i_l]
-        if c > 0.0:
-            kappa = c / h
-            dpos = pos_c - pos_c_start
-            A_d = rotation_difference_matrix(R_c, R_c_start, 0.5 * kappa * I3)
-            energy += 0.5 * kappa * dpos.norm_sqr() + rotation_difference_merit(R_c, R_c_start, 0.5 * kappa * I3)
-            g_t += kappa * dpos
-            g_r += rotation_difference_gradient(A_d)
-            H_t += kappa * I3
-            H_r += rotation_difference_hessian(A_d)
-
         # Center of mass -> link origin: d pos_c = d pos - [r_c]x d theta.
         S_c = skew(r_c)
         if qd.static(assem_obj):

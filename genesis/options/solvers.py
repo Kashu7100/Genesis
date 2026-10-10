@@ -1033,9 +1033,6 @@ class MochiOptions(GravityMixin, TimeBasedMixin):
     fade_friction : bool, optional
         Whether friction fades out as the colliding surface normal and the collider gradient become aligned, i.e. as a
         sample point passes through the far side of a thin collider. Defaults to True.
-    max_alignment_normals : float, optional
-        Cosine of the angle between the colliding surface normal and the collider gradient above which a contact is
-        disabled, so that a fully embedded body can escape instead of being trapped. Defaults to 0.0.
     implicit_normal_force_for_dissipation : bool, optional
         Whether friction and damping scale with the normal force evaluated at the current iterate instead of the one
         recovered at the start of the step. The implicit form is required for an accurate coefficient of restitution
@@ -1128,7 +1125,6 @@ class MochiOptions(GravityMixin, TimeBasedMixin):
     use_fitted_friction_hessian: StrictBool = True
     friction_with_collider_normal: StrictBool = True
     fade_friction: StrictBool = True
-    max_alignment_normals: float = 0.0
     implicit_normal_force_for_dissipation: StrictBool = False
     boundary_element_type: Literal["P1Q1", "P1Q3", "P1Q6"] = "P1Q3"
     equality_stiffness: PositiveFloat = 1e6
@@ -1151,8 +1147,6 @@ class MochiOptions(GravityMixin, TimeBasedMixin):
     def model_post_init(self, context: Any) -> None:
         if not (0.0 < self.linesearch_alpha < 1.0):
             gs.raise_exception("`linesearch_alpha` must be strictly between 0 and 1.")
-        if not (-1.0 <= self.max_alignment_normals <= 1.0):
-            gs.raise_exception("`max_alignment_normals` must be in [-1, 1].")
 
 
 class SFOptions(TimeBasedMixin):

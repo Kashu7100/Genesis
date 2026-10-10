@@ -231,20 +231,6 @@ class Simulator(RBC):
         # A coupler exchanges state once per substep, so it is built once the rate that loop runs at is known.
         self._coupler.build()
 
-        if self.mochi_solver.is_active:
-            other_solvers = [
-                solver
-                for solver in self._active_solvers
-                if solver is not self.mochi_solver and type(solver) is not KinematicSolver
-            ]
-            if other_solvers:
-                gs.raise_exception(
-                    "MochiSolver cannot run alongside other physics solvers: "
-                    f"{[type(solver).__name__ for solver in other_solvers]}."
-                )
-            if self._requires_grad:
-                gs.raise_exception("MochiSolver does not support differentiable simulation.")
-
         if self.n_envs > 0 and self.sf_solver.is_active:
             gs.raise_exception("Batching is not supported for SF solver as of now.")
 
@@ -363,10 +349,8 @@ class Simulator(RBC):
         # kernel right away. Moreover, if computations are still not done at this point, then the queue will just
         # continue growing endlessly, which will not make the simulation faster either.
         if self._cur_substep_global % RATE_CHECK_ERRNO == 0:
-            if self.rigid_solver.is_active:
-                self.rigid_solver.check_errno()
-            if self.mochi_solver.is_active:
-                self.mochi_solver.check_errno()
+            for solver in self._active_solvers:
+                solver.check_errno()
 
         # Reconstructing a checkpoint window replays steps the environments already simulated, so only a forward step
         # advances their clock. The backward pass winds it down again through `_step_grad`.

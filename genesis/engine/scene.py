@@ -888,12 +888,12 @@ class Scene(RBC):
 
         with gs.logger.timer("Compiling simulation kernels..."):
             self._sim.step()
-            if self._sim.rigid_solver.is_active:
-                try:
-                    self._sim.rigid_solver.check_errno()
-                except gs.GenesisException:
-                    self.destroy()
-                    raise
+            try:
+                for solver in self._sim.active_solvers:
+                    solver.check_errno()
+            except gs.GenesisException:
+                self.destroy()
+                raise
             self._reset()
 
         # visualizer

@@ -80,8 +80,6 @@ def kernel_init_mochi_fields(
     links_has_gravity: qd.types.ndarray(),
     links_mass: qd.types.ndarray(),
     links_inertia: qd.types.ndarray(),
-    links_damping: qd.types.ndarray(),
-    links_layer: qd.types.ndarray(),
     links_sample_start: qd.types.ndarray(),
     links_sample_end: qd.types.ndarray(),
     links_samples_aabb_min: qd.types.ndarray(),
@@ -108,8 +106,6 @@ def kernel_init_mochi_fields(
         mochi_info.links.is_dynamic[i_l] = links_is_dynamic[i_l]
         mochi_info.links.has_gravity[i_l] = links_has_gravity[i_l]
         mochi_info.links.mass[i_l] = links_mass[i_l]
-        mochi_info.links.damping[i_l] = links_damping[i_l]
-        mochi_info.links.layer[i_l] = links_layer[i_l]
         mochi_info.links.sample_start[i_l] = links_sample_start[i_l]
         mochi_info.links.sample_end[i_l] = links_sample_end[i_l]
         trace = gs.qd_float(0.0)
@@ -431,15 +427,6 @@ def kernel_broadphase_pairs(
         rigid_config,
         errno,
     )
-
-
-@qd.func
-def func_pair_param(value_a, value_b, is_static_b: qd.template()):
-    """Geometric mean of the two bodies' parameter, or the colliding body's value against a static collider."""
-    value = qd.sqrt(value_a * value_b)
-    if qd.static(is_static_b):
-        value = value_a
-    return value
 
 
 @qd.func

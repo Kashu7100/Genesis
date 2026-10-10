@@ -253,7 +253,7 @@ class Raytracer:
                 if isinstance(entity, entities.RigidEntity):
                     for geom in entity.geoms:
                         self.add_surface(str(geom.uid), geom.surface)
-            elif isinstance(entity, entities.FEMEntity):
+            elif isinstance(entity, (entities.FEMEntity, entities.MochiSoftEntity)):
                 for vgeom in entity.vgeoms:
                     self.add_surface(str(vgeom.uid), vgeom.surface)
             else:
@@ -271,8 +271,11 @@ class Raytracer:
                 )
 
         # rigid entities
-        if self.sim.rigid_solver.is_active:
-            for rigid_entity in self.sim.rigid_solver.entities:
+        for solver in (self.sim.rigid_solver, self.sim.mochi_solver):
+            if not solver.is_active:
+                continue
+
+            for rigid_entity in solver.entities:
                 if rigid_entity.surface.vis_mode == "visual":
                     geoms = rigid_entity.vgeoms
                 else:
@@ -280,27 +283,6 @@ class Raytracer:
 
                 for geom in geoms:
                     if "sdf" in rigid_entity.surface.vis_mode:
-                        mesh = geom.get_sdf_trimesh()
-                    else:
-                        mesh = geom.get_trimesh()
-                    self.add_rigid_batch(
-                        name=str(geom.uid),
-                        vertices=mesh.vertices,
-                        triangles=mesh.faces,
-                        normals=mesh.vertex_normals,
-                        uvs=np.array([]) if geom.uvs is None else geom.uvs,
-                    )
-
-        # mochi entities
-        if self.sim.mochi_solver.is_active:
-            for mochi_entity in self.sim.mochi_solver.entities:
-                if mochi_entity.surface.vis_mode == "visual":
-                    geoms = mochi_entity.vgeoms
-                else:
-                    geoms = mochi_entity.geoms
-
-                for geom in geoms:
-                    if "sdf" in mochi_entity.surface.vis_mode:
                         mesh = geom.get_sdf_trimesh()
                     else:
                         mesh = geom.get_trimesh()
@@ -362,19 +344,11 @@ class Raytracer:
                         pbd_entity._tets_mesh = mesh
                         self.add_deformable(str(pbd_entity.uid))
 
-        # FEM entities
-        if self.sim.fem_solver.is_active:
-            for fem_entity in self.sim.fem_solver.entities:
-                if fem_entity.surface.vis_mode == "visual":
-                    for vgeom in fem_entity.vgeoms:
-                        self.add_deformable(str(vgeom.uid))
-
-        # Deformable Mochi entities
-        if self.sim.mochi_solver.has_soft:
-            for soft_entity in self.sim.mochi_solver.soft_entities:
-                if soft_entity.surface.vis_mode == "visual":
-                    for vgeom in soft_entity.vgeoms:
-                        self.add_deformable(str(vgeom.uid))
+        # deformable entities (FEM and Mochi)
+        for deformable_entity in (*self.sim.fem_solver.entities, *self.sim.mochi_solver.soft_entities):
+            if deformable_entity.surface.vis_mode == "visual":
+                for vgeom in deformable_entity.vgeoms:
+                    self.add_deformable(str(vgeom.uid))
 
     def get_transform(self, matrix):
         if matrix is None:
@@ -829,38 +803,22 @@ class Raytracer:
                             np.array([]),
                         )
 
-        # Deformable Mochi entities
-        if self.sim.mochi_solver.has_soft:
-            vverts_pos, _, _ = self.sim.mochi_solver.get_soft_state_render(self.sim.cur_substep_local)
+        # deformable entities (FEM and Mochi)
+        for deformable_entities, get_state_render in (
+            (self.sim.fem_solver.entities, self.sim.fem_solver.get_state_render),
+            (self.sim.mochi_solver.soft_entities, self.sim.mochi_solver.get_soft_state_render),
+        ):
+            if not deformable_entities:
+                continue
+
+            vverts_pos, _, _ = get_state_render(self.sim.cur_substep_local)
             vverts_all = miscu.qd_to_numpy(vverts_pos, self.rendered_envs_idx[0], keepdim=False, transpose=True)
 
-            for soft_entity in self.sim.mochi_solver.soft_entities:
-                if soft_entity.surface.vis_mode != "visual":
+            for deformable_entity in deformable_entities:
+                if deformable_entity.surface.vis_mode != "visual":
                     continue
 
-                for vgeom in soft_entity.vgeoms:
-                    render_verts = vverts_all[vgeom.vvert_start : vgeom.vvert_end]
-                    vertex_normals = trimesh.Trimesh(
-                        vertices=render_verts, faces=vgeom.vmesh.faces, process=False
-                    ).vertex_normals
-                    self.update_deformable(
-                        str(vgeom.uid),
-                        render_verts,
-                        vgeom.vmesh.faces,
-                        vertex_normals,
-                        np.array([]) if vgeom.uvs is None else vgeom.uvs,
-                    )
-
-        # FEM entities
-        if self.sim.fem_solver.is_active:
-            vverts_pos, _, _ = self.sim.fem_solver.get_state_render(self.sim.cur_substep_local)
-            vverts_all = miscu.qd_to_numpy(vverts_pos, self.rendered_envs_idx[0], keepdim=False, transpose=True)
-
-            for fem_entity in self.sim.fem_solver.entities:
-                if fem_entity.surface.vis_mode != "visual":
-                    continue
-
-                for vgeom in fem_entity.vgeoms:
+                for vgeom in deformable_entity.vgeoms:
                     render_verts = vverts_all[vgeom.vvert_start : vgeom.vvert_end]
                     vertex_normals = trimesh.Trimesh(
                         vertices=render_verts, faces=vgeom.vmesh.faces, process=False

@@ -4,7 +4,7 @@
 
 Protocol (shared with bench_mochi.py): warm-up steps, then `--n-windows` windows of `--n-steps` steps; the best and the
 mean window are reported in ms/step. Every run also records the solver's memory (per environment and static, from
-`MochiSolver.memory_report()`), the process' device memory (NVML, when available), the Newton and conjugate-gradient
+`memory_report`), the process' device memory (NVML, when available), the Newton and conjugate-gradient
 iteration counts and the usage of the bounded contact lists. `--profile` adds the quadrants kernel profiler (launches per
 step, kernel time, top kernels), `--hits` reads the contact-hit lists back (counts, redundancy of the self-contact
 couplings), `--cprofile` profiles the Python side of a step. Results are written as JSON into `--out` (default `results/`).
@@ -13,6 +13,7 @@ couplings), `--cprofile` profiles the Python side of a step. Results are written
 import argparse
 import contextlib
 import cProfile
+import dataclasses
 import io
 import json
 import os
@@ -40,6 +41,89 @@ def vram_mib():
         return backend.get_per_process_vram_mib().get(os.getpid()), backend.get_device_vram_mib()[0]
     except (ImportError, OSError, RuntimeError, KeyError, IndexError):
         return None, None
+
+
+def memory_report(solver):
+    """Bytes held by the arrays of the solver: totals, the per-environment and static parts and every field by size.
+
+    An array counts as per environment when one of its axes has the batch size, which is unambiguous from two
+    environments on.
+    """
+    import numpy as np
+    import torch
+    from quadrants.lang.util import to_numpy_type
+
+    _B = solver._B
+
+    def tensor_bytes(tensor):
+        if hasattr(tensor, "get_member_field") and hasattr(tensor, "keys"):
+            keys = tensor.keys() if callable(tensor.keys) else tensor.keys
+            return sum(tensor_bytes(tensor.get_member_field(key))[0] for key in keys), tuple(tensor.shape)
+        shape = tuple(int(n) for n in tensor.shape)
+        element_shape = tuple(int(n) for n in (getattr(tensor, "element_shape", None) or ()))
+        n_bytes = np.prod(shape, dtype=np.int64) * np.prod(element_shape, dtype=np.int64)
+        return int(n_bytes) * np.dtype(to_numpy_type(tensor.dtype)).itemsize, shape
+
+    def is_tensor(value):
+        return hasattr(value, "shape") and hasattr(value, "dtype") and not isinstance(value, (np.ndarray, torch.Tensor))
+
+    def walk(obj, prefix, fields, seen):
+        if obj is None or id(obj) in seen:
+            return
+        seen.add(id(obj))
+        if dataclasses.is_dataclass(obj):
+            items = [(field.name, getattr(obj, field.name)) for field in dataclasses.fields(obj)]
+        elif hasattr(obj, "__dict__"):
+            items = list(vars(obj).items())
+        else:
+            return
+        for name, value in items:
+            if is_tensor(value):
+                n_bytes, shape = tensor_bytes(value)
+                fields.append((f"{prefix}.{name}", n_bytes, shape))
+            elif dataclasses.is_dataclass(value) or type(value).__module__.startswith(("genesis.", "quadrants.")):
+                if not isinstance(value, (str, bytes, np.ndarray, torch.Tensor)):
+                    walk(value, f"{prefix}.{name}", fields, seen)
+
+    fields = []
+    seen = set()
+    for name in (
+        "mochi_info",
+        "mochi_state",
+        "contact_state",
+        "island_state",
+        "eq_info",
+        "eq_state",
+        "soft_info",
+        "soft_state",
+        "hit_readback",
+        "dyn_state",
+        "dyn_info",
+        "rigid_info",
+        "geoms_init_AABB",
+        "_soft_vverts_render",
+        "_errno",
+    ):
+        value = getattr(solver, name, None)
+        if is_tensor(value):
+            n_bytes, shape = tensor_bytes(value)
+            fields.append((name, n_bytes, shape))
+        else:
+            walk(value, name, fields, seen)
+    if solver.sdf is not None:
+        walk(solver.sdf._sdf_info, "sdf_info", fields, seen)
+    total = sum(n_bytes for _, n_bytes, _ in fields)
+    per_env_bytes = sum(n_bytes for _, n_bytes, shape in fields if _B >= 2 and _B in shape)
+    return {
+        "total_bytes": total,
+        "per_env_bytes": per_env_bytes // _B if _B >= 2 else None,
+        "static_bytes": total - per_env_bytes if _B >= 2 else None,
+        "n_envs": _B,
+        "fields": sorted(
+            ({"name": name, "bytes": n_bytes, "shape": shape} for name, n_bytes, shape in fields),
+            key=lambda item: -item["bytes"],
+        ),
+    }
 
 
 def hit_statistics(solver):
@@ -140,7 +224,7 @@ def main():
         qd.sync()
         windows.append((time.perf_counter() - t0) / args.n_steps * 1e3)
     info = solver.get_convergence_info()
-    memory = solver.memory_report()
+    memory = memory_report(solver)
     vram_process, vram_device = vram_mib()
     mem_per_env = memory["per_env_bytes"] / MIB if memory["per_env_bytes"] is not None else None
     max_envs = None
