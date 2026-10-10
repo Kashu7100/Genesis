@@ -88,7 +88,7 @@ def main():
         # After the ball has settled, drive the corners along a sinusoidal sway; they reach the prescribed positions
         # exactly at the end of each step.
         if i_step >= 120:
-            t = (i_step + 1 - 120) * scene.sim_options.dt
+            t = (i_step + 1 - 120) * scene.options.sim.dt
             net.set_vertices_target(corners, corners_rest + np.array([0.15 * np.sin(np.pi * t), 0.0, 0.0]))
         scene.step()
         if i_step % 60 == 0:

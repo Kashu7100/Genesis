@@ -4,14 +4,10 @@
 """Simulation islands of the MochiSolver: bodies coupled through this step's contact candidates are grouped per
 environment, and the direct linear solver factorizes the Newton system island by island."""
 
-import dataclasses
-
-import numpy as np
 import quadrants as qd
 
 import genesis as gs
 from genesis.utils import array_class
-from genesis.utils.array_class import V
 
 from .data import (
     COLLIDER_TYPE,
@@ -21,7 +17,6 @@ from .data import (
     MochiSoftInfo,
     MochiSoftState,
     MochiState,
-    get_mochi_island_state,
 )
 from .equalities import MochiEqualitiesInfo
 

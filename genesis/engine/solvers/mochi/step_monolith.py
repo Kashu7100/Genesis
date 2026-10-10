@@ -14,12 +14,6 @@ import quadrants as qd
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.engine.solvers.rigid.abd.forward_kinematics import (
-    func_COM_links,
-    func_forward_kinematics_batch,
-    func_forward_velocity_batch,
-    func_update_geoms_batch,
-)
 from genesis.utils import array_class
 
 from .articulated import func_assemble_joints, func_project_links_residual, func_update_conv_weights
@@ -48,6 +42,7 @@ from .equalities import (
 )
 from .integration import func_post_stage, func_step_start, func_store_stage_start_poses
 from .islands import func_build_islands, func_cholesky_solve_islands
+from .kinematics import func_forward_kinematics_env
 from .linear_solver import func_condense_dense, func_pcg_init, func_pcg_iter
 from .newton import (
     func_apply_increment,
@@ -102,11 +97,7 @@ def func_update_kinematics_env(
     with_velocity: qd.template(),
 ):
     """Link poses, motion subspaces, geom poses and bounds of one environment (joint-space velocities on request)."""
-    func_forward_kinematics_batch(i_b, dyn_state, dyn_info, rigid_info, rigid_config, is_backward=False)
-    func_COM_links(i_b, dyn_state, dyn_info, rigid_info, rigid_config, is_backward=False)
-    if qd.static(with_velocity):
-        func_forward_velocity_batch(i_b, dyn_state, dyn_info, rigid_info, rigid_config, is_backward=False)
-    func_update_geoms_batch(i_b, dyn_state, dyn_info, rigid_info, rigid_config, False, is_backward=False)
+    func_forward_kinematics_env(i_b, dyn_state, dyn_info, rigid_info, rigid_config, with_velocity)
     n_geoms = dyn_state.geoms.pos.shape[0]
     for i_g in range(n_geoms):
         g_pos = dyn_state.geoms.pos[i_g, i_b]

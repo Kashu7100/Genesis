@@ -2823,12 +2823,6 @@ def kernel_soft_set_pair_enabled(
         soft_info.entities_pair_enabled[i_e, j_e] = entities_pair_enabled[i_e, j_e]
 
 
-@qd.kernel
-def kernel_soft_collider_query(bvh: qd.template(), query_aabbs: qd.template()) -> qd.i32:
-    """Intersect the sample points with the tetrahedron hierarchy; returns 1 when the result buffer overflowed."""
-    return 1 if bvh.query(query_aabbs) else 0
-
-
 # ------------------------------------------------------------------------------------
 # --------------------------------------- shells -------------------------------------
 # ------------------------------------------------------------------------------------
@@ -3130,19 +3124,6 @@ def func_rod_stencil_dofs(i_s, soft_info: MochiSoftInfo):
     dofs[3] = func_rod_twist_dof(e[0], soft_info)
     dofs[7] = func_rod_twist_dof(e[1], soft_info)
     return dofs
-
-
-@qd.func
-def func_rod_stencil_dof_is_free(i_s, p: qd.template(), i_b, soft_info: MochiSoftInfo, soft_state: MochiSoftState):
-    v = soft_info.rod_stencils_v[i_s]
-    is_free = True
-    if qd.static(p < 3):
-        is_free = not soft_state.verts_is_fixed[v[0], i_b]
-    elif qd.static(4 <= p < 7):
-        is_free = not soft_state.verts_is_fixed[v[1], i_b]
-    elif qd.static(p >= 8):
-        is_free = not soft_state.verts_is_fixed[v[2], i_b]
-    return is_free
 
 
 @qd.kernel
@@ -3660,7 +3641,6 @@ def func_rod_update_conv_weights(
     """Convergence weights of the twist degrees of freedom from the rotational inertia: 1 / ((a_ref / r_gyr)^2 sum_e
     I_e I_e) with the gyration radius sqrt(I_lin / rho_lin) of the entity."""
     n_elems = soft_state.rod_elems_H.shape[0]
-    n_entities = soft_info.entities_mass.shape[0]
     _B = soft_state.verts_pos.shape[1]
     EPS = mochi_info.EPS[None]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))

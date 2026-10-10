@@ -4,7 +4,7 @@
 import dataclasses
 import math
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import igl
 import numpy as np
@@ -15,10 +15,12 @@ import genesis as gs
 import genesis.utils.geom as gu
 from genesis.constants import link_ref_frame
 from genesis.engine.entities.mochi_entity import MochiEntity, MochiSoftEntity
+from genesis.engine.materials import Mochi
 from genesis.engine.states.solvers import MochiSolverState
+from genesis.options.morphs import Morph
 from genesis.options.solvers import MochiOptions
 from genesis.utils import array_class
-from genesis.utils.misc import fits_in_gpu_shared_memory, qd_to_numpy, qd_to_torch, tensor_to_array
+from genesis.utils.misc import get_gpu_shared_tile_sizes, qd_to_numpy, qd_to_torch, tensor_to_array
 from genesis.utils.sdf import SDF
 
 from ..base_solver import GravityMixin, StateChange, Subscriber, TimeBasedMixin
@@ -37,13 +39,13 @@ from ..rigid.abd.accessor import (
     kernel_set_dofs_limit,
     kernel_set_dofs_stiffness,
 )
-from ..rigid.abd.forward_kinematics import kernel_forward_kinematics, kernel_update_geom_aabbs, kernel_update_geoms
+from ..rigid.abd.forward_kinematics import kernel_forward_kinematics, kernel_update_geoms
 from ..rigid.abd.misc import (
     kernel_bit_reduction,
     kernel_init_entity_fields,
     kernel_init_geom_fields,
+    kernel_init_link_dynamics,
     kernel_init_vert_fields,
-    kernel_update_geoms_render_T,
 )
 from .articulated import kernel_assemble_joints, kernel_project_links_residual, kernel_update_conv_weights
 from .colliders import query_collider
@@ -73,6 +75,7 @@ from .data import (
     get_mochi_contact_state,
     get_mochi_hit_readback,
     get_mochi_info,
+    get_mochi_island_state,
     get_mochi_soft_info,
     get_mochi_soft_state,
     get_mochi_state,
@@ -89,8 +92,8 @@ from .integration import (
     kernel_step_start,
     kernel_store_stage_start_poses,
 )
-from .islands import get_mochi_island_state, kernel_build_islands, kernel_cholesky_solve_islands
-from .kinematics import kernel_update_kinematics
+from .islands import kernel_build_islands, kernel_cholesky_solve_islands
+from .kinematics import kernel_update_geom_aabbs, kernel_update_kinematics
 from .linear_solver import (
     kernel_condense_dense,
     kernel_pcg_any_active,
@@ -195,6 +198,35 @@ _AUTO_COLLIDER_TYPE_BY_GEOM_TYPE = {
 }
 
 
+class SoftCSRLayout(NamedTuple):
+    """Scalar compressed sparse row (CSR) sparsity of the deformable Hessian and the CSR index tables of the element
+    blocks (see `MochiSolver._soft_csr_layout`)."""
+
+    start: np.ndarray
+    col: np.ndarray
+    elems: np.ndarray
+    shell: np.ndarray
+    rod_elems: np.ndarray
+    rod_stencils: np.ndarray
+    elems_block: np.ndarray
+    shell_block: np.ndarray
+
+
+class RodBandLayout(NamedTuple):
+    """Band ordering of the open rods' degrees of freedom and the rod ranges per entity (see
+    `MochiSolver._rod_band_layout`)."""
+
+    dofs_row: np.ndarray
+    rows_dof: np.ndarray
+    rows_entity: np.ndarray
+    band_start: np.ndarray
+    band_n: np.ndarray
+    rod_elem_start: np.ndarray
+    rod_elem_end: np.ndarray
+    rod_stencil_start: np.ndarray
+    rod_stencil_end: np.ndarray
+
+
 def _next_power_of_two(n):
     return 1 << max(0, int(n) - 1).bit_length()
 
@@ -209,6 +241,9 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     assembled from per-link, per-contact-pair and per-tetrahedron blocks. The solve is a damped Newton iteration with a
     line search; contact is re-detected at every iterate.
     """
+
+    material_cls = Mochi.Base
+    _entity_classes = ((Morph, MochiEntity),)
 
     def __init__(self, scene: "Scene", sim: "Simulator", options: MochiOptions) -> None:
         super().__init__(scene, sim, options)
@@ -233,11 +268,12 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     # ----------------------------------- add_entity -------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def add_entity(self, idx, material, morph, surface, visualize_contact=False, name=None):
-        if isinstance(morph, (tuple, list)):
+    def add_entity(self, idx, material, morph, surface, visualize_contact=False, name=None, desc=None):
+        morphs = desc.morphs if desc is not None else ((morph,) if isinstance(morph, Morph) else tuple(morph))
+        if len(morphs) > 1:
             gs.raise_exception("Heterogeneous morphs are not supported by the MochiSolver.")
-        if isinstance(morph, (gs.morphs.Terrain, gs.morphs.USD, gs.morphs.Drone)):
-            gs.raise_exception(f"Morph {type(morph).__name__} is not supported by the MochiSolver.")
+        if isinstance(morphs[0], (gs.morphs.Terrain, gs.morphs.USD, gs.morphs.Drone)):
+            gs.raise_exception(f"Morph {type(morphs[0]).__name__} is not supported by the MochiSolver.")
 
         if isinstance(material, (gs.materials.Mochi.Elastic, gs.materials.Mochi.Shell, gs.materials.Mochi.Rod)):
             is_rod = isinstance(material, gs.materials.Mochi.Rod)
@@ -259,8 +295,6 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 idx=idx,
                 idx_in_solver=self.n_soft_entities,
                 v_start=self.n_soft_verts,
-                el_start=self.n_soft_elems,
-                s_start=self.n_soft_surfaces,
                 vvert_start=self.n_soft_vverts,
                 vface_start=self.n_soft_vfaces,
                 name=name,
@@ -268,37 +302,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             self._soft_entities.append(entity)
             return entity
 
-        morph._enable_mujoco_compatibility = self._enable_mujoco_compatibility
-
-        entity = MochiEntity(
-            scene=self._scene,
-            solver=self,
-            material=material,
-            morph=morph,
-            surface=surface,
-            idx=idx,
-            idx_in_solver=self.n_entities,
-            link_start=self.n_links,
-            joint_start=self.n_joints,
-            q_start=self.n_qs,
-            dof_start=self.n_dofs,
-            geom_start=self.n_geoms,
-            cell_start=self.n_cells,
-            vert_start=self.n_verts,
-            free_verts_state_start=self.n_free_verts,
-            fixed_verts_state_start=self.n_fixed_verts,
-            face_start=self.n_faces,
-            edge_start=self.n_edges,
-            vgeom_start=self.n_vgeoms,
-            vvert_start=self.n_vverts,
-            vface_start=self.n_vfaces,
-            custom_vvert_start=self.n_custom_vverts,
-            custom_vface_start=self.n_custom_vfaces,
-            visualize_contact=visualize_contact,
-            name=name,
-        )
-        self._entities.append(entity)
-        return entity
+        return super().add_entity(idx, material, morph, surface, visualize_contact, name, desc)
 
     # ------------------------------------------------------------------------------------
     # ------------------------------------ build -----------------------------------------
@@ -318,6 +322,20 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         return self.sim._para_level
 
     def build(self):
+        if self.is_active:
+            other_solvers = [
+                solver
+                for solver in self.sim.solvers
+                if solver is not self and solver.is_active and type(solver) is not KinematicSolver
+            ]
+            if other_solvers:
+                gs.raise_exception(
+                    "MochiSolver cannot run alongside other physics solvers: "
+                    f"{[type(solver).__name__ for solver in other_solvers]}."
+                )
+            if self.sim.requires_grad:
+                gs.raise_exception("MochiSolver does not support differentiable simulation.")
+
         self._n_geoms = self.n_geoms
         self._n_cells = self.n_cells
         self._n_verts = self.n_verts
@@ -336,6 +354,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self.n_fixed_verts_ = max(1, self.n_fixed_verts)
 
         super().build()
+        self._init_default_armature()
         self._external_state_dirty_mask = np.zeros((self._B,), dtype=bool)
         # Which of the two linear arms have environments to solve; refreshed at every substep by _select_linear_arms.
         self._has_dense_envs = False
@@ -344,9 +363,6 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if not self.is_active:
             return
 
-        self._n_soft_entities = self.n_soft_entities
-        self._n_soft_verts = self.n_soft_verts
-        self._n_soft_elems = self.n_soft_elems
         self.n_soft_entities_ = max(1, self.n_soft_entities)
         self.n_soft_verts_ = max(1, self.n_soft_verts)
         self.n_soft_elems_ = max(1, self.n_soft_elems)
@@ -372,7 +388,6 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self._init_mochi()
         self._init_soft()
         self._step_kernel = self._resolve_step_kernel()
-        self._use_monolith = self._step_kernel == "monolith"
         # loop counters of the graph step kernel (the same physical arrays every launch)
         self._newton_counter = qd.ndarray(qd.i32, shape=())
         self._round_counter = qd.ndarray(qd.i32, shape=())
@@ -414,6 +429,44 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self.geoms_init_AABB = array_class.V_VEC(3, dtype=gs.qd_float, shape=(self.n_geoms_, 8))
         self._errno = data_manager.errno
 
+    def _init_default_armature(self):
+        """Fill in the default rotor inertia of the rotor joints whose armature the model leaves unset.
+
+        A rotor joint is the single revolute or prismatic joint of a link. Only a scene or robot description file yields
+        one, and its morph states the default armature (see 'KinematicVariantDescription').
+        """
+        dofs_idx, dofs_default = [], []
+        for entity in self._entities:
+            for link in entity.links:
+                if link.n_dofs == 1 and link.joints[0].type in (gs.JOINT_TYPE.REVOLUTE, gs.JOINT_TYPE.PRISMATIC):
+                    if entity.main_morph.default_armature:
+                        dofs_idx.append(link.dof_start)
+                        dofs_default.append(entity.main_morph.default_armature)
+        if not dofs_idx:
+            return
+        dofs_idx, dofs_default = np.array(dofs_idx), np.array(dofs_default)
+        # Field layout, batch last, since the array is written back as a field
+        dofs_armature = qd_to_numpy(self.dyn_info.dofs.armature, transpose=False, copy=True)
+        is_default = (np.atleast_2d(dofs_armature[dofs_idx].T) <= 0.0).all(axis=0)
+        if self._options.batch_dofs_info:
+            dofs_armature[dofs_idx[is_default]] = dofs_default[is_default, None]
+        else:
+            dofs_armature[dofs_idx[is_default]] = dofs_default[is_default]
+        self.dyn_info.dofs.armature.from_numpy(dofs_armature)
+
+    def _init_link_fields(self):
+        if self.links:
+            links = self.links
+            kernel_init_link_dynamics(
+                np.array([link.desc.invweight for link in links], dtype=gs.np_float),
+                np.array([link.desc.inertial_pos for link in links], dtype=gs.np_float),
+                np.array([link.desc.inertial_quat for link in links], dtype=gs.np_float),
+                np.array([link.desc.inertia for link in links], dtype=gs.np_float),
+                np.array([link.desc.mass for link in links], dtype=gs.np_float),
+                self.dyn_info,
+            )
+        super()._init_link_fields()
+
     def _init_vert_fields(self):
         if self.n_verts > 0:
             geoms = self.geoms
@@ -437,7 +490,6 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             )
 
     def _init_geom_fields(self):
-        self._geoms_render_T = np.empty((self.n_geoms_, self._B, 4, 4), dtype=np.float32)
         if self.n_geoms == 0:
             return
         geoms = self.geoms
@@ -605,7 +657,6 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self._n_samples = n_samples
         self.n_samples_ = max(1, n_samples)
         self.n_tree_nodes_ = max(1, n_tree_nodes)
-        self._max_samples_per_link = int(max(1, (links_sample_end - links_sample_start).max(initial=0)))
 
         n_collider_geoms = int((geoms_collider_type != COLLIDER_TYPE.NONE).sum())
         n_links_with_samples = int((links_sample_end > links_sample_start).sum())
@@ -630,7 +681,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             has_dense
             and gs.backend != gs.cpu
             and self.n_dofs_total >= 16
-            and fits_in_gpu_shared_memory(tiled_n_dofs, tiled_n_dofs + 1)
+            and tiled_n_dofs <= get_gpu_shared_tile_sizes(max_n_sizes=1)[-1]
         )
         self._n_pcg_iterations = options.n_pcg_iterations
         if self._n_pcg_iterations is None:
@@ -684,8 +735,6 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             np.array([link.entity.material.has_gravity for link in links], dtype=gs.np_bool),
             np.array([link.desc.mass for link in links], dtype=gs.np_float),
             np.array([link.desc.inertia for link in links], dtype=gs.np_float).reshape((-1, 3, 3)),
-            np.zeros(self.n_links, dtype=gs.np_float),
-            np.array([self._layers.index(link.entity.material.contact_layer) for link in links], dtype=gs.np_int),
             links_sample_start,
             links_sample_end,
             links_samples_aabb_min,
@@ -699,7 +748,6 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             samples_geom_idx,
             self._compute_links_pair_enabled(),
             dofs_entity_mass,
-            np.tile(np.asarray(self._options.gravity, dtype=gs.np_float), (self._B, 1)),
             self.mochi_info,
             self.rigid_config,
         )
@@ -721,7 +769,6 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         """Rest data, contact samples and material parameters of the deformable bodies."""
         options = self._options
         entities = self._soft_entities
-        n_links_ = self.n_links_
         _B = self._B
 
         if self.has_soft:
@@ -841,7 +888,6 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             entities_sample_range = np.zeros((0, 2), dtype=gs.np_int)
             sdf_values = np.zeros((0,), dtype=gs.np_float)
             n_samples = 0
-        self._n_soft_samples = n_samples
         self.n_soft_samples_ = max(1, n_samples)
         self._max_samples_per_soft_entity = int(
             max(1, (entities_sample_range[:, 1] - entities_sample_range[:, 0]).max(initial=0))
@@ -852,7 +898,6 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if self._max_soft_pairs is None:
             self._max_soft_pairs = max(1, len(entities) * n_collider_geoms)
         self._max_soft_hits = max(1, options.max_soft_hits_per_sample * n_samples)
-        self._n_soft_sdf_voxels = len(sdf_values)
         self.n_soft_sdf_voxels_ = max(1, len(sdf_values))
 
         # Deformable colliders: the query list holds the rigid samples (dynamic links query the deformed tetrahedra
@@ -885,45 +930,46 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self._pc_hash_cell = 2.0 * max(pc_bands) * (1.0 + 1e-3) if pc_bands else 1.0
 
         band = self._rod_band_layout()
-        self.n_band_rows_ = max(1, len(band["rows_dof"]))
+        self.n_band_rows_ = max(1, len(band.rows_dof))
         csr = self._soft_csr_layout(
             elems_v, shell_elems_v, shell_elems_hinge, rod_elems_v, rod_stencils_v, rod_stencils_e
         )
-        self.n_soft_dofs_ = max(1, len(csr["start"]) - 1)
-        self.n_csr_ = max(1, len(csr["col"]))
+        self.n_soft_dofs_ = max(1, len(csr.start) - 1)
+        self.n_csr_ = max(1, len(csr.col))
         self.soft_info = get_mochi_soft_info(self)
         self.soft_state = get_mochi_soft_state(
             self, self._max_soft_pairs, self._max_soft_hits, self._max_sc_hits, self._max_pc_hits
         )
-        self.soft_info.dofs_band_row.from_numpy(band["dofs_row"])
+        self.soft_info.dofs_band_row.from_numpy(band.dofs_row)
         if self._tet_tree is not None:
-            for name in ("first", "count", "escape", "is_leaf", "level_nodes", "level_start"):
-                getattr(self.soft_info, f"tet_tree_{name}").from_numpy(self._tet_tree[name])
+            self.soft_info.tet_tree_first.from_numpy(self._tet_tree.first)
+            self.soft_info.tet_tree_count.from_numpy(self._tet_tree.count)
+            self.soft_info.tet_tree_escape.from_numpy(self._tet_tree.escape)
+            self.soft_info.tet_tree_is_leaf.from_numpy(self._tet_tree.is_leaf)
+            self.soft_info.tet_tree_level_nodes.from_numpy(self._tet_tree.level_nodes)
+            self.soft_info.tet_tree_level_start.from_numpy(self._tet_tree.level_start)
             self.soft_info.tet_tree_elems.from_numpy(self._tet_tree_elems)
-        if len(csr["col"]) > 0:
-            self.soft_info.csr_start.from_numpy(csr["start"])
-            self.soft_info.csr_col.from_numpy(csr["col"])
-            for name, field in (
-                ("elems_block", "elems_csr_block"),
-                ("shell_block", "shell_csr_block"),
-                ("rod_elems", "rod_elems_csr"),
-                ("rod_stencils", "rod_stencils_csr"),
+        if len(csr.col) > 0:
+            self.soft_info.csr_start.from_numpy(csr.start)
+            self.soft_info.csr_col.from_numpy(csr.col)
+            for field, table in (
+                (self.soft_info.elems_csr_block, csr.elems_block),
+                (self.soft_info.shell_csr_block, csr.shell_block),
+                (self.soft_info.rod_elems_csr, csr.rod_elems),
+                (self.soft_info.rod_stencils_csr, csr.rod_stencils),
             ):
-                if len(csr[name]) > 0:
-                    getattr(self.soft_info, field).from_numpy(csr[name])
-        if len(band["rows_dof"]) > 0:
-            self.soft_info.band_rows_dof.from_numpy(band["rows_dof"])
-            self.soft_info.band_rows_entity.from_numpy(band["rows_entity"])
+                if len(table) > 0:
+                    field.from_numpy(table)
+        if len(band.rows_dof) > 0:
+            self.soft_info.band_rows_dof.from_numpy(band.rows_dof)
+            self.soft_info.band_rows_entity.from_numpy(band.rows_entity)
         if self.n_soft_entities > 0:
-            for name in (
-                "band_start",
-                "band_n",
-                "rod_elem_start",
-                "rod_elem_end",
-                "rod_stencil_start",
-                "rod_stencil_end",
-            ):
-                getattr(self.soft_info, f"entities_{name}").from_numpy(band[name])
+            self.soft_info.entities_band_start.from_numpy(band.band_start)
+            self.soft_info.entities_band_n.from_numpy(band.band_n)
+            self.soft_info.entities_rod_elem_start.from_numpy(band.rod_elem_start)
+            self.soft_info.entities_rod_elem_end.from_numpy(band.rod_elem_end)
+            self.soft_info.entities_rod_stencil_start.from_numpy(band.rod_stencil_start)
+            self.soft_info.entities_rod_stencil_end.from_numpy(band.rod_stencil_end)
         kernel_init_soft_fields(
             verts_rest,
             verts_entity_idx,
@@ -1099,22 +1145,11 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 att_damping.append(np.full(len(verts_idx), att["damping"], dtype=gs.np_float))
         att_vert = np.concatenate(att_vert)
         att_link = np.concatenate(att_link)
-        links_pos = self.dyn_state.links.pos.to_numpy()[:, 0].astype(np.float64)
-        links_quat = self.dyn_state.links.quat.to_numpy()[:, 0].astype(np.float64)
-        quat = links_quat[att_link]
-        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
-        rot = np.empty((len(att_vert), 3, 3))
-        rot[:, 0, 0] = 1.0 - 2.0 * (y * y + z * z)
-        rot[:, 0, 1] = 2.0 * (x * y - z * w)
-        rot[:, 0, 2] = 2.0 * (x * z + y * w)
-        rot[:, 1, 0] = 2.0 * (x * y + z * w)
-        rot[:, 1, 1] = 1.0 - 2.0 * (x * x + z * z)
-        rot[:, 1, 2] = 2.0 * (y * z - x * w)
-        rot[:, 2, 0] = 2.0 * (x * z - y * w)
-        rot[:, 2, 1] = 2.0 * (y * z + x * w)
-        rot[:, 2, 2] = 1.0 - 2.0 * (x * x + y * y)
-        lever = verts_rest[att_vert].astype(np.float64) - links_pos[att_link]
-        pos_local = np.einsum("nij,ni->nj", rot, lever)
+        links_pos = qd_to_numpy(self.dyn_state.links.pos, row_mask=0, col_mask=att_link, keepdim=False, transpose=True)
+        links_quat = qd_to_numpy(
+            self.dyn_state.links.quat, row_mask=0, col_mask=att_link, keepdim=False, transpose=True
+        )
+        pos_local = gu.inv_transform_by_trans_quat(verts_rest[att_vert], links_pos, links_quat)
         self.soft_info.att_vert.from_numpy(att_vert.astype(gs.np_int))
         self.soft_info.att_link.from_numpy(att_link)
         self.soft_info.att_link_is_dynamic.from_numpy(np.concatenate(att_is_dynamic))
@@ -1160,37 +1195,36 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             blocks[name] = (block_keys, valid)
             keys.append(block_keys[valid])
         unique_keys = np.unique(np.concatenate(keys))
-        csr = {
-            "start": np.searchsorted(unique_keys // n_dofs, np.arange(n_dofs + 1)).astype(gs.np_int),
-            "col": (unique_keys % n_dofs).astype(gs.np_int),
-        }
+        start = np.searchsorted(unique_keys // n_dofs, np.arange(n_dofs + 1))
+        col = unique_keys % n_dofs
         if self.n_soft_verts > 0:
             # the three rows of a vertex must hold the same columns in the same order
-            start = csr["start"]
             lengths = np.diff(start)[: 3 * self.n_soft_verts].reshape(-1, 3)
             assert (lengths[:, 1:] == lengths[:, :1]).all(), "vertex rows with different lengths"
-            cols = csr["col"]
+            n_cols = lengths[:, 0]
+            entries_offset = np.arange(n_cols.sum()) - np.repeat(np.cumsum(n_cols) - n_cols, n_cols)
+            entries_first = np.repeat(start[0 : 3 * self.n_soft_verts : 3], n_cols) + entries_offset
             for k in (1, 2):
-                same = np.ones(self.n_soft_verts, dtype=bool)
-                for i_v in range(self.n_soft_verts):
-                    a, b = start[3 * i_v], start[3 * i_v + k]
-                    n = start[3 * i_v + 1] - a
-                    same[i_v] = np.array_equal(cols[a : a + n], cols[b : b + n])
-                assert same.all(), "vertex rows with different columns"
+                entries_row = np.repeat(start[k : 3 * self.n_soft_verts : 3], n_cols) + entries_offset
+                assert (col[entries_first] == col[entries_row]).all(), "vertex rows with different columns"
+        tables = {}
         for name, (block_keys, valid) in blocks.items():
             index = np.searchsorted(unique_keys, np.where(valid, block_keys, 0))
             n_block = block_keys.shape[1] * block_keys.shape[2]
-            csr[name] = np.where(valid, index, -1).reshape(len(block_keys), n_block).astype(gs.np_int)
+            tables[name] = np.where(valid, index, -1).reshape(len(block_keys), n_block)
         # Tetrahedra and shells scatter per 3x3 vertex block: the position of the block's first column in the shared
         # column sequence of the row vertex (the scalar index is csr_start[3 f + r] + position + c).
-        start = csr["start"].astype(np.int64)
         for name, n_nodes in (("elems", 4), ("shell", 6)):
-            table = csr[name].astype(np.int64).reshape(-1, 3 * n_nodes, 3 * n_nodes)
+            table = tables[name].reshape(-1, 3 * n_nodes, 3 * n_nodes)
             first = table[:, ::3, ::3]  # entry (3 f, 3 g) of every block
             row_dof = np.where(first >= 0, unique_keys[np.maximum(first, 0)] // n_dofs, 0)
             position = np.where(first >= 0, first - start[row_dof], -1)
-            csr[name + "_block"] = position.reshape(len(table), n_nodes * n_nodes).astype(gs.np_int)
-        return csr
+            tables[f"{name}_block"] = position.reshape(len(table), n_nodes * n_nodes)
+        return SoftCSRLayout(
+            start=start.astype(gs.np_int),
+            col=col.astype(gs.np_int),
+            **{name: table.astype(gs.np_int) for name, table in tables.items()},
+        )
 
     def _rod_band_layout(self):
         """Node-interleaved ordering [x_0, theta_0, x_1, theta_1, ..., x_(n-1)] of every open rod's degrees of freedom
@@ -1199,17 +1233,9 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         dofs_row = np.full(self.n_dofs_total_, -1, dtype=gs.np_int)
         rows_dof = []
         rows_entity = []
-        band = {
-            name: np.zeros(max(1, n_entities), dtype=gs.np_int)
-            for name in (
-                "band_start",
-                "band_n",
-                "rod_elem_start",
-                "rod_elem_end",
-                "rod_stencil_start",
-                "rod_stencil_end",
-            )
-        }
+        band_start, band_n, rod_elem_start, rod_elem_end, rod_stencil_start, rod_stencil_end = np.zeros(
+            (6, max(1, n_entities)), dtype=gs.np_int
+        )
         elem_offset, stencil_offset = 0, 0
         for entity in self._soft_entities:
             if not entity.is_rod:
@@ -1217,25 +1243,32 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             i_e = entity.idx_in_solver
             n_nodes, n_elems = entity.n_vertices, entity.n_elements
             n_stencils = n_nodes if entity.morph.is_closed_loop else n_nodes - 2
-            band["rod_elem_start"][i_e], band["rod_elem_end"][i_e] = elem_offset, elem_offset + n_elems
-            band["rod_stencil_start"][i_e], band["rod_stencil_end"][i_e] = stencil_offset, stencil_offset + n_stencils
+            rod_elem_start[i_e], rod_elem_end[i_e] = elem_offset, elem_offset + n_elems
+            rod_stencil_start[i_e], rod_stencil_end[i_e] = stencil_offset, stencil_offset + n_stencils
             if not entity.morph.is_closed_loop:
-                band["band_start"][i_e] = len(rows_dof)
+                band_start[i_e] = len(rows_dof)
                 for i_n in range(n_nodes):
                     for k in range(3):
                         rows_dof.append(self.n_dofs + 3 * (entity.v_start + i_n) + k)
                     if i_n < n_elems:
                         rows_dof.append(self.n_dofs + 3 * self.n_soft_verts + elem_offset + i_n)
-                band["band_n"][i_e] = len(rows_dof) - band["band_start"][i_e]
-                rows_entity.extend([i_e] * band["band_n"][i_e])
+                band_n[i_e] = len(rows_dof) - band_start[i_e]
+                rows_entity.extend([i_e] * band_n[i_e])
             elem_offset += n_elems
             stencil_offset += n_stencils
         rows_dof = np.array(rows_dof, dtype=gs.np_int)
         dofs_row[rows_dof] = np.arange(len(rows_dof), dtype=gs.np_int)
-        band["rows_dof"] = rows_dof
-        band["rows_entity"] = np.array(rows_entity, dtype=gs.np_int)
-        band["dofs_row"] = dofs_row
-        return band
+        return RodBandLayout(
+            dofs_row=dofs_row,
+            rows_dof=rows_dof,
+            rows_entity=np.array(rows_entity, dtype=gs.np_int),
+            band_start=band_start,
+            band_n=band_n,
+            rod_elem_start=rod_elem_start,
+            rod_elem_end=rod_elem_end,
+            rod_stencil_start=rod_stencil_start,
+            rod_stencil_end=rod_stencil_end,
+        )
 
     @staticmethod
     def _rod_stencils(rods):
@@ -1400,9 +1433,9 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             e_start += entity.n_elements
         if elems:
             self._tet_tree = build_tet_tree(np.concatenate(aabb_min), np.concatenate(aabb_max))
-            self._tet_tree_elems = np.concatenate(elems)[self._tet_tree["order"]].astype(gs.np_int)
-        self.n_tet_levels = self._tet_tree["n_levels"] if self._tet_tree is not None else 0
-        self.n_tet_nodes_ = max(1, len(self._tet_tree["first"])) if self._tet_tree is not None else 1
+            self._tet_tree_elems = np.concatenate(elems)[self._tet_tree.order].astype(gs.np_int)
+        self.n_tet_levels = self._tet_tree.n_levels if self._tet_tree is not None else 0
+        self.n_tet_nodes_ = max(1, len(self._tet_tree.first)) if self._tet_tree is not None else 1
         self.n_tet_tree_elems_ = max(1, len(self._tet_tree_elems))
 
     def _compute_soft_pair_enabled(self):
@@ -1469,7 +1502,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             kernel_update_geoms(
                 self._scene._envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, False
             )
-            kernel_update_geom_aabbs(self.geoms_init_AABB, self.dyn_state, self.rigid_config)
+            kernel_update_geom_aabbs(self.geoms_init_AABB, self.dyn_state, self.dyn_info, self.rigid_config)
         else:
             kernel_update_kinematics(
                 self._scene._envs_idx,
@@ -1576,7 +1609,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             self._is_forward_vel_updated = True
             self._is_contacts_recorded = False
             return
-        if self._use_monolith:
+        if self._step_kernel == "monolith":
             options = self._options
             n_linesearch = (
                 0 if self.mochi_config.linesearch_type == LINESEARCH.NONE else options.n_linesearch_iterations
@@ -2094,9 +2127,6 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     # ------------------------------------ render ----------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def update_geoms_render_T(self):
-        kernel_update_geoms_render_T(self._geoms_render_T, self.dyn_state, self.rigid_info, self.rigid_config)
-
     def get_soft_state_render(self, f):
         """Environment-offset render vertex positions of the deformable surfaces, shape (n_vverts, B), as (positions,
         None, None) (UVs and faces are read from the visual geoms)."""
@@ -2160,7 +2190,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         state.links_vsym_prev = (
             qd_to_torch(self.mochi_state.links_vsym_prev, copy=True).permute((2, 0, 1, 3, 4)).contiguous()
         )
-        state.n_hist = qd_to_torch(self.mochi_state.n_hist, copy=True).contiguous()
+        state.n_hist = qd_to_torch(self.mochi_state.n_hist, copy=True)
         if self.has_soft:
             kernel_soft_get_state(
                 state.soft_pos,
@@ -2197,7 +2227,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         kernel_update_geoms(
             self._scene._envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, False
         )
-        kernel_update_geom_aabbs(self.geoms_init_AABB, self.dyn_state, self.rigid_config)
+        kernel_update_geom_aabbs(self.geoms_init_AABB, self.dyn_state, self.dyn_info, self.rigid_config)
         if self.has_soft:
             kernel_soft_set_state(
                 envs_idx,
@@ -2349,99 +2379,6 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             usage["soft_collider_hits"] = (int(qd_to_numpy(self.soft_state.n_sc_hits_max)), self._max_sc_hits)
             usage["point_cloud_hits"] = (int(qd_to_numpy(self.soft_state.n_pc_hits_max)), self._max_pc_hits)
         return usage
-
-    def memory_report(self):
-        """Bytes held by the solver's arrays: totals, the per-environment and static parts (an array is per
-        environment when one of its axes has the batch size; unambiguous from two environments on) and every field
-        sorted by size, to size scenes for large batches."""
-        import dataclasses
-
-        from quadrants.lang.util import to_numpy_type
-
-        _B = self._B
-
-        def tensor_bytes(tensor):
-            if hasattr(tensor, "get_member_field") and hasattr(tensor, "keys"):
-                keys = tensor.keys() if callable(tensor.keys) else tensor.keys
-                return sum(tensor_bytes(tensor.get_member_field(key))[0] for key in keys), tuple(tensor.shape)
-            shape = tuple(int(n) for n in tensor.shape)
-            element_shape = tuple(int(n) for n in (getattr(tensor, "element_shape", None) or ()))
-            try:
-                itemsize = np.dtype(to_numpy_type(tensor.dtype)).itemsize
-            except (TypeError, ValueError, KeyError):
-                itemsize = 4
-            n_bytes = int(np.prod(shape, dtype=np.int64)) * int(np.prod(element_shape, dtype=np.int64)) * itemsize
-            return n_bytes, shape
-
-        def is_tensor(value):
-            return (
-                hasattr(value, "shape")
-                and hasattr(value, "dtype")
-                and not isinstance(value, (np.ndarray, torch.Tensor))
-            )
-
-        def walk(obj, prefix, fields, seen):
-            if obj is None or id(obj) in seen:
-                return
-            seen.add(id(obj))
-            if dataclasses.is_dataclass(obj):
-                items = [(field.name, getattr(obj, field.name)) for field in dataclasses.fields(obj)]
-            elif hasattr(obj, "__dict__"):
-                items = list(vars(obj).items())
-            else:
-                return
-            for name, value in items:
-                if is_tensor(value):
-                    n_bytes, shape = tensor_bytes(value)
-                    fields.append((f"{prefix}.{name}", n_bytes, shape))
-                elif dataclasses.is_dataclass(value) or type(value).__module__.startswith(("genesis.", "quadrants.")):
-                    if not isinstance(value, (str, bytes, np.ndarray, torch.Tensor)):
-                        walk(value, f"{prefix}.{name}", fields, seen)
-
-        fields = []
-        seen = set()
-        for name in (
-            "mochi_info",
-            "mochi_state",
-            "contact_state",
-            "island_state",
-            "eq_info",
-            "eq_state",
-            "soft_info",
-            "soft_state",
-            "hit_readback",
-            "dyn_state",
-            "dyn_info",
-            "rigid_info",
-            "geoms_init_AABB",
-            "_soft_vverts_render",
-            "_errno",
-            "_pc_bvh",
-            "_soft_tet_bvh",
-            "_soft_query_aabb",
-            "_pc_aabb",
-            "_soft_tet_aabb",
-        ):
-            value = getattr(self, name, None)
-            if is_tensor(value):
-                n_bytes, shape = tensor_bytes(value)
-                fields.append((name, n_bytes, shape))
-            else:
-                walk(value, name, fields, seen)
-        if getattr(self, "sdf", None) is not None:
-            walk(getattr(self.sdf, "_sdf_info", None), "sdf_info", fields, seen)
-        total = sum(n_bytes for _, n_bytes, _ in fields)
-        per_env_bytes = sum(n_bytes for _, n_bytes, shape in fields if _B >= 2 and _B in shape)
-        return {
-            "total_bytes": total,
-            "per_env_bytes": per_env_bytes // _B if _B >= 2 else None,
-            "static_bytes": total - per_env_bytes if _B >= 2 else None,
-            "n_envs": _B,
-            "fields": sorted(
-                ({"name": name, "bytes": n_bytes, "shape": shape} for name, n_bytes, shape in fields),
-                key=lambda item: -item["bytes"],
-            ),
-        }
 
     # ------------------------------------------------------------------------------------
     # ------------------------------------ control ---------------------------------------
@@ -2785,7 +2722,15 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
     @property
     def n_equalities(self):
-        return 0
+        if self.is_built:
+            return len(self._equalities)
+        return sum(entity.n_equalities for entity in self._entities)
+
+    @property
+    def equalities(self):
+        if self.is_built:
+            return self._equalities
+        return gs.List(equality for entity in self._entities for equality in entity.equalities)
 
     @property
     def n_samples(self):
@@ -2832,20 +2777,12 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         return sum(entity.n_rod_stencils for entity in self._soft_entities)
 
     @property
-    def n_soft_surfaces(self):
-        return sum(entity.n_surfaces for entity in self._soft_entities)
-
-    @property
     def n_soft_vverts(self):
         return sum(entity.n_vverts for entity in self._soft_entities)
 
     @property
     def n_soft_vfaces(self):
         return sum(entity.n_vfaces for entity in self._soft_entities)
-
-    @property
-    def n_soft_samples(self):
-        return self._n_soft_samples
 
     @property
     def n_dofs_total(self):

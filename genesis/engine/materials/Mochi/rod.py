@@ -1,9 +1,8 @@
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 import numpy as np
 from pydantic import Field, StrictBool
 
-import genesis as gs
 from genesis.typing import NonNegativeFloat, PositiveFloat, ValidFloat
 
 from .base import Base
@@ -47,8 +46,8 @@ class Rod(Base["MochiSoftEntity"]):
     stiffness_damping : float, optional
         Stiffness-proportional (Rayleigh) damping coefficient in s. Default is 0.
     friction, penalty_coefficient, penalty_smoothing_half_distance, penalty_threshold, friction_falloff_vel,
-    viscous_friction, normal_viscous_damping, max_alignment_normals : float, optional
-        Contact parameters, see `Mochi.Rigid`.
+    viscous_friction, normal_viscous_damping, max_alignment_normals, has_gravity, contact_layer : optional
+        Contact parameters, see `Mochi.Base`.
     collider_type : str, optional
         Whether other bodies collide against this rod: "point_cloud" (and "auto") places a sphere of the rod radius at
         every node, "none" makes the rod collide only through its own samples. Default is "auto".
@@ -60,10 +59,6 @@ class Rod(Base["MochiSoftEntity"]):
         threshold of a vertex do not collide with the sphere of that vertex (neighbors along the rod); the rest
         distance to the second-nearest vertices must exceed this range plus the contact band. Must be larger than 1.
         Default is 1.5.
-    has_gravity : bool, optional
-        Whether gravity acts on this body. Default is True.
-    contact_layer : str, optional
-        Name of the contact layer of this body. Default is "default".
     """
 
     E: PositiveFloat = 1e7
@@ -76,24 +71,9 @@ class Rod(Base["MochiSoftEntity"]):
     linear_rotational_inertia: NonNegativeFloat | None = None
     mass_damping: NonNegativeFloat = 0.0
     stiffness_damping: NonNegativeFloat = 0.0
-    friction: NonNegativeFloat = 0.5
-    penalty_coefficient: PositiveFloat = 1e9
-    penalty_smoothing_half_distance: NonNegativeFloat = 5e-3
-    penalty_threshold: ValidFloat = 1e-3
-    friction_falloff_vel: NonNegativeFloat = 1e-2
-    viscous_friction: NonNegativeFloat = 0.0
-    normal_viscous_damping: NonNegativeFloat = 0.0
-    max_alignment_normals: ValidFloat = 0.0
     collider_type: RodColliderType = "auto"
     self_contact: StrictBool = False
     self_contact_exclusion_ratio: Annotated[ValidFloat, Field(gt=1.0)] = 1.5
-    has_gravity: StrictBool = True
-    contact_layer: str = "default"
-
-    def model_post_init(self, context: Any) -> None:
-        super().model_post_init(context)
-        if not (-1.0 <= self.max_alignment_normals <= 1.0):
-            gs.raise_exception("`max_alignment_normals` must be in [-1, 1].")
 
     def resolve(self, radius):
         """Stiffnesses and inertia per unit length of a circular cross-section of the given radius (the overrides win)."""

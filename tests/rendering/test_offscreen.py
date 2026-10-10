@@ -62,6 +62,12 @@ def test_render_api(show_viewer, renderer_type, renderer):
             fixed=True,
         ),
     )
+    box = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(2.0, 0.0, 0.0),
+            size=(0.5, 0.5, 0.5),
+        ),
+    )
     camera = scene.add_camera(
         pos=(0.0, 0.0, 10.0),
         lookat=(0.0, 0.0, 0.0),
@@ -96,9 +102,18 @@ def test_render_api(show_viewer, renderer_type, renderer):
             pytest.xfail("Flaky on MacOS with Apple Software Renderer.")
         raise
 
+    if renderer_type == RENDERER_TYPE.RASTERIZER:
+        # An entity whose pose blew up stays drawn where it last was, and follows its pose again once it is valid
+        box.set_pos((float("nan"), 0.0, 0.0))
+        rgb_frozen, *_ = camera.render(rgb=True, force_render=True)
+        assert_equal(rgb_frozen, rgb_arrs[0])
+        box.set_pos((-2.0, 0.0, 0.0))
+        rgb_moved, *_ = camera.render(rgb=True, force_render=True)
+        assert (rgb_moved != rgb_frozen).any()
+
 
 @pytest.mark.required
-def test_emissive_composites_over_base_color_without_double_counting(base_plus_emissive_glb, show_viewer, renderer):
+def test_emissive_composites(base_plus_emissive_glb, show_viewer, renderer):
     # The rasterizer must composite emissive on top of the base color under flat ambient light, checked on one scene
     # whose entities are separated by segmentation:
     #  - image_quad: a rigid GLB pairing a red base atlas with a blue emissive atlas keeps red dominant (the base is
@@ -211,7 +226,7 @@ def test_render_api_advanced(tmp_path, n_envs, show_viewer, png_snapshot, render
         vis_options=gs.options.VisOptions(
             # Disable shadows systematically for Rasterizer because they are forcibly disabled on CPU backend anyway
             shadow=(renderer_type != RENDERER_TYPE.RASTERIZER),
-            env_separate_rigid=False,
+            split_envs=False,
         ),
         renderer=renderer,
         show_viewer=False,
@@ -439,7 +454,7 @@ def test_deterministic(tmp_path, renderer_type, renderer, show_viewer, tol):
             # When env are not separated, their world pos is different, which affects lighting
             shadow=False,
             # rendered_envs_idx=(0, 1, 2),
-            env_separate_rigid=False,
+            split_envs=False,
         ),
         renderer=renderer,
         show_viewer=False,
@@ -666,7 +681,7 @@ def test_renders_heterogeneous_entities(n_envs, show_viewer, png_snapshot, rende
     scene = gs.Scene(
         vis_options=gs.options.VisOptions(
             shadow=False,
-            env_separate_rigid=False,
+            split_envs=False,
         ),
         renderer=renderer,
         show_viewer=show_viewer,
@@ -1339,6 +1354,9 @@ def test_camera_gimbal_lock_singularity(renderer, show_viewer):
 
         prev_right = right
 
+        # The extrinsics follow the camera: the lookat point lies on the optical axis, at the distance of the camera
+        assert_allclose(cam.extrinsics @ (0.0, 0.0, 0.0, 1.0), (0.0, 0.0, np.linalg.norm(cam.pos), 1.0), tol=1e-6)
+
     # Move camera through singularity along x-axis: x=-1.5 to x=1.5 (singularity at x=0)
     prev_right = None
     for i in range(7):
@@ -1377,7 +1395,7 @@ def test_rasterizer_env_separate(renderer, png_snapshot, show_viewer, force_show
             show_link_frame=True,
             # Disable shadows systematically for Rasterizer because they are forcibly disabled on CPU backend anyway
             shadow=False,
-            env_separate_rigid=True,
+            split_envs=True,
             rendered_envs_idx=RENDERED_ENVS,
         ),
         viewer_options=gs.options.ViewerOptions(
@@ -1424,16 +1442,18 @@ def test_rasterizer_env_separate(renderer, png_snapshot, show_viewer, force_show
     )
     scene.build(n_envs=4, env_spacing=(0.3, 0.3))
 
-    # Hardcoded joint positions from a converged 200-step simulation with randomized initial states, each arm resting
-    # against the ground so the contact markers have contacts to draw, in a pose distinct from the other envs.
-    franka.set_dofs_position(
-        [
-            [1.728, -1.763, -2.157, -2.275, -0.327, 2.201, 1.833, 0.018, 0.018],
-            [-2.717, -1.763, -2.217, -2.566, 0.226, 2.933, 1.307, 0.017, 0.017],
-            [-1.411, 1.763, 0.657, -2.817, 1.597, 3.567, 2.872, 0.000, 0.000],
-            [-2.098, 1.763, -1.004, -2.421, -0.227, 2.850, -0.136, 0.020, 0.020],
-        ]
+    # The rendered environments hold an arm resting against the ground, whose contacts give the contact markers
+    # something to draw, and an arm yawed a quarter turn and reaching sideways, so the two render as differently as the
+    # arm's reach allows. The others hold resting arms of their own from a converged simulation.
+    dofs_pos = np.array(
+        (
+            (-2.717, -1.763, -2.217, -2.566, 0.226, 2.933, 1.307, 0.017, 0.017),
+            (1.728, -1.763, -2.157, -2.275, -0.327, 2.201, 1.833, 0.018, 0.018),
+            (1.57, 1.0, 0.0, -0.5, 0.0, 1.5, 0.0, 0.04, 0.04),
+            (-2.098, 1.763, -1.004, -2.421, -0.227, 2.850, -0.136, 0.020, 0.020),
+        )
     )
+    franka.set_dofs_position(dofs_pos)
     scene.step()
 
     # Capture viewer screenshot when the interactive viewer is enabled
@@ -1447,12 +1467,23 @@ def test_rasterizer_env_separate(renderer, png_snapshot, show_viewer, force_show
         png_snapshot.extension._std_err_threshold = STD_ERR_THR
         assert rgb_array_to_png_bytes(viewer_rgb) == png_snapshot
 
+        # The interactive viewer shows a setter right away, without stepping
+        franka.set_dofs_position(np.roll(dofs_pos, 1, axis=0))
+        pyrender_viewer.on_draw()
+        viewer_rgb_set = pyrender_viewer._renderer.jit.read_color_buf(*pyrender_viewer._viewport_size, rgba=False)
+        scene.visualizer.update(force=True)
+        pyrender_viewer.on_draw()
+        viewer_rgb_forced = pyrender_viewer._renderer.jit.read_color_buf(*pyrender_viewer._viewport_size, rgba=False)
+        assert_equal(viewer_rgb_set, viewer_rgb_forced)
+        franka.set_dofs_position(dofs_pos)
+        scene.step()
+
     # Render both cameras
     rgb, *_ = cam.render(rgb=True)
     rgb_debug, *_ = cam_debug.render(rgb=True)
     assert rgb is not None and rgb_debug is not None
 
-    # With env_separate_rigid, renders are batched: (n_rendered_envs, H, W, 3)
+    # With split_envs, renders are batched: (n_rendered_envs, H, W, 3)
     assert rgb.shape == (len(RENDERED_ENVS), *CAM_RES, 3)
     assert rgb_debug.shape == (len(RENDERED_ENVS), *CAM_RES, 3)
 
@@ -1502,6 +1533,17 @@ def test_rasterizer_env_separate(renderer, png_snapshot, show_viewer, force_show
         env_diff = np.abs(env_rgb[0].astype(np.float32) - env_rgb[1].astype(np.float32))
         assert env_diff.mean() > 5.0, "Per-env renders are too similar — env isolation may be broken"
 
+    # The markers drawn for other contacts, then cleared by a reset that brings back the first state, never show again
+    franka.set_dofs_position(dofs_pos[::-1])
+    for _ in range(2):
+        scene.step()
+    cam_debug.render(rgb=True)
+    scene.reset()
+    franka.set_dofs_position(dofs_pos)
+    scene.step()
+    rgb_debug_reset, *_ = cam_debug.render(rgb=True)
+    assert_equal(rgb_debug_reset, rgb_debug)
+
 
 @pytest.mark.required
 @pytest.mark.parametrize("renderer_type", [RENDERER_TYPE.RASTERIZER])
@@ -1511,69 +1553,109 @@ def test_rasterizer_sensor_env_spacing_invariance(renderer, context_mode):
         pytest.skip(SKIP_NO_VIEWER)
 
     CAM_RES = (128, 128)
-    N_ENVS = 4
 
-    def build_scene(env_spacing):
-        show_viewer = context_mode == "with_viewer"
-        viewer_options = (
-            gs.options.ViewerOptions(
-                res=CAM_RES,
-                run_in_thread=False,
-            )
-            if show_viewer
-            else None
+    # The sensor renders each environment on its own whatever the setting, which only picks how the scene camera below
+    # renders, so the window keeps the environments side by side
+    scene = gs.Scene(
+        vis_options=gs.options.VisOptions(
+            split_envs=context_mode == "with_scene_camera",
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            res=CAM_RES,
+            run_in_thread=False,
+            camera_pos=(2.0, -2.0, 1.5),
+            camera_lookat=(0.0, 0.0, 0.3),
+            enable_help_text=False,
+        ),
+        renderer=renderer,
+        show_viewer=context_mode == "with_viewer",
+        show_FPS=False,
+    )
+    # The environments are spaced by a length that is no multiple of the 1 m checker tile of the floor, so a floor
+    # pattern anchored to the world rather than to the environment would show in the images. The floors stay clear of
+    # each other and fit in every frame below, as a software renderer misrasterizes geometry outside the frustum.
+    scene.add_entity(
+        gs.morphs.Plane(
+            plane_size=(1.4, 1.4),
+        ),
+    )
+    scene.add_entity(
+        gs.morphs.Mesh(
+            file="meshes/duck.obj",
+            scale=0.02,
+            pos=(0.0, 0.0, 0.05),
+            euler=(90.0, 90.0, 0.0),
+            fixed=True,
+        ),
+    )
+    scene.add_entity(
+        gs.morphs.Box(
+            pos=(0.4, 0.3, 0.1),
+            size=(0.2, 0.2, 0.2),
+            fixed=True,
+        ),
+        surface=gs.surfaces.Default(
+            color=(0.8, 0.2, 0.2),
+        ),
+    )
+    scene.add_entity(
+        gs.morphs.Sphere(
+            pos=(-0.4, 0.2, 0.15),
+            radius=0.15,
+            fixed=True,
+        ),
+        surface=gs.surfaces.Default(
+            color=(0.2, 0.3, 0.9),
+        ),
+    )
+    # The window draws the environments in one shared world, where a point light lights each of them differently, so
+    # its frames are compared under the directional light alone
+    lights = [{"type": "directional", "dir": (-1.0, -1.0, -2.0), "intensity": 3.0}]
+    if context_mode != "with_viewer":
+        lights.append({"type": "point", "pos": (1.0, -1.0, 2.0), "color": (1.0, 0.5, 0.25), "intensity": 5.0})
+    sensor = scene.add_sensor(
+        RasterizerCameraOptions(
+            res=CAM_RES,
+            pos=(2.0, -2.0, 1.5),
+            lookat=(0.0, 0.0, 0.3),
+            fov=40.0,
+            lights=lights,
         )
-        scene = gs.Scene(
-            vis_options=gs.options.VisOptions(
-                shadow=False,
-                env_separate_rigid=True,
-            ),
-            viewer_options=viewer_options,
-            renderer=renderer,
-            show_viewer=show_viewer,
-            show_FPS=False,
+    )
+    if context_mode == "with_scene_camera":
+        cam = scene.add_camera(
+            res=CAM_RES,
+            pos=(2.0, -2.0, 1.5),
+            lookat=(0.0, 0.0, 0.3),
+            fov=40.0,
+            GUI=False,
         )
-        scene.add_entity(
-            gs.morphs.Box(
-                size=(0.2, 0.2, 0.2),
-                pos=(0.5, 0.0, 0.1),
-            )
-        )
-        cam = scene.add_sensor(
-            RasterizerCameraOptions(
-                res=CAM_RES,
-                pos=(1.5, 0.0, 0.5),
-                lookat=(0.5, 0.0, 0.1),
-                fov=60,
-            )
-        )
-        if context_mode == "with_scene_camera":
-            scene.add_camera(
-                res=CAM_RES,
-                pos=(2.0, 0.0, 1.0),
-                lookat=(0.0, 0.0, 0.0),
-                fov=60,
-                GUI=False,
-            )
-        build_kwargs = {"n_envs": N_ENVS}
-        if env_spacing is not None:
-            build_kwargs["env_spacing"] = env_spacing
-        scene.build(**build_kwargs)
-        return scene, cam
+    scene.build(n_envs=2, env_spacing=(2.3, 2.3))
 
-    # Reference: no spacing
-    scene_ref, cam_ref = build_scene(env_spacing=None)
-    img_ref = tensor_to_array(cam_ref.read(envs_idx=0).rgb)
-    scene_ref.destroy()
-
-    # Test: with spacing
-    scene_test, cam_test = build_scene(env_spacing=(2.0, 2.0))
-    img_test = tensor_to_array(cam_test.read(envs_idx=0).rgb)
-    scene_test.destroy()
-
-    # Per-env sensor images must be invariant to env_spacing — the offset is purely for
-    # visual separation in the interactive viewer and must be transparent to sensors.
-    assert np.abs(img_ref.astype(np.float32) - img_test.astype(np.float32)).mean() < 1.0
+    # The environments hold the same state at different places of the grid, so their images must be the same down to
+    # the shading and the shadows, which must show for the comparison to mean anything
+    rgb = sensor.read().rgb
+    assert rgb[0].float().std() > 10.0
+    assert_equal(rgb[0], rgb[1])
+    if context_mode == "with_scene_camera":
+        rgb, *_ = cam.render(rgb=True)
+        assert rgb[0].std() > 10.0
+        assert_equal(rgb[0], rgb[1])
+    if context_mode == "with_viewer":
+        # The window lays the environments out side by side, each on its own floor, so from one viewpoint relative to
+        # each environment it shows the same frame, up to where the shadow map is sampled. The viewpoint faces across
+        # the row of environments, so the neighbour stays out of frame.
+        viewer = scene.visualizer.viewer
+        pyrender_viewer = viewer._pyrender_viewer
+        frames = []
+        for env_offset in scene.envs_offset:
+            viewer.set_camera_pose(pos=(2.8, 0.0, 1.5) + env_offset, lookat=(0.0, 0.0, 0.3) + env_offset)
+            frame, *_ = pyrender_viewer.render_offscreen(
+                pyrender_viewer._camera_node, pyrender_viewer._renderer, rgb=True, depth=False, seg=False, normal=False
+            )
+            frames.append(frame)
+        assert frames[0].std() > 10.0
+        assert_pixel_match(frames[0], frames[1])
 
 
 @pytest.mark.required

@@ -101,6 +101,8 @@ to record a video):
 - `soft_bodies.py`: a soft sphere and cube dropped onto the ground, and a rigid box landing on a soft slab.
 - `finray_gripper.py`: a Schunk WSG-50 gripper with deformable FinRay fingers attached to its finger links and
   skinned visual meshes, closing on a box (requires the LBM eval models, see the example).
+- `articulated_finray_grasp.py`: the same FinRay gripper mounted on a Franka Panda in place of its hand
+  (`RigidEntity.attach`), picking a box off the ground and lifting it 24 cm (requires the LBM eval models).
 - `soft_duck.py`: the mochi duck (1899 nodes, 8608 tetrahedra) dropped onto the ground (`soft_duck` benchmark scene).
 - `cloth_tshirt.py`: the mochi t-shirt (3593 nodes, self-contact) falling onto the ground (`cloth_tshirt` benchmark
   scene).

@@ -402,7 +402,7 @@ class KinematicOptions(Options):
     batch_links_info : bool, optional
         Whether to batch link info. Automatically enabled for heterogeneous simulation. Defaults to False.
     batch_dofs_info : bool, optional
-        Whether to batch DOF info. Defaults to False.
+        Whether to batch DOF info. Automatically enabled for heterogeneous simulation. Defaults to False.
     IK_max_targets : int, optional
         Maximum number of IK targets. Increasing this doesn't affect IK solving speed, but will increase memory usage.
         Defaults to 6.
@@ -481,16 +481,19 @@ class RigidOptions(GravityMixin, TimeBasedMixin):
         memory-bound kernels. Automatically enabled for heterogeneous simulation. Defaults to False.
     batch_joints_info : bool, optional
         Whether the model parameters of a joint are stored per environment rather than shared by the whole batch,
-        with the same tradeoff as `batch_links_info`. Defaults to False.
+        with the same tradeoff as `batch_links_info`. Automatically enabled for heterogeneous simulation. Defaults to
+        False.
     batch_dofs_info : bool, optional
         Whether the model parameters of a degree of freedom are stored per environment rather than shared by the
-        whole batch, with the same tradeoff as `batch_links_info`. Defaults to False.
+        whole batch, with the same tradeoff as `batch_links_info`. Automatically enabled for heterogeneous simulation.
+        Defaults to False.
     constraint_solver : gs.constraint_solver, optional
         Constraint solver type. Current supported constraint solvers are 'gs.constraint_solver.CG' (conjugate gradient)
         and 'gs.constraint_solver.Newton' (Newton's method). Defaults to 'Newton'.
     iterations : int, optional
-        Maximum number of iterations for the constraint solver; the solve exits early once its convergence tolerance
-        is met, so this bound only binds on hard steps. Defaults to 50.
+        Maximum number of iterations of the constraint solver, which exits early once its tolerance is met. A batch of
+        parallel environments waits for its slowest one on every step, so raising the bound buys accuracy on the steps
+        whose hardest contacts never converge at the price of every such step. Defaults to 25.
     tolerance : float, optional
         Tolerance for the constraint solver. If None, resolved based on the floating-point precision selected via
         `gs.init(precision=...)`: 1e-5 for single precision ("32") and 1e-8 for double precision ("64"). Defaults
@@ -556,10 +559,6 @@ class RigidOptions(GravityMixin, TimeBasedMixin):
         allows, and what a model authoring its own values expects, at the cost of contacts that respond more abruptly. This parameter is called
         'timeconst' in Mujoco (https://mujoco.readthedocs.io/en/latest/modeling.html#solver-parameters). Defaults to
         0.01.
-    use_contact_island : bool, optional
-        Whether to partition the constraint solve into independent per-island blocks. It has no effect on a scene that
-        is a single dense-coupled tree (one island) or is differentiable, where the dense whole-scene solve is used
-        regardless. Defaults to True.
     use_hibernation : bool, optional
         Whether to put bodies that have come to rest to sleep, so the solver skips them until they are disturbed. It
         quietly has no effect on a body that is differentiable, prunable, or under no-slip friction. Defaults to False.
@@ -583,8 +582,8 @@ class RigidOptions(GravityMixin, TimeBasedMixin):
         otherwise. Defaults to None.
     broadphase_traversal : gs.broadphase_traversal, optional
         Broadphase traversal strategy. ``SAP`` (sweep-and-prune) or ``ALL_VS_ALL`` (parallel pair iteration). Defaults
-        to ``None`` (auto: ``SAP`` on CPU or when hibernation/heterogeneous entities are enabled, ``ALL_VS_ALL`` on GPU
-        otherwise). See ``gs.broadphase_traversal`` for details on each strategy.
+        to ``None`` (auto: ``SAP`` on CPU or with heterogeneous entities, ``ALL_VS_ALL`` on GPU otherwise). See
+        ``gs.broadphase_traversal`` for details on each strategy.
 
     Warning
     -------
@@ -598,7 +597,7 @@ class RigidOptions(GravityMixin, TimeBasedMixin):
     enable_adjacent_collision: StrictBool = False
     disable_constraint: StrictBool = False
     max_collision_pairs: NonNegativeInt = 150
-    max_contacts: PositiveInt | None = None
+    max_contacts: NonNegativeInt | None = None
     multiplier_collision_broad_phase: PositiveInt = 8
     integrator: gs.integrator = gs.integrator.approximate_implicitfast
     IK_max_targets: PositiveInt = 6
@@ -610,7 +609,7 @@ class RigidOptions(GravityMixin, TimeBasedMixin):
 
     # constraint solver
     constraint_solver: gs.constraint_solver = gs.constraint_solver.Newton
-    iterations: PositiveInt = 50
+    iterations: PositiveInt = 25
     tolerance: PositiveFloat | None = None
     ls_iterations: PositiveInt = 50
     ls_tolerance: PositiveFloat = 1e-2
@@ -624,7 +623,6 @@ class RigidOptions(GravityMixin, TimeBasedMixin):
     contact_pruning_tolerance: PositiveFloat | None = 0.02
     sparse_solve: StrictBool | None = None
     constraint_timeconst: PositiveFloat | None = 0.01
-    use_contact_island: StrictBool = True
     box_box_detection: StrictBool = False
 
     # hibernation threshold
@@ -645,10 +643,17 @@ class RigidOptions(GravityMixin, TimeBasedMixin):
     # broadphase configuration
     broadphase_traversal: gs.broadphase_traversal | None = None
 
-    def __init__(self, *, contact_resolve_time: float | None = None, **data):
+    def __init__(self, *, contact_resolve_time: float | None = None, use_contact_island: bool | None = None, **data):
         super().__init__(**data)
         if contact_resolve_time is not None:
             gs.logger.warning("'contact_resolve_time' is deprecated. Use 'constraint_timeconst' instead.")
+        if use_contact_island is not None:
+            if not use_contact_island:
+                gs.raise_exception(
+                    "'use_contact_island=False' is not supported: the constraint solver always solves the contact "
+                    "islands of the scene."
+                )
+            gs.logger.warning("'use_contact_island' is deprecated and has no effect.")
 
     def model_post_init(self, context):
         super().model_post_init(context)
@@ -1028,9 +1033,6 @@ class MochiOptions(GravityMixin, TimeBasedMixin):
     fade_friction : bool, optional
         Whether friction fades out as the colliding surface normal and the collider gradient become aligned, i.e. as a
         sample point passes through the far side of a thin collider. Defaults to True.
-    max_alignment_normals : float, optional
-        Cosine of the angle between the colliding surface normal and the collider gradient above which a contact is
-        disabled, so that a fully embedded body can escape instead of being trapped. Defaults to 0.0.
     implicit_normal_force_for_dissipation : bool, optional
         Whether friction and damping scale with the normal force evaluated at the current iterate instead of the one
         recovered at the start of the step. The implicit form is required for an accurate coefficient of restitution
@@ -1123,7 +1125,6 @@ class MochiOptions(GravityMixin, TimeBasedMixin):
     use_fitted_friction_hessian: StrictBool = True
     friction_with_collider_normal: StrictBool = True
     fade_friction: StrictBool = True
-    max_alignment_normals: float = 0.0
     implicit_normal_force_for_dissipation: StrictBool = False
     boundary_element_type: Literal["P1Q1", "P1Q3", "P1Q6"] = "P1Q3"
     equality_stiffness: PositiveFloat = 1e6
@@ -1146,8 +1147,6 @@ class MochiOptions(GravityMixin, TimeBasedMixin):
     def model_post_init(self, context: Any) -> None:
         if not (0.0 < self.linesearch_alpha < 1.0):
             gs.raise_exception("`linesearch_alpha` must be strictly between 0 and 1.")
-        if not (-1.0 <= self.max_alignment_normals <= 1.0):
-            gs.raise_exception("`max_alignment_normals` must be in [-1, 1].")
 
 
 class SFOptions(TimeBasedMixin):

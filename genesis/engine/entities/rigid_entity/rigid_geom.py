@@ -12,8 +12,9 @@ import genesis as gs
 import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
 from genesis.repr_base import RBC
-from genesis.utils.description import GeomDescription
 from genesis.utils.misc import DeprecationError, qd_to_torch, tensor_to_array
+
+from .description import RigidGeomDescription, RigidVisGeomDescription
 
 if TYPE_CHECKING:
     from genesis.engine.materials.rigid import Rigid as RigidMaterial
@@ -43,11 +44,10 @@ class RigidGeom(RBC):
         edge_start: int,
         verts_state_start: int,
         needs_coup: bool,
-        desc: GeomDescription,
-        center_init=None,
+        desc: RigidGeomDescription,
     ):
         mesh = desc.mesh
-        self.desc: GeomDescription = desc
+        self.desc: RigidGeomDescription = desc
         self._link: "RigidLink" = link
         self._entity: "RigidEntity" = link.entity
         self._material: "RigidMaterial" = link.entity.material
@@ -79,12 +79,10 @@ class RigidGeom(RBC):
         self._surface = mesh.surface
         self._metadata = mesh.metadata
 
-        if center_init is None:
-            self._init_center_pos = np.repeat(
-                self._init_verts.mean(0, keepdims=True), repeats=self._init_verts.shape[0], axis=0
-            )
-        else:
-            self._init_center_pos = np.array(center_init)
+        self._init_center_pos = np.repeat(
+            self._init_verts.mean(0, keepdims=True), repeats=self._init_verts.shape[0], axis=0
+        )
+
         # The solver reads a row of fixed width, so copy the described shape data into one
         self._data = np.zeros([7])
         if desc.data is not None:
@@ -167,7 +165,7 @@ class RigidGeom(RBC):
                 gs.logger.info("Ignoring corrupted cache.")
 
         if not is_cached_loaded:
-            with gs.logger.timer(f"Preprocessing geom idx ~~<{self._idx}>~~."):
+            with gs.logger.timer(f"Preprocessing geom idx ~<{self._idx}>~."):
                 ######## sdf ########
                 lower = self._init_verts.min(axis=0)
                 upper = self._init_verts.max(axis=0)
@@ -403,8 +401,8 @@ class RigidGeom(RBC):
         """
         Get the position of the geom.
 
-        When 'relative' is True (default), the position is reported in the user frame, with the entity's morph pose
-        offset stripped, rather than the world frame used by the solver.
+        When 'relative' is True (default), the position reported is that of the authored geom origin. The internal geom
+        origin used by the solver is the authored one moved by the entity's morph 'offset_pos' / 'offset_quat'.
         """
         return self._solver.get_geoms_pos(self._idx, envs_idx, relative=relative)[..., 0, :]
 
@@ -413,8 +411,8 @@ class RigidGeom(RBC):
         """
         Get the quaternion of the geom.
 
-        When 'relative' is True (default), the orientation is reported in the user frame, with the entity's morph pose
-        offset stripped, rather than the world frame used by the solver.
+        When 'relative' is True (default), the orientation reported is that of the authored geom origin. The internal
+        geom origin used by the solver is the authored one moved by the entity's morph 'offset_pos' / 'offset_quat'.
         """
         return self._solver.get_geoms_quat(self._idx, envs_idx, relative=relative)[..., 0, :]
 
@@ -451,16 +449,16 @@ class RigidGeom(RBC):
         else:
             self.desc.sol_params = sol_params
 
-    # ------------------------------------------------------------------------------------
-    # ----------------------------------- properties -------------------------------------
-    # ------------------------------------------------------------------------------------
-
     @gs.assert_built
     def get_sol_params(self):
         """
         Get the solver parameters the simulation is currently using for this geom.
         """
         return self._solver.get_sol_params(geoms_idx=self._idx, envs_idx=None)[0]
+
+    # ------------------------------------------------------------------------------------
+    # ----------------------------------- properties -------------------------------------
+    # ------------------------------------------------------------------------------------
 
     @property
     def uid(self):
@@ -864,8 +862,8 @@ class RigidVisGeom(RBC):
     A `RigidVisGeom` is a counterpart of `RigidGeom`, but for visualization purposes. This can be accessed via `link.vis_geoms`.
     """
 
-    def __init__(self, link, idx, vvert_start, vface_start, desc: GeomDescription):
-        self.desc: GeomDescription = desc
+    def __init__(self, link, idx, vvert_start, vface_start, desc: RigidVisGeomDescription):
+        self.desc: RigidVisGeomDescription = desc
         self._link = link
         self._entity = link.entity
         self._material = link.entity.material
@@ -904,8 +902,8 @@ class RigidVisGeom(RBC):
         """
         Get the position of the visual geom.
 
-        When 'relative' is True (default), the position is reported in the user frame, with the entity's morph pose
-        offset stripped, rather than the world frame used by the solver.
+        When 'relative' is True (default), the position reported is that of the authored geom origin. The internal geom
+        origin used by the solver is the authored one moved by the entity's morph 'offset_pos' / 'offset_quat'.
         """
         return self._solver.get_vgeoms_pos(self._idx, envs_idx, relative=relative)[..., 0, :]
 
@@ -914,8 +912,8 @@ class RigidVisGeom(RBC):
         """
         Get the quaternion of the visual geom.
 
-        When 'relative' is True (default), the orientation is reported in the user frame, with the entity's morph pose
-        offset stripped, rather than the world frame used by the solver.
+        When 'relative' is True (default), the orientation reported is that of the authored geom origin. The internal
+        geom origin used by the solver is the authored one moved by the entity's morph 'offset_pos' / 'offset_quat'.
         """
         return self._solver.get_vgeoms_quat(self._idx, envs_idx, relative=relative)[..., 0, :]
 
@@ -954,6 +952,7 @@ class RigidVisGeom(RBC):
             gs.raise_exception(
                 "'set_vverts' requires the entity's morph to be created with 'enable_custom_vverts=True'."
             )
+        self._entity._is_vverts_overridden = True
         custom_offset = self._entity._custom_vvert_start - self._entity._vvert_start
         self._entity._solver.set_vverts(
             self.vvert_start + custom_offset,

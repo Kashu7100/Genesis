@@ -15,6 +15,8 @@ by level from the deepest nodes to the root (a level's boxes only depend on the 
 listed by depth.
 """
 
+from typing import NamedTuple
+
 import numpy as np
 
 import genesis as gs
@@ -23,12 +25,25 @@ import genesis as gs
 LEAF_SIZE = 1
 
 
+class TetTree(NamedTuple):
+    """Bounding-box hierarchy over items, nodes in depth-first order (see `build_tet_tree`)."""
+
+    order: np.ndarray
+    first: np.ndarray
+    count: np.ndarray
+    escape: np.ndarray
+    is_leaf: np.ndarray
+    level_nodes: np.ndarray
+    level_start: np.ndarray
+    n_levels: int
+
+
 def build_tet_tree(aabb_min, aabb_max, leaf_size=LEAF_SIZE):
     """Build the hierarchy over items given by their bounds.
 
-    Returns a dict: `order` (the permutation that makes the items of every leaf contiguous), per-node `first`, `count`,
-    `escape`, `is_leaf`, and `level_nodes` / `level_start` listing the nodes from the deepest level up (`level_start`
-    has one more entry than there are levels).
+    Returns a `TetTree`: `order` (the permutation that makes the items of every leaf contiguous), per-node `first`,
+    `count`, `escape`, `is_leaf`, and `level_nodes` / `level_start` listing the nodes from the deepest level up
+    (`level_start` has one more entry than there are levels).
     """
     aabb_min = np.asarray(aabb_min, dtype=np.float64).reshape((-1, 3))
     aabb_max = np.asarray(aabb_max, dtype=np.float64).reshape((-1, 3))
@@ -69,13 +84,13 @@ def build_tet_tree(aabb_min, aabb_max, leaf_size=LEAF_SIZE):
     level_start = np.zeros((n_levels + 1,), dtype=np.int64)
     for i_level in range(n_levels):
         level_start[i_level + 1] = level_start[i_level] + int((depth == n_levels - 1 - i_level).sum())
-    return {
-        "order": order,
-        "first": np.asarray(first, dtype=gs.np_int),
-        "count": np.asarray(count, dtype=gs.np_int),
-        "escape": np.asarray(escape, dtype=gs.np_int),
-        "is_leaf": np.asarray(is_leaf, dtype=gs.np_int),
-        "level_nodes": level_nodes.astype(gs.np_int),
-        "level_start": level_start.astype(gs.np_int),
-        "n_levels": n_levels,
-    }
+    return TetTree(
+        order=order,
+        first=np.asarray(first, dtype=gs.np_int),
+        count=np.asarray(count, dtype=gs.np_int),
+        escape=np.asarray(escape, dtype=gs.np_int),
+        is_leaf=np.asarray(is_leaf, dtype=gs.np_int),
+        level_nodes=level_nodes.astype(gs.np_int),
+        level_start=level_start.astype(gs.np_int),
+        n_levels=n_levels,
+    )

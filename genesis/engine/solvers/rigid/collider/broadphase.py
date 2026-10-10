@@ -10,14 +10,15 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.array_class as array_class
 
+from .contact import func_collider_clear_env
 from .utils import func_is_geom_aabbs_overlap
 
 
 @qd.func
 def func_check_collision_valid(
-    i_ga,
-    i_gb,
-    i_b,
+    i_ga: int,
+    i_gb: int,
+    i_b: int,
     dyn_state: array_class.DynState,
     constraint_state: array_class.ConstraintState,
     dyn_info: array_class.DynInfo,
@@ -39,15 +40,19 @@ def func_check_collision_valid(
                 if (i_leqa == i_la and i_leqb == i_lb) or (i_leqa == i_lb and i_leqb == i_la):
                     is_valid = False
 
-        # hibernated <-> fixed links
+        # A sleeping link against a fixed or sleeping one: the pair stands still, so a contact between them is either
+        # kept from the last awake solve (see func_collider_clear_env) or settled, and an awake link striking either
+        # one is the only motion that reaches them.
         if qd.static(rigid_config.use_hibernation):
-            I_la = [i_la, i_b] if qd.static(rigid_config.batch_links_info) else i_la
-            I_lb = [i_lb, i_b] if qd.static(rigid_config.batch_links_info) else i_lb
-
-            if (dyn_state.links.is_hibernated[i_la, i_b] and dyn_info.links.is_fixed[I_lb]) or (
-                dyn_state.links.is_hibernated[i_lb, i_b] and dyn_info.links.is_fixed[I_la]
-            ):
-                is_valid = False
+            if rigid_info.n_awake_dofs[i_b] < dyn_state.dofs.is_hibernated.shape[0]:
+                I_la = [i_la, i_b] if qd.static(rigid_config.batch_links_info) else i_la
+                I_lb = [i_lb, i_b] if qd.static(rigid_config.batch_links_info) else i_lb
+                is_a_hibernated = dyn_state.links.is_hibernated[i_la, i_b]
+                is_b_hibernated = dyn_state.links.is_hibernated[i_lb, i_b]
+                if (is_a_hibernated and (is_b_hibernated or dyn_info.links.is_fixed[I_lb])) or (
+                    is_b_hibernated and dyn_info.links.is_fixed[I_la]
+                ):
+                    is_valid = False
 
     return is_valid
 
@@ -57,72 +62,17 @@ def func_collision_clear(
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
     dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
 ):
     _B = collider_state.n_contacts.shape[0]
 
     qd.loop_config(name="collision_clear", serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
-        if qd.static(rigid_config.use_hibernation):
-            collider_state.n_contacts_hibernated[i_b] = 0
-
-            # Advect hibernated contacts
-            for i_c in range(collider_state.n_contacts[i_b]):
-                i_la = collider_state.contact_data.link_a[i_c, i_b]
-                i_lb = collider_state.contact_data.link_b[i_c, i_b]
-                I_la = [i_la, i_b] if qd.static(rigid_config.batch_links_info) else i_la
-                I_lb = [i_lb, i_b] if qd.static(rigid_config.batch_links_info) else i_lb
-
-                # Pair of hibernated-fixed links -> hibernated contact
-                # TODO: we should also include hibernated-hibernated links and wake up the whole contact island
-                # once a new collision is detected
-                if (dyn_state.links.is_hibernated[i_la, i_b] and dyn_info.links.is_fixed[I_lb]) or (
-                    dyn_state.links.is_hibernated[i_lb, i_b] and dyn_info.links.is_fixed[I_la]
-                ):
-                    i_c_hibernated = collider_state.n_contacts_hibernated[i_b]
-                    if i_c != i_c_hibernated:
-                        # Copying all fields of class ContactData individually
-                        # (fields mode doesn't support struct-level copy operations):
-                        # fmt: off
-                        collider_state.contact_data.geom_a[i_c_hibernated, i_b] = collider_state.contact_data.geom_a[i_c, i_b]
-                        collider_state.contact_data.geom_b[i_c_hibernated, i_b] = collider_state.contact_data.geom_b[i_c, i_b]
-                        collider_state.contact_data.penetration[i_c_hibernated, i_b] = collider_state.contact_data.penetration[i_c, i_b]
-                        collider_state.contact_data.normal[i_c_hibernated, i_b] = collider_state.contact_data.normal[i_c, i_b]
-                        collider_state.contact_data.pos[i_c_hibernated, i_b] = collider_state.contact_data.pos[i_c, i_b]
-                        collider_state.contact_data.friction[i_c_hibernated, i_b] = collider_state.contact_data.friction[i_c, i_b]
-                        collider_state.contact_data.friction_torsional[i_c_hibernated, i_b] = collider_state.contact_data.friction_torsional[i_c, i_b]
-                        collider_state.contact_data.friction_rolling[i_c_hibernated, i_b] = collider_state.contact_data.friction_rolling[i_c, i_b]
-                        collider_state.contact_data.sol_params[i_c_hibernated, i_b] = collider_state.contact_data.sol_params[i_c, i_b]
-                        collider_state.contact_data.force[i_c_hibernated, i_b] = collider_state.contact_data.force[i_c, i_b]
-                        collider_state.contact_data.link_a[i_c_hibernated, i_b] = collider_state.contact_data.link_a[i_c, i_b]
-                        collider_state.contact_data.link_b[i_c_hibernated, i_b] = collider_state.contact_data.link_b[i_c, i_b]
-                        # fmt: on
-                    collider_state.n_contacts_hibernated[i_b] = i_c_hibernated + 1
-
-        # Clear contacts: when hibernation is enabled, only clear non-hibernated contacts.
-        # The hibernated contacts (positions 0 to n_contacts_hibernated-1) were just advected and should be preserved.
-        for i_c in range(collider_state.n_contacts[i_b]):
-            should_clear = True
-            if qd.static(rigid_config.use_hibernation):
-                # Only clear if this is not a hibernated contact
-                should_clear = i_c >= collider_state.n_contacts_hibernated[i_b]
-            if should_clear:
-                collider_state.contact_data.link_a[i_c, i_b] = -1
-                collider_state.contact_data.link_b[i_c, i_b] = -1
-                collider_state.contact_data.geom_a[i_c, i_b] = -1
-                collider_state.contact_data.geom_b[i_c, i_b] = -1
-                collider_state.contact_data.penetration[i_c, i_b] = 0.0
-                collider_state.contact_data.pos[i_c, i_b] = qd.Vector.zero(gs.qd_float, 3)
-                collider_state.contact_data.normal[i_c, i_b] = qd.Vector.zero(gs.qd_float, 3)
-                collider_state.contact_data.force[i_c, i_b] = qd.Vector.zero(gs.qd_float, 3)
-
-        if qd.static(rigid_config.use_hibernation):
-            collider_state.n_contacts[i_b] = collider_state.n_contacts_hibernated[i_b]
-        else:
-            collider_state.n_contacts[i_b] = 0
+        func_collider_clear_env(i_b, dyn_state, collider_state, dyn_info, rigid_info, rigid_config)
 
 
-@qd.kernel(fastcache=True)
+@qd.func
 def _func_broad_phase_sap(
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
@@ -131,6 +81,7 @@ def _func_broad_phase_sap(
     rigid_info: array_class.RigidInfo,
     collider_info: array_class.ColliderInfo,
     rigid_config: qd.template(),
+    collider_static_config: qd.template(),
     errno: qd.Tensor,
 ):
     """
@@ -143,7 +94,7 @@ def _func_broad_phase_sap(
     n_links = dyn_info.links.geom_start.shape[0]
 
     # Clear collider state
-    func_collision_clear(dyn_state, collider_state, dyn_info, rigid_config)
+    func_collision_clear(dyn_state, collider_state, dyn_info, rigid_info, rigid_config)
 
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
@@ -169,9 +120,6 @@ def _func_broad_phase_sap(
                     collider_state.sort_buffer.value[2 * i_buffer + 1, i_b] = dyn_state.geoms.aabb_max[i_g, i_b][axis]
                     collider_state.sort_buffer.i_g[2 * i_buffer + 1, i_b] = i_g
                     collider_state.sort_buffer.is_max[2 * i_buffer + 1, i_b] = True
-
-                    dyn_state.geoms.min_buffer_idx[i_buffer, i_b] = 2 * i_g
-                    dyn_state.geoms.max_buffer_idx[i_buffer, i_b] = 2 * i_g + 1
                     i_buffer = i_buffer + 1
 
             collider_state.first_time[i_b] = False
@@ -211,23 +159,10 @@ def _func_broad_phase_sap(
                 collider_state.sort_buffer.value[j + 1, i_b] = collider_state.sort_buffer.value[j, i_b]
                 collider_state.sort_buffer.is_max[j + 1, i_b] = collider_state.sort_buffer.is_max[j, i_b]
                 collider_state.sort_buffer.i_g[j + 1, i_b] = collider_state.sort_buffer.i_g[j, i_b]
-
-                if qd.static(rigid_config.use_hibernation):
-                    if collider_state.sort_buffer.is_max[j, i_b]:
-                        dyn_state.geoms.max_buffer_idx[collider_state.sort_buffer.i_g[j, i_b], i_b] = j + 1
-                    else:
-                        dyn_state.geoms.min_buffer_idx[collider_state.sort_buffer.i_g[j, i_b], i_b] = j + 1
-
                 j -= 1
             collider_state.sort_buffer.value[j + 1, i_b] = key_value
             collider_state.sort_buffer.is_max[j + 1, i_b] = key_is_max
             collider_state.sort_buffer.i_g[j + 1, i_b] = key_i_g
-
-            if qd.static(rigid_config.use_hibernation):
-                if key_is_max:
-                    dyn_state.geoms.max_buffer_idx[key_i_g, i_b] = j + 1
-                else:
-                    dyn_state.geoms.min_buffer_idx[key_i_g, i_b] = j + 1
 
         # sweep over the sorted AABBs to find potential collision pairs
         n_broad = 0
@@ -256,7 +191,10 @@ def _func_broad_phase_sap(
 
                         if not func_is_geom_aabbs_overlap(i_ga, i_gb, i_b, dyn_state):
                             # Clear collision normal cache if not in contact
-                            if qd.static(not rigid_config.enable_mujoco_compatibility):
+                            if qd.static(
+                                collider_static_config.has_non_box_plane_convex_convex
+                                and not rigid_config.enable_mujoco_compatibility
+                            ):
                                 i_pair = collider_info.collision_pair_idx[i_ga, i_gb]
                                 collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
                                 collider_state.contact_cache.penetration[i_pair, i_b] = 0.0
@@ -312,12 +250,18 @@ def _func_broad_phase_sap(
 
                             if not func_is_geom_aabbs_overlap(i_ga, i_gb, i_b, dyn_state):
                                 # Clear collision normal cache if not in contact
-                                if qd.static(not rigid_config.enable_mujoco_compatibility):
+                                if qd.static(
+                                    collider_static_config.has_non_box_plane_convex_convex
+                                    and not rigid_config.enable_mujoco_compatibility
+                                ):
                                     i_pair = collider_info.collision_pair_idx[i_ga, i_gb]
                                     collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
                                     collider_state.contact_cache.penetration[i_pair, i_b] = 0.0
                                 continue
 
+                            if n_broad == collider_info.max_collision_pairs_broad[None]:
+                                errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_CANDIDATE_CONTACTS
+                                break
                             collider_state.broad_collision_pairs[n_broad, i_b][0] = i_ga
                             collider_state.broad_collision_pairs[n_broad, i_b][1] = i_gb
                             n_broad = n_broad + 1
@@ -345,11 +289,17 @@ def _func_broad_phase_sap(
 
                                 if not func_is_geom_aabbs_overlap(i_ga, i_gb, i_b, dyn_state):
                                     # Clear collision normal cache if not in contact
-                                    i_pair = collider_info.collision_pair_idx[i_ga, i_gb]
-                                    collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
-                                    collider_state.contact_cache.penetration[i_pair, i_b] = 0.0
+                                    if qd.static(collider_static_config.has_non_box_plane_convex_convex):
+                                        i_pair = collider_info.collision_pair_idx[i_ga, i_gb]
+                                        collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(
+                                            gs.qd_float, 3
+                                        )
+                                        collider_state.contact_cache.penetration[i_pair, i_b] = 0.0
                                     continue
 
+                                if n_broad == collider_info.max_collision_pairs_broad[None]:
+                                    errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_CANDIDATE_CONTACTS
+                                    break
                                 collider_state.broad_collision_pairs[n_broad, i_b][0] = i_ga
                                 collider_state.broad_collision_pairs[n_broad, i_b][1] = i_gb
                                 n_broad = n_broad + 1
@@ -387,7 +337,7 @@ def _func_broad_phase_sap(
         collider_state.n_broad_pairs[i_b] = n_broad
 
 
-@qd.kernel(fastcache=True)
+@qd.func
 def _func_broad_phase_all_vs_all(
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
@@ -396,6 +346,7 @@ def _func_broad_phase_all_vs_all(
     rigid_info: array_class.RigidInfo,
     collider_info: array_class.ColliderInfo,
     rigid_config: qd.template(),
+    collider_static_config: qd.template(),
     errno: qd.Tensor,
 ):
     """
@@ -405,7 +356,7 @@ def _func_broad_phase_all_vs_all(
     Passing pairs are appended to the output buffer via atomic add.
     """
 
-    func_collision_clear(dyn_state, collider_state, dyn_info, rigid_config)
+    func_collision_clear(dyn_state, collider_state, dyn_info, rigid_info, rigid_config)
 
     _B = collider_state.n_contacts.shape[0]
     qd.loop_config(name="init_broad_pairs", serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
@@ -413,7 +364,7 @@ def _func_broad_phase_all_vs_all(
         collider_state.n_broad_pairs[i_b] = 0
 
     n_valid_pairs = collider_info.n_valid_pairs[None]
-    qd.loop_config(name="traverse_valid")
+    qd.loop_config(name="traverse_valid", serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
     for i_vp, i_b in qd.ndrange(n_valid_pairs, _B):
         pair = collider_info.valid_collision_pairs[i_vp]
         i_ga = pair[0]
@@ -425,7 +376,9 @@ def _func_broad_phase_all_vs_all(
             continue
 
         if not func_is_geom_aabbs_overlap(i_ga, i_gb, i_b, dyn_state):
-            if qd.static(not rigid_config.enable_mujoco_compatibility):
+            if qd.static(
+                collider_static_config.has_non_box_plane_convex_convex and not rigid_config.enable_mujoco_compatibility
+            ):
                 i_pair = collider_info.collision_pair_idx[i_ga, i_gb]
                 collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
                 collider_state.contact_cache.penetration[i_pair, i_b] = 0.0
@@ -439,15 +392,40 @@ def _func_broad_phase_all_vs_all(
             errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_CANDIDATE_CONTACTS
 
 
+@qd.func
 def func_broad_phase(
-    dyn_state, dyn_info, rigid_info, rigid_config, constraint_state, collider_state, collider_info, errno
+    dyn_state: array_class.DynState,
+    collider_state: array_class.ColliderState,
+    constraint_state: array_class.ConstraintState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    collider_info: array_class.ColliderInfo,
+    rigid_config: qd.template(),
+    collider_static_config: qd.template(),
+    errno: qd.Tensor,
 ):
-    """Dispatch to the appropriate broad-phase kernel based on config."""
-    if rigid_config.broadphase_traversal == gs.broadphase_traversal.ALL_VS_ALL:
+    """Run the broad phase with the traversal the rigid config selects."""
+    if qd.static(rigid_config.broadphase_traversal == gs.broadphase_traversal.ALL_VS_ALL):
         _func_broad_phase_all_vs_all(
-            dyn_state, collider_state, constraint_state, dyn_info, rigid_info, collider_info, rigid_config, errno
+            dyn_state,
+            collider_state,
+            constraint_state,
+            dyn_info,
+            rigid_info,
+            collider_info,
+            rigid_config,
+            collider_static_config,
+            errno,
         )
     else:
         _func_broad_phase_sap(
-            dyn_state, collider_state, constraint_state, dyn_info, rigid_info, collider_info, rigid_config, errno
+            dyn_state,
+            collider_state,
+            constraint_state,
+            dyn_info,
+            rigid_info,
+            collider_info,
+            rigid_config,
+            collider_static_config,
+            errno,
         )

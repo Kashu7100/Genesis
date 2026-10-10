@@ -1,27 +1,15 @@
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 import torch
 
 import genesis as gs
 from genesis.options.morphs import Morph
-from genesis.options.solvers import (
-    BaseCouplerOptions,
-    FEMOptions,
-    IPCCouplerOptions,
-    KinematicOptions,
-    LegacyCouplerOptions,
-    MochiOptions,
-    MPMOptions,
-    PBDOptions,
-    RigidOptions,
-    SAPCouplerOptions,
-    SFOptions,
-    SPHOptions,
-    SimOptions,
-    ToolOptions,
-)
+from genesis.options.solvers import IPCCouplerOptions, LegacyCouplerOptions, SAPCouplerOptions
 from genesis.repr_base import RBC
+from genesis.utils.array_class import DataItem, DataKind
 from genesis.utils.misc import indices_to_mask
+from genesis.utils.tools import FPSTracker
 
 from .couplers import IPCCoupler, LegacyCoupler, SAPCoupler
 from .entities import HybridEntity
@@ -39,11 +27,12 @@ from .solvers import (
 )
 from .solvers.base_solver import GravityMixin, TimeBasedMixin
 from .states.cache import QueriedStates
-from .states.solvers import SimState
+from .states.solvers import SimState, SimulatorCheckpoint
 
 if TYPE_CHECKING:
+    from genesis.engine.entities.base_entity import Entity, EntityDescription
     from genesis.engine.scene import Scene
-    from genesis.engine.entities.base_entity import Entity
+    from genesis.options.scene import SceneOptions
 
     from .solvers.base_solver import Solver
 
@@ -59,77 +48,44 @@ class Simulator(RBC):
     ----------
     scene : gs.Scene
         The scene object that the simulator is associated with.
-    options : gs.SimOptions
-        A SimOptions object that contains all simulator-level options.
-    tool_options : gs.ToolOptions
-        A ToolOptions object that contains all the options for the ToolSolver.
-    rigid_options : gs.RigidOptions
-        A RigidOptions object that contains all the options for the RigidSolver.
-    mpm_options : gs.MPMOptions
-        An MPMOptions object that contains all the options for the MPMSolver.
-    sph_options : gs.SPHOptions
-        An SPHOptions object that contains all the options for the SPHSolver.
-    fem_options : gs.FEMOptions
-        An FEMOptions object that contains all the options for the FEMSolver.
-    sf_options : gs.SFOptions
-        An SFOptions object that contains all the options for the SFSolver.
-    pbd_options : gs.PBDOptions
-        A PBDOptions object that contains all the options for the PBDSolver.
-    mochi_options : gs.MochiOptions
-        A MochiOptions object that contains all the options for the MochiSolver.
-    coupler_options : gs.CouplerOptions
-        A CouplerOptions object that contains all the options for the coupler.
+    options : SceneOptions
+        Every option the scene was created with. The simulator keeps the one that configures itself and hands each
+        solver, the coupler and the visualizer the one that configures it. All of them stay reachable as
+        ``sim.scene.options``.
     """
 
-    def __init__(
-        self,
-        scene: "Scene",
-        options: SimOptions,
-        tool_options: ToolOptions,
-        rigid_options: RigidOptions,
-        kinematic_options: KinematicOptions,
-        mpm_options: MPMOptions,
-        sph_options: SPHOptions,
-        fem_options: FEMOptions,
-        sf_options: SFOptions,
-        pbd_options: PBDOptions,
-        mochi_options: MochiOptions,
-        coupler_options: BaseCouplerOptions,
-    ):
+    def __init__(self, scene: "Scene", options: "SceneOptions"):
         self._scene = scene
+        # The environment count the FPS log reports is known at `build`
+        self._fps_tracker = FPSTracker(
+            n_envs=0,
+            alpha=options.profiling.FPS_tracker_alpha,
+            timings_window=options.profiling.timings_window,
+            log=options.profiling.show_FPS,
+        )
 
         # options
-        self.options = options
-        self.tool_options = tool_options
-        self.rigid_options = rigid_options
-        self.kinematic_options = kinematic_options
-        self.mpm_options = mpm_options
-        self.sph_options = sph_options
-        self.fem_options = fem_options
-        self.sf_options = sf_options
-        self.pbd_options = pbd_options
-        self.mochi_options = mochi_options
-        self.coupler_options = coupler_options
+        self.options = options.sim
 
-        self._dt: float = options.dt
-        self._substep_dt: float = options.dt / options.substeps
-        self._substeps: int = options.substeps
-        self._substeps_local: int | None = options.substeps_local
-        self._requires_grad: bool = options.requires_grad
-        self._steps_local: int | None = options._steps_local
+        self._dt: float = self.options.dt
+        self._substep_dt: float = self.options.dt / self.options.substeps
+        self._substeps: int = self.options.substeps
+        self._substeps_local: int | None = self.options.substeps_local
+        self._requires_grad: bool = self.options.requires_grad
+        self._steps_local: int | None = self.options._steps_local
 
         self._cur_substep_global = 0
 
         # solvers
-        self.tool_solver = ToolSolver(self.scene, self, self.tool_options)
-        self.rigid_solver = RigidSolver(self.scene, self, self.rigid_options)
-        self.kinematic_solver = KinematicSolver(self.scene, self, self.kinematic_options)
-        self.mpm_solver = MPMSolver(self.scene, self, self.mpm_options)
-        self.sph_solver = SPHSolver(self.scene, self, self.sph_options)
-        self.pbd_solver = PBDSolver(self.scene, self, self.pbd_options)
-        self.fem_solver = FEMSolver(self.scene, self, self.fem_options)
-        self.sf_solver = SFSolver(self.scene, self, self.sf_options)
-        self.mochi_solver = MochiSolver(self.scene, self, self.mochi_options)
+        self.tool_solver = ToolSolver(self.scene, self, options.tool)
+        self.rigid_solver = RigidSolver(self.scene, self, options.rigid)
+        self.kinematic_solver = KinematicSolver(self.scene, self, options.kinematic)
+        self.mpm_solver = MPMSolver(self.scene, self, options.mpm)
+        self.sph_solver = SPHSolver(self.scene, self, options.sph)
+        self.pbd_solver = PBDSolver(self.scene, self, options.pbd)
+        self.fem_solver = FEMSolver(self.scene, self, options.fem)
+        self.sf_solver = SFSolver(self.scene, self, options.sf)
+        self.mochi_solver = MochiSolver(self.scene, self, options.mochi)
 
         self._solvers: list["Solver"] = gs.List(
             [
@@ -148,15 +104,16 @@ class Simulator(RBC):
         self._active_solvers: list["Solver"] = gs.List()
 
         # coupler
-        if isinstance(self.coupler_options, SAPCouplerOptions):
-            self._coupler = SAPCoupler(self, self.coupler_options)
-        elif isinstance(self.coupler_options, LegacyCouplerOptions):
-            self._coupler = LegacyCoupler(self, self.coupler_options)
-        elif isinstance(self.coupler_options, IPCCouplerOptions):
-            self._coupler = IPCCoupler(self, self.coupler_options)
+        if isinstance(options.coupler, SAPCouplerOptions):
+            self._coupler = SAPCoupler(self, options.coupler)
+        elif isinstance(options.coupler, LegacyCouplerOptions):
+            self._coupler = LegacyCoupler(self, options.coupler)
+        elif isinstance(options.coupler, IPCCouplerOptions):
+            self._coupler = IPCCoupler(self, options.coupler)
         else:
             gs.raise_exception(
-                f"Coupler options {self.coupler_options} not supported. Please use SAPCouplerOptions, LegacyCouplerOptions, or IPCCouplerOptions."
+                f"Coupler options {options.coupler} not supported. Please use SAPCouplerOptions, "
+                "LegacyCouplerOptions, or IPCCouplerOptions."
             )
 
         # states
@@ -168,36 +125,37 @@ class Simulator(RBC):
         # sensors
         self._sensor_manager = SensorManager(self)
 
-    def _add_entity(self, morph: Morph, material, surface, visualize_contact=False, name: str | None = None):
-        if isinstance(material, gs.materials.Tool):
-            entity = self.tool_solver.add_entity(self.n_entities, material, morph, surface, name=name)
-        elif isinstance(material, gs.materials.Mochi.Base):
-            entity = self.mochi_solver.add_entity(
-                self.n_entities, material, morph, surface, visualize_contact, name=name
-            )
-        elif isinstance(material, gs.materials.Rigid):
-            entity = self.rigid_solver.add_entity(
-                self.n_entities, material, morph, surface, visualize_contact, name=name
-            )
-        elif isinstance(material, gs.materials.Kinematic):
-            entity = self.kinematic_solver.add_entity(
-                self.n_entities, material, morph, surface, visualize_contact=False, name=name
-            )
-        elif isinstance(material, gs.materials.MPM.Base):
-            entity = self.mpm_solver.add_entity(self.n_entities, material, morph, surface, name=name)
-        elif isinstance(material, gs.materials.SPH.Base):
-            entity = self.sph_solver.add_entity(self.n_entities, material, morph, surface, name=name)
-        elif isinstance(material, gs.materials.PBD.Base):
-            entity = self.pbd_solver.add_entity(self.n_entities, material, morph, surface, name=name)
-        elif isinstance(material, gs.materials.FEM.Base):
-            entity = self.fem_solver.add_entity(self.n_entities, material, morph, surface, name=name)
-        elif isinstance(material, gs.materials.Hybrid):
+    def _add_entity(
+        self,
+        morph: Morph | None = None,
+        material=None,
+        surface=None,
+        visualize_contact=False,
+        name: str | None = None,
+        desc: "EntityDescription | None" = None,
+    ):
+        if desc is not None:
+            material = desc.material
+        if visualize_contact and not isinstance(material, gs.materials.Rigid):
+            gs.raise_exception("'visualize_contact' only applies to rigid entities.")
+        if isinstance(material, gs.materials.Hybrid):
             # Note that adding to solver is handled in the hybrid entity
             entity = HybridEntity(self.n_entities, self.scene, material, morph, surface, name=name)
         else:
-            gs.raise_exception(f"Material not supported.: {material}")
-
+            # Several solvers may declare a class the material belongs to, since 'Rigid' derives from 'Kinematic' and
+            # 'Mochi.Rigid' from both 'Mochi.Base' and 'Rigid'. The one declaring the class that comes first in the
+            # method resolution order of the material simulates it (see 'Solver.material_cls').
+            materials_cls = type(material).__mro__
+            solvers = [solver for solver in self._solvers if solver.material_cls in materials_cls]
+            if not solvers:
+                gs.raise_exception(f"No solver simulates entities of material {type(material).__name__}.")
+            solver = min(solvers, key=lambda solver: materials_cls.index(solver.material_cls))
+            entity = solver.add_entity(
+                self.n_entities, material, morph, surface, visualize_contact, name=name, desc=desc
+            )
         self._entities.append(entity)
+        if entity.desc is not None:
+            self.scene._desc.entities.append(entity.desc)
         return entity
 
     def _add_force_field(self, force_field):
@@ -206,6 +164,7 @@ class Simulator(RBC):
 
     def build(self):
         self.n_envs = self.scene.n_envs
+        self._fps_tracker.n_envs = self.n_envs
         self._B = self.scene._B
         self._para_level = self.scene._para_level
 
@@ -272,20 +231,6 @@ class Simulator(RBC):
         # A coupler exchanges state once per substep, so it is built once the rate that loop runs at is known.
         self._coupler.build()
 
-        if self.mochi_solver.is_active:
-            other_solvers = [
-                solver
-                for solver in self._active_solvers
-                if solver is not self.mochi_solver and type(solver) is not KinematicSolver
-            ]
-            if other_solvers:
-                gs.raise_exception(
-                    "MochiSolver cannot run alongside other physics solvers: "
-                    f"{[type(solver).__name__ for solver in other_solvers]}."
-                )
-            if self._requires_grad:
-                gs.raise_exception("MochiSolver does not support differentiable simulation.")
-
         if self.n_envs > 0 and self.sf_solver.is_active:
             gs.raise_exception("Batching is not supported for SF solver as of now.")
 
@@ -304,19 +249,64 @@ class Simulator(RBC):
             if solver.n_entities > 0 or solver.is_active:
                 solver.set_state(0, solver_state, envs_idx)
 
+        if envs_idx is None:
+            self._steps.zero_()
+        else:
+            self._steps[indices_to_mask(envs_idx)] = 0
+        self._restart(envs_idx)
+
+    def _restart(self, envs_idx=None):
+        """Restart the coupler, the gradient tape and the sensors."""
         self._coupler.reset(envs_idx=envs_idx)
 
         # TODO: keeping as is for now
         self.reset_grad()
         # The tape cursor is a position in the recorded window, not a clock, so it rewinds whole.
         self._cur_substep_global = 0
-        if envs_idx is None:
-            self._steps.zero_()
-        else:
-            self._steps[indices_to_mask(envs_idx)] = 0
 
         # reset sensors state
         self._sensor_manager.reset(envs_idx=envs_idx)
+
+    def data(self, kinds: frozenset[DataKind]) -> Iterator[DataItem]:
+        """Yield every item of the given kinds the active solvers hold, each under the class name of its solver."""
+        if isinstance(self._coupler, IPCCoupler):
+            gs.raise_exception(
+                "A scene coupled by IPC cannot be checkpointed yet: the IPC world holds state of its own."
+            )
+        for solver in self._active_solvers:
+            prefix = type(solver).__name__
+            for name, value, kind in solver.data:
+                if kind in kinds:
+                    yield DataItem(f"{prefix}.{name}", value, kind)
+
+    def __getstate__(self) -> SimulatorCheckpoint:
+        """Return a SimulatorCheckpoint of the simulation, for '__setstate__' to restore."""
+        if isinstance(self._coupler, IPCCoupler):
+            gs.raise_exception(
+                "A scene coupled by IPC cannot be checkpointed yet: the IPC world holds state of its own."
+            )
+        return SimulatorCheckpoint(
+            steps=self._steps.clone(),
+            solvers={type(solver).__name__: solver.__getstate__() for solver in self._active_solvers},
+        )
+
+    def __setstate__(self, state: SimulatorCheckpoint) -> None:
+        """Put the built simulation back in a state '__getstate__' read.
+
+        Everything around the state restarts as under a reset.
+
+        The clock of each environment comes back as recorded, since simulated time is state. The tape cursor, the
+        gradients, the coupler and the sensors are restarted (see 'reset'): they describe the run that led here.
+        """
+        # The record was checked against every solver by the scene (see 'Scene.__setstate__'). The restart precedes the
+        # state, whose gradients it would zero otherwise.
+        self._restart()
+        for solver in self._active_solvers:
+            solver.__setstate__(state.solvers[type(solver).__name__])
+        self._steps[:] = torch.as_tensor(state.steps, device=gs.device)
+        # Flush the zero-copy writes of fill_data on Metal.
+        if gs.use_zerocopy and gs.backend == gs.metal:
+            torch.mps.synchronize()
 
     def reset_grad(self):
         for solver in self._active_solvers:
@@ -359,33 +349,33 @@ class Simulator(RBC):
         # kernel right away. Moreover, if computations are still not done at this point, then the queue will just
         # continue growing endlessly, which will not make the simulation faster either.
         if self._cur_substep_global % RATE_CHECK_ERRNO == 0:
-            if self.rigid_solver.is_active:
-                self.rigid_solver.check_errno()
-            if self.mochi_solver.is_active:
-                self.mochi_solver.check_errno()
+            for solver in self._active_solvers:
+                solver.check_errno()
 
         # Reconstructing a checkpoint window replays steps the environments already simulated, so only a forward step
         # advances their clock. The backward pass winds it down again through `_step_grad`.
         if not in_backward:
             self._steps += 1
 
-        if self._rigid_only and not self._requires_grad:  # "Only Advance!" --Thomas Wade :P
-            for _ in range(self._substeps):
-                self.rigid_solver.substep(self.cur_substep_local)
-                self._cur_substep_global += 1
-        else:
-            self.process_input(in_backward=in_backward)
-            for _ in range(self._substeps):
-                self.substep(self.cur_substep_local)
+        with self._fps_tracker.phase("physics"):
+            if self._rigid_only and not self._requires_grad:  # "Only Advance!" --Thomas Wade :P
+                for _ in range(self._substeps):
+                    self.rigid_solver.substep(self.cur_substep_local)
+                    self._cur_substep_global += 1
+            else:
+                self.process_input(in_backward=in_backward)
+                for _ in range(self._substeps):
+                    self.substep(self.cur_substep_local)
 
-                self._cur_substep_global += 1
-                if self.cur_substep_local == 0 and not in_backward:
-                    self.save_ckpt()
+                    self._cur_substep_global += 1
+                    if self.cur_substep_local == 0 and not in_backward:
+                        self.save_ckpt()
 
-        if self.rigid_solver.is_active:
-            self.rigid_solver.clear_external_force()
+            if self.rigid_solver.is_active:
+                self.rigid_solver.clear_external_force()
 
-        self._sensor_manager.step()
+        with self._fps_tracker.phase("sensors"):
+            self._sensor_manager.step()
 
     def _step_grad(self):
         self._steps -= 1
@@ -533,6 +523,11 @@ class Simulator(RBC):
     # ------------------------------------------------------------------------------------
 
     @property
+    def steps(self) -> torch.Tensor:
+        """The number of steps each environment has run since its last reset, of shape [B]."""
+        return self._steps
+
+    @property
     def dt(self) -> float:
         """The time duration for each simulation step."""
         return self._dt
@@ -588,6 +583,11 @@ class Simulator(RBC):
         return self.f_global_to_s_local(self._cur_substep_global)
 
     @property
+    def fps_tracker(self):
+        """The tracker timing the phases of the steps and logging the step rate (FPSTracker in genesis.utils.tools)."""
+        return self._fps_tracker
+
+    @property
     def cur_step_global(self):
         """Number of `scene.step()` calls, counted for the whole batch.
 
@@ -602,7 +602,7 @@ class Simulator(RBC):
         Environments are stepped and reset independently, so simulated time is per environment, and this is where it
         is read from.
         """
-        time = self._steps[indices_to_mask(envs_idx)] * self._dt
+        time = self._steps[indices_to_mask(envs_idx)].to(dtype=gs.tc_float) * self._dt
         return time[0] if self.n_envs == 0 else time
 
     @property

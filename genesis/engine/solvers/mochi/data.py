@@ -12,7 +12,7 @@ import numpy as np
 import quadrants as qd
 
 import genesis as gs
-from genesis.utils.array_class import V_MAT, V_VEC, AutoInitMeta, V
+from genesis.utils.array_class import V_MAT, AutoInitMeta, V
 
 
 class COLLIDER_TYPE(IntEnum):
@@ -112,8 +112,6 @@ class MochiLinksInfo:
     # the rotation merit.
     inertia: qd.Tensor
     second_moment: qd.Tensor
-    damping: qd.Tensor
-    layer: qd.Tensor
     # Contact sample range and the link-frame bounding box of the sample cloud.
     sample_start: qd.Tensor
     sample_end: qd.Tensor
@@ -132,8 +130,6 @@ def get_mochi_links_info(solver):
         mass=V(dtype=gs.qd_float, shape=(n_links_,)),
         inertia=V(dtype=gs.qd_mat3, shape=(n_links_,)),
         second_moment=V(dtype=gs.qd_mat3, shape=(n_links_,)),
-        damping=V(dtype=gs.qd_float, shape=(n_links_,)),
-        layer=V(dtype=gs.qd_int, shape=(n_links_,)),
         sample_start=V(dtype=gs.qd_int, shape=(n_links_,)),
         tree_start=V(dtype=gs.qd_int, shape=(n_links_,)),
         tree_end=V(dtype=gs.qd_int, shape=(n_links_,)),

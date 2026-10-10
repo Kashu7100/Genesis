@@ -154,8 +154,6 @@ class MochiSoftEntity(Entity):
         idx,
         idx_in_solver,
         v_start,
-        el_start,
-        s_start,
         vvert_start,
         vface_start,
         name=None,
@@ -167,8 +165,6 @@ class MochiSoftEntity(Entity):
         super().__init__(idx, scene, morph, solver, material, surface, name=name)
         self._idx_in_solver = idx_in_solver
         self._v_start = v_start
-        self._el_start = el_start
-        self._s_start = s_start
         self._vvert_start = vvert_start
         self._vface_start = vface_start
         self._queried_states = QueriedStates()
@@ -176,16 +172,14 @@ class MochiSoftEntity(Entity):
 
         self.sample()
 
-        # Boundary triangles (outward winding) and the tetrahedron owning each of them; all triangles of a shell; none
-        # for a rod (its contact samples lie on the centerline).
+        # Boundary triangles (outward winding), all triangles of a shell, none for a rod (its contact samples lie on
+        # the centerline).
         if self._is_rod:
             self._surface_tri_np = np.zeros((0, 3), dtype=gs.np_int)
-            self._surface_el_np = np.zeros((0,), dtype=gs.np_int)
         elif self._is_shell:
             self._surface_tri_np = self.elems
-            self._surface_el_np = np.arange(len(self.elems), dtype=gs.np_int)
         else:
-            self._surface_tri_np, self._surface_el_np = self._boundary_triangles(self.elems)
+            self._surface_tri_np = self._boundary_triangles(self.elems)
 
     def _get_morph_identifier(self) -> str:
         morph = self._morph
@@ -220,7 +214,7 @@ class MochiSoftEntity(Entity):
             # The morph rotation is applied by `instantiate` (about the vertex centroid, like every other morph).
             verts = verts * np.asarray(morph.scale, dtype=np.float64) + np.asarray(morph.pos, dtype=np.float64)
             self.instantiate(verts, elems)
-            surface_tri, _ = self._boundary_triangles(self.elems)
+            surface_tri = self._boundary_triangles(self.elems)
             vmesh = gs.Mesh.from_trimesh(
                 trimesh.Trimesh(vertices=self.init_positions, faces=surface_tri, process=False),
                 surface=self._surface,
@@ -339,13 +333,13 @@ class MochiSoftEntity(Entity):
 
     @staticmethod
     def _boundary_triangles(elems):
-        """Boundary triangles of positively oriented tetrahedra (outward winding) and the tetrahedron owning each."""
+        """Boundary triangles of positively oriented tetrahedra, with outward winding."""
         el2tri = np.array(
             [[[v[0], v[1], v[2]], [v[0], v[3], v[1]], [v[1], v[3], v[2]], [v[0], v[2], v[3]]] for v in elems],
             dtype=gs.np_int,
         ).reshape((-1, 3))
         _, unique_idcs, cnt = np.unique(np.sort(el2tri, axis=1), axis=0, return_counts=True, return_index=True)
-        return el2tri[unique_idcs][cnt == 1], (unique_idcs // 4)[cnt == 1].astype(gs.np_int)
+        return el2tri[unique_idcs][cnt == 1]
 
     def instantiate(self, verts, elems):
         """Set the rest vertex positions (with the morph orientation applied about their centroid and the morph pose
@@ -582,10 +576,6 @@ class MochiSoftEntity(Entity):
         return self._surface_tri_np
 
     @property
-    def surface_elements(self):
-        return self._surface_el_np
-
-    @property
     def n_dofs(self):
         return 3 * self.n_vertices
 
@@ -596,14 +586,6 @@ class MochiSoftEntity(Entity):
     @property
     def v_end(self):
         return self._v_start + self.n_vertices
-
-    @property
-    def el_start(self):
-        return self._el_start
-
-    @property
-    def s_start(self):
-        return self._s_start
 
     @property
     def vgeoms(self):

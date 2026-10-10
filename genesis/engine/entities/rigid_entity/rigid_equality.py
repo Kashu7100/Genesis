@@ -1,6 +1,6 @@
 import genesis as gs
 from genesis.repr_base import RBC
-from genesis.utils.description import EqualityDescription
+from .description import RigidEqualityDescription
 
 
 class RigidEquality(RBC):
@@ -8,8 +8,8 @@ class RigidEquality(RBC):
     Equality class for rigid body entities.
     """
 
-    def __init__(self, entity, idx, eq_obj1id, eq_obj2id, desc: EqualityDescription):
-        self.desc: EqualityDescription = desc
+    def __init__(self, entity, idx, eq_obj1id, eq_obj2id, desc: RigidEqualityDescription):
+        self.desc: RigidEqualityDescription = desc
         self._entity = entity
         self._solver = entity.solver
 
@@ -105,7 +105,7 @@ class RigidEquality(RBC):
     @property
     def eq_obj2id(self):
         """
-        Returns the index of the second object (joint for EQUALITY_TYPE.JOINT, link otherwise)
+        Returns the index of the second object, or -1 for a JOINT equality that fixes one joint to a constant.
         """
         return self._eq_obj2id
 

@@ -49,12 +49,6 @@ def func_svk_stress(S, A_inv, lam, mu):
 
 
 @qd.func
-def func_svk_tangent_pair(G1, G2, A_inv, lam, mu):
-    """G1 : D2Psi : G2 for two symmetric 2x2 tensors."""
-    return 2.0 * mu * func_colon(G1, A_inv @ G2 @ A_inv) + lam * func_colon(A_inv, G1) * func_colon(A_inv, G2)
-
-
-@qd.func
 def func_svk_tangent_dof(G, A_inv):
     """Per-dof factors of the tangent pairs: the metric product A^-1 G A^-1 (symmetric, three numbers) and the trace
     A^-1 : G, so that G1 : D2Psi : G2 = 2 mu G1 : (A^-1 G2 A^-1) + lam (A^-1 : G1)(A^-1 : G2) costs a handful of

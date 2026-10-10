@@ -1,13 +1,12 @@
 import numpy as np
 
-
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.entities.rigid_entity.rigid_link import RigidLink
 from genesis.repr_base import RBC
-from genesis.utils import array_class
-from genesis.utils.description import JointDescription
 from genesis.utils.misc import DeprecationError, tensor_to_array
+
+from .description import RigidJointDescription
 
 
 class RigidJoint(RBC):
@@ -15,8 +14,8 @@ class RigidJoint(RBC):
     Joint class for rigid body entities. Each RigidLink is connected to its parent link via a RigidJoint.
     """
 
-    def __init__(self, entity, idx, link_idx, q_start, dof_start, desc: JointDescription):
-        self.desc: JointDescription = desc
+    def __init__(self, entity, idx, link_idx, q_start, dof_start, desc: RigidJointDescription):
+        self.desc: RigidJointDescription = desc
         self._entity = entity
         self._solver = entity.solver
 
@@ -94,16 +93,16 @@ class RigidJoint(RBC):
         else:
             self.desc.sol_params = sol_params
 
-    # ------------------------------------------------------------------------------------
-    # ----------------------------------- properties -------------------------------------
-    # ------------------------------------------------------------------------------------
-
     @gs.assert_built
     def get_sol_params(self):
         """
         Get the solver parameters the simulation is currently using for this joint.
         """
         return self._solver.get_sol_params(joints_idx=self._idx, envs_idx=None)[..., 0, :]
+
+    # ------------------------------------------------------------------------------------
+    # ----------------------------------- properties -------------------------------------
+    # ------------------------------------------------------------------------------------
 
     @property
     def uid(self):
@@ -304,14 +303,6 @@ class RigidJoint(RBC):
         return list(range(self.q_start - self._entity.q_start, self.q_end - self._entity.q_start))
 
     @property
-    def dofs_motion_ang(self):
-        return self.desc.dofs_motion_ang
-
-    @property
-    def dofs_motion_vel(self):
-        return self.desc.dofs_motion_vel
-
-    @property
     def dofs_length(self):
         """
         Returns the characteristic length of each dof, used to put dof velocities on a common linear (m/s) scale.
@@ -371,17 +362,25 @@ class RigidJoint(RBC):
             # Per rotational dof, the largest perpendicular distance from its rotation axis (through the joint anchor)
             # to the geometry. Tighter than one shared sphere, and correct for an offset hinge (where the body rotates
             # about one end rather than its COM).
-            anchor = self.pos
+            geoms_joint = [self.desc] * len(geoms)
+            if self.link._variant_geom_ranges is not None:
+                i_link, i_joint = self.link.idx - self._entity.link_start, self.idx - self.link.joint_start
+                for i_variant, (geom_start, geom_end) in enumerate(self.link._variant_geom_ranges[1:], start=1):
+                    v_joint = self._entity.desc.variants[i_variant].links[i_link].joints[i_joint]
+                    for i_g, geom in enumerate(geoms):
+                        if geom_start <= geom.idx < geom_end:
+                            geoms_joint[i_g] = v_joint
             verts = [
-                gu.transform_by_trans_quat(geom.init_verts, geom.init_pos, geom.init_quat) - anchor for geom in geoms
+                gu.transform_by_trans_quat(geom.init_verts, geom.init_pos, geom.init_quat) - j_desc.pos
+                for geom, j_desc in zip(geoms, geoms_joint)
             ]
             for i_d in range(n_dofs):
-                axis = self.desc.dofs_motion_ang[i_d]
-                axis_norm = np.linalg.norm(axis)
-                if axis_norm < gs.EPS:
+                if np.linalg.norm(self.desc.dofs_motion_ang[i_d]) < gs.EPS:
                     continue  # translational dof, length stays 1
-                axis = axis / axis_norm
-                perp = [np.linalg.norm(v - np.outer(v @ axis, axis), axis=1).max() for v in verts]
+                perp = []
+                for geom_verts, j_desc in zip(verts, geoms_joint):
+                    axis = j_desc.dofs_motion_ang[i_d] / np.linalg.norm(j_desc.dofs_motion_ang[i_d])
+                    perp.append(np.linalg.norm(geom_verts - np.outer(geom_verts @ axis, axis), axis=1).max())
                 lengths[i_d] = body_radius(perp)
         return lengths
 

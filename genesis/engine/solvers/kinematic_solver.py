@@ -1,4 +1,6 @@
-from typing import TYPE_CHECKING, Literal
+from collections.abc import Iterator
+from dataclasses import asdict
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -7,6 +9,7 @@ import genesis as gs
 import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 from genesis.engine.entities.rigid_entity import KinematicEntity
+from genesis.engine.materials import Kinematic
 from genesis.engine.solvers.rigid.abd.inverse_kinematics import (
     kernel_forward_kinematics_query,
     kernel_get_jacobian,
@@ -14,12 +17,14 @@ from genesis.engine.solvers.rigid.abd.inverse_kinematics import (
     kernel_inverse_kinematics_entity,
     kernel_set_ik_targets,
 )
-from genesis.engine.states.solvers import KinematicSolverState
-from genesis.options.solvers import KinematicOptions, RigidOptions
+from genesis.engine.states.solvers import KinematicSolverCheckpoint, KinematicSolverState
+from genesis.options.morphs import Morph
+from genesis.options.solvers import KinematicOptions
 from genesis.utils.misc import (
     assign_indexed_tensor,
     broadcast_tensor,
     indices_to_mask,
+    qd_to_numpy,
     qd_to_torch,
     qd_zero_grad,
     sanitize_indexed_tensor,
@@ -60,7 +65,6 @@ from .rigid.abd.misc import (
     kernel_init_vgeom_fields,
     kernel_init_vvert_fields,
     kernel_update_heterogeneous_links_vgeom,
-    kernel_update_vgeoms_render_T,
 )
 
 if TYPE_CHECKING:
@@ -85,24 +89,25 @@ def _balanced_variant_mapping(n_variants, B):
 def _select_links_offset(offset, links_idx, envs_idx):
     """Index a base-link forward offset for a transposed state query.
 
-    'offset' has shape '[n_offset_envs, n_links, dim]', where 'n_offset_envs' is 1 for an environment-uniform offset
-    (broadcast over the batch) or 'n_envs' when heterogeneous variants make it environment-specific. It is indexed
-    with the same combined mask as 'qd_to_torch' so the result broadcasts against the '[n_envs, n_sel, dim]' state
-    tensor, keeping the link dimension for integer indices. The environment axis is left unindexed (broadcast) when
-    the offset is environment-uniform.
+    'offset' has shape '[n_links, dim]' for an environment-uniform offset or '[n_envs, n_links, dim]' when
+    heterogeneous variants make it environment-specific. It is indexed with the same combined mask as 'qd_to_torch' so
+    the result broadcasts against the '[n_envs, n_sel, dim]' state tensor, keeping the link dimension for integer
+    indices.
     """
-    row_mask = None if offset.shape[0] == 1 else envs_idx
-    return offset[indices_to_mask(row_mask, links_idx)]
+    if offset.ndim == 2:
+        return offset[indices_to_mask(links_idx)]
+    return offset[indices_to_mask(envs_idx, links_idx)]
 
 
 def _offset_world_shift(offset_pos, offset_quat, world_quat):
     """World-frame displacement contributed by a body-frame offset position at a given world orientation.
 
-    The user orientation is 'world_quat' with the offset stripped, and 'offset_pos' rotates with it. Relative getters
-    subtract this from the world position to recover the user position; relative setters add it to do the reverse.
+    The authored orientation is 'world_quat' with the offset stripped, and 'offset_pos' rotates with it. Relative
+    getters subtract this from the world position to recover the authored position; relative setters add it to do the
+    reverse.
     """
-    user_quat = gu.transform_quat_by_quat(gu.inv_quat(offset_quat), world_quat)
-    return gu.transform_by_quat(offset_pos, user_quat)
+    authored_quat = gu.transform_quat_by_quat(gu.inv_quat(offset_quat), world_quat)
+    return gu.transform_by_quat(offset_pos, authored_quat)
 
 
 def _fill_base_link_geom_offsets(offset_pos, offset_quat, entity, geoms, ranges):
@@ -118,10 +123,13 @@ def _fill_base_link_geom_offsets(offset_pos, offset_quat, entity, geoms, ranges)
     """
     for geom in geoms:
         if ranges is None:
-            link_off_pos = entity._links_offset_pos.get(geom.link.idx - entity._link_start)
-            if link_off_pos is None:
+            # An identity link offset leaves the geom frame in place, so the conjugation is skipped
+            link_off_pos = geom.link.desc.offset_pos
+            link_off_quat = geom.link.desc.offset_quat
+            if np.allclose(link_off_pos, 0.0, atol=gs.EPS) and np.allclose(
+                link_off_quat, gu.identity_quat(), atol=gs.EPS
+            ):
                 continue
-            link_off_quat = entity._links_offset_quat[geom.link.idx - entity._link_start]
             morph = entity._morph
         else:
             # 'ranges' only cover the heterogeneous base link's variant geoms; geoms on other (child) links carry no
@@ -129,8 +137,8 @@ def _fill_base_link_geom_offsets(offset_pos, offset_quat, entity, geoms, ranges)
             i_variant = next((i for i, (start, end) in enumerate(ranges) if start <= geom.idx < end), None)
             if i_variant is None:
                 continue
-            link_off_pos = entity._variant_offset_pos[i_variant]
-            link_off_quat = entity._variant_offset_quat[i_variant]
+            link_off_pos = entity._desc.variants[i_variant].offset_pos
+            link_off_quat = entity._desc.variants[i_variant].offset_quat
             morph = entity._morph if i_variant == 0 else entity._morph_heterogeneous[i_variant - 1]
         frame_pos, frame_quat = gu.transform_pos_quat_by_trans_quat(
             geom.init_pos, geom.init_quat, link_off_pos, link_off_quat
@@ -159,6 +167,10 @@ class KinematicSolver(Solver):
     RigidSolver extends this with physics (collision, constraints, dynamics).
     """
 
+    material_cls = Kinematic
+    # The kinds of entity this solver builds, each with the morph class it is built from, the most specific first
+    _entity_classes = ((Morph, KinematicEntity),)
+
     def __init__(self, scene: "Scene", sim: "Simulator", options: "KinematicOptions") -> None:
         super().__init__(scene, sim, options)
 
@@ -181,35 +193,33 @@ class KinematicSolver(Solver):
     # ----------------------------------- add_entity -------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def add_entity(self, idx, material, morph, surface, visualize_contact=False, name=None) -> "KinematicEntity":
-        morph_heterogeneous = []
-        if isinstance(morph, (tuple, list)):
-            morph, *morph_heterogeneous = morph
-            self._enable_heterogeneous |= bool(morph_heterogeneous)
+    def add_entity(
+        self, idx, material, morph, surface, visualize_contact=False, name=None, desc=None
+    ) -> "KinematicEntity":
+        """Create an entity from its description.
 
-        morph._enable_mujoco_compatibility = self._enable_mujoco_compatibility
-
-        entity = KinematicEntity(
-            scene=self._scene,
-            solver=self,
-            material=material,
-            morph=morph,
-            surface=surface,
-            idx=idx,
-            idx_in_solver=self.n_entities,
-            link_start=self.n_links,
-            joint_start=self.n_joints,
-            q_start=self.n_qs,
-            dof_start=self.n_dofs,
-            vgeom_start=self.n_vgeoms,
-            vvert_start=self.n_vverts,
-            vface_start=self.n_vfaces,
-            custom_vvert_start=self.n_custom_vverts,
-            custom_vface_start=self.n_custom_vfaces,
-            morph_heterogeneous=morph_heterogeneous,
-            name=name,
-        )
+        Given no description, one is resolved from the other arguments (see 'KinematicEntityDescription'), the morph
+        deciding the kind of entity among those the solver builds ('_entity_classes'). The class of a given description
+        says which kind it holds. Creation from a description reads no asset.
+        """
+        if desc is None:
+            morphs = (morph,) if isinstance(morph, Morph) else tuple(morph)
+            entity_cls = next(cls for morph_cls, cls in self._entity_classes if isinstance(morphs[0], morph_cls))
+            desc = entity_cls._description_cls.resolve(
+                morphs, material, surface, self._options, self._enable_mujoco_compatibility, visualize_contact, name
+            )
+        else:
+            for _, entity_cls in self._entity_classes:
+                if entity_cls._description_cls is type(desc):
+                    break
+            else:
+                gs.raise_exception(f"{type(self).__name__} simulates no entity described by {type(desc).__name__}.")
+        self._enable_heterogeneous |= bool(desc.variants)
+        entity = entity_cls(self._scene, self, idx, desc)
         self._entities.append(entity)
+        # An attachment names an entity added before this one, which 'attach' requires, so it is restored here
+        if desc.attachment is not None:
+            entity.attach(self._scene.get_entity(desc.attachment.entity_name), desc.attachment.link_name)
         return entity
 
     # ------------------------------------------------------------------------------------
@@ -254,54 +264,57 @@ class KinematicSolver(Solver):
                 base_links_idx.append(joint.link.idx)
         self._base_links_idx = torch.tensor(base_links_idx, dtype=gs.tc_int, device=gs.device)
 
-        # World<-user pose offset, applied by the relative get/set methods. Links carry the morph offset composed with
-        # the base-link inertial alignment (identity for non-base links); geoms and visual geoms carry only the morph
-        # offset, since alignment re-expresses them into the aligned frame. Heterogeneous entities vary the base-link
-        # offset per environment (one offset per variant), so the link offset is stored per-env when any such entity
-        # has divergent variant offsets, and as a single broadcast row otherwise. Forward offset device tensors are
-        # None when everything is identity, and the relative getters recompute the inverse on the fly.
+        # World<-authored pose offset, applied by the relative get/set methods. Links carry the morph offset composed
+        # with the base-link inertial alignment (identity for non-base links); geoms and visual geoms carry only the
+        # morph offset, since alignment re-expresses them into the aligned frame. Heterogeneous entities vary the
+        # base-link offset per environment (one offset per variant), so the link offset is stored per-env when any such
+        # entity has divergent variant offsets, and without an environment axis otherwise. The relative getters
+        # recompute the inverse on the fly.
         links_offset_per_env = any(
-            entity._variant_offset_pos is not None
-            and not all(
-                np.allclose(pos, entity._variant_offset_pos[0]) and np.allclose(quat, entity._variant_offset_quat[0])
-                for pos, quat in zip(entity._variant_offset_pos, entity._variant_offset_quat)
+            not all(
+                np.allclose(variant.offset_pos, entity._desc.variants[0].offset_pos)
+                and np.allclose(variant.offset_quat, entity._desc.variants[0].offset_quat)
+                for variant in entity._desc.variants
             )
             for entity in self._entities
         )
-        n_offset_envs = self._B if links_offset_per_env else 1
-        links_offset_pos = np.zeros((n_offset_envs, self.n_links, 3), dtype=gs.np_float)
-        links_offset_quat = np.tile(gu.identity_quat(), (n_offset_envs, self.n_links, 1))
+        offset_shape = (self._B, self.n_links) if links_offset_per_env else (self.n_links,)
+        links_offset_pos = np.zeros((*offset_shape, 3), dtype=gs.np_float)
+        links_offset_quat = np.tile(gu.identity_quat(), (*offset_shape, 1))
         vgeoms_offset_pos = np.zeros((self.n_vgeoms, 3), dtype=gs.np_float)
         vgeoms_offset_quat = np.tile(gu.identity_quat(), (self.n_vgeoms, 1))
         for entity in self._entities:
-            if links_offset_per_env and entity._variant_offset_pos is not None:
-                variant_idx = _balanced_variant_mapping(len(entity._variant_offset_pos), self._B)
+            if links_offset_per_env and entity._desc.variants:
+                variant_idx = _balanced_variant_mapping(len(entity._desc.variants), self._B)
                 links_offset_pos[np.arange(self._B), entity.base_link_idx] = np.stack(
-                    [entity._variant_offset_pos[v] for v in variant_idx]
+                    [entity._desc.variants[v].offset_pos for v in variant_idx]
                 )
                 links_offset_quat[np.arange(self._B), entity.base_link_idx] = np.stack(
-                    [entity._variant_offset_quat[v] for v in variant_idx]
+                    [entity._desc.variants[v].offset_quat for v in variant_idx]
                 )
                 vgeoms_ranges = entity.base_link._variant_vgeom_ranges
             else:
                 # Each root link carries its own offset; children inherit it through the kinematic chain and stay
                 # identity. Visual geoms get the morph offset conjugated into their own frame.
-                for local_idx, link_offset_pos in entity._links_offset_pos.items():
-                    links_offset_pos[:, entity._link_start + local_idx] = link_offset_pos
-                    links_offset_quat[:, entity._link_start + local_idx] = entity._links_offset_quat[local_idx]
+                for local_idx, link in enumerate(entity.links):
+                    links_offset_pos[..., entity._link_start + local_idx, :] = link.desc.offset_pos
+                    links_offset_quat[..., entity._link_start + local_idx, :] = link.desc.offset_quat
                 vgeoms_ranges = None
             _fill_base_link_geom_offsets(vgeoms_offset_pos, vgeoms_offset_quat, entity, entity.vgeoms, vgeoms_ranges)
-        # Per-link identity masks gate the relative set/backward paths: a relative set on a link whose offset is
+        # Per-link identity masks gate the relative get/set/backward paths: a relative set on a link whose offset is
         # identity is a plain passthrough, while a non-identity offset rewrites the world position or drops the
         # composition jacobian. Kept as host-side numpy (never used in kernels) so the gates avoid a GPU->host sync.
         self._links_offset_quat_is_identity = np.all(
-            np.isclose(gu.quat_to_xyz(links_offset_quat), 0.0, atol=gs.EPS), axis=2
-        ).all(axis=0)
-        self._links_offset_pos_is_identity = np.all(np.isclose(links_offset_pos, 0.0, atol=gs.EPS), axis=2).all(axis=0)
-        self._links_offset_pos = self._links_offset_quat = None
-        if not (self._links_offset_pos_is_identity.all() and self._links_offset_quat_is_identity.all()):
-            self._links_offset_pos = torch.from_numpy(links_offset_pos).to(device=gs.device, dtype=gs.tc_float)
-            self._links_offset_quat = torch.from_numpy(links_offset_quat).to(device=gs.device, dtype=gs.tc_float)
+            np.isclose(gu.quat_to_xyz(links_offset_quat), 0.0, atol=gs.EPS), axis=-1
+        )
+        self._links_offset_pos_is_identity = np.all(np.isclose(links_offset_pos, 0.0, atol=gs.EPS), axis=-1)
+        if links_offset_per_env:
+            self._links_offset_quat_is_identity = self._links_offset_quat_is_identity.all(axis=0)
+            self._links_offset_pos_is_identity = self._links_offset_pos_is_identity.all(axis=0)
+        # The link offset tensors are allocated even when every link is identity, so the getter kernels can take them
+        # unconditionally.
+        self._links_offset_pos = torch.from_numpy(links_offset_pos).to(device=gs.device, dtype=gs.tc_float)
+        self._links_offset_quat = torch.from_numpy(links_offset_quat).to(device=gs.device, dtype=gs.tc_float)
         self._vgeoms_offset_pos = self._vgeoms_offset_quat = None
         if not (
             np.allclose(vgeoms_offset_pos, 0.0, atol=gs.EPS)
@@ -321,10 +334,42 @@ class KinematicSolver(Solver):
         self.n_custom_vfaces_ = max(1, self.n_custom_vfaces)
         self.n_entities_ = max(1, self.n_entities)
 
-        # batch_links_info is required when heterogeneous simulation is used.
-        # We must update options because get_links_info reads from solver._options.batch_links_info.
+        # The kinematic roots and trees, see roots_link_idx and trees_root_idx in array_class.py. A link no dof moves,
+        # its own or an ancestor's, is static and belongs to no tree. A moving link roots the tree of its parent, or its
+        # own when its parent is static or absent. The parents precede the children.
+        self._n_roots = len({link.root_idx for link in self.links})
+        self.n_roots_ = max(1, self._n_roots)
+        links_is_static = np.ones(self.n_links, dtype=bool)
+        links_tree_root_idx = np.full(self.n_links, -1, dtype=gs.np_int)
+        for link in self.links:
+            is_parent_static = link.parent_idx == -1 or links_is_static[link.parent_idx]
+            links_is_static[link.idx] = is_parent_static and link.n_dofs == 0
+            if links_is_static[link.idx]:
+                continue
+            links_tree_root_idx[link.idx] = link.idx if is_parent_static else links_tree_root_idx[link.parent_idx]
+        self._links_tree_root_idx = links_tree_root_idx
+        self._n_trees = np.unique(links_tree_root_idx[links_tree_root_idx >= 0]).size
+        self.n_trees_ = max(1, self._n_trees)
+
+        # The level of a link in its root and in its tree is its number of ancestors below the root link of either (see
+        # trees_levels_links_idx in array_class.py). Each pass moves every link one ancestor up, so the depth of a link
+        # is the number of passes it takes to run out of parents.
+        links_depth = np.zeros(self.n_links, dtype=gs.np_int)
+        links_ancestor_idx = self._links_parent_idx
+        while (links_ancestor_idx >= 0).any():
+            has_ancestor = links_ancestor_idx >= 0
+            links_depth += has_ancestor
+            links_ancestor_idx = np.where(has_ancestor, self._links_parent_idx[links_ancestor_idx], -1)
+        self._links_root_idx = np.array([link.root_idx for link in self.links], dtype=gs.np_int)
+        self._links_root_level = links_depth - links_depth[self._links_root_idx]
+        self._links_tree_level = np.where(links_tree_root_idx >= 0, links_depth - links_depth[links_tree_root_idx], -1)
+
+        # Heterogeneous simulation stores the link, joint and dof info per environment, every variant stating its own
+        # (see '_dispatch_heterogeneous_kinematics'). We must update options because the getters read from them.
         if self._enable_heterogeneous:
             self._options.batch_links_info = True
+            self._options.batch_joints_info = True
+            self._options.batch_dofs_info = True
 
         self._build_static_config()
         self._create_data_manager()
@@ -333,10 +378,10 @@ class KinematicSolver(Solver):
         self._init_vvert_fields()
         self._init_vgeom_fields()
         self._init_link_fields()
+        self._init_tree_fields()
         self._init_entity_fields()
         self._init_vfaces_raycast_mask()
 
-        self._init_envs_offset()
         self._init_vverts_state()
 
     def _init_vverts_state(self):
@@ -366,8 +411,8 @@ class KinematicSolver(Solver):
             requires_grad=False,
             use_hibernation=False,
             batch_links_info=self._options.batch_links_info,
-            batch_dofs_info=False,
-            batch_joints_info=False,
+            batch_dofs_info=self._options.batch_dofs_info,
+            batch_joints_info=self._options.batch_joints_info,
             enable_mujoco_compatibility=False,
             enable_elliptic_friction=False,
             enable_signorini_contact=False,
@@ -376,7 +421,6 @@ class KinematicSolver(Solver):
             enable_joint_limit=False,
             box_box_detection=False,
             sparse_solve=False,
-            sparse_envelope=False,
             integrator=gs.integrator.approximate_implicitfast,
             solver_type=0,
         )
@@ -388,6 +432,16 @@ class KinematicSolver(Solver):
         self.dyn_info = self.data_manager.dyn_info
         self.dyn_state = self.data_manager.dyn_state
         self.kinematics_scratch = self.data_manager.kinematics_scratch
+
+    @property
+    def data(self) -> Iterator[array_class.DataItem]:
+        yield from array_class.iter_data(self.rigid_config, "rigid_config")
+        yield from array_class.iter_data(self.data_manager.errno, "errno", array_class.DataKind.STATE)
+        structs = ["rigid_info", "dyn_info", "dyn_state", "rigid_adjoint_cache"]
+        if self.rigid_config.requires_grad:
+            structs.append("dyn_state_adjoint_cache")
+        for name in structs:
+            yield from array_class.iter_data(getattr(self.data_manager, name), name)
 
     # ------------------------------------------------------------------------------------
     # --------------------------------- hook methods -------------------------------------
@@ -433,6 +487,132 @@ class KinematicSolver(Solver):
 
         self.dyn_state.dofs.force.fill(0)
 
+    def _init_tree_fields(self):
+        """Initialize the fields describing the kinematic roots and trees (see roots_link_idx and trees_root_idx in
+        array_class.py).
+
+        The links come parent first and each branch occupies a contiguous index range, so the dofs of a tree form one
+        contiguous range and the trees are disjoint in dof space.
+        """
+        # A static link belongs to no tree, and a scene without any tree keeps its padded tree slot empty (see
+        # trees_root_idx in array_class.py)
+        links_tree_idx = np.full(self.n_links_, -1, dtype=gs.np_int)
+        if self._n_roots:
+            roots_link_idx, links_root_rank = np.unique(self._links_root_idx, return_inverse=True)
+            roots_link_end = np.zeros(self._n_roots, dtype=gs.np_int)
+            np.maximum.at(roots_link_end, links_root_rank, np.arange(1, self.n_links + 1, dtype=gs.np_int))
+            self.rigid_info.roots_link_idx.from_numpy(roots_link_idx)
+            self.rigid_info.links_root_end.from_numpy(roots_link_end[links_root_rank])
+        if self._n_trees:
+            links_n_dofs = np.array([link.n_dofs for link in self.links], dtype=gs.np_int)
+            links_dof_start = np.array([link.dof_start for link in self.links], dtype=gs.np_int)
+            links_dof_end = np.array([link.dof_end for link in self.links], dtype=gs.np_int)
+            tree_links = np.flatnonzero(self._links_tree_root_idx >= 0)
+            trees_root_idx, links_tree_rank = np.unique(self._links_tree_root_idx[tree_links], return_inverse=True)
+            trees_n_dofs = np.zeros(self._n_trees, dtype=gs.np_int)
+            np.add.at(trees_n_dofs, links_tree_rank, links_n_dofs[tree_links])
+            # A dof-less link carries no dof range of its own
+            dof_links = np.flatnonzero(links_n_dofs[tree_links])
+            trees_dof_start = np.full(self._n_trees, self.n_dofs, dtype=gs.np_int)
+            np.minimum.at(trees_dof_start, links_tree_rank[dof_links], links_dof_start[tree_links][dof_links])
+            trees_dof_end = np.zeros(self._n_trees, dtype=gs.np_int)
+            np.maximum.at(trees_dof_end, links_tree_rank[dof_links], links_dof_end[tree_links][dof_links])
+            if (trees_dof_end - trees_dof_start != trees_n_dofs).any():
+                gs.raise_exception("The dofs of a kinematic tree must be contiguous.")
+            trees_link_end = np.zeros(self._n_trees, dtype=gs.np_int)
+            np.maximum.at(trees_link_end, links_tree_rank, tree_links + 1)
+            trees_n_links = np.zeros(self._n_trees, dtype=gs.np_int)
+            np.add.at(trees_n_links, links_tree_rank, 1)
+            trees_order = np.argsort(trees_dof_start)
+            trees_rank = np.empty(self._n_trees, dtype=gs.np_int)
+            trees_rank[trees_order] = np.arange(self._n_trees, dtype=gs.np_int)
+            links_tree_idx[tree_links] = trees_rank[links_tree_rank]
+            self.rigid_info.trees_root_idx.from_numpy(trees_root_idx[trees_order])
+            self.rigid_info.trees_link_end.from_numpy(trees_link_end[trees_order])
+            self.rigid_info.trees_n_links.from_numpy(trees_n_links[trees_order])
+            self.rigid_info.trees_dof_start.from_numpy(trees_dof_start[trees_order])
+            self.rigid_info.trees_n_dofs.from_numpy(trees_n_dofs[trees_order])
+        else:
+            self.rigid_info.trees_root_idx.fill(0)
+            self.rigid_info.trees_link_end.fill(0)
+        self.rigid_info.links_tree_idx.from_numpy(links_tree_idx)
+
+        # Fill the level tables of every tree and root for the level sweep (see trees_levels_links_idx in
+        # array_class.py). A scene without any tree keeps its padded tree slot at zero levels.
+        if self._n_roots and self.rigid_config.enable_level_sweep:
+            for links_group_idx, links_group_level, n_groups, groups_fields in (
+                (
+                    links_tree_idx,
+                    self._links_tree_level,
+                    self.n_trees_,
+                    (
+                        self.rigid_info.trees_level_start,
+                        self.rigid_info.trees_n_levels,
+                        self.rigid_info.trees_levels_links_idx,
+                        None,
+                        self.rigid_info.trees_levels_links_end,
+                    ),
+                ),
+                (
+                    links_root_rank,
+                    self._links_root_level,
+                    self._n_roots,
+                    (
+                        self.rigid_info.roots_level_start,
+                        self.rigid_info.roots_n_levels,
+                        self.rigid_info.roots_levels_links_idx,
+                        self.rigid_info.roots_levels_links_start,
+                        self.rigid_info.roots_levels_links_end,
+                    ),
+                ),
+            ):
+                group_links = np.arange(self.n_links, dtype=gs.np_int)[links_group_idx >= 0]
+                links_group = links_group_idx[group_links]
+                links_level = links_group_level[group_links]
+                groups_n_levels = np.zeros(n_groups, dtype=gs.np_int)
+                np.maximum.at(groups_n_levels, links_group, links_level + 1)
+                groups_level_start = np.zeros(n_groups, dtype=gs.np_int)
+                np.cumsum(np.bincount(links_group, minlength=n_groups)[:-1], out=groups_level_start[1:])
+                # The links of every group, group after group, level after level, and each level in ascending order
+                entries_order = np.lexsort((group_links, links_level, links_group))
+                groups_levels_links_idx = group_links[entries_order]
+                entries_group = links_group[entries_order]
+                entries_level = links_level[entries_order]
+                entries_idx = np.arange(len(groups_levels_links_idx), dtype=gs.np_int)
+                # An entry ends its level where the next entry starts another level or another group
+                is_level_last = np.ones(len(groups_levels_links_idx), dtype=bool)
+                is_level_last[:-1] = (np.diff(entries_group) != 0) | (np.diff(entries_level) != 0)
+                levels_last_entry = entries_idx[is_level_last]
+                groups_levels_links_end = levels_last_entry[np.searchsorted(levels_last_entry, entries_idx)] + 1
+                is_level_first = np.ones(len(groups_levels_links_idx), dtype=bool)
+                is_level_first[1:] = is_level_last[:-1]
+                levels_first_entry = entries_idx[is_level_first]
+                groups_levels_links_start = levels_first_entry[
+                    np.searchsorted(levels_first_entry, entries_idx, side="right") - 1
+                ]
+                for field, value in zip(
+                    groups_fields,
+                    (
+                        groups_level_start,
+                        groups_n_levels,
+                        groups_levels_links_idx,
+                        groups_levels_links_start,
+                        groups_levels_links_end,
+                    ),
+                ):
+                    if field is not None and len(value):
+                        field.from_numpy(value)
+            child_links = np.arange(self.n_links, dtype=gs.np_int)[self._links_parent_idx >= 0]
+            links_child_start = np.zeros(self.n_links_ + 1, dtype=gs.np_int)
+            np.cumsum(
+                np.bincount(self._links_parent_idx[child_links], minlength=self.n_links_), out=links_child_start[1:]
+            )
+            self.rigid_info.links_child_start.from_numpy(links_child_start)
+            if len(child_links):
+                self.rigid_info.links_child_idx.from_numpy(
+                    child_links[np.lexsort((-child_links, self._links_parent_idx[child_links]))]
+                )
+
     def _init_link_fields(self):
         if self.links:
             links = self.links
@@ -450,14 +630,9 @@ class KinematicSolver(Solver):
                 np.array([link.geom_end for link in links], dtype=gs.np_int),
                 np.array([link.vgeom_start for link in links], dtype=gs.np_int),
                 np.array([link.vgeom_end for link in links], dtype=gs.np_int),
-                np.array([link.desc.invweight for link in links], dtype=gs.np_float),
                 np.array([link.is_fixed for link in links], dtype=gs.np_bool),
                 np.array([link.desc.pos for link in links], dtype=gs.np_float),
                 np.array([link.desc.quat for link in links], dtype=gs.np_float),
-                np.array([link.desc.inertial_pos for link in links], dtype=gs.np_float),
-                np.array([link.desc.inertial_quat for link in links], dtype=gs.np_float),
-                np.array([link.desc.inertia for link in links], dtype=gs.np_float),
-                np.array([link.desc.mass for link in links], dtype=gs.np_float),
                 self.dyn_state,
                 self.dyn_info,
                 self.rigid_info,
@@ -481,6 +656,8 @@ class KinematicSolver(Solver):
                 self.rigid_config,
             )
 
+        self._dispatch_heterogeneous_kinematics()
+
         # Set initial qpos
         self.qpos = self.rigid_info.qpos
         self.qpos0 = self.rigid_info.qpos0
@@ -489,20 +666,23 @@ class KinematicSolver(Solver):
 
             # Dispatch per-variant init_qpos for heterogeneous entities
             for entity in self.entities:
-                if entity._variant_init_qpos is None:
+                if not entity._desc.variants:
                     continue
-                n_variants = len(entity._variant_init_qpos)
+                n_variants = len(entity._desc.variants)
                 variant_idx = _balanced_variant_mapping(n_variants, self._B)
                 q_s, q_e = entity.q_start, entity.q_start + entity.n_qs
                 for i_b in range(self._B):
-                    init_qpos[q_s:q_e, i_b] = entity._variant_init_qpos[variant_idx[i_b]]
+                    init_qpos[q_s:q_e, i_b] = entity._desc.variants[variant_idx[i_b]].init_qpos
 
             self.qpos0.from_numpy(init_qpos)
+            dofs_limit = np.broadcast_to(
+                qd_to_numpy(self.dyn_info.dofs.limit, transpose=True), (self._B, self.n_dofs_, 2)
+            )
             is_init_qpos_out_of_bounds = False
             for joint in self.joints:
                 if joint.type in (gs.JOINT_TYPE.REVOLUTE, gs.JOINT_TYPE.PRISMATIC):
-                    is_init_qpos_out_of_bounds |= (joint.desc.dofs_limit[0, 0] > init_qpos[joint.q_start]).any()
-                    is_init_qpos_out_of_bounds |= (init_qpos[joint.q_start] > joint.desc.dofs_limit[0, 1]).any()
+                    is_init_qpos_out_of_bounds |= (dofs_limit[:, joint.dof_start, 0] > init_qpos[joint.q_start]).any()
+                    is_init_qpos_out_of_bounds |= (init_qpos[joint.q_start] > dofs_limit[:, joint.dof_start, 1]).any()
             if is_init_qpos_out_of_bounds:
                 gs.logger.warning("Neutral robot position (qpos0) exceeds joint limits.")
             self.qpos.from_numpy(init_qpos)
@@ -511,6 +691,86 @@ class KinematicSolver(Solver):
 
         # Dispatch heterogeneous variant vgeom ranges per-environment
         self._dispatch_heterogeneous_vgeoms()
+
+    def _dispatch_heterogeneous_kinematics(self):
+        """Write the link frames and the joint and dof parameters of each heterogeneous variant to the envs carrying it.
+
+        The init kernels broadcast those of the primary to every environment, while heterogeneous simulation batches
+        the link, joint and dof info (see 'build').
+        """
+        entities = [entity for entity in self._entities if entity._desc.variants]
+        if not entities:
+            return
+
+        # Field layout, batch second, since the arrays are written back as fields
+        links_pos = qd_to_numpy(self.dyn_info.links.pos, transpose=False, copy=True)
+        links_quat = qd_to_numpy(self.dyn_info.links.quat, transpose=False, copy=True)
+        joints_pos = qd_to_numpy(self.dyn_info.joints.pos, transpose=False, copy=True)
+        joints_sol_params = qd_to_numpy(self.dyn_info.joints.sol_params, transpose=False, copy=True)
+        dofs_info = self.dyn_info.dofs
+        dofs_fields = (
+            (dofs_info.motion_ang, "dofs_motion_ang"),
+            (dofs_info.motion_vel, "dofs_motion_vel"),
+            (dofs_info.limit, "dofs_limit"),
+            (dofs_info.stiffness, "dofs_stiffness"),
+            (dofs_info.damping, "dofs_damping"),
+            (dofs_info.frictionloss, "dofs_frictionloss"),
+            (dofs_info.armature, "dofs_armature"),
+            (dofs_info.act_gain, "dofs_act_gain"),
+            (dofs_info.act_bias, "dofs_act_bias"),
+            (dofs_info.force_range, "dofs_force_range"),
+        )
+        dofs_values = [qd_to_numpy(field, transpose=False, copy=True) for field, _ in dofs_fields]
+
+        for entity in entities:
+            variants_links = [entity._desc.links, *(variant.links for variant in entity._desc.variants[1:])]
+            envs_variant_idx = _balanced_variant_mapping(len(variants_links), self._B)
+            links_slice = slice(entity.link_start, entity.link_end)
+            variants_links_pos = np.stack([[l_desc.pos for l_desc in links] for links in variants_links])
+            variants_links_quat = np.stack([[l_desc.quat for l_desc in links] for links in variants_links])
+            links_pos[links_slice] = variants_links_pos[envs_variant_idx].swapaxes(0, 1)
+            links_quat[links_slice] = variants_links_quat[envs_variant_idx].swapaxes(0, 1)
+
+            # A file morph drops its joints without degrees of freedom, so a fixed one may leave the entity without any
+            if entity.n_joints == 0:
+                continue
+            variants_joints = [
+                [asdict(j_desc) for l_desc in links for j_desc in l_desc.joints] for links in variants_links
+            ]
+            joints_slice = slice(entity.joint_start, entity.joint_end)
+            variants_joints_pos = np.stack([[j_fields["pos"] for j_fields in joints] for joints in variants_joints])
+            joints_pos[joints_slice] = variants_joints_pos[envs_variant_idx].swapaxes(0, 1)
+            variants_sol_params = np.stack(
+                [[j_fields["sol_params"] for j_fields in joints] for joints in variants_joints]
+            )
+            variants_sol_params = self._sanitize_joint_sol_params(variants_sol_params).reshape(
+                variants_sol_params.shape
+            )
+            joints_sol_params[joints_slice] = variants_sol_params[envs_variant_idx].swapaxes(0, 1)
+            dofs_slice = slice(entity.dof_start, entity.dof_end)
+            for dofs_value, (_, name) in zip(dofs_values, dofs_fields):
+                variants_value = np.stack(
+                    [np.concatenate([j_fields[name] for j_fields in joints]) for joints in variants_joints]
+                )
+                dofs_value[dofs_slice] = variants_value[envs_variant_idx].swapaxes(0, 1)
+
+        self.dyn_info.links.pos.from_numpy(links_pos)
+        self.dyn_info.links.quat.from_numpy(links_quat)
+        self.dyn_info.joints.pos.from_numpy(joints_pos)
+        self.dyn_info.joints.sol_params.from_numpy(joints_sol_params)
+        for (field, _), dofs_value in zip(dofs_fields, dofs_values):
+            field.from_numpy(dofs_value)
+
+        # The state of a fixed root link is set at init alone (see kernel_init_link_fields), so it takes the frame of
+        # the variant its environment carries too
+        fixed_roots_idx = [entity.link_start for entity in entities if entity.base_link.is_fixed]
+        if fixed_roots_idx:
+            links_state_pos = qd_to_numpy(self.dyn_state.links.pos, transpose=False, copy=True)
+            links_state_quat = qd_to_numpy(self.dyn_state.links.quat, transpose=False, copy=True)
+            links_state_pos[fixed_roots_idx] = links_pos[fixed_roots_idx]
+            links_state_quat[fixed_roots_idx] = links_quat[fixed_roots_idx]
+            self.dyn_state.links.pos.from_numpy(links_state_pos)
+            self.dyn_state.links.quat.from_numpy(links_state_quat)
 
     def _dispatch_heterogeneous_vgeoms(self):
         """Override per-link vgeom ranges for heterogeneous variants. RigidSolver extends this."""
@@ -553,8 +813,6 @@ class KinematicSolver(Solver):
         )
 
     def _init_vgeom_fields(self):
-        self._vgeoms_render_T = np.empty((self.n_vgeoms_, self._B, 4, 4), dtype=np.float32)
-
         if self.n_vgeoms > 0:
             vgeoms = self.vgeoms
             kernel_init_vgeom_fields(
@@ -601,10 +859,6 @@ class KinematicSolver(Solver):
                 self.rigid_info,
                 self.rigid_config,
             )
-
-    def _init_envs_offset(self):
-        self.envs_offset = self.rigid_info.envs_offset
-        self.envs_offset.from_numpy(self._scene.envs_offset)
 
     # ------------------------------------------------------------------------------------
     # -------------------------------- simulation no-ops ----------------------------------
@@ -684,15 +938,6 @@ class KinematicSolver(Solver):
         self._queried_states.clear()
 
     # ------------------------------------------------------------------------------------
-    # ----------------------------------- render -----------------------------------------
-    # ------------------------------------------------------------------------------------
-
-    def update_vgeoms_render_T(self):
-        kernel_update_vgeoms_render_T(
-            self._vgeoms_render_T, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
-        )
-
-    # ------------------------------------------------------------------------------------
     # -------------------------------- state get/set -------------------------------------
     # ------------------------------------------------------------------------------------
 
@@ -742,6 +987,28 @@ class KinematicSolver(Solver):
         else:
             self._is_forward_pos_updated = False
             self._is_forward_vel_updated = False
+
+    def __getstate__(self) -> KinematicSolverCheckpoint:
+        state = super().__getstate__()
+        return KinematicSolverCheckpoint(
+            arrays=state.arrays,
+            configs=state.configs,
+            kinds=state.kinds,
+            is_forward_pos_updated=self._is_forward_pos_updated,
+            is_forward_vel_updated=self._is_forward_vel_updated,
+        )
+
+    @mutates(StateChange.GEOMETRY, StateChange.DYNAMICS)
+    def __setstate__(self, state: KinematicSolverCheckpoint) -> None:
+        super().__setstate__(state)
+        if array_class.DataKind.DERIVED in state.kinds:
+            self._is_forward_pos_updated = state.is_forward_pos_updated
+            self._is_forward_vel_updated = state.is_forward_vel_updated
+        else:
+            # Without the derived arrays, forward kinematics runs now so the scene is drawn where the record put it. The
+            # next step recomputes the rest of the derived state.
+            self._is_forward_pos_updated = self._is_forward_vel_updated = False
+            self.update_forward_pos()
 
     # ------------------------------------------------------------------------------------
     # -------------------------------- process_input -------------------------------------
@@ -813,8 +1080,10 @@ class KinematicSolver(Solver):
     def set_base_links_pos(self, pos, links_idx=None, envs_idx=None, *, relative=False, skip_forward=False):
         if links_idx is None:
             links_idx = self._base_links_idx
-        # Without any pose offset, the user and world frames coincide, so a relative set is just an absolute one.
-        if relative and self._links_offset_pos is None:
+        # Without any offset position on the targeted links, the authored and internal link origins coincide, so a
+        # relative set is just an absolute one.
+        idx = links_idx if isinstance(links_idx, int) else slice(None)
+        if relative and self._links_offset_pos_is_identity[idx].all():
             relative = False
         pos, links_idx, envs_idx = self._sanitize_io_variables(
             pos, links_idx, self.n_links, "links_idx", envs_idx, (3,), skip_allocation=True
@@ -823,8 +1092,8 @@ class KinematicSolver(Solver):
             pos = pos[None]
 
         if relative:
-            # Compose the body-frame offset onto the user position while keeping the current orientation, then set the
-            # resulting world position.
+            # Compose the body-frame offset onto the authored position while keeping the current orientation, then set
+            # the resulting world position.
             cur_quat = qd_to_torch(self.dyn_state.links.quat, envs_idx, links_idx, transpose=True, copy=True)
             offset_pos = _select_links_offset(self._links_offset_pos, links_idx, envs_idx)
             offset_quat = _select_links_offset(self._links_offset_quat, links_idx, envs_idx)
@@ -846,9 +1115,9 @@ class KinematicSolver(Solver):
     def set_base_links_pos_grad(self, links_idx, envs_idx, relative, pos_grad):
         if links_idx is None:
             links_idx = self._base_links_idx
-        # A relative 'set_pos' adds 'R(user_quat) @ offset_pos', which reads the current orientation; that dependency
-        # is not propagated, so with a non-zero offset position the backward pass is only supported on links without
-        # one. 'relative=False' sets the world position directly and is a plain passthrough.
+        # A relative 'set_pos' adds 'R(authored_quat) @ offset_pos', which reads the current orientation; that
+        # dependency is not propagated, so with a non-zero offset position the backward pass is only supported on links
+        # without one. 'relative=False' sets the world position directly and is a plain passthrough.
         idx = links_idx if isinstance(links_idx, int) else slice(None)
         if relative and not self._links_offset_pos_is_identity[idx].all():
             gs.raise_exception(
@@ -869,10 +1138,13 @@ class KinematicSolver(Solver):
     def set_base_links_quat(self, quat, links_idx=None, envs_idx=None, *, relative=False, skip_forward=False):
         if links_idx is None:
             links_idx = self._base_links_idx
-        # Without any pose offset, the user and world frames coincide, so a relative set is just an absolute one.
-        if relative and self._links_offset_quat is None:
-            relative = False
+        # Without any pose offset on the targeted links, the authored and internal link origins coincide, so a relative
+        # set is just an absolute one.
         idx = links_idx if isinstance(links_idx, int) else slice(None)
+        if relative and (
+            self._links_offset_quat_is_identity[idx].all() and self._links_offset_pos_is_identity[idx].all()
+        ):
+            relative = False
         relative_pos_passthrough = relative and self._links_offset_pos_is_identity[idx].all()
         quat, links_idx, envs_idx = self._sanitize_io_variables(
             quat, links_idx, self.n_links, "links_idx", envs_idx, (4,), skip_allocation=True
@@ -883,17 +1155,17 @@ class KinematicSolver(Solver):
         if relative:
             offset_quat = _select_links_offset(self._links_offset_quat, links_idx, envs_idx)
             if not relative_pos_passthrough:
-                # The offset position rotates with the orientation, so keep the user-frame position fixed by rewriting
-                # the world position from the current user position and the new user orientation.
+                # The offset position rotates with the orientation, so keep the authored-frame position fixed by
+                # rewriting the world position from the current authored position and the new authored orientation.
                 cur_pos = qd_to_torch(self.dyn_state.links.pos, envs_idx, links_idx, transpose=True, copy=True)
                 cur_quat = qd_to_torch(self.dyn_state.links.quat, envs_idx, links_idx, transpose=True, copy=True)
                 offset_pos = _select_links_offset(self._links_offset_pos, links_idx, envs_idx)
-                user_pos = cur_pos - _offset_world_shift(offset_pos, offset_quat, cur_quat)
-                world_pos = user_pos + gu.transform_by_quat(offset_pos, quat)
+                authored_pos = cur_pos - _offset_world_shift(offset_pos, offset_quat, cur_quat)
+                world_pos = authored_pos + gu.transform_by_quat(offset_pos, quat)
                 kernel_set_links_pos(
                     links_idx, envs_idx, world_pos, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
                 )
-            # Compose the offset onto the user orientation, then set the resulting world orientation.
+            # Compose the offset onto the authored orientation, then set the resulting world orientation.
             quat = gu.transform_quat_by_quat(offset_quat, quat)
             relative = False
 
@@ -1111,13 +1383,14 @@ class KinematicSolver(Solver):
         return heights
 
     def get_links_pos(self, links_idx=None, envs_idx=None, *, relative=False):
+        idx = links_idx if isinstance(links_idx, int) else slice(None)
         if not gs.use_zerocopy:
             _, links_idx, envs_idx = self._sanitize_io_variables(
                 None, links_idx, self.n_links, "links_idx", envs_idx, (3,), skip_allocation=True
             )
         tensor = qd_to_torch(self.dyn_state.links.pos, envs_idx, links_idx, transpose=True, copy=True)
-        if relative and self._links_offset_pos is not None:
-            quat = qd_to_torch(self.dyn_state.links.quat, envs_idx, links_idx, transpose=True, copy=True)
+        if relative and not self._links_offset_pos_is_identity[idx].all():
+            quat = qd_to_torch(self.dyn_state.links.quat, envs_idx, links_idx, transpose=True)
             offset_pos = _select_links_offset(self._links_offset_pos, links_idx, envs_idx)
             offset_quat = _select_links_offset(self._links_offset_quat, links_idx, envs_idx)
             tensor -= _offset_world_shift(offset_pos, offset_quat, quat)
@@ -1125,7 +1398,8 @@ class KinematicSolver(Solver):
 
     def get_links_quat(self, links_idx=None, envs_idx=None, *, relative=False):
         tensor = qd_to_torch(self.dyn_state.links.quat, envs_idx, links_idx, transpose=True, copy=True)
-        if relative and self._links_offset_quat is not None:
+        idx = links_idx if isinstance(links_idx, int) else slice(None)
+        if relative and not self._links_offset_quat_is_identity[idx].all():
             offset_quat = _select_links_offset(self._links_offset_quat, links_idx, envs_idx)
             tensor = gu.transform_quat_by_quat(gu.inv_quat(offset_quat), tensor)
         return tensor[0] if self.n_envs == 0 else tensor
@@ -1154,23 +1428,39 @@ class KinematicSolver(Solver):
             tensor = gu.transform_quat_by_quat(gu.inv_quat(offset_quat), tensor)
         return tensor[0] if self.n_envs == 0 else tensor
 
-    def get_links_vel(self, links_idx=None, envs_idx=None):
+    def get_links_vel(self, links_idx=None, envs_idx=None, *, relative=False):
+        idx = links_idx if isinstance(links_idx, int) else slice(None)
+        is_relative = relative and not self._links_offset_pos_is_identity[idx].all()
         if gs.use_zerocopy:
-            mask = (0, *indices_to_mask(links_idx)) if self.n_envs == 0 else indices_to_mask(envs_idx, links_idx)
+            mask = indices_to_mask(envs_idx, links_idx)
             cd_vel = qd_to_torch(self.dyn_state.links.cd_vel, transpose=True)
             cd_ang = qd_to_torch(self.dyn_state.links.cd_ang, transpose=True)
             pos = qd_to_torch(self.dyn_state.links.pos, transpose=True)
             root_COM = qd_to_torch(self.dyn_state.links.root_COM, transpose=True)
-            return cd_vel[mask] + cd_ang[mask].cross(pos[mask] - root_COM[mask], dim=-1)
+            cpos = pos[mask] - root_COM[mask]
+            if is_relative:
+                quat = qd_to_torch(self.dyn_state.links.quat, envs_idx, links_idx, transpose=True)
+                offset_pos = _select_links_offset(self._links_offset_pos, links_idx, envs_idx)
+                offset_quat = _select_links_offset(self._links_offset_quat, links_idx, envs_idx)
+                cpos = cpos - _offset_world_shift(offset_pos, offset_quat, quat)
+            tensor = cd_vel[mask] + cd_ang[mask].cross(cpos, dim=-1)
+            return tensor[0] if self.n_envs == 0 else tensor
 
         _tensor, links_idx, envs_idx = self._sanitize_io_variables(
             None, links_idx, self.n_links, "links_idx", envs_idx, (3,)
         )
-        assert _tensor is not None
         tensor = _tensor[None] if self.n_envs == 0 else _tensor
         # The frame is passed as a plain int, see 'RigidSolver._sanitize_ref_frame'.
         kernel_get_links_vel(
-            links_idx, envs_idx, tensor, self.dyn_state, self.rigid_config, ref=int(gs.link_ref_frame.link_origin)
+            links_idx,
+            envs_idx,
+            tensor,
+            self._links_offset_pos,
+            self._links_offset_quat,
+            self.dyn_state,
+            self.rigid_config,
+            ref=int(gs.link_ref_frame.link_origin),
+            is_relative=is_relative,
         )
         return _tensor
 
@@ -1302,10 +1592,7 @@ class KinematicSolver(Solver):
         hold, and restores the one it does. Returns positions (n_envs, n_links, 3) and orientations
         (n_envs, n_links, 4), without the batch dimension when the scene is not batched.
         """
-        if self.n_envs == 0:
-            envs_idx = torch.zeros(1, dtype=gs.tc_int)
-        else:
-            envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
         qpos = broadcast_tensor(qpos, gs.tc_float, (len(envs_idx), entity.n_qs), ("envs_idx", "qs_idx")).contiguous()
 
         qs_idx = torch.arange(entity._q_start, entity._q_start + entity.n_qs, dtype=gs.tc_int, device=gs.device)
@@ -1465,6 +1752,11 @@ class KinematicSolver(Solver):
         return gs.List(joint for entity in self._entities for joint in entity.joints)
 
     @property
+    def equalities(self):
+        """The equality constraints the solver enforces, which a kinematic solver holds none of."""
+        return gs.List()
+
+    @property
     def geoms(self):
         if self.is_built:
             return self._geoms
@@ -1534,6 +1826,16 @@ class KinematicSolver(Solver):
         if self.is_built:
             return self._n_qs
         return sum(entity.n_qs for entity in self._entities)
+
+    @property
+    def is_forward_pos_updated(self) -> bool:
+        """Whether the link and geom poses are current for the configuration, so the next step skips forward kinematics."""
+        return self._is_forward_pos_updated
+
+    @property
+    def is_forward_vel_updated(self) -> bool:
+        """Whether the link velocities are current for the generalized velocities."""
+        return self._is_forward_vel_updated
 
     @property
     def n_dofs(self):

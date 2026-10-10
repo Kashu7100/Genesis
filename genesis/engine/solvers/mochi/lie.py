@@ -102,16 +102,6 @@ def project_sym_psd3(A, eps):
 
 
 @qd.func
-def sym_sqrt3(A, eps):
-    """Principal square root of a symmetric positive semi-definite 3x3 matrix."""
-    eigenvalues, Q = sym_eig3(A, n_sweeps=8)
-    L = qd.Matrix.zero(gs.qd_float, 3, 3)
-    for k in qd.static(range(3)):
-        L[k, k] = qd.sqrt(qd.max(eigenvalues[k], eps))
-    return Q @ L @ Q.transpose()
-
-
-@qd.func
 def vsym_from_omega(omega, dt_stage, eps):
     """Symmetric rotation-derivative correction that makes R + h (skew(w) + S) R an exact rotation for the given
     angular velocity w (valid for |w| < 1/h; the discriminant is clamped otherwise)."""
