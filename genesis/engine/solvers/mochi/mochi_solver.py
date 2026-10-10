@@ -2666,7 +2666,15 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
     @property
     def n_equalities(self):
-        return 0
+        if self.is_built:
+            return len(self._equalities)
+        return sum(entity.n_equalities for entity in self._entities)
+
+    @property
+    def equalities(self):
+        if self.is_built:
+            return self._equalities
+        return gs.List(equality for entity in self._entities for equality in entity.equalities)
 
     @property
     def n_samples(self):
