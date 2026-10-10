@@ -21,6 +21,7 @@ from .solvers import (
     PBDSolver,
     RigidSolver,
     SFSolver,
+    ShellSolver,
     SPHSolver,
     ToolSolver,
 )
@@ -84,6 +85,7 @@ class Simulator(RBC):
         self.pbd_solver = PBDSolver(self.scene, self, options.pbd)
         self.fem_solver = FEMSolver(self.scene, self, options.fem)
         self.sf_solver = SFSolver(self.scene, self, options.sf)
+        self.shell_solver = ShellSolver(self.scene, self, options.shell)
 
         self._solvers: list["Solver"] = gs.List(
             [
@@ -95,6 +97,7 @@ class Simulator(RBC):
                 self.pbd_solver,
                 self.fem_solver,
                 self.sf_solver,
+                self.shell_solver,
             ]
         )
 
@@ -226,6 +229,11 @@ class Simulator(RBC):
                 self._active_solvers.append(solver)
                 if not isinstance(solver, RigidSolver):
                     self._rigid_only = False
+
+        if self.shell_solver.is_active and not isinstance(self._coupler, LegacyCoupler):
+            gs.raise_exception(
+                f"Shell entities are only supported with LegacyCouplerOptions, got {type(self._coupler).__name__}."
+            )
 
         # A coupler exchanges state once per substep, so it is built once the rate that loop runs at is known.
         self._coupler.build()

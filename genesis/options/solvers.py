@@ -108,6 +108,8 @@ class LegacyCouplerOptions(BaseCouplerOptions):
         Whether to enable coupling between FEM and MPM solvers. Defaults to True.
     fem_sph : bool, optional
         Whether to enable coupling between FEM and SPH solvers. Defaults to True.
+    rigid_shell : bool, optional
+        Whether to enable coupling between rigid and shell solvers. Defaults to True.
     """
 
     rigid_mpm: StrictBool = True
@@ -118,6 +120,7 @@ class LegacyCouplerOptions(BaseCouplerOptions):
     mpm_pbd: StrictBool = True
     fem_mpm: StrictBool = True
     fem_sph: StrictBool = True
+    rigid_shell: StrictBool = True
 
 
 class SAPCouplerOptions(BaseCouplerOptions):
@@ -408,6 +411,11 @@ class KinematicOptions(Options):
     IK_max_targets : int, optional
         Maximum number of IK targets. Increasing this doesn't affect IK solving speed, but will increase memory usage.
         Defaults to 6.
+    coarse_update_interval : int, optional
+        Number of substeps between two updates of the coarse correction above, which then lags behind the deformation
+        of the sheets. Updating it less often saves the cost of rebuilding it, which grows with the square of the
+        number of patches times the number of triangles, at the cost of more iterations for sheets that rotate or tear
+        quickly. Defaults to 10.
     """
 
     batch_links_info: StrictBool = False
@@ -936,6 +944,46 @@ class FEMOptions(GravityMixin, TimeBasedMixin):
     damping_alpha: NonNegativeFloat = 0.5
     damping_beta: NonNegativeFloat = 5e-4
     enable_vertex_constraints: StrictBool = False
+
+
+class ShellOptions(GravityMixin, TimeBasedMixin):
+    """
+    Options configuring the ShellSolver, which simulates thin sheets that stretch, bend, yield and fracture.
+
+    Each substep integrates the sheets implicitly, solving a linear system whose accuracy the iterative solver below
+    trades for speed.
+
+    Parameters
+    ----------
+    n_pcg_iterations : int, optional
+        Maximum number of iterations of the linear solve of each substep. More iterations resolve stiff sheets
+        (metal, glass, paper) more accurately, while fewer make them softer and more damped than their material says,
+        at a lower runtime cost. Defaults to 50.
+    pcg_threshold : float, optional
+        Residual of the linear solve, relative to its initial value, at which an environment stops iterating. A lower
+        value is more accurate and slower. Defaults to 1e-4.
+    fracture_capacity : float, optional
+        Number of vertices a fracturable sheet can create by splitting, as a fraction of its own vertex count. Each one
+        costs memory in every environment. Fracture stops in an environment that exhausted it. Defaults to 1.0.
+    n_coarse_patches : int, optional
+        Maximum number of patches each sheet is split into to accelerate the linear solve, each one moving as a whole
+        in a coarse correction of every iteration. Stiff sheets (paper, plastic, metal, glass) converge in several
+        times fewer iterations with it, at a memory cost growing with the square of the number of patches in every
+        environment, and a dense factorization of that size per substep. More patches converge faster on large
+        meshes. 0 disables it, which suits soft sheets (cloth, rubber) whose solve converges quickly anyway.
+        Defaults to 6.
+    coarse_update_interval : int, optional
+        Number of substeps between two updates of the coarse correction above, which then lags behind the deformation
+        of the sheets. Updating it less often saves the cost of rebuilding it, which grows with the square of the
+        number of patches times the number of triangles, at the cost of more iterations for sheets that rotate or tear
+        quickly. Defaults to 10.
+    """
+
+    n_pcg_iterations: PositiveInt = 50
+    pcg_threshold: PositiveFloat = 1e-4
+    fracture_capacity: NonNegativeFloat = 1.0
+    n_coarse_patches: NonNegativeInt = 6
+    coarse_update_interval: PositiveInt = 10
 
 
 class SFOptions(TimeBasedMixin):
