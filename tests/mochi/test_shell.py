@@ -223,13 +223,16 @@ def test_rigid_ball_on_cloth(tmp_path, show_viewer):
         gs.morphs.Sphere(radius=radius, pos=(0.0, 0.0, 0.7)), material=gs.materials.Mochi.Rigid(rho=500.0)
     )
     scene.build()
-    assert scene.mochi_solver._has_pc_colliders
+    # A single cloth without self-contact leaves the point-cloud collider with nothing to collide with: the spheres
+    # only act against other point-cloud entities (mochi's rule), never against rigid bodies.
+    assert not scene.mochi_solver._has_pc_colliders
     for _ in range(240):
         scene.step()
-    # The ball rests on the cloth lying on the ground: its bottom sits within the collider spheres of the vertices.
+    # The ball rests on the cloth lying on the ground: its bottom sits within the contact band of the shell samples
+    # colliding against its sphere collider.
     cloth_top = tensor_to_array(cloth.get_vertices_position())[:, 2].max()
     ball_z = float(tensor_to_array(ball.get_pos())[2])
-    assert cloth_top + radius < ball_z < cloth_top + radius + collider_radius
+    assert cloth_top + radius - 5e-3 < ball_z < cloth_top + radius + 2e-3
     # A residual slow roll on the (not perfectly symmetric) cloth remains.
     ball_vel = tensor_to_array(ball.get_dofs_velocity())
     assert_allclose(ball_vel[:3], 0.0, atol=1e-4)
@@ -239,3 +242,40 @@ def test_rigid_ball_on_cloth(tmp_path, show_viewer):
     assert_allclose(
         tensor_to_array(cloth.get_vertices_contact_force()).sum(axis=0), (0.0, 0.0, cloth.mass * 9.8), atol=1e-3
     )
+
+
+@pytest.mark.precision("64")
+def test_cloth_drapes_over_box(tmp_path, show_viewer):
+    # A sheet draped over a fixed box settles on its faces and edges: the box's samples must not act on the cloth's
+    # collider spheres (point-cloud colliders never collide with rigid bodies) or the two contact models fight,
+    # the drape oscillates on the box and is ejected once the residual blows up.
+    box_pos, box_half = np.array([0.0, 0.0, 0.15]), np.array([0.15, 0.15, 0.15])
+    verts, faces = _sheet_mesh(12, 0.8)
+    obj_path = _write_obj(tmp_path / "sheet.obj", verts, faces)
+    scene = _mochi_scene(show_viewer, 1.0 / 60.0, n_newton_iterations=8)
+    scene.add_entity(gs.morphs.Plane(), material=gs.materials.Mochi.Rigid())
+    scene.add_entity(
+        gs.morphs.Box(size=(0.3, 0.3, 0.3), pos=tuple(box_pos), fixed=True), material=gs.materials.Mochi.Rigid()
+    )
+    cloth = scene.add_entity(
+        gs.morphs.Mesh(file=obj_path, pos=(0.0, 0.0, 0.6)),
+        material=gs.materials.Mochi.Shell(
+            E=2e4, nu=0.3, rho=200.0, thickness=2e-3, friction=0.6, collider_radius=0.02, penalty_coefficient=1e7
+        ),
+    )
+    scene.build()
+    for _ in range(300):
+        scene.step()
+    pos = tensor_to_array(cloth.get_vertices_position())
+    # The drape rests: no oscillation of the cloth on the box.
+    assert np.abs(tensor_to_array(cloth.get_vertices_velocity())).max() < 0.05
+    # The lowest cloth vertex hangs down the sides without tunnelling under the box, and the center lies on the top
+    # face: no vertex sits deeper than the contact ramp of the penalty.
+    q = np.abs(pos - box_pos) - box_half
+    sdf = np.linalg.norm(np.maximum(q, 0.0), axis=-1) + np.minimum(q.max(axis=-1), 0.0)
+    assert sdf.min() > -2.5e-3
+    # The center of the sheet ends on the top face: within the contact ramp below it, small wrinkles above it.
+    center = np.linalg.norm(pos[:, :2] - box_pos[:2], axis=-1) < 0.1
+    box_top = box_pos[2] + box_half[2]
+    assert np.all(pos[center, 2] > box_top - 2.5e-3)
+    assert np.all(pos[center, 2] < box_top + 1e-2)

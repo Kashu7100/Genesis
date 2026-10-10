@@ -12,7 +12,7 @@ import genesis.utils.geom as gu
 from genesis.utils import array_class
 
 from .colliders import query_collider, query_collider_lower_bound
-from .contact_utils import collision_response
+from .contact_utils import collision_response, func_mat3_to_sym6, func_sym6_to_mat3
 from .data import (
     COLLIDER_TYPE,
     MochiContactState,
@@ -227,9 +227,9 @@ def func_zero_assembly(
         if func_is_env_active(i_b, mochi_state, skip_ls_done) and i_p < contact_state.n_pairs[i_b]:
             contact_state.acc_f[i_p, i_b] = qd.Vector.zero(gs.qd_float, 3)
             contact_state.acc_q[i_p, i_b] = qd.Vector.zero(gs.qd_float, 3)
-            contact_state.acc_D[i_p, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
+            contact_state.acc_D[i_p, i_b] = qd.Vector.zero(gs.qd_float, 6)
             contact_state.acc_SD[i_p, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
-            contact_state.acc_SDS[i_p, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
+            contact_state.acc_SDS[i_p, i_b] = qd.Vector.zero(gs.qd_float, 6)
             contact_state.acc_obj[i_p, i_b] = 0.0
             contact_state.n_hits[i_p, i_b] = 0
 
@@ -243,7 +243,7 @@ def kernel_zero_assembly(
     rigid_config: qd.template(),
     assem_obj: qd.template(),
     assem_res: qd.template(),
-    assem_dres: qd.i32,
+    assem_dres: qd.template(),
     skip_ls_done: qd.i32,
     record: qd.template(),
 ):
@@ -380,7 +380,8 @@ def func_broadphase_pairs(
         i_lb = dyn_info.geoms.link_idx[i_gb]
         if i_lb == i_la:
             continue
-        if not (mochi_info.links.is_dynamic[i_la] or mochi_info.links.is_dynamic[i_lb]):
+        # A static body is only a collider: its samples never collide (mochi's rule); the collider may be static.
+        if not mochi_info.links.is_dynamic[i_la]:
             continue
         if not mochi_info.links_pair_enabled[i_la, i_lb]:
             continue
@@ -558,9 +559,9 @@ def func_contact_eval_sample(
         if assem_dres:
             D = -w * (R_g @ dforce_geom @ R_g.transpose())
             S_b = skew(r_b)
-            qd.atomic_add(contact_state.acc_D[i_p, i_b], D)
+            qd.atomic_add(contact_state.acc_D[i_p, i_b], func_mat3_to_sym6(D))
             qd.atomic_add(contact_state.acc_SD[i_p, i_b], S_b @ D)
-            qd.atomic_add(contact_state.acc_SDS[i_p, i_b], S_b @ D @ S_b)
+            qd.atomic_add(contact_state.acc_SDS[i_p, i_b], func_mat3_to_sym6(S_b @ D @ S_b))
 
         if qd.static(record):
             qd.atomic_add(dyn_state.links.contact_force[i_la, i_b], w * force)
@@ -759,9 +760,9 @@ def func_pairs_to_blocks(
                     qd.atomic_add(mochi_state.links_res[i_lb, i_b][3 + k], Q[k])
 
         if assem_dres:
-            Dbar = contact_state.acc_D[i_p, i_b]
+            Dbar = func_sym6_to_mat3(contact_state.acc_D[i_p, i_b])
             Sh = contact_state.acc_SD[i_p, i_b]
-            Sh2 = contact_state.acc_SDS[i_p, i_b]
+            Sh2 = func_sym6_to_mat3(contact_state.acc_SDS[i_p, i_b])
             ShT = Sh.transpose()
             C = skew(c)
             if is_dynamic_a:

@@ -20,7 +20,7 @@ from genesis.utils import array_class
 from .articulated import func_jacobian_times_dofs, func_jacobian_transpose_add, func_link_dof_jacobian
 from .colliders import query_collider
 from .contact import CONSERVATIVE_MAX_ACCEL, CONSERVATIVE_SPEED_SCALE
-from .contact_utils import collision_response
+from .contact_utils import collision_response, func_mat3_to_sym6, func_sym6_to_mat3
 from .data import (
     COLLIDER_TYPE,
     INTEGRATOR,
@@ -587,39 +587,45 @@ def func_soft_zero_assembly(
             soft_state.n_soft_hits[i_b] = 0
             soft_state.n_sc_hits[i_b] = 0
             soft_state.n_pc_hits[i_b] = 0
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_v, i_slot in qd.ndrange(n_verts, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if func_is_env_active(i_b, mochi_state, skip_ls_done):
-            if assem_dres:
-                soft_state.verts_H_diag[i_v, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
-            if qd.static(record):
-                soft_state.verts_contact_force[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
-    # The Hessian is zeroed on full assemblies only. The runtime flag is tested inside the loops: a loop nested under a
-    # runtime condition is not offloaded as a parallel task and would run serially on one thread.
-    n_csr = soft_state.csr_values.shape[0]
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for j, i_slot in qd.ndrange(n_csr, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_csr, 1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if assem_dres and func_is_env_active(i_b, mochi_state, skip_ls_done):
-            soft_state.csr_values[j, i_b] = 0.0
-    # The rod blocks kept for the banded preconditioner are overwritten by the assembly kernels (padding elements
-    # keep their zero allocation); only the accumulated twist diagonal needs zeroing.
-    n_rod_elems = soft_state.rod_elems_H.shape[0]
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_r, i_slot in qd.ndrange(n_rod_elems, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_rod_elems, 1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if assem_dres and func_is_env_active(i_b, mochi_state, skip_ls_done):
-            soft_state.rod_elems_twist_pcg[i_r, i_b] = 0.0
+    if qd.static((not isinstance(assem_dres, (bool, int)) or bool(assem_dres)) or record):
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_v, i_slot in qd.ndrange(n_verts, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
+            i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+            if func_is_env_active(i_b, mochi_state, skip_ls_done):
+                if assem_dres:
+                    soft_state.verts_H_diag[i_v, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
+                if qd.static(record):
+                    soft_state.verts_contact_force[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
+    # The Hessian is zeroed on full assemblies only. When the caller binds the flag to a compile-time constant (the
+    # pipeline's zeroing kernel), the residual-only variant compiles these loops out entirely; the monolith and graph
+    # step kernels bind a runtime flag and keep the loops, testing the flag per element (a loop nested under a runtime
+    # condition is not offloaded as a parallel task and would run serially on one thread).
+    if qd.static(not isinstance(assem_dres, (bool, int)) or bool(assem_dres)):
+        n_csr = soft_state.csr_values.shape[0]
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for j, i_slot in qd.ndrange(n_csr, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_csr, 1):
+            i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+            if assem_dres and func_is_env_active(i_b, mochi_state, skip_ls_done):
+                soft_state.csr_values[j, i_b] = 0.0
+        # The rod blocks kept for the banded preconditioner are overwritten by the assembly kernels (padding elements
+        # keep their zero allocation); only the accumulated twist diagonal needs zeroing.
+        n_rod_elems = soft_state.rod_elems_H.shape[0]
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_r, i_slot in (
+            qd.ndrange(n_rod_elems, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_rod_elems, 1)
+        ):
+            i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+            if assem_dres and func_is_env_active(i_b, mochi_state, skip_ls_done):
+                soft_state.rod_elems_twist_pcg[i_r, i_b] = 0.0
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_p, i_slot in qd.ndrange(max_pairs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(max_pairs, 1):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if func_is_env_active(i_b, mochi_state, skip_ls_done) and i_p < soft_state.n_pairs[i_b]:
             soft_state.acc_f[i_p, i_b] = qd.Vector.zero(gs.qd_float, 3)
             soft_state.acc_q[i_p, i_b] = qd.Vector.zero(gs.qd_float, 3)
-            soft_state.acc_D[i_p, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
+            soft_state.acc_D[i_p, i_b] = qd.Vector.zero(gs.qd_float, 6)
             soft_state.acc_SD[i_p, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
-            soft_state.acc_SDS[i_p, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
+            soft_state.acc_SDS[i_p, i_b] = qd.Vector.zero(gs.qd_float, 6)
             soft_state.acc_obj[i_p, i_b] = 0.0
             soft_state.n_hits[i_p, i_b] = 0
 
@@ -629,7 +635,7 @@ def kernel_soft_zero_assembly(
     mochi_state: MochiState,
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
-    assem_dres: qd.i32,
+    assem_dres: qd.template(),
     skip_ls_done: qd.i32,
     record: qd.template(),
 ):
@@ -1158,9 +1164,9 @@ def func_soft_contact_eval(
         # The three per-pair Hessian sums are read by kernel_soft_pairs_to_blocks under the same flag, and they carry
         # most of the atomic traffic of this kernel: the line search re-evaluates contact for the residual alone.
         if assem_dres:
-            qd.atomic_add(soft_state.acc_D[i_p, i_b], D)
+            qd.atomic_add(soft_state.acc_D[i_p, i_b], func_mat3_to_sym6(D))
             qd.atomic_add(soft_state.acc_SD[i_p, i_b], S_b @ D)
-            qd.atomic_add(soft_state.acc_SDS[i_p, i_b], S_b @ D @ S_b)
+            qd.atomic_add(soft_state.acc_SDS[i_p, i_b], func_mat3_to_sym6(S_b @ D @ S_b))
             for i in qd.static(range(3)):
                 qd.atomic_add(soft_state.verts_H_diag[tri[i], i_b], (bary[i] * bary[i]) * D)
         if assem_dres or record:
@@ -1169,7 +1175,7 @@ def func_soft_contact_eval(
                 soft_state.hit_sample[i_h, i_b] = i_s
                 soft_state.hit_link_b[i_h, i_b] = -1 if is_static_b else i_lb
                 soft_state.hit_r_b[i_h, i_b] = r_b
-                soft_state.hit_D[i_h, i_b] = D
+                soft_state.hit_D[i_h, i_b] = func_mat3_to_sym6(D)
                 if qd.static(record):
                     hit_readback.soft_hit_geom_b[i_h, i_b] = soft_state.pair_geom_b[i_p, i_b]
                     hit_readback.soft_hit_force[i_h, i_b] = w * force
@@ -1266,9 +1272,9 @@ def func_soft_pairs_to_blocks(
                 qd.atomic_add(mochi_state.links_res[i_lb, i_b][k], F[k])
                 qd.atomic_add(mochi_state.links_res[i_lb, i_b][3 + k], Q[k])
         if assem_dres:
-            Dbar = soft_state.acc_D[i_p, i_b]
+            Dbar = func_sym6_to_mat3(soft_state.acc_D[i_p, i_b])
             Sh = soft_state.acc_SD[i_p, i_b]
-            Sh2 = soft_state.acc_SDS[i_p, i_b]
+            Sh2 = func_sym6_to_mat3(soft_state.acc_SDS[i_p, i_b])
             ShT = Sh.transpose()
             for k in qd.static(range(3)):
                 for l in qd.static(range(3)):
@@ -1378,6 +1384,133 @@ def func_soft_hit_counts_max(
 
 
 @qd.func
+def func_attachments_stage_start(
+    i_b_env,
+    per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    """Attachment violations at the stage start, the reference of the penalty damping. Runs after the stage-start
+    poses of the links are stored."""
+    n_att = soft_info.att_vert.shape[0]
+    _B = mochi_state.is_active.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_a, i_slot in qd.ndrange(n_att, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_att, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+        if i_a >= soft_info.n_attachments[None]:
+            continue
+        i_v = soft_info.att_vert[i_a]
+        i_l = soft_info.att_link[i_a]
+        rho = gu.qd_transform_by_quat(soft_info.att_pos_local[i_a], mochi_state.links_quat_stage_start[i_l, i_b])
+        soft_state.att_c_start[i_a, i_b] = (
+            soft_state.verts_pos_stage_start[i_v, i_b] - mochi_state.links_pos_stage_start[i_l, i_b] - rho
+        )
+
+
+@qd.kernel
+def kernel_attachments_stage_start(
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+):
+    func_attachments_stage_start(
+        0, False, mochi_state.all_envs, mochi_state.n_envs_all, mochi_state, soft_info, soft_state, rigid_config
+    )
+
+
+@qd.func
+def func_assemble_attachments(
+    i_b_env,
+    per_env: qd.template(),
+    envs: qd.types.ndarray(),
+    n_envs: qd.types.ndarray(),
+    dyn_state: array_class.DynState,
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    assem_obj: qd.template(),
+    assem_res: qd.template(),
+    assem_dres,
+    skip_ls_done,
+):
+    """Penalty of every rigid-deformable attachment: E = 1/2 k |c|^2 + 1/2 (d / h) |c - c_stage_start|^2 on the
+    violation c = x_v - (t_l + R_l p_local), with Gauss-Newton blocks on the vertex and on the link; the coupling
+    between them is applied by the linear solver straight from the attachment tables."""
+    n_att = soft_info.att_vert.shape[0]
+    _B = mochi_state.is_active.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_a, i_slot in qd.ndrange(n_att, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_att, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+        if not func_is_env_active(i_b, mochi_state, skip_ls_done) or i_a >= soft_info.n_attachments[None]:
+            continue
+        i_v = soft_info.att_vert[i_a]
+        i_l = soft_info.att_link[i_a]
+        k = soft_info.att_stiffness[i_a]
+        kappa = soft_info.att_damping[i_a] / mochi_state.dt_stage[i_b]
+        K = k + kappa
+        rho = gu.qd_transform_by_quat(soft_info.att_pos_local[i_a], dyn_state.links.quat[i_l, i_b])
+        c = soft_state.verts_pos[i_v, i_b] - dyn_state.links.pos[i_l, i_b] - rho
+        dc = c - soft_state.att_c_start[i_a, i_b]
+        g = k * c + kappa * dc
+        is_dynamic = soft_info.att_link_is_dynamic[i_a] != 0
+        if qd.static(assem_obj):
+            qd.atomic_add(mochi_state.obj[i_b], 0.5 * k * c.dot(c) + 0.5 * kappa * dc.dot(dc))
+        if qd.static(assem_res):
+            func_add_soft_vec(mochi_state.res, i_v, i_b, g, soft_info)
+            if is_dynamic:
+                torque = rho.cross(g)
+                for kk in qd.static(range(3)):
+                    qd.atomic_add(mochi_state.links_res[i_l, i_b][kk], -g[kk])
+                    qd.atomic_add(mochi_state.links_res[i_l, i_b][3 + kk], -torque[kk])
+        if assem_dres:
+            qd.atomic_add(soft_state.verts_H_diag[i_v, i_b], K * qd.Matrix.identity(gs.qd_float, 3))
+            if is_dynamic:
+                S = skew(rho)
+                SS = -K * (S @ S)
+                I3 = qd.Matrix.identity(gs.qd_float, 3)
+                for kk, ll in qd.static(qd.ndrange(3, 3)):
+                    qd.atomic_add(mochi_state.H_diag[i_l, i_b][kk, ll], K * I3[kk, ll])
+                    qd.atomic_add(mochi_state.H_diag[i_l, i_b][kk, 3 + ll], -K * S[kk, ll])
+                    qd.atomic_add(mochi_state.H_diag[i_l, i_b][3 + kk, ll], K * S[kk, ll])
+                    qd.atomic_add(mochi_state.H_diag[i_l, i_b][3 + kk, 3 + ll], SS[kk, ll])
+
+
+@qd.kernel
+def kernel_assemble_attachments(
+    dyn_state: array_class.DynState,
+    mochi_state: MochiState,
+    soft_info: MochiSoftInfo,
+    soft_state: MochiSoftState,
+    rigid_config: qd.template(),
+    assem_obj: qd.template(),
+    assem_res: qd.template(),
+    assem_dres: qd.i32,
+    skip_ls_done: qd.i32,
+):
+    func_assemble_attachments(
+        0,
+        False,
+        mochi_state.all_envs,
+        mochi_state.n_envs_all,
+        dyn_state,
+        mochi_state,
+        soft_info,
+        soft_state,
+        rigid_config,
+        assem_obj,
+        assem_res,
+        assem_dres,
+        skip_ls_done,
+    )
+
+
+@qd.func
 def func_soft_matvec(
     i_b_env,
     per_env: qd.template(),
@@ -1402,165 +1535,178 @@ def func_soft_matvec(
     dof_start = soft_info.dof_start[None]
     twist_dof_start = soft_info.twist_dof_start[None]
     n_vert_rows = (twist_dof_start - dof_start) // 3
-    # The three rows of a vertex share one column sequence (the pattern is built from whole vertex blocks): one thread
-    # per vertex reads every column index and source value once for the three rows.
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_v, i_slot in qd.ndrange(n_vert_rows, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_vert_rows, 1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if not mochi_state.pcg_is_active[i_b] or soft_state.verts_is_fixed[i_v, i_b]:
-            continue
-        j0 = soft_info.csr_start[3 * i_v]
-        j1 = soft_info.csr_start[3 * i_v + 1]
-        j2 = soft_info.csr_start[3 * i_v + 2]
-        acc = qd.Vector.zero(gs.qd_float, 3)
-        for jj in range(j1 - j0):
-            j_l = soft_info.csr_col[j0 + jj]
-            j_d = dof_start + j_l
-            if j_d < twist_dof_start and soft_state.verts_is_fixed[j_l // 3, i_b]:
-                continue
-            x = src[j_d, i_b]
-            acc[0] += soft_state.csr_values[j0 + jj, i_b] * x
-            acc[1] += soft_state.csr_values[j1 + jj, i_b] * x
-            acc[2] += soft_state.csr_values[j2 + jj, i_b] * x
-        for k in qd.static(range(3)):
-            dst[dof_start + 3 * i_v + k, i_b] += acc[k]
-    # rod twist rows: scalar walk
+    # One pass covers the vertex rows and the rod twist rows. The three rows of a vertex share one column sequence
+    # (the pattern is built from whole vertex blocks): one thread per vertex reads every column index and source
+    # value once for the three rows; a twist row is a scalar walk of its own sequence.
     n_twist_rows = n_soft_dofs - 3 * n_vert_rows
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_t, i_slot in (
-        qd.ndrange(n_twist_rows, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_twist_rows, 1)
+    for i_x, i_slot in (
+        qd.ndrange(n_vert_rows + n_twist_rows, n_envs[None])
+        if qd.static(not per_env)
+        else qd.ndrange(n_vert_rows + n_twist_rows, 1)
     ):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not mochi_state.pcg_is_active[i_b]:
             continue
-        i_l = 3 * n_vert_rows + i_t
-        acc = gs.qd_float(0.0)
-        for j in range(soft_info.csr_start[i_l], soft_info.csr_start[i_l + 1]):
-            j_l = soft_info.csr_col[j]
-            j_d = dof_start + j_l
-            if j_d < twist_dof_start and soft_state.verts_is_fixed[j_l // 3, i_b]:
-                continue
-            acc += soft_state.csr_values[j, i_b] * src[j_d, i_b]
-        dst[dof_start + i_l, i_b] += acc
+        if i_x < n_vert_rows:
+            i_v = i_x
+            if not soft_state.verts_is_fixed[i_v, i_b]:
+                j0 = soft_info.csr_start[3 * i_v]
+                j1 = soft_info.csr_start[3 * i_v + 1]
+                j2 = soft_info.csr_start[3 * i_v + 2]
+                acc = qd.Vector.zero(gs.qd_float, 3)
+                for jj in range(j1 - j0):
+                    j_l = soft_info.csr_col[j0 + jj]
+                    j_d = dof_start + j_l
+                    if j_d < twist_dof_start and soft_state.verts_is_fixed[j_l // 3, i_b]:
+                        continue
+                    x = src[j_d, i_b]
+                    acc[0] += soft_state.csr_values[j0 + jj, i_b] * x
+                    acc[1] += soft_state.csr_values[j1 + jj, i_b] * x
+                    acc[2] += soft_state.csr_values[j2 + jj, i_b] * x
+                for k in qd.static(range(3)):
+                    dst[dof_start + 3 * i_v + k, i_b] += acc[k]
+        else:
+            i_l = 3 * n_vert_rows + (i_x - n_vert_rows)
+            acc_t = gs.qd_float(0.0)
+            for j in range(soft_info.csr_start[i_l], soft_info.csr_start[i_l + 1]):
+                j_l = soft_info.csr_col[j]
+                j_d = dof_start + j_l
+                if j_d < twist_dof_start and soft_state.verts_is_fixed[j_l // 3, i_b]:
+                    continue
+                acc_t += soft_state.csr_values[j, i_b] * src[j_d, i_b]
+            dst[dof_start + i_l, i_b] += acc_t
 
+    # One segmented pass covers the contact hits of the three kinds, the attachments and the fixed-row identities:
+    # they are independent accumulations into dst (nothing writes a fixed vertex's rows but the identity), and each
+    # offloaded loop costs a fixed launch on the device.
+    n_h_soft = soft_state.n_soft_hits_max[None]
+    n_h_sc = soft_state.n_sc_hits_max[None]
+    n_h_pc = soft_state.n_pc_hits_max[None]
+    n_att = soft_info.att_vert.shape[0]
+    n_soft_items = n_h_soft + n_h_sc + n_h_pc + n_att + n_verts
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_h, i_slot in (
-        qd.ndrange(soft_state.n_soft_hits_max[None], n_envs[None])
-        if qd.static(not per_env)
-        else qd.ndrange(soft_state.n_soft_hits_max[None], 1)
+    for i_x, i_slot in (
+        qd.ndrange(n_soft_items, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_soft_items, 1)
     ):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if not mochi_state.pcg_is_active[i_b] or i_h >= soft_state.n_soft_hits[i_b]:
+        if not mochi_state.pcg_is_active[i_b]:
             continue
-        i_s = soft_state.hit_sample[i_h, i_b]
-        tri = soft_info.samples_tri[i_s]
-        bary = soft_info.samples_bary[i_s]
-        D = soft_state.hit_D[i_h, i_b]
-        i_lb = soft_state.hit_link_b[i_h, i_b]
-        # Relative displacement of the sample against the collider point.
-        dp = qd.Vector.zero(gs.qd_float, 3)
-        for i in qd.static(range(3)):
-            if not soft_state.verts_is_fixed[tri[i], i_b]:
-                dp += bary[i] * func_read_soft_vec(src, tri[i], i_b, soft_info)
-        r_b = soft_state.hit_r_b[i_h, i_b]
-        if i_lb >= 0:
-            dp -= func_soft_point_displacement(i_lb, i_b, r_b, src, dyn_state, dyn_info, rigid_config)
-        g = D @ dp
-        for i in qd.static(range(3)):
-            if not soft_state.verts_is_fixed[tri[i], i_b]:
-                func_add_soft_vec(dst, tri[i], i_b, bary[i] * g, soft_info)
-        if i_lb >= 0:
-            # The rigid-rigid part J_b^T D J_b is already in the link block; only the coupling remains.
-            g_soft = qd.Vector.zero(gs.qd_float, 3)
-            for i in qd.static(range(3)):
-                if not soft_state.verts_is_fixed[tri[i], i_b]:
-                    g_soft += bary[i] * func_read_soft_vec(src, tri[i], i_b, soft_info)
-            func_soft_point_force_add(i_lb, i_b, r_b, -(D @ g_soft), dst, dyn_state, dyn_info, rigid_config)
-
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_h, i_slot in (
-        qd.ndrange(soft_state.n_sc_hits_max[None], n_envs[None])
-        if qd.static(not per_env)
-        else qd.ndrange(soft_state.n_sc_hits_max[None], 1)
-    ):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if not mochi_state.pcg_is_active[i_b] or i_h >= soft_state.n_sc_hits[i_b]:
-            continue
-        D = soft_state.sc_hit_D[i_h, i_b]
-        kind_a = soft_state.sc_hit_kind_a[i_h, i_b]
-        i_la = soft_state.sc_hit_link_a[i_h, i_b]
-        r_a = soft_state.sc_hit_r_a[i_h, i_b]
-        v_b = soft_info.elems_v[soft_state.sc_hit_elem_b[i_h, i_b]]
-        bary_b = soft_state.sc_hit_bary_b[i_h, i_b]
-        # Relative displacement of the colliding point against the collider point (barycentric in its tetrahedron).
-        dp = qd.Vector.zero(gs.qd_float, 3)
-        tri_a = soft_info.samples_tri[soft_state.sc_hit_sample_a[i_h, i_b]]
-        bary_a = soft_info.samples_bary[soft_state.sc_hit_sample_a[i_h, i_b]]
-        if kind_a == 1:
-            for i in qd.static(range(3)):
-                if not soft_state.verts_is_fixed[tri_a[i], i_b]:
-                    dp += bary_a[i] * func_read_soft_vec(src, tri_a[i], i_b, soft_info)
-        elif i_la >= 0:
-            dp += func_soft_point_displacement(i_la, i_b, r_a, src, dyn_state, dyn_info, rigid_config)
-        dp_b = qd.Vector.zero(gs.qd_float, 3)
-        for j in qd.static(range(4)):
-            if not soft_state.verts_is_fixed[v_b[j], i_b]:
-                dp_b += bary_b[j] * func_read_soft_vec(src, v_b[j], i_b, soft_info)
-        g = D @ (dp - dp_b)
-        if kind_a == 1:
-            for i in qd.static(range(3)):
-                if not soft_state.verts_is_fixed[tri_a[i], i_b]:
-                    func_add_soft_vec(dst, tri_a[i], i_b, bary_a[i] * g, soft_info)
-        elif i_la >= 0:
-            # The rigid-rigid part J_a^T D J_a is already in the link block; only the coupling remains.
-            func_soft_point_force_add(i_la, i_b, r_a, -(D @ dp_b), dst, dyn_state, dyn_info, rigid_config)
-        for j in qd.static(range(4)):
-            if not soft_state.verts_is_fixed[v_b[j], i_b]:
-                func_add_soft_vec(dst, v_b[j], i_b, -bary_b[j] * g, soft_info)
-
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_h, i_slot in (
-        qd.ndrange(soft_state.n_pc_hits_max[None], n_envs[None])
-        if qd.static(not per_env)
-        else qd.ndrange(soft_state.n_pc_hits_max[None], 1)
-    ):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if not mochi_state.pcg_is_active[i_b] or i_h >= soft_state.n_pc_hits[i_b]:
-            continue
-        D = soft_state.pc_hit_D[i_h, i_b]
-        kind_a = soft_state.pc_hit_kind_a[i_h, i_b]
-        i_la = soft_state.pc_hit_link_a[i_h, i_b]
-        r_a = soft_state.pc_hit_r_a[i_h, i_b]
-        i_vb = soft_state.pc_hit_vert_b[i_h, i_b]
-        tri_a = soft_info.samples_tri[soft_state.pc_hit_sample_a[i_h, i_b]]
-        bary_a = soft_info.samples_bary[soft_state.pc_hit_sample_a[i_h, i_b]]
-        dp = qd.Vector.zero(gs.qd_float, 3)
-        if kind_a == 1:
-            for i in qd.static(range(3)):
-                if not soft_state.verts_is_fixed[tri_a[i], i_b]:
-                    dp += bary_a[i] * func_read_soft_vec(src, tri_a[i], i_b, soft_info)
-        elif i_la >= 0:
-            dp += func_soft_point_displacement(i_la, i_b, r_a, src, dyn_state, dyn_info, rigid_config)
-        dp_b = qd.Vector.zero(gs.qd_float, 3)
-        if not soft_state.verts_is_fixed[i_vb, i_b]:
-            dp_b = func_read_soft_vec(src, i_vb, i_b, soft_info)
-        g = D @ (dp - dp_b)
-        if kind_a == 1:
-            for i in qd.static(range(3)):
-                if not soft_state.verts_is_fixed[tri_a[i], i_b]:
-                    func_add_soft_vec(dst, tri_a[i], i_b, bary_a[i] * g, soft_info)
-        elif i_la >= 0:
-            func_soft_point_force_add(i_la, i_b, r_a, -(D @ dp_b), dst, dyn_state, dyn_info, rigid_config)
-        if not soft_state.verts_is_fixed[i_vb, i_b]:
-            func_add_soft_vec(dst, i_vb, i_b, -g, soft_info)
-
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_v, i_slot in qd.ndrange(n_verts, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if mochi_state.pcg_is_active[i_b] and soft_state.verts_is_fixed[i_v, i_b]:
-            for k in qd.static(range(3)):
-                i_d = func_soft_dof(i_v, k, soft_info)
-                dst[i_d, i_b] = src[i_d, i_b]
+        if i_x < n_h_soft:
+            i_h = i_x
+            if i_h < soft_state.n_soft_hits[i_b]:
+                i_s = soft_state.hit_sample[i_h, i_b]
+                tri = soft_info.samples_tri[i_s]
+                bary = soft_info.samples_bary[i_s]
+                D = func_sym6_to_mat3(soft_state.hit_D[i_h, i_b])
+                i_lb = soft_state.hit_link_b[i_h, i_b]
+                # Relative displacement of the sample against the collider point.
+                dp = qd.Vector.zero(gs.qd_float, 3)
+                for i in qd.static(range(3)):
+                    if not soft_state.verts_is_fixed[tri[i], i_b]:
+                        dp += bary[i] * func_read_soft_vec(src, tri[i], i_b, soft_info)
+                r_b = soft_state.hit_r_b[i_h, i_b]
+                if i_lb >= 0:
+                    dp -= func_soft_point_displacement(i_lb, i_b, r_b, src, dyn_state, dyn_info, rigid_config)
+                g = D @ dp
+                for i in qd.static(range(3)):
+                    if not soft_state.verts_is_fixed[tri[i], i_b]:
+                        func_add_soft_vec(dst, tri[i], i_b, bary[i] * g, soft_info)
+                if i_lb >= 0:
+                    # The rigid-rigid part J_b^T D J_b is already in the link block; only the coupling remains.
+                    g_soft = qd.Vector.zero(gs.qd_float, 3)
+                    for i in qd.static(range(3)):
+                        if not soft_state.verts_is_fixed[tri[i], i_b]:
+                            g_soft += bary[i] * func_read_soft_vec(src, tri[i], i_b, soft_info)
+                    func_soft_point_force_add(i_lb, i_b, r_b, -(D @ g_soft), dst, dyn_state, dyn_info, rigid_config)
+        elif i_x < n_h_soft + n_h_sc:
+            i_h = i_x - n_h_soft
+            if i_h < soft_state.n_sc_hits[i_b]:
+                D = func_sym6_to_mat3(soft_state.sc_hit_D[i_h, i_b])
+                kind_a = soft_state.sc_hit_kind_a[i_h, i_b]
+                i_la = soft_state.sc_hit_link_a[i_h, i_b]
+                r_a = soft_state.sc_hit_r_a[i_h, i_b]
+                v_b = soft_info.elems_v[soft_state.sc_hit_elem_b[i_h, i_b]]
+                bary_b = soft_state.sc_hit_bary_b[i_h, i_b]
+                # Relative displacement of the colliding point against the collider point (barycentric in its
+                # tetrahedron).
+                dp = qd.Vector.zero(gs.qd_float, 3)
+                tri_a = soft_info.samples_tri[soft_state.sc_hit_sample_a[i_h, i_b]]
+                bary_a = soft_info.samples_bary[soft_state.sc_hit_sample_a[i_h, i_b]]
+                if kind_a == 1:
+                    for i in qd.static(range(3)):
+                        if not soft_state.verts_is_fixed[tri_a[i], i_b]:
+                            dp += bary_a[i] * func_read_soft_vec(src, tri_a[i], i_b, soft_info)
+                elif i_la >= 0:
+                    dp += func_soft_point_displacement(i_la, i_b, r_a, src, dyn_state, dyn_info, rigid_config)
+                dp_b = qd.Vector.zero(gs.qd_float, 3)
+                for j in qd.static(range(4)):
+                    if not soft_state.verts_is_fixed[v_b[j], i_b]:
+                        dp_b += bary_b[j] * func_read_soft_vec(src, v_b[j], i_b, soft_info)
+                g = D @ (dp - dp_b)
+                if kind_a == 1:
+                    for i in qd.static(range(3)):
+                        if not soft_state.verts_is_fixed[tri_a[i], i_b]:
+                            func_add_soft_vec(dst, tri_a[i], i_b, bary_a[i] * g, soft_info)
+                elif i_la >= 0:
+                    # The rigid-rigid part J_a^T D J_a is already in the link block; only the coupling remains.
+                    func_soft_point_force_add(i_la, i_b, r_a, -(D @ dp_b), dst, dyn_state, dyn_info, rigid_config)
+                for j in qd.static(range(4)):
+                    if not soft_state.verts_is_fixed[v_b[j], i_b]:
+                        func_add_soft_vec(dst, v_b[j], i_b, -bary_b[j] * g, soft_info)
+        elif i_x < n_h_soft + n_h_sc + n_h_pc:
+            i_h = i_x - n_h_soft - n_h_sc
+            if i_h < soft_state.n_pc_hits[i_b]:
+                D = func_sym6_to_mat3(soft_state.pc_hit_D[i_h, i_b])
+                kind_a = soft_state.pc_hit_kind_a[i_h, i_b]
+                i_la = soft_state.pc_hit_link_a[i_h, i_b]
+                r_a = soft_state.pc_hit_r_a[i_h, i_b]
+                i_vb = soft_state.pc_hit_vert_b[i_h, i_b]
+                tri_a = soft_info.samples_tri[soft_state.pc_hit_sample_a[i_h, i_b]]
+                bary_a = soft_info.samples_bary[soft_state.pc_hit_sample_a[i_h, i_b]]
+                dp = qd.Vector.zero(gs.qd_float, 3)
+                if kind_a == 1:
+                    for i in qd.static(range(3)):
+                        if not soft_state.verts_is_fixed[tri_a[i], i_b]:
+                            dp += bary_a[i] * func_read_soft_vec(src, tri_a[i], i_b, soft_info)
+                elif i_la >= 0:
+                    dp += func_soft_point_displacement(i_la, i_b, r_a, src, dyn_state, dyn_info, rigid_config)
+                dp_b = qd.Vector.zero(gs.qd_float, 3)
+                if not soft_state.verts_is_fixed[i_vb, i_b]:
+                    dp_b = func_read_soft_vec(src, i_vb, i_b, soft_info)
+                g = D @ (dp - dp_b)
+                if kind_a == 1:
+                    for i in qd.static(range(3)):
+                        if not soft_state.verts_is_fixed[tri_a[i], i_b]:
+                            func_add_soft_vec(dst, tri_a[i], i_b, bary_a[i] * g, soft_info)
+                elif i_la >= 0:
+                    func_soft_point_force_add(i_la, i_b, r_a, -(D @ dp_b), dst, dyn_state, dyn_info, rigid_config)
+                if not soft_state.verts_is_fixed[i_vb, i_b]:
+                    func_add_soft_vec(dst, i_vb, i_b, -g, soft_info)
+        elif i_x < n_h_soft + n_h_sc + n_h_pc + n_att:
+            i_a = i_x - n_h_soft - n_h_sc - n_h_pc
+            if i_a < soft_info.n_attachments[None]:
+                i_v = soft_info.att_vert[i_a]
+                i_l = soft_info.att_link[i_a]
+                K = soft_info.att_stiffness[i_a] + soft_info.att_damping[i_a] / mochi_state.dt_stage[i_b]
+                is_fixed = soft_state.verts_is_fixed[i_v, i_b]
+                dp = qd.Vector.zero(gs.qd_float, 3)
+                if not is_fixed:
+                    dp = func_read_soft_vec(src, i_v, i_b, soft_info)
+                if soft_info.att_link_is_dynamic[i_a] != 0:
+                    rho = gu.qd_transform_by_quat(soft_info.att_pos_local[i_a], dyn_state.links.quat[i_l, i_b])
+                    g_soft = K * dp
+                    dp -= func_soft_point_displacement(i_l, i_b, rho, src, dyn_state, dyn_info, rigid_config)
+                    # The rigid-rigid part J^T K J is already in the link block; only the coupling remains.
+                    func_soft_point_force_add(i_l, i_b, rho, -g_soft, dst, dyn_state, dyn_info, rigid_config)
+                if not is_fixed:
+                    func_add_soft_vec(dst, i_v, i_b, K * dp, soft_info)
+        else:
+            i_v = i_x - n_h_soft - n_h_sc - n_h_pc - n_att
+            if soft_state.verts_is_fixed[i_v, i_b]:
+                for k in qd.static(range(3)):
+                    i_d = func_soft_dof(i_v, k, soft_info)
+                    dst[i_d, i_b] = src[i_d, i_b]
 
 
 @qd.func
@@ -1577,38 +1723,45 @@ def func_soft_precondition(
     rigid_config: qd.template(),
     eps,
 ):
-    """z = M^-1 r on the vertex degrees of freedom with the block-Jacobi preconditioner of the 3x3 vertex blocks."""
+    """z = M^-1 r: scalar Jacobi on the rigid degrees of freedom, the twist diagonal on closed-loop rod twists and
+    the 3x3 block Jacobi on the vertex blocks, in one segmented pass; the per-rod band solve follows."""
     n_verts = soft_state.verts_pos.shape[0]
     _B = soft_state.verts_pos.shape[1]
     n_rod_elems = soft_state.rod_elems_H.shape[0]
+    # The deformable dofs are all written by the deformable branches below (vertex blocks, rod band, twist
+    # diagonal): the scalar Jacobi branch covers the rigid dofs only.
+    n_jacobi = soft_info.dof_start[None]
+    n_items = n_jacobi + n_rod_elems + n_verts
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_r, i_slot in qd.ndrange(n_rod_elems, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_rod_elems, 1):
+    for i_x, i_slot in qd.ndrange(n_items, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_items, 1):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if not mochi_state.pcg_is_active[i_b] or soft_info.rod_elems_L[i_r] <= 0.0:
+        if not mochi_state.pcg_is_active[i_b]:
             continue
-        i_d = func_rod_twist_dof(i_r, soft_info)
-        if soft_info.dofs_band_row[i_d] >= 0:
-            continue
-        diag = mochi_state.dofs_H_diag[i_d, i_b] + soft_state.rod_elems_twist_pcg[i_r, i_b]
-        z[i_d, i_b] = r[i_d, i_b] / qd.max(diag, eps)
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_v, i_slot in qd.ndrange(n_verts, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
-        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
-        if not mochi_state.pcg_is_active[i_b] or soft_info.dofs_band_row[func_soft_dof(i_v, 0, soft_info)] >= 0:
-            continue
-        r_v = func_read_soft_vec(r, i_v, i_b, soft_info)
-        z_v = r_v
-        if not soft_state.verts_is_fixed[i_v, i_b]:
-            H = soft_state.verts_H_diag[i_v, i_b]
-            det = H.determinant()
-            if det > eps:
-                z_v = H.inverse() @ r_v
-            else:
+        if i_x < n_jacobi:
+            z[i_x, i_b] = r[i_x, i_b] / qd.max(mochi_state.pcg_diag[i_x, i_b], eps)
+        elif i_x < n_jacobi + n_rod_elems:
+            i_r = i_x - n_jacobi
+            if soft_info.rod_elems_L[i_r] > 0.0:
+                i_d = func_rod_twist_dof(i_r, soft_info)
+                if soft_info.dofs_band_row[i_d] < 0:
+                    diag = mochi_state.dofs_H_diag[i_d, i_b] + soft_state.rod_elems_twist_pcg[i_r, i_b]
+                    z[i_d, i_b] = r[i_d, i_b] / qd.max(diag, eps)
+        else:
+            i_v = i_x - n_jacobi - n_rod_elems
+            if soft_info.dofs_band_row[func_soft_dof(i_v, 0, soft_info)] < 0:
+                r_v = func_read_soft_vec(r, i_v, i_b, soft_info)
+                z_v = r_v
+                if not soft_state.verts_is_fixed[i_v, i_b]:
+                    H = soft_state.verts_H_diag[i_v, i_b]
+                    det = H.determinant()
+                    if det > eps:
+                        z_v = H.inverse() @ r_v
+                    else:
+                        for k in qd.static(range(3)):
+                            z_v[k] = r_v[k] / qd.max(H[k, k], eps)
+                i_d = func_soft_dof(i_v, 0, soft_info)
                 for k in qd.static(range(3)):
-                    z_v[k] = r_v[k] / qd.max(H[k, k], eps)
-        i_d = func_soft_dof(i_v, 0, soft_info)
-        for k in qd.static(range(3)):
-            z[i_d + k, i_b] = z_v[k]
+                    z[i_d + k, i_b] = z_v[k]
     func_rod_band_solve(i_b_env, per_env, envs, n_envs, r, z, mochi_state, soft_info, soft_state, rigid_config)
 
 
@@ -1655,7 +1808,7 @@ def func_soft_condense_dense(
         i_s = soft_state.hit_sample[i_h, i_b]
         tri = soft_info.samples_tri[i_s]
         bary = soft_info.samples_bary[i_s]
-        D = soft_state.hit_D[i_h, i_b]
+        D = func_sym6_to_mat3(soft_state.hit_D[i_h, i_b])
         for i in qd.static(range(3)):
             for j in qd.static(range(3)):
                 i_d = func_soft_dof(tri[i], 0, soft_info)
@@ -1688,7 +1841,7 @@ def func_soft_condense_dense(
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or i_h >= soft_state.n_sc_hits[i_b]:
             continue
-        D = soft_state.sc_hit_D[i_h, i_b]
+        D = func_sym6_to_mat3(soft_state.sc_hit_D[i_h, i_b])
         kind_a = soft_state.sc_hit_kind_a[i_h, i_b]
         v_b = soft_info.elems_v[soft_state.sc_hit_elem_b[i_h, i_b]]
         bary_b = soft_state.sc_hit_bary_b[i_h, i_b]
@@ -1741,7 +1894,7 @@ def func_soft_condense_dense(
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or i_h >= soft_state.n_pc_hits[i_b]:
             continue
-        D = soft_state.pc_hit_D[i_h, i_b]
+        D = func_sym6_to_mat3(soft_state.pc_hit_D[i_h, i_b])
         kind_a = soft_state.pc_hit_kind_a[i_h, i_b]
         i_vb = soft_state.pc_hit_vert_b[i_h, i_b]
         b_d = func_soft_dof(i_vb, 0, soft_info)
@@ -1776,6 +1929,33 @@ def func_soft_condense_dense(
                             qd.atomic_add(mochi_state.H_dense[i_b, b_d + r, k_d], column[r])
                             qd.atomic_add(mochi_state.H_dense[i_b, k_d, b_d + r], column[r])
                     i_anc = dyn_info.links.parent_idx[I_anc]
+
+    n_att = soft_info.att_vert.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_a, i_slot in qd.ndrange(n_att, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_att, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+        if not (mochi_state.is_active[i_b] and island_state.uses_dense[i_b]) or i_a >= soft_info.n_attachments[None]:
+            continue
+        i_v = soft_info.att_vert[i_a]
+        if soft_state.verts_is_fixed[i_v, i_b]:
+            continue
+        K = soft_info.att_stiffness[i_a] + soft_info.att_damping[i_a] / mochi_state.dt_stage[i_b]
+        b_d = func_soft_dof(i_v, 0, soft_info)
+        for r in qd.static(range(3)):
+            qd.atomic_add(mochi_state.H_dense[i_b, b_d + r, b_d + r], K)
+        if soft_info.att_link_is_dynamic[i_a] != 0:
+            i_la = soft_info.att_link[i_a]
+            rho = gu.qd_transform_by_quat(soft_info.att_pos_local[i_a], dyn_state.links.quat[i_la, i_b])
+            i_anc = i_la
+            while i_anc != -1:
+                I_anc = [i_anc, i_b] if qd.static(rigid_config.batch_links_info) else i_anc
+                for k_d in range(dyn_info.links.dof_start[I_anc], dyn_info.links.dof_end[I_anc]):
+                    vel, ang = func_link_dof_jacobian(i_la, k_d, i_b, dyn_state)
+                    column = -K * (vel + ang.cross(rho))
+                    for r in qd.static(range(3)):
+                        qd.atomic_add(mochi_state.H_dense[i_b, b_d + r, k_d], column[r])
+                        qd.atomic_add(mochi_state.H_dense[i_b, k_d, b_d + r], column[r])
+                i_anc = dyn_info.links.parent_idx[I_anc]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_v, i_slot in qd.ndrange(n_verts, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_verts, 1):
@@ -2044,7 +2224,10 @@ def kernel_rod_init_render(
 def kernel_soft_get_state_render(
     vverts_render: qd.Tensor,
     vverts_vert_idx: qd.Tensor,
+    vverts_elem: qd.Tensor,
+    vverts_bary: qd.Tensor,
     envs_offset: qd.types.ndarray(),
+    soft_info: MochiSoftInfo,
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
 ):
@@ -2052,15 +2235,34 @@ def kernel_soft_get_state_render(
     _B = soft_state.verts_pos.shape[1]
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_vv, i_b in qd.ndrange(n_vverts, _B):
-        pos = soft_state.verts_pos[vverts_vert_idx[i_vv], i_b]
+        pos = qd.Vector.zero(gs.qd_float, 3)
+        i_el = vverts_elem[i_vv]
+        if i_el >= 0:
+            # An embedded render vertex follows the barycentric combination of its element's nodes.
+            v = soft_info.elems_v[i_el]
+            bary = vverts_bary[i_vv]
+            for k in qd.static(range(4)):
+                pos += bary[k] * soft_state.verts_pos[v[k], i_b]
+        else:
+            pos = soft_state.verts_pos[vverts_vert_idx[i_vv], i_b]
         for k in qd.static(range(3)):
             vverts_render[i_vv, i_b][k] = qd.cast(pos[k] + envs_offset[i_b, k], qd.f32)
 
 
 @qd.kernel
-def kernel_soft_init_render(vert_idx: qd.types.ndarray(), vverts_vert_idx: qd.Tensor):
+def kernel_soft_init_render(
+    vert_idx: qd.types.ndarray(),
+    elems_idx: qd.types.ndarray(),
+    bary: qd.types.ndarray(),
+    vverts_vert_idx: qd.Tensor,
+    vverts_elem: qd.Tensor,
+    vverts_bary: qd.Tensor,
+):
     for i_vv in range(vert_idx.shape[0]):
         vverts_vert_idx[i_vv] = vert_idx[i_vv]
+        vverts_elem[i_vv] = elems_idx[i_vv]
+        for k in qd.static(range(4)):
+            vverts_bary[i_vv][k] = bary[i_vv, k]
 
 
 @qd.kernel
@@ -2371,9 +2573,12 @@ def func_soft_collider_eval(
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
-        # A deformable sample whose entity has no tetrahedral collider to hit never queries.
+        # A deformable sample whose entity has no tetrahedral collider to hit never queries; a static body is only a
+        # collider: its samples never collide (mochi's rule).
         n_rigid = soft_info.n_rigid_queries[None]
         if i_q >= n_rigid and soft_info.entities_queries_tets[soft_info.samples_entity_idx[i_q - n_rigid]] == 0:
+            continue
+        if i_q < n_rigid and not mochi_info.links.is_dynamic[mochi_info.samples.link_idx[i_q]]:
             continue
         kind_a, i_la, e_a, i_sample, pos, pos_start, normal_a0, w, k_a, falloff_a, mu_a, c_visc_a, c_ndamp_a = (
             func_query_point(i_q, i_b, dyn_state, mochi_info, mochi_state, soft_info, soft_state, EPS)
@@ -2521,7 +2726,7 @@ def func_soft_collider_eval(
                                 soft_state.sc_hit_r_a[i_h, i_b] = r_a
                                 soft_state.sc_hit_elem_b[i_h, i_b] = i_el_cur
                                 soft_state.sc_hit_bary_b[i_h, i_b] = bary_b
-                                soft_state.sc_hit_D[i_h, i_b] = D
+                                soft_state.sc_hit_D[i_h, i_b] = func_mat3_to_sym6(D)
                                 if qd.static(record):
                                     hit_readback.sc_hit_force[i_h, i_b] = wf
                                     hit_readback.sc_hit_pos[i_h, i_b] = pos
@@ -3523,33 +3728,37 @@ def func_pc_collider_eval(
     record: qd.template(),
     errno: qd.Tensor,
 ):
-    """Evaluate every sample point against the collider spheres of the vertices found in the 27 hash cells around it:
-    signed distance |p - x_b| - r with radial gradient, contact stiffness scaled by the nodal area over r^2, response on
-    the sample and on the vertex."""
+    """Evaluate the sample points of the point-cloud entities against the collider spheres of the vertices found in
+    the 27 hash cells around them: signed distance |p - x_b| - r with radial gradient, contact stiffness scaled by the
+    nodal area over r^2, response on the sample and on the vertex. Rigid samples never query the spheres (mochi's
+    rule: point-cloud colliders only collide with each other)."""
     n_bins = soft_state.pc_hash_heads.shape[0]
     n_verts = soft_state.verts_pos.shape[0]
     _B = soft_state.verts_pos.shape[1]
     max_hits = soft_state.pc_hit_kind_a.shape[0]
     EPS = mochi_info.EPS[None]
     inv_cell = 1.0 / soft_info.pc_hash_cell[None]
-    n_queries = soft_info.n_queries[None]
+    n_rigid = soft_info.n_rigid_queries[None]
+    n_soft_queries = soft_info.n_queries[None] - n_rigid
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_q, i_slot in qd.ndrange(n_queries, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_queries, 1):
+    for i_q_soft, i_slot in (
+        qd.ndrange(n_soft_queries, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_soft_queries, 1)
+    ):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if not func_is_env_active(i_b, mochi_state, skip_ls_done):
             continue
         # A deformable sample whose entity has no sphere collider to hit never queries.
-        n_rigid = soft_info.n_rigid_queries[None]
-        if i_q >= n_rigid and soft_info.entities_queries_spheres[soft_info.samples_entity_idx[i_q - n_rigid]] == 0:
+        if soft_info.entities_queries_spheres[soft_info.samples_entity_idx[i_q_soft]] == 0:
             continue
+        i_q = n_rigid + i_q_soft
         kind_a, i_la, e_a, i_sample, pos, pos_start, normal_a0, w, k_a, falloff_a, mu_a, c_visc_a, c_ndamp_a = (
             func_query_point(i_q, i_b, dyn_state, mochi_info, mochi_state, soft_info, soft_state, EPS)
         )
         is_shell_a = kind_a == 1 and soft_info.entities_kind[e_a] != SOFT_KIND_SOLID
         cell_q = func_hash_cell(pos, inv_cell)
         entry = soft_state.pc_hash_heads[func_hash_bin(cell_q, n_bins - 1), i_b]
-        for _ in range(8 * n_verts):
+        for _walk in range(8 * n_verts):
             if entry < 0:
                 break
             i_vb = entry // 8
@@ -3680,7 +3889,7 @@ def func_pc_collider_eval(
                     soft_state.pc_hit_link_a[i_h, i_b] = i_la if (kind_a == 0 and is_dynamic_a) else -1
                     soft_state.pc_hit_r_a[i_h, i_b] = r_a
                     soft_state.pc_hit_vert_b[i_h, i_b] = i_vb
-                    soft_state.pc_hit_D[i_h, i_b] = D
+                    soft_state.pc_hit_D[i_h, i_b] = func_mat3_to_sym6(D)
                     if qd.static(record):
                         hit_readback.pc_hit_force[i_h, i_b] = wf
                         hit_readback.pc_hit_pos[i_h, i_b] = pos

@@ -386,3 +386,29 @@ def test_rigid_ball_on_ropes(show_viewer):
     assert_allclose(ball_vel[3:], 0.0, atol=1e-2)
     ball_mass = float(tensor_to_array(ball.get_mass()))
     assert_allclose(tensor_to_array(ball.get_links_net_contact_force())[0], (0.0, 0.0, ball_mass * 9.8), atol=1e-3)
+
+
+@pytest.mark.required
+@pytest.mark.precision("64")
+def test_rod_band_preconditioner_exact_in_contact(show_viewer):
+    # The banded per-rod Cholesky includes the contact blocks on the rod's vertices: in a scene with no other
+    # coupling the preconditioner is the exact inverse of the rod's Hessian and every Newton solve converges in one
+    # conjugate-gradient iteration, resting on the plane included (without the contact blocks a rod pressed into a
+    # collider costs 3-5 iterations per solve).
+    scene = _mochi_scene(show_viewer, 0.01, n_newton_iterations=8)
+    scene.add_entity(gs.morphs.Plane(), material=gs.materials.Mochi.Rigid())
+    rod = scene.add_entity(
+        gs.morphs.Rod(points=_straight_rod_points(20, 1.0), radius=0.01, pos=(0.0, 0.0, 0.05)),
+        material=gs.materials.Mochi.Rod(E=1e7, nu=0.3, rho=1000.0),
+    )
+    scene.build()
+    in_contact_steps = 0
+    for _ in range(60):
+        scene.step()
+        info = scene.mochi_solver.get_convergence_info()
+        n_iter = int(tensor_to_array(info["n_iter"]).ravel()[0])
+        n_pcg = int(tensor_to_array(info["n_pcg_iter"]).ravel()[0])
+        assert n_pcg <= n_iter + 1
+        if len(rod.get_contacts()["position"]) > 0:
+            in_contact_steps += 1
+    assert in_contact_steps > 30

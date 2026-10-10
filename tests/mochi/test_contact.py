@@ -127,3 +127,34 @@ def test_collider_distance_fields(show_viewer):
     distances, gradients, is_valid = solver.get_collider_distances(plane.geoms[0].idx, points)
     assert_allclose(distances, [-2.0, -1.0, 0.0, 1.0], tol=1e-9)
     assert_allclose(gradients, np.tile([[0.0, 0.0, 1.0]], (4, 1)), tol=1e-9)
+
+
+@pytest.mark.required
+@pytest.mark.precision("64")
+@pytest.mark.parametrize("params_name", ["coulomb", "viscous", "damping"])
+@pytest.mark.parametrize("friction_model", ["c1", "cinf"])
+def test_collision_response_tangent_is_symmetric(params_name, friction_model):
+    # The contact force derivative is built from grad grad^T, I - n n^T and n n^T terms only, so it is symmetric by
+    # construction: the solver stores it as six floats (see func_mat3_to_sym6), which is exact only as long as every
+    # response path keeps the symmetry.
+    from genesis.engine.solvers.mochi.data import FRICTION_MODEL
+
+    params = CONTACT_PARAMS[params_name]
+    dt_stage = 0.01
+    rng = np.random.default_rng(1)
+    normal = np.array([0.1, 0.4, 0.911])
+    normal /= np.linalg.norm(normal)
+    distances = np.array([0.003, -0.001, 0.002, -0.005, -0.012, 0.0005])
+    points = distances[:, None] * normal[None, :] + rng.normal(scale=0.01, size=(len(distances), 3)) * (1 - normal)
+    points_stage_start = points - rng.normal(scale=0.5 * dt_stage, size=points.shape)
+    for use_fitted in (True, False):
+        for implicit_normal in (True, False):
+            config = make_static_config(
+                friction_model=FRICTION_MODEL.CINF if friction_model == "cinf" else FRICTION_MODEL.C1,
+                use_fitted_friction_hessian=use_fitted,
+                implicit_normal_force_for_dissipation=implicit_normal,
+            )
+            _, _, dforce = plane_collision_response(
+                points, points_stage_start, normal, -normal, params, dt_stage, config
+            )
+            assert_allclose(dforce, np.swapaxes(dforce, -1, -2), tol=1e-12)

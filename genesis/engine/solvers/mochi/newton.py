@@ -92,7 +92,14 @@ def func_residual_norms(
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if func_is_env_active(i_b, mochi_state, skip_ls_done):
             island_state.nodes_res_w_sq[i_n, i_b] = 0.0
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    qd.loop_config(
+        # A per-environment scalar accumulation contends on one cache line per environment: keep it
+        # serial on the CPU backend unless environments themselves are the parallel axis.
+        serialize=qd.static(
+            rigid_config.para_level < gs.PARA_LEVEL.PARTIAL
+            or (rigid_config.backend == gs.cpu and rigid_config.para_level < gs.PARA_LEVEL.ALL)
+        )
+    )
     for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if func_is_env_active(i_b, mochi_state, skip_ls_done):
@@ -202,7 +209,14 @@ def func_linesearch_begin(
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if mochi_state.is_active[i_b]:
             mochi_state.qpos_ls_ref[i_q, i_b] = rigid_info.qpos[i_q, i_b]
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    qd.loop_config(
+        # A per-environment scalar accumulation contends on one cache line per environment: keep it
+        # serial on the CPU backend unless environments themselves are the parallel axis.
+        serialize=qd.static(
+            rigid_config.para_level < gs.PARA_LEVEL.PARTIAL
+            or (rigid_config.backend == gs.cpu and rigid_config.para_level < gs.PARA_LEVEL.ALL)
+        )
+    )
     for i_d, i_slot in qd.ndrange(n_dofs, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_dofs, 1):
         i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
         if mochi_state.is_active[i_b]:

@@ -118,6 +118,8 @@ from .soft import (
     SOFT_KIND_SHELL,
     SOFT_KIND_SOLID,
     build_soft_samples,
+    kernel_assemble_attachments,
+    kernel_attachments_stage_start,
     kernel_init_rod_fields,
     kernel_init_shell_fields,
     kernel_init_soft_fields,
@@ -277,6 +279,19 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     # ------------------------------------ build -----------------------------------------
     # ------------------------------------------------------------------------------------
 
+    @property
+    def n_attachments(self):
+        """Number of rigid-deformable vertex attachments registered on the deformable entities."""
+        return sum(len(att["verts_idx"]) for entity in self._soft_entities for att in entity.attachments)
+
+    def _resolve_para_level(self):
+        # On a CPU backend initialized with more than one quadrants thread (`gs.init(cpu_threads=...)` or
+        # QD_NUM_THREADS), the solver's item loops run in parallel even at one environment. The scene-global level
+        # and the other solvers are unaffected: this solver builds its own static configs.
+        if gs.backend == gs.cpu and gs.cpu_threads_effective > 1:
+            return max(self.sim._para_level, gs.PARA_LEVEL.PARTIAL)
+        return self.sim._para_level
+
     def build(self):
         self._n_geoms = self.n_geoms
         self._n_cells = self.n_cells
@@ -314,6 +329,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self.n_shell_elems_ = max(1, self.n_shell_elems)
         self.n_rod_elems_ = max(1, self.n_rod_elems)
         self.n_rod_stencils_ = max(1, self.n_rod_stencils)
+        self.n_attachments_ = max(1, self.n_attachments)
         self.n_dofs_total_ = max(1, self.n_dofs_total)
 
         if gs.qd_float == qd.f32 and any(
@@ -636,7 +652,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self._resolve_soft_collider_flags()
         self.mochi_config = MochiStaticConfig(
             backend=gs.backend,
-            para_level=self.sim._para_level,
+            para_level=self._resolve_para_level(),
             integrator=INTEGRATOR.BDF2 if options.integrator == "bdf2" else INTEGRATOR.BACKWARD_EULER,
             use_newton_euler_inertia=options.use_newton_euler_inertia,
             friction_model=FRICTION_MODEL.CINF if options.friction_model == "cinf" else FRICTION_MODEL.C1,
@@ -662,11 +678,14 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             has_soft=self.has_soft,
             has_tets=self.n_soft_elems > 0,
             has_pc_colliders=self._has_pc_colliders,
+            has_rod_band=any(e.is_rod and not e.morph.is_closed_loop for e in self._soft_entities),
             has_soft_colliders=self._has_soft_colliders,
             tet_tree_levels=self.n_tet_levels,
             has_equalities=len(self._equalities) > 0,
+            has_attachments=self.n_attachments > 0,
         )
         self.mochi_info = get_mochi_info(self)
+        self._build_gravity(self.mochi_info.gravity)
         self.mochi_state = get_mochi_state(self, self._max_pairs, has_dense)
         self.mochi_state.all_envs.from_numpy(np.arange(self._B, dtype=gs.np_int))
         self.contact_state = get_mochi_contact_state(self, self._max_pairs)
@@ -696,7 +715,6 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             self.mochi_info,
             self.rigid_config,
         )
-        self._build_gravity(self.mochi_info.gravity)
         if self.n_links > 0:
             self.mochi_info.links.tree_start.from_numpy(links_tree_start)
             self.mochi_info.links.tree_end.from_numpy(links_tree_end)
@@ -849,8 +867,9 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self._n_soft_sdf_voxels = len(sdf_values)
         self.n_soft_sdf_voxels_ = max(1, len(sdf_values))
 
-        # Deformable colliders: every rigid and deformable sample point is located in the collider spheres / deformed
-        # tetrahedra through a spatial hash rebuilt at every assembly (the flags are resolved in `_init_mochi`).
+        # Deformable colliders: the query list holds the rigid samples (dynamic links query the deformed tetrahedra
+        # only) followed by the deformable samples (tetrahedra of other entities; spheres for point-cloud entities),
+        # located through structures rebuilt at every assembly (the flags are resolved in `_init_mochi`).
         self._n_soft_queries = self.n_samples + n_samples
         self._max_sc_hits = (
             max(1, options.max_deformable_collider_hits_per_query * self._n_soft_queries)
@@ -858,16 +877,12 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             else 1
         )
         # A deformable sample under self-contact sees the spheres of the opposing layer of its own body (up to
-        # about a dozen within the contact range), a rigid sample the spheres of the deformable it touches.
+        # about a dozen within the contact range); only point-cloud entities query spheres.
         has_self_contact = any((e.is_shell or e.is_rod) and e.material.self_contact for e in entities)
         pc_hits_per_query = options.max_point_cloud_hits_per_query
         if pc_hits_per_query is None:
-            pc_hits_per_query = 8 if has_self_contact else 2
-        self._max_pc_hits = (
-            max(1, pc_hits_per_query * n_samples + options.max_soft_hits_per_sample * self.n_samples)
-            if self._has_pc_colliders
-            else 1
-        )
+            pc_hits_per_query = 4 if has_self_contact else 2
+        self._max_pc_hits = max(1, pc_hits_per_query * n_samples) if self._has_pc_colliders else 1
         bins_per_item = options.spatial_hash_bins_per_item
         # every item occupies up to eight entries (the cells its bounds overlap)
         self.n_pc_bins_ = _next_power_of_two(bins_per_item * 8 * self.n_soft_verts) if self._has_pc_colliders else 1
@@ -910,6 +925,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                     getattr(self.soft_info, field).from_numpy(csr[name])
         if len(band["rows_dof"]) > 0:
             self.soft_info.band_rows_dof.from_numpy(band["rows_dof"])
+            self.soft_info.band_rows_entity.from_numpy(band["rows_entity"])
         if self.n_soft_entities > 0:
             for name in (
                 "band_start",
@@ -937,8 +953,9 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             self.soft_state,
             self.rigid_config,
         )
-        # A sample only queries the colliders it can hit: the tetrahedra of other entities, the spheres of other
-        # entities or of its own body under self-contact.
+        # A sample only queries the colliders it can hit: the tetrahedra of other entities, and, for point-cloud
+        # entities only, the spheres of other point-cloud entities or of its own body under self-contact (mochi's
+        # rule: point-cloud colliders only collide with each other, never with rigid bodies or solids).
         kinds = [self._soft_collider_kind(entity) for entity in entities]
         queries_tets = np.zeros((self.n_soft_entities_,), dtype=gs.np_int)
         queries_spheres = np.zeros((self.n_soft_entities_,), dtype=gs.np_int)
@@ -946,11 +963,10 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             others = [kind for j, kind in enumerate(kinds) if j != i]
             queries_tets[i] = int(any(kind == COLLIDER_TYPE.GRID for kind in others))
             queries_spheres[i] = int(
-                any(kind == COLLIDER_TYPE.POINT_CLOUD for kind in others)
-                or (
-                    kinds[i] == COLLIDER_TYPE.POINT_CLOUD
-                    and (entity.is_shell or entity.is_rod)
-                    and entity.material.self_contact
+                kinds[i] == COLLIDER_TYPE.POINT_CLOUD
+                and (
+                    any(kind == COLLIDER_TYPE.POINT_CLOUD for kind in others)
+                    or ((entity.is_shell or entity.is_rod) and entity.material.self_contact)
                 )
             )
         self.soft_info.entities_queries_tets.from_numpy(queries_tets)
@@ -971,15 +987,46 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 self.rigid_config,
             )
 
-        # Render geometry of the deformable surfaces.
+        # Render geometry of the deformable surfaces. The render-vertex offsets are renormalized here because an
+        # entity's visual geoms may have been replaced after later entities were added (`set_visual_mesh`).
+        vvert_start, vface_start = 0, 0
+        for entity in entities:
+            entity._vvert_start, entity._vface_start = vvert_start, vface_start
+            for vgeom in entity.vgeoms:
+                vgeom._vvert_start, vgeom._vface_start = vvert_start, vface_start
+                vvert_start += vgeom.n_vverts
+                vface_start += vgeom.n_vfaces
         n_soft_vverts_ = max(1, self.n_soft_vverts)
         self._soft_vverts_render = array_class.V_VEC(3, dtype=qd.f32, shape=(n_soft_vverts_, _B))
         self._soft_vverts_vert_idx = array_class.V(dtype=gs.qd_int, shape=(n_soft_vverts_,))
+        self._soft_vverts_elem = array_class.V(dtype=gs.qd_int, shape=(n_soft_vverts_,))
+        self._soft_vverts_bary = array_class.V_VEC(4, dtype=gs.qd_float, shape=(n_soft_vverts_,))
         if self.n_soft_vverts > 0:
-            vert_idx = np.concatenate(
-                [vgeom.sim_verts_idx + entity.v_start for entity in entities for vgeom in entity.vgeoms]
-            ).astype(gs.np_int)
-            kernel_soft_init_render(vert_idx, self._soft_vverts_vert_idx)
+            # Global tetrahedron offset of every solid entity, in the concatenation order of the element tables.
+            tet_start, n_tets = {}, 0
+            for entity in entities:
+                if not (entity.is_shell or entity.is_rod):
+                    tet_start[entity.idx_in_solver] = n_tets
+                    n_tets += entity.n_elements
+            vert_idx, elems_idx, bary = [], [], []
+            for entity in entities:
+                for vgeom in entity.vgeoms:
+                    if vgeom.elems_idx is not None:
+                        vert_idx.append(np.zeros(vgeom.n_vverts, dtype=gs.np_int))
+                        elems_idx.append(vgeom.elems_idx + tet_start[entity.idx_in_solver])
+                        bary.append(vgeom.bary)
+                    else:
+                        vert_idx.append(vgeom.sim_verts_idx + entity.v_start)
+                        elems_idx.append(np.full(vgeom.n_vverts, -1, dtype=gs.np_int))
+                        bary.append(np.zeros((vgeom.n_vverts, 4), dtype=gs.np_float))
+            kernel_soft_init_render(
+                np.concatenate(vert_idx).astype(gs.np_int),
+                np.concatenate(elems_idx).astype(gs.np_int),
+                np.concatenate(bary).astype(gs.np_float),
+                self._soft_vverts_vert_idx,
+                self._soft_vverts_elem,
+                self._soft_vverts_bary,
+            )
         rods = [entity for entity in entities if entity.is_rod]
         self._n_rod_vverts = sum(entity.n_vverts for entity in rods)
         n_rod_vverts_ = max(1, self._n_rod_vverts)
@@ -1008,6 +1055,8 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 self._rod_vverts_offset,
             )
         self._envs_offset = np.asarray(self._scene.envs_offset, dtype=gs.np_float).reshape((_B, 3))
+        if self.n_attachments > 0:
+            self._init_attachments(verts_rest)
 
     @staticmethod
     def _shell_hinges(entity):
@@ -1042,6 +1091,48 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         bary = np.tile(np.stack([1.0 - points, points, np.zeros(3)], axis=-1), (len(elems), 1))
         sample_weights = (weights[None, :] * lengths[:, None]).reshape((-1,))
         return tri.astype(gs.np_int), bary.astype(gs.np_float), sample_weights.astype(gs.np_float)
+
+    def _init_attachments(self, verts_rest):
+        """Static tables of the rigid-deformable attachments, with the anchors expressed in the link frames of the
+        build pose so that every attachment starts at zero violation."""
+        # The link poses of the build configuration (the deformable rest state is already in world coordinates).
+        self._forward_kinematics(with_velocity=False)
+        att_vert, att_link, att_is_dynamic, att_stiffness, att_damping = [], [], [], [], []
+        for entity in self._soft_entities:
+            for att in entity.attachments:
+                verts_idx = np.asarray(att["verts_idx"], dtype=gs.np_int)
+                link = att["link"]
+                if not (0 <= link.idx < self.n_links):
+                    gs.raise_exception(f"Attachment link '{link.name}' is not simulated by this solver.")
+                att_vert.append(verts_idx + entity.v_start)
+                att_link.append(np.full(len(verts_idx), link.idx, dtype=gs.np_int))
+                att_is_dynamic.append(np.full(len(verts_idx), 0 if link.is_fixed else 1, dtype=gs.np_int))
+                att_stiffness.append(np.full(len(verts_idx), att["stiffness"], dtype=gs.np_float))
+                att_damping.append(np.full(len(verts_idx), att["damping"], dtype=gs.np_float))
+        att_vert = np.concatenate(att_vert)
+        att_link = np.concatenate(att_link)
+        links_pos = self.dyn_state.links.pos.to_numpy()[:, 0].astype(np.float64)
+        links_quat = self.dyn_state.links.quat.to_numpy()[:, 0].astype(np.float64)
+        quat = links_quat[att_link]
+        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        rot = np.empty((len(att_vert), 3, 3))
+        rot[:, 0, 0] = 1.0 - 2.0 * (y * y + z * z)
+        rot[:, 0, 1] = 2.0 * (x * y - z * w)
+        rot[:, 0, 2] = 2.0 * (x * z + y * w)
+        rot[:, 1, 0] = 2.0 * (x * y + z * w)
+        rot[:, 1, 1] = 1.0 - 2.0 * (x * x + z * z)
+        rot[:, 1, 2] = 2.0 * (y * z - x * w)
+        rot[:, 2, 0] = 2.0 * (x * z - y * w)
+        rot[:, 2, 1] = 2.0 * (y * z + x * w)
+        rot[:, 2, 2] = 1.0 - 2.0 * (x * x + y * y)
+        lever = verts_rest[att_vert].astype(np.float64) - links_pos[att_link]
+        pos_local = np.einsum("nij,ni->nj", rot, lever)
+        self.soft_info.att_vert.from_numpy(att_vert.astype(gs.np_int))
+        self.soft_info.att_link.from_numpy(att_link)
+        self.soft_info.att_link_is_dynamic.from_numpy(np.concatenate(att_is_dynamic))
+        self.soft_info.att_pos_local.from_numpy(pos_local.astype(gs.np_float))
+        self.soft_info.att_stiffness.from_numpy(np.concatenate(att_stiffness))
+        self.soft_info.att_damping.from_numpy(np.concatenate(att_damping))
 
     def _soft_csr_layout(self, elems_v, shell_elems_v, shell_elems_hinge, rod_elems_v, rod_stencils_v, rod_stencils_e):
         """Scalar CSR sparsity of the deformable Hessian (local dofs: 3 i_v + k for the vertices, then one twist dof
@@ -1119,6 +1210,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         n_entities = self.n_soft_entities
         dofs_row = np.full(self.n_dofs_total_, -1, dtype=gs.np_int)
         rows_dof = []
+        rows_entity = []
         band = {
             name: np.zeros(max(1, n_entities), dtype=gs.np_int)
             for name in (
@@ -1147,11 +1239,13 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                     if i_n < n_elems:
                         rows_dof.append(self.n_dofs + 3 * self.n_soft_verts + elem_offset + i_n)
                 band["band_n"][i_e] = len(rows_dof) - band["band_start"][i_e]
+                rows_entity.extend([i_e] * band["band_n"][i_e])
             elem_offset += n_elems
             stencil_offset += n_stencils
         rows_dof = np.array(rows_dof, dtype=gs.np_int)
         dofs_row[rows_dof] = np.arange(len(rows_dof), dtype=gs.np_int)
         band["rows_dof"] = rows_dof
+        band["rows_entity"] = np.array(rows_entity, dtype=gs.np_int)
         band["dofs_row"] = dofs_row
         return band
 
@@ -1287,16 +1381,17 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         return COLLIDER_TYPE.GRID
 
     def _resolve_soft_collider_flags(self):
-        """Whether the scene has deformable colliders that something can query: rigid samples, another deformable
-        entity, or the entity's own samples under self-contact."""
+        """Whether the scene has deformable colliders that something can query. Tetrahedral colliders are queried by
+        the samples of dynamic rigid links and of other deformable entities; point-cloud colliders only collide with
+        each other (mochi's rule): they are queried solely by the samples of other point-cloud entities, or by their
+        own under self-contact, never by rigid bodies or solids."""
         entities = self._soft_entities
         kinds = [self._soft_collider_kind(entity) for entity in entities]
         has_self_contact = any((e.is_shell or e.is_rod) and e.material.self_contact for e in entities)
         has_queries = self.n_samples > 0 or len(entities) > 1
         self._has_soft_colliders = has_queries and any(kind == COLLIDER_TYPE.GRID for kind in kinds)
-        self._has_pc_colliders = (has_queries or has_self_contact) and any(
-            kind == COLLIDER_TYPE.POINT_CLOUD for kind in kinds
-        )
+        n_pc = sum(1 for kind in kinds if kind == COLLIDER_TYPE.POINT_CLOUD)
+        self._has_pc_colliders = n_pc > 1 or (n_pc > 0 and has_self_contact)
         self._build_tet_tree(kinds)
 
     def _build_tet_tree(self, kinds):
@@ -1435,6 +1530,13 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if step_kernel != "auto":
             return step_kernel
         if gs.backend == gs.cpu:
+            # With several quadrants CPU threads, a deformable scene with enough work per loop runs the pipeline so
+            # its element and contact loops parallelize. The threshold is empirical: each offloaded task costs
+            # ~15-70 us of fork/join on the CPU pool, so a scene whose conjugate-gradient iteration does less serial
+            # work than that overhead (the duck: 0.21 ms across ~20 tasks) is faster in the single-launch monolith,
+            # while a larger cloth (the t-shirt: 0.71 ms per iteration) gains ~1.2x.
+            if gs.cpu_threads_effective > 1 and self.has_soft and self.n_soft_verts >= 3000:
+                return "pipeline"
             return "monolith"
         if self.n_dofs_total <= 64 and not self.has_soft:
             return "monolith"
@@ -1554,6 +1656,8 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 self.eq_state,
                 self.rigid_config,
             )
+        if self.mochi_config.has_attachments:
+            kernel_attachments_stage_start(self.mochi_state, self.soft_info, self.soft_state, self.rigid_config)
         kernel_reset_newton(self.mochi_state, self.rigid_config)
         kernel_conservative_bounds(
             self.dyn_state, self.dyn_info, self.mochi_info, self.mochi_state, self.contact_state, self.rigid_config
@@ -1754,6 +1858,18 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 self.mochi_state,
                 self.eq_info,
                 self.eq_state,
+                self.rigid_config,
+                assem_obj,
+                assem_res,
+                assem_dres,
+                skip_ls_done,
+            )
+        if self.mochi_config.has_attachments:
+            kernel_assemble_attachments(
+                self.dyn_state,
+                self.mochi_state,
+                self.soft_info,
+                self.soft_state,
                 self.rigid_config,
                 assem_obj,
                 assem_res,
@@ -1996,7 +2112,14 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if not self.has_soft or self.n_soft_vverts == 0:
             return None, None, None
         kernel_soft_get_state_render(
-            self._soft_vverts_render, self._soft_vverts_vert_idx, self._envs_offset, self.soft_state, self.rigid_config
+            self._soft_vverts_render,
+            self._soft_vverts_vert_idx,
+            self._soft_vverts_elem,
+            self._soft_vverts_bary,
+            self._envs_offset,
+            self.soft_info,
+            self.soft_state,
+            self.rigid_config,
         )
         if self._n_rod_vverts > 0:
             kernel_rod_get_state_render(
@@ -2427,11 +2550,46 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             values[geoms_idx] = value
             field.from_numpy(values)
 
+    @property
+    def is_links_info_batched(self) -> bool:
+        """Whether the inertial properties of a link are stored per environment rather than shared by the batch."""
+        return self._options.batch_links_info
+
     def get_links_mass(self, links_idx=None, envs_idx=None):
         """The mass of each link, as the solver currently uses it."""
-        if envs_idx is not None:
+        if not self._options.batch_links_info and envs_idx is not None:
             gs.raise_exception("`envs_idx` cannot be specified for non-batched links info.")
-        return qd_to_torch(self.mochi_info.links.mass, links_idx, copy=True)
+        tensor = qd_to_torch(self.dyn_info.links.inertial_mass, envs_idx, links_idx, transpose=True, copy=True)
+        return tensor[0] if self.n_envs == 0 and self._options.batch_links_info else tensor
+
+    def get_links_inertia(self, links_idx=None, envs_idx=None):
+        """The inertia matrix of each link, in its inertial frame, as the solver currently uses it."""
+        if not self._options.batch_links_info and envs_idx is not None:
+            gs.raise_exception("`envs_idx` cannot be specified for non-batched links info.")
+        tensor = qd_to_torch(self.dyn_info.links.inertial_i, envs_idx, links_idx, transpose=True, copy=True)
+        return tensor[0] if self.n_envs == 0 and self._options.batch_links_info else tensor
+
+    def get_links_COM(self, links_idx=None, envs_idx=None):
+        """The center of mass (COM) of each link, as an offset from the origin of its local frame."""
+        if not self._options.batch_links_info and envs_idx is not None:
+            gs.raise_exception("`envs_idx` cannot be specified for non-batched links info.")
+        tensor = qd_to_torch(self.dyn_info.links.inertial_pos, envs_idx, links_idx, transpose=True, copy=True)
+        return tensor[0] if self.n_envs == 0 and self._options.batch_links_info else tensor
+
+    def get_links_invweight(self, links_idx=None, envs_idx=None):
+        if not self._options.batch_links_info and envs_idx is not None:
+            gs.raise_exception("`envs_idx` cannot be specified for non-batched links info.")
+        tensor = qd_to_torch(self.dyn_info.links.invweight, envs_idx, links_idx, transpose=True, copy=True)
+        return tensor[0] if self.n_envs == 0 and self._options.batch_links_info else tensor
+
+    def set_links_mass(self, mass, links_idx=None, envs_idx=None, scale_inertia=False):
+        gs.raise_exception("`set_links_mass` is not supported by the MochiSolver: link masses are fixed at build.")
+
+    def set_links_inertia(self, inertia, links_idx=None, envs_idx=None):
+        gs.raise_exception("`set_links_inertia` is not supported by the MochiSolver: link inertias are fixed at build.")
+
+    def set_links_COM(self, com, links_idx=None, envs_idx=None):
+        gs.raise_exception("`set_links_COM` is not supported by the MochiSolver: link inertials are fixed at build.")
 
     def set_links_has_gravity(self, links_idx, has_gravity):
         links_idx = tensor_to_array(links_idx).reshape((-1,))
@@ -2518,7 +2676,15 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
     @property
     def n_equalities(self):
-        return 0
+        if self.is_built:
+            return len(self._equalities)
+        return sum(entity.n_equalities for entity in self._entities)
+
+    @property
+    def equalities(self):
+        if self.is_built:
+            return self._equalities
+        return gs.List(equality for entity in self._entities for equality in entity.equalities)
 
     @property
     def n_samples(self):

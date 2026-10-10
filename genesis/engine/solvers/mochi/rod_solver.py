@@ -11,6 +11,7 @@ import quadrants as qd
 
 import genesis as gs
 
+from .contact_utils import func_sym6_to_mat3
 from .data import ROD_BAND, MochiSoftInfo, MochiSoftState, MochiState
 
 
@@ -19,6 +20,19 @@ def func_rod_band_add(row, col, value, i_b, soft_state: MochiSoftState):
     """Accumulate an entry of the lower triangle (row >= col within the band); rows are global band rows."""
     if row >= col and row - col <= ROD_BAND:
         soft_state.rod_band[row, row - col, i_b] += value
+
+
+@qd.func
+def func_rod_band_add_vertex_block(i_va, i_vb, weight, D, i_b, soft_info: MochiSoftInfo, soft_state: MochiSoftState):
+    """Scatter a weighted 3x3 coupling between two vertices into the band. A vertex outside any band (a non-rod
+    vertex, or a closed-loop rod) and a pair spanning two rods are dropped: they are outside the per-rod block this
+    preconditioner inverts, exactly as the couplings with rigid bodies are."""
+    row_a = soft_info.dofs_band_row[soft_info.dof_start[None] + 3 * i_va]
+    row_b = soft_info.dofs_band_row[soft_info.dof_start[None] + 3 * i_vb]
+    if row_a >= 0 and row_b >= 0 and soft_info.band_rows_entity[row_a] == soft_info.band_rows_entity[row_b]:
+        for k in qd.static(range(3)):
+            for l in qd.static(range(3)):
+                func_rod_band_add(row_a + k, row_b + l, weight * D[k, l], i_b, soft_state)
 
 
 @qd.func
@@ -80,6 +94,82 @@ def func_rod_band_factor(
             for p in qd.static(range(11)):
                 for q in qd.static(range(11)):
                     func_rod_band_add(rows[p], rows[q], K[p, q], i_b, soft_state)
+    # Contact and attachment blocks on rod vertices: without them the band is only exact while the rod is free, and
+    # a rod pressed into a collider costs several extra conjugate-gradient iterations per solve. The couplings with
+    # rigid bodies and with vertices outside the band are dropped, as mochi's per-actor preconditioner drops them.
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_h, i_slot in (
+        qd.ndrange(soft_state.n_soft_hits_max[None], n_envs[None])
+        if qd.static(not per_env)
+        else qd.ndrange(soft_state.n_soft_hits_max[None], 1)
+    ):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+        if not mochi_state.pcg_is_active[i_b] or i_h >= soft_state.n_soft_hits[i_b]:
+            continue
+        i_s = soft_state.hit_sample[i_h, i_b]
+        tri = soft_info.samples_tri[i_s]
+        bary = soft_info.samples_bary[i_s]
+        D = func_sym6_to_mat3(soft_state.hit_D[i_h, i_b])
+        for i in qd.static(range(3)):
+            for j in qd.static(range(3)):
+                func_rod_band_add_vertex_block(tri[i], tri[j], bary[i] * bary[j], D, i_b, soft_info, soft_state)
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_h, i_slot in (
+        qd.ndrange(soft_state.n_sc_hits_max[None], n_envs[None])
+        if qd.static(not per_env)
+        else qd.ndrange(soft_state.n_sc_hits_max[None], 1)
+    ):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+        if not mochi_state.pcg_is_active[i_b] or i_h >= soft_state.n_sc_hits[i_b]:
+            continue
+        # The collider side of a deformable-collider hit is a tetrahedron, never banded: only the sample side enters.
+        if soft_state.sc_hit_kind_a[i_h, i_b] == 1:
+            i_s = soft_state.sc_hit_sample_a[i_h, i_b]
+            tri = soft_info.samples_tri[i_s]
+            bary = soft_info.samples_bary[i_s]
+            D = func_sym6_to_mat3(soft_state.sc_hit_D[i_h, i_b])
+            for i in qd.static(range(3)):
+                for j in qd.static(range(3)):
+                    func_rod_band_add_vertex_block(tri[i], tri[j], bary[i] * bary[j], D, i_b, soft_info, soft_state)
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_h, i_slot in (
+        qd.ndrange(soft_state.n_pc_hits_max[None], n_envs[None])
+        if qd.static(not per_env)
+        else qd.ndrange(soft_state.n_pc_hits_max[None], 1)
+    ):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+        if not mochi_state.pcg_is_active[i_b] or i_h >= soft_state.n_pc_hits[i_b]:
+            continue
+        D = func_sym6_to_mat3(soft_state.pc_hit_D[i_h, i_b])
+        i_vb = soft_state.pc_hit_vert_b[i_h, i_b]
+        func_rod_band_add_vertex_block(i_vb, i_vb, 1.0, D, i_b, soft_info, soft_state)
+        if soft_state.pc_hit_kind_a[i_h, i_b] == 1:
+            i_s = soft_state.pc_hit_sample_a[i_h, i_b]
+            tri = soft_info.samples_tri[i_s]
+            bary = soft_info.samples_bary[i_s]
+            for i in qd.static(range(3)):
+                func_rod_band_add_vertex_block(tri[i], i_vb, -bary[i], D, i_b, soft_info, soft_state)
+                func_rod_band_add_vertex_block(i_vb, tri[i], -bary[i], D, i_b, soft_info, soft_state)
+                for j in qd.static(range(3)):
+                    func_rod_band_add_vertex_block(tri[i], tri[j], bary[i] * bary[j], D, i_b, soft_info, soft_state)
+    n_att = soft_info.att_vert.shape[0]
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_a, i_slot in qd.ndrange(n_att, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_att, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+        if not mochi_state.pcg_is_active[i_b] or i_a >= soft_info.n_attachments[None]:
+            continue
+        row = soft_info.dofs_band_row[soft_info.dof_start[None] + 3 * soft_info.att_vert[i_a]]
+        if row >= 0:
+            K = soft_info.att_stiffness[i_a] + soft_info.att_damping[i_a] / mochi_state.dt_stage[i_b]
+            for k in qd.static(range(3)):
+                func_rod_band_add(row + k, row + k, K, i_b, soft_state)
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_e, i_slot in qd.ndrange(n_entities, n_envs[None]) if qd.static(not per_env) else qd.ndrange(n_entities, 1):
+        i_b = envs[i_slot] if qd.static(not per_env) else i_b_env
+        n = soft_info.entities_band_n[i_e]
+        if n == 0 or not mochi_state.pcg_is_active[i_b]:
+            continue
+        start = soft_info.entities_band_start[i_e]
         # Dirichlet rows and columns: identity.
         for r in range(n):
             i_d = soft_info.band_rows_dof[start + r]

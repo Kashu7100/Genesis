@@ -20,6 +20,7 @@ from ..base_entity import Entity
 from .mochi_entity import filter_entity_contacts
 
 TET_NODE_FORMAT = ".node"
+TET_VTK_FORMAT = ".vtk"
 
 
 def load_tet_files(node_path):
@@ -54,6 +55,82 @@ def load_tet_files(node_path):
     if tets.min(initial=0) < 0 or tets.max(initial=-1) >= len(verts):
         gs.raise_exception(f"Tetrahedral mesh '{ele_path}' references vertices outside '{node_path}'.")
     return verts, tets
+
+
+def load_vtk_tet_files(path):
+    """Vertices and tetrahedra of a legacy ASCII VTK unstructured grid holding a tetrahedral mesh (the format Drake
+    ships its deformable meshes in)."""
+    with open(path) as f:
+        lines = [line.split("#", 1)[0] for line in f]
+
+    def read_tokens(start, count):
+        tokens = []
+        i = start
+        while len(tokens) < count and i < len(lines):
+            tokens.extend(lines[i].split())
+            i += 1
+        if len(tokens) < count:
+            gs.raise_exception(f"Truncated VTK mesh file: '{path}'.")
+        return tokens[:count], i
+
+    verts = cells = cell_types = None
+    i = 0
+    while i < len(lines):
+        parts = lines[i].split()
+        if parts and parts[0] == "POINTS":
+            values, i = read_tokens(i + 1, 3 * int(parts[1]))
+            verts = np.array(values, dtype=np.float64).reshape((-1, 3))
+        elif parts and parts[0] == "CELLS":
+            values, i = read_tokens(i + 1, int(parts[2]))
+            cells = np.array(values, dtype=np.int64)
+        elif parts and parts[0] == "CELL_TYPES":
+            values, i = read_tokens(i + 1, int(parts[1]))
+            cell_types = np.array(values, dtype=np.int64)
+        else:
+            i += 1
+    if verts is None or cells is None or cell_types is None:
+        gs.raise_exception(f"'{path}' is not an ASCII VTK unstructured grid (POINTS, CELLS and CELL_TYPES required).")
+
+    tets = []
+    offset = 0
+    for cell_type in cell_types:
+        n_nodes = int(cells[offset])
+        if cell_type == 10:
+            if n_nodes != 4:
+                gs.raise_exception(f"Malformed tetrahedron in VTK mesh file '{path}'.")
+            tets.append(cells[offset + 1 : offset + 5])
+        offset += 1 + n_nodes
+    if not tets:
+        gs.raise_exception(f"VTK mesh file '{path}' holds no tetrahedra.")
+    tets = np.stack(tets)
+    if tets.min() < 0 or tets.max() >= len(verts):
+        gs.raise_exception(f"VTK mesh file '{path}' references vertices outside its POINTS block.")
+    return verts, tets
+
+
+def embed_in_tets(points, verts, tets):
+    """Element index and barycentric coordinates of every point in the tetrahedral mesh (verts, tets): each point
+    takes the tetrahedron whose barycentric coordinates are least negative, so points inside a tetrahedron are exact
+    and points outside the coarse mesh extrapolate linearly from the nearest one."""
+    points = np.asarray(points, dtype=np.float64)
+    verts = np.asarray(verts, dtype=np.float64)
+    tets = np.asarray(tets, dtype=np.int64)
+    x3 = verts[tets[:, 3]]
+    Dm = np.stack([verts[tets[:, k]] - x3 for k in range(3)], axis=-1)
+    Dm_inv = np.linalg.inv(Dm)
+    elems_idx = np.empty(len(points), dtype=gs.np_int)
+    bary = np.empty((len(points), 4), dtype=gs.np_float)
+    chunk = max(1, int(2e7) // max(1, len(tets)))
+    for start in range(0, len(points), chunk):
+        block = points[start : start + chunk]
+        # b[i, t, :] barycentric coordinates of point i in tetrahedron t
+        b123 = np.einsum("tjk,itk->itj", Dm_inv, block[:, None, :] - x3[None, :, :])
+        b = np.concatenate([b123, 1.0 - b123.sum(axis=-1, keepdims=True)], axis=-1)
+        best = b.min(axis=-1).argmax(axis=-1)
+        rows = np.arange(len(block))
+        elems_idx[start : start + chunk] = best
+        bary[start : start + chunk] = b[rows, best]
+    return elems_idx, bary
 
 
 class MochiSoftEntity(Entity):
@@ -95,6 +172,7 @@ class MochiSoftEntity(Entity):
         self._vvert_start = vvert_start
         self._vface_start = vface_start
         self._queried_states = QueriedStates()
+        self._attachments = []
 
         self.sample()
 
@@ -134,10 +212,12 @@ class MochiSoftEntity(Entity):
         if self._is_rod:
             self._sample_rod()
             return
-        if isinstance(morph, gs.morphs.Mesh) and morph.file.endswith(TET_NODE_FORMAT):
+        if isinstance(morph, gs.morphs.Mesh) and morph.file.endswith((TET_NODE_FORMAT, TET_VTK_FORMAT)):
             if self._is_shell:
                 gs.raise_exception("Shells are surface meshes: a tetrahedral mesh file cannot be used for a shell.")
-            verts, elems = load_tet_files(morph.file)
+            load_files = load_tet_files if morph.file.endswith(TET_NODE_FORMAT) else load_vtk_tet_files
+            verts, elems = load_files(morph.file)
+            # The morph rotation is applied by `instantiate` (about the vertex centroid, like every other morph).
             verts = verts * np.asarray(morph.scale, dtype=np.float64) + np.asarray(morph.pos, dtype=np.float64)
             self.instantiate(verts, elems)
             surface_tri, _ = self._boundary_triangles(self.elems)
@@ -274,6 +354,7 @@ class MochiSoftEntity(Entity):
         elems = np.asarray(elems, dtype=gs.np_int)
         if len(verts) == 0 or len(elems) == 0:
             gs.raise_exception("Entity has no tetrahedra.")
+        self._instantiate_verts_COM = verts.mean(axis=0)
         morph_quat = np.array(self._morph.quat, dtype=gs.np_float)
         init_quat = gu.transform_quat_by_quat(np.array(self._morph.offset_quat, dtype=gs.np_float), morph_quat)
         R = gu.quat_to_R(init_quat)
@@ -303,6 +384,87 @@ class MochiSoftEntity(Entity):
         self._solver.get_soft_entity_state(self, state.pos, state.vel)
         self._queried_states.append(state)
         return state
+
+    def attach_to_link(self, link, verts_idx, stiffness=1e6, damping=0.0):
+        """Rigidly attach vertices of this deformable body to a rigid link.
+
+        Each attached vertex is tied by a stiff penalty (inside the implicit solve) to the point of the link it
+        coincides with when the scene is built, so place the body at its mounted pose. Forces act on both sides and
+        the coupled bodies form one simulation island. Must be called before the scene is built.
+
+        Parameters
+        ----------
+        link : RigidLink
+            A link of a rigid or articulated entity simulated by the MochiSolver.
+        verts_idx : array_like
+            Indices of the vertices of this entity to attach.
+        stiffness : float, optional
+            Penalty stiffness k of the energy 1/2 k |c|^2 per vertex, in N/m. Defaults to 1e6 (mochi's constraint
+            default).
+        damping : float, optional
+            Damping d on the violation rate, adding 1/2 (d / dt) |c - c_stage_start|^2 per stage. Defaults to 0.
+        """
+        if self.is_built:
+            gs.raise_exception("Attachments must be registered before the scene is built.")
+        verts_idx = np.unique(np.asarray(verts_idx, dtype=gs.np_int).reshape((-1,)))
+        if len(verts_idx) == 0 or verts_idx[0] < 0 or verts_idx[-1] >= self.n_vertices:
+            gs.raise_exception(f"'verts_idx' must be non-empty vertex indices within [0, {self.n_vertices}).")
+        if stiffness <= 0.0 or damping < 0.0:
+            gs.raise_exception("'stiffness' must be positive and 'damping' non-negative.")
+        self._attachments.append(
+            {"link": link, "verts_idx": verts_idx, "stiffness": float(stiffness), "damping": float(damping)}
+        )
+
+    @property
+    def attachments(self):
+        """Rigid-link attachment registrations of this entity."""
+        return self._attachments
+
+    def set_visual_mesh(self, file, pos=(0.0, 0.0, 0.0), euler=(0.0, 0.0, 0.0), scale=1.0):
+        """Replace the render mesh of this solid by a detailed visual mesh skinned by the simulation tetrahedra.
+
+        Every vertex of the visual mesh is embedded in the tetrahedron whose barycentric coordinates it takes (points
+        outside the coarse simulation mesh extrapolate linearly from the nearest one), so the visual surface follows
+        the deformation of the simulation mesh - the usual pairing of a fine render mesh with a coarse collision
+        mesh. `pos`, `euler` (degrees) and `scale` place the visual mesh in the frame of the simulation mesh file;
+        the entity's morph transform then applies to both. Must be called before the scene is built.
+        """
+        if self.is_built:
+            gs.raise_exception("The visual mesh must be set before the scene is built.")
+        if self._is_shell or self._is_rod:
+            gs.raise_exception("Only solid (tetrahedral) entities can carry an embedded visual mesh.")
+        visual_trimesh = trimesh.load(file, force="mesh", process=False)
+        quat = gu.xyz_to_quat(np.asarray(euler, dtype=np.float64), rpy=True, degrees=True)
+        verts = visual_trimesh.vertices * float(scale) @ gu.quat_to_R(quat).T + np.asarray(pos, dtype=np.float64)
+        # Mirror the placement of the simulation mesh: the pre-rotation transform of `sample` (the morph scale and
+        # position for file meshes), then the morph rotation about the simulation mesh's centroid of `instantiate`.
+        morph = self._morph
+        if isinstance(morph, gs.morphs.Mesh):
+            verts = verts * np.asarray(morph.scale, dtype=np.float64)
+        verts = verts + np.asarray(morph.pos, dtype=np.float64)
+        morph_quat = np.array(morph.quat, dtype=gs.np_float)
+        init_quat = gu.transform_quat_by_quat(np.array(morph.offset_quat, dtype=gs.np_float), morph_quat)
+        com = self._instantiate_verts_COM
+        verts = (verts - com) @ gu.quat_to_R(init_quat).T + com
+        verts = verts + gu.transform_by_quat(np.array(morph.offset_pos, dtype=gs.np_float), morph_quat)
+        elems_idx, bary = embed_in_tets(verts, self.init_positions, self.elems)
+        # Keep the loaded mesh's UVs and material; only the vertex positions move into the simulation frame.
+        visual_trimesh = visual_trimesh.copy()
+        visual_trimesh.vertices = verts
+        vmesh = gs.Mesh.from_trimesh(visual_trimesh, surface=self._surface)
+        self._vgeoms = gs.List(
+            [
+                FEMVisGeom(
+                    entity=self,
+                    vvert_start=self._vvert_start,
+                    vface_start=self._vface_start,
+                    vmesh=vmesh,
+                    sim_verts_idx=None,
+                    elems_idx=elems_idx,
+                    bary=bary,
+                )
+            ]
+        )
 
     def get_vertices_position(self, envs_idx=None):
         """World positions of the vertices, shape (n_vertices, 3) or (n_envs, n_vertices, 3)."""

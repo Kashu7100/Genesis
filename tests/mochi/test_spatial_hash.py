@@ -60,7 +60,9 @@ def _tetrahedron_hits(solver):
 
 @pytest.mark.precision("64")
 def test_point_cloud_hash_matches_brute_force(tmp_path, show_viewer):
-    # Two sheets stacked within their contact range under a ball: sheet-sheet, self and rigid-sheet contacts.
+    # Two sheets stacked within their contact range under a ball: sheet-sheet and self contacts (the ball
+    # presses the sheets through their samples against its sphere collider; rigid bodies never hit the collider
+    # spheres).
     scene = _mochi_scene(show_viewer, 1.0 / 60.0, n_newton_iterations=4)
     scene.add_entity(gs.morphs.Plane(), material=gs.materials.Mochi.Rigid())
     material = gs.materials.Mochi.Shell(
@@ -89,7 +91,8 @@ def test_point_cloud_hash_matches_brute_force(tmp_path, show_viewer):
         assert len(hits_brute[i_b]) > 100
         assert hits_hash[i_b] == hits_brute[i_b]
     assert hits_hash[0] != hits_hash[1]
-    assert {kind for kind, _, _ in hits_hash[0]} == {0, 1}
+    # Every point-cloud contact has a deformable sample on the colliding side.
+    assert {kind for kind, _, _ in hits_hash[0]} == {1}
     del lower, upper
 
 
