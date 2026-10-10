@@ -14,13 +14,15 @@ import torch
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.entities.mochi_entity import MochiEntity, MochiSoftEntity
+from genesis.engine.materials import Mochi
 from genesis.engine.states.solvers import MochiSolverState
+from genesis.options.morphs import Morph
 from genesis.options.solvers import MochiOptions
 from genesis.utils import array_class
-from genesis.utils.misc import fits_in_gpu_shared_memory, qd_to_numpy, qd_to_torch, tensor_to_array
+from genesis.utils.misc import get_gpu_shared_tile_sizes, qd_to_numpy, qd_to_torch, tensor_to_array
 from genesis.utils.sdf import SDF
 
-from ..base_solver import StateChange, Subscriber
+from ..base_solver import GravityMixin, StateChange, Subscriber, TimeBasedMixin
 from ..kinematic_solver import KinematicSolver
 from ..rigid.abd.accessor import (
     kernel_control_dofs_force,
@@ -36,13 +38,13 @@ from ..rigid.abd.accessor import (
     kernel_set_dofs_limit,
     kernel_set_dofs_stiffness,
 )
-from ..rigid.abd.forward_kinematics import kernel_forward_kinematics, kernel_update_geom_aabbs, kernel_update_geoms
+from ..rigid.abd.forward_kinematics import kernel_forward_kinematics, kernel_update_geoms
 from ..rigid.abd.misc import (
     kernel_bit_reduction,
     kernel_init_entity_fields,
     kernel_init_geom_fields,
+    kernel_init_link_dynamics,
     kernel_init_vert_fields,
-    kernel_update_geoms_render_T,
 )
 from .articulated import kernel_assemble_joints, kernel_project_links_residual, kernel_update_conv_weights
 from .colliders import query_collider
@@ -89,7 +91,7 @@ from .integration import (
     kernel_store_stage_start_poses,
 )
 from .islands import get_mochi_island_state, kernel_build_islands, kernel_cholesky_solve_islands
-from .kinematics import kernel_update_kinematics
+from .kinematics import kernel_update_geom_aabbs, kernel_update_kinematics
 from .linear_solver import (
     kernel_condense_dense,
     kernel_pcg_any_active,
@@ -196,7 +198,7 @@ def _next_power_of_two(n):
     return 1 << max(0, int(n) - 1).bit_length()
 
 
-class MochiSolver(KinematicSolver):
+class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     """
     Fully-implicit multi-physics solver with smooth penalty contact.
 
@@ -206,6 +208,9 @@ class MochiSolver(KinematicSolver):
     assembled from per-link, per-contact-pair and per-tetrahedron blocks. The solve is a damped Newton iteration with a
     line search; contact is re-detected at every iterate.
     """
+
+    material_cls = Mochi.Base
+    _entity_classes = ((Morph, MochiEntity),)
 
     def __init__(self, scene: "Scene", sim: "Simulator", options: MochiOptions) -> None:
         super().__init__(scene, sim, options)
@@ -230,11 +235,12 @@ class MochiSolver(KinematicSolver):
     # ----------------------------------- add_entity -------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def add_entity(self, idx, material, morph, surface, visualize_contact=False, name=None):
-        if isinstance(morph, (tuple, list)):
+    def add_entity(self, idx, material, morph, surface, visualize_contact=False, name=None, desc=None):
+        morphs = desc.morphs if desc is not None else ((morph,) if isinstance(morph, Morph) else tuple(morph))
+        if len(morphs) > 1:
             gs.raise_exception("Heterogeneous morphs are not supported by the MochiSolver.")
-        if isinstance(morph, (gs.morphs.Terrain, gs.morphs.USD, gs.morphs.Drone)):
-            gs.raise_exception(f"Morph {type(morph).__name__} is not supported by the MochiSolver.")
+        if isinstance(morphs[0], (gs.morphs.Terrain, gs.morphs.USD, gs.morphs.Drone)):
+            gs.raise_exception(f"Morph {type(morphs[0]).__name__} is not supported by the MochiSolver.")
 
         if isinstance(material, (gs.materials.Mochi.Elastic, gs.materials.Mochi.Shell, gs.materials.Mochi.Rod)):
             is_rod = isinstance(material, gs.materials.Mochi.Rod)
@@ -265,37 +271,7 @@ class MochiSolver(KinematicSolver):
             self._soft_entities.append(entity)
             return entity
 
-        morph._enable_mujoco_compatibility = self._enable_mujoco_compatibility
-
-        entity = MochiEntity(
-            scene=self._scene,
-            solver=self,
-            material=material,
-            morph=morph,
-            surface=surface,
-            idx=idx,
-            idx_in_solver=self.n_entities,
-            link_start=self.n_links,
-            joint_start=self.n_joints,
-            q_start=self.n_qs,
-            dof_start=self.n_dofs,
-            geom_start=self.n_geoms,
-            cell_start=self.n_cells,
-            vert_start=self.n_verts,
-            free_verts_state_start=self.n_free_verts,
-            fixed_verts_state_start=self.n_fixed_verts,
-            face_start=self.n_faces,
-            edge_start=self.n_edges,
-            vgeom_start=self.n_vgeoms,
-            vvert_start=self.n_vverts,
-            vface_start=self.n_vfaces,
-            custom_vvert_start=self.n_custom_vverts,
-            custom_vface_start=self.n_custom_vfaces,
-            visualize_contact=visualize_contact,
-            name=name,
-        )
-        self._entities.append(entity)
-        return entity
+        return super().add_entity(idx, material, morph, surface, visualize_contact, name, desc)
 
     # ------------------------------------------------------------------------------------
     # ------------------------------------ build -----------------------------------------
@@ -320,6 +296,7 @@ class MochiSolver(KinematicSolver):
         self.n_fixed_verts_ = max(1, self.n_fixed_verts)
 
         super().build()
+        self._init_default_armature()
         self._external_state_dirty_mask = np.zeros((self._B,), dtype=bool)
         # Which of the two linear arms have environments to solve; refreshed at every substep by _select_linear_arms.
         self._has_dense_envs = False
@@ -397,6 +374,44 @@ class MochiSolver(KinematicSolver):
         self.geoms_init_AABB = array_class.V_VEC(3, dtype=gs.qd_float, shape=(self.n_geoms_, 8))
         self._errno = data_manager.errno
 
+    def _init_default_armature(self):
+        """Fill in the default rotor inertia of the rotor joints whose armature the model leaves unset.
+
+        A rotor joint is the single revolute or prismatic joint of a link. Only a scene or robot description file yields
+        one, and its morph states the default armature (see 'KinematicVariantDescription').
+        """
+        dofs_idx, dofs_default = [], []
+        for entity in self._entities:
+            for link in entity.links:
+                if link.n_dofs == 1 and link.joints[0].type in (gs.JOINT_TYPE.REVOLUTE, gs.JOINT_TYPE.PRISMATIC):
+                    if entity.main_morph.default_armature:
+                        dofs_idx.append(link.dof_start)
+                        dofs_default.append(entity.main_morph.default_armature)
+        if not dofs_idx:
+            return
+        dofs_idx, dofs_default = np.array(dofs_idx), np.array(dofs_default)
+        # Field layout, batch last, since the array is written back as a field
+        dofs_armature = qd_to_numpy(self.dyn_info.dofs.armature, transpose=False, copy=True)
+        is_default = (np.atleast_2d(dofs_armature[dofs_idx].T) <= 0.0).all(axis=0)
+        if self._options.batch_dofs_info:
+            dofs_armature[dofs_idx[is_default]] = dofs_default[is_default, None]
+        else:
+            dofs_armature[dofs_idx[is_default]] = dofs_default[is_default]
+        self.dyn_info.dofs.armature.from_numpy(dofs_armature)
+
+    def _init_link_fields(self):
+        if self.links:
+            links = self.links
+            kernel_init_link_dynamics(
+                np.array([link.desc.invweight for link in links], dtype=gs.np_float),
+                np.array([link.desc.inertial_pos for link in links], dtype=gs.np_float),
+                np.array([link.desc.inertial_quat for link in links], dtype=gs.np_float),
+                np.array([link.desc.inertia for link in links], dtype=gs.np_float),
+                np.array([link.desc.mass for link in links], dtype=gs.np_float),
+                self.dyn_info,
+            )
+        super()._init_link_fields()
+
     def _init_vert_fields(self):
         if self.n_verts > 0:
             geoms = self.geoms
@@ -420,7 +435,6 @@ class MochiSolver(KinematicSolver):
             )
 
     def _init_geom_fields(self):
-        self._geoms_render_T = np.empty((self.n_geoms_, self._B, 4, 4), dtype=np.float32)
         if self.n_geoms == 0:
             return
         geoms = self.geoms
@@ -442,10 +456,10 @@ class MochiSolver(KinematicSolver):
             np.array(geoms_center, dtype=gs.np_float),
             np.array([geom.init_quat for geom in geoms], dtype=gs.np_float),
             np.array([geom.type for geom in geoms], dtype=gs.np_int),
-            np.array([geom.friction for geom in geoms], dtype=gs.np_float),
-            np.array([geom.friction_torsional for geom in geoms], dtype=gs.np_float),
-            np.array([geom.friction_rolling for geom in geoms], dtype=gs.np_float),
-            np.array([geom.sol_params for geom in geoms], dtype=gs.np_float),
+            np.array([geom.desc.friction for geom in geoms], dtype=gs.np_float),
+            np.array([geom.desc.friction_torsional for geom in geoms], dtype=gs.np_float),
+            np.array([geom.desc.friction_rolling for geom in geoms], dtype=gs.np_float),
+            np.array([geom.desc.sol_params for geom in geoms], dtype=gs.np_float),
             np.array([geom.data for geom in geoms], dtype=gs.np_float),
             np.array([geom.is_convex for geom in geoms], dtype=gs.np_bool),
             np.array([geom.needs_coup for geom in geoms], dtype=gs.np_int),
@@ -497,7 +511,7 @@ class MochiSolver(KinematicSolver):
         self._equalities = [equality for entity in self._entities for equality in entity.equalities]
         dofs_entity_mass = np.zeros(self.n_dofs_total_, dtype=gs.np_float)
         for entity in self._entities:
-            dofs_entity_mass[entity.dof_start : entity.dof_end] = sum(link.inertial_mass for link in entity.links)
+            dofs_entity_mass[entity.dof_start : entity.dof_end] = sum(link.desc.mass for link in entity.links)
         for entity in self._soft_entities:
             dof_start = self.n_dofs + 3 * entity.v_start
             dofs_entity_mass[dof_start : dof_start + entity.n_dofs] = entity.mass
@@ -517,7 +531,7 @@ class MochiSolver(KinematicSolver):
                     geom.entity.material.penalty_coefficient,
                     geom.entity.material.penalty_smoothing_half_distance,
                     geom.entity.material.penalty_threshold,
-                    geom.friction,
+                    geom.desc.friction,
                     geom.entity.material.friction_falloff_vel,
                     geom.entity.material.viscous_friction,
                     geom.entity.material.normal_viscous_damping,
@@ -613,7 +627,7 @@ class MochiSolver(KinematicSolver):
             has_dense
             and gs.backend != gs.cpu
             and self.n_dofs_total >= 16
-            and fits_in_gpu_shared_memory(tiled_n_dofs, tiled_n_dofs + 1)
+            and tiled_n_dofs <= get_gpu_shared_tile_sizes(max_n_sizes=1)[-1]
         )
         self._n_pcg_iterations = options.n_pcg_iterations
         if self._n_pcg_iterations is None:
@@ -662,8 +676,8 @@ class MochiSolver(KinematicSolver):
         kernel_init_mochi_fields(
             np.array([not link.is_fixed for link in links], dtype=gs.np_bool),
             np.array([link.entity.material.has_gravity for link in links], dtype=gs.np_bool),
-            np.array([link.inertial_mass for link in links], dtype=gs.np_float),
-            np.array([link.inertial_i for link in links], dtype=gs.np_float).reshape((-1, 3, 3)),
+            np.array([link.desc.mass for link in links], dtype=gs.np_float),
+            np.array([link.desc.inertia for link in links], dtype=gs.np_float).reshape((-1, 3, 3)),
             np.zeros(self.n_links, dtype=gs.np_float),
             np.array([self._layers.index(link.entity.material.contact_layer) for link in links], dtype=gs.np_int),
             links_sample_start,
@@ -679,10 +693,10 @@ class MochiSolver(KinematicSolver):
             samples_geom_idx,
             self._compute_links_pair_enabled(),
             dofs_entity_mass,
-            np.tile(np.asarray(self._init_gravity, dtype=gs.np_float), (self._B, 1)),
             self.mochi_info,
             self.rigid_config,
         )
+        self._build_gravity(self.mochi_info.gravity)
         if self.n_links > 0:
             self.mochi_info.links.tree_start.from_numpy(links_tree_start)
             self.mochi_info.links.tree_end.from_numpy(links_tree_end)
@@ -1372,7 +1386,7 @@ class MochiSolver(KinematicSolver):
             kernel_update_geoms(
                 self._scene._envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, False
             )
-            kernel_update_geom_aabbs(self.geoms_init_AABB, self.dyn_state, self.rigid_config)
+            kernel_update_geom_aabbs(self.geoms_init_AABB, self.dyn_state, self.dyn_info, self.rigid_config)
         else:
             kernel_update_kinematics(
                 self._scene._envs_idx,
@@ -1976,9 +1990,6 @@ class MochiSolver(KinematicSolver):
     # ------------------------------------ render ----------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def update_geoms_render_T(self):
-        kernel_update_geoms_render_T(self._geoms_render_T, self.dyn_state, self.rigid_info, self.rigid_config)
-
     def get_soft_state_render(self, f):
         """Environment-offset render vertex positions of the deformable surfaces, shape (n_vverts, B), as (positions,
         None, None) (UVs and faces are read from the visual geoms)."""
@@ -2013,7 +2024,6 @@ class MochiSolver(KinematicSolver):
             return self._queried_states[s_global][0]
         state = MochiSolverState(self._scene, s_global)
         kernel_get_kinematic_state(
-            state.i_pos_shift,
             state.qpos,
             state.dofs_vel,
             state.links_pos,
@@ -2073,7 +2083,7 @@ class MochiSolver(KinematicSolver):
         kernel_update_geoms(
             self._scene._envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, False
         )
-        kernel_update_geom_aabbs(self.geoms_init_AABB, self.dyn_state, self.rigid_config)
+        kernel_update_geom_aabbs(self.geoms_init_AABB, self.dyn_state, self.dyn_info, self.rigid_config)
         if self.has_soft:
             kernel_soft_set_state(
                 envs_idx,
@@ -2416,6 +2426,12 @@ class MochiSolver(KinematicSolver):
             values = qd_to_numpy(field)
             values[geoms_idx] = value
             field.from_numpy(values)
+
+    def get_links_mass(self, links_idx=None, envs_idx=None):
+        """The mass of each link, as the solver currently uses it."""
+        if envs_idx is not None:
+            gs.raise_exception("`envs_idx` cannot be specified for non-batched links info.")
+        return qd_to_torch(self.mochi_info.links.mass, links_idx, copy=True)
 
     def set_links_has_gravity(self, links_idx, has_gravity):
         links_idx = tensor_to_array(links_idx).reshape((-1,))

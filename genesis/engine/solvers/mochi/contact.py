@@ -95,7 +95,6 @@ def kernel_init_mochi_fields(
     samples_geom_idx: qd.types.ndarray(),
     links_pair_enabled: qd.types.ndarray(),
     dofs_entity_mass: qd.types.ndarray(),
-    gravity: qd.types.ndarray(),
     mochi_info: MochiInfo,
     rigid_config: qd.template(),
 ):
@@ -103,7 +102,6 @@ def kernel_init_mochi_fields(
     n_dofs = dofs_entity_mass.shape[0]
     n_geoms = geoms_collider_type.shape[0]
     n_samples = samples_weight.shape[0]
-    _B = gravity.shape[0]
 
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_l in range(n_links):
@@ -154,11 +152,6 @@ def kernel_init_mochi_fields(
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_d in range(n_dofs):
         mochi_info.dofs_entity_mass[i_d] = dofs_entity_mass[i_d]
-
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
-        for k in qd.static(range(3)):
-            mochi_info.gravity[i_b][k] = gravity[i_b, k]
 
 
 @qd.kernel

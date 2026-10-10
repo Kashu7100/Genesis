@@ -1,5 +1,4 @@
 from .base_entity import Entity
-from .drone_entity import DroneEntity
 from .emitter import Emitter
 from .fem_entity import FEMEntity
 from .hybrid_entity import HybridEntity
@@ -11,7 +10,7 @@ from .pbd_entity import (
     PBDFreeParticleEntity,
     PBDParticleEntity,
 )
-from .rigid_entity import KinematicEntity, RigidEntity
+from .rigid_entity import DroneEntity, KinematicEntity, RigidEntity, TerrainEntity
 from .sf_entity import SFParticleEntity
 from .sph_entity import SPHEntity
 from .tool_entity import ToolEntity

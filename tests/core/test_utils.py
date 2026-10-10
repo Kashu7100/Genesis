@@ -1,24 +1,29 @@
 import math
+import re
+import subprocess
+import sys
 from functools import partial
 from unittest.mock import patch
 
+import numpy as np
+import torch
+
 import igl
 import pytest
-import torch
 import trimesh
-import numpy as np
 from scipy.linalg import polar as scipy_polar
 from scipy.spatial.transform import Rotation as R, Slerp
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.utils.tools import FPSTracker
-from genesis.utils.misc import tensor_to_array
 from genesis.utils import warnings as warnings_mod
-from genesis.utils.warnings import warn_once
+from genesis.utils.image_exporter import as_grayscale_image
+from genesis.utils.misc import tensor_to_array
+from genesis.utils.tools import FPSTracker
 from genesis.utils.urdf import compose_inertial_properties
+from genesis.utils.warnings import warn_once
 
-from ..utils.assertions import assert_allclose
+from ..utils.assertions import assert_allclose, assert_equal
 from ..utils.assets import get_hf_dataset
 from ..utils.collision import display_collision_pairs, get_genuine_interpenetration
 
@@ -170,8 +175,10 @@ def test_geom_quadrants_vs_tensor_consistency(batch_shape):
 def test_geom_numpy_vs_torch_consistency(batch_shape, tol):
     for py_func, shapes_in, shapes_out in (
         (gu.slerp, [[4], [4], [1]], [[4]]),
+        (gu.z_up_to_R, [[3]], [[3, 3]]),
         (gu.z_up_to_R, [[3], [3], [3, 3]], [[3, 3]]),
         (gu.pos_lookat_up_to_T, [[3], [3], [3]], [[4, 4]]),
+        (gu.inv_transform_by_T, [[5, 3], [4, 4]], [[5, 3]]),
         (partial(polar, pure_rotation=False, side="left", tol=tol), [[3, 3]], [[3, 3], [3, 3]]),
         (partial(polar, pure_rotation=False, side="right", tol=tol), [[3, 3]], [[3, 3], [3, 3]]),
     ):
@@ -180,6 +187,9 @@ def test_geom_numpy_vs_torch_consistency(batch_shape, tol):
         np_args, tc_args = [], []
         for i in range(len(shape_args)):
             np_arg = np.random.randn(*batch_shape, *shape_args[i]).clip(-1.0, 1.0).astype(gs.np_float)
+            # Axis-aligned vectors hit the degenerate branches: poles, up colinear with z, coincident pos and lookat
+            if batch_shape and shape_args[i] == [3]:
+                np_arg[..., :6, :] = np.concatenate((np.eye(3), -np.eye(3)))
             tc_arg = torch.as_tensor(np_arg, dtype=gs.tc_float, device=gs.device)
 
             if i < num_inputs:
@@ -313,13 +323,23 @@ def test_slerp(batch_shape, tol):
     q1 /= np.linalg.norm(q1)
 
     lerp_true = np.empty_like(q0)
+    lerp_from_one_true = np.empty_like(q1)
     for i in range(numel):
         rots = R.from_quat([q0[i], q1[i]], scalar_first=True)
         slerp = Slerp([0, 1], rots)
         lerp_true[i] = slerp([INTERP_RATIO]).as_quat(scalar_first=True)
+        rots = R.from_quat([q0[0], q1[i]], scalar_first=True)
+        slerp = Slerp([0, 1], rots)
+        lerp_from_one_true[i] = slerp([INTERP_RATIO]).as_quat(scalar_first=True)
 
-    lerp = gu.slerp(q0.reshape((*batch_shape, 4)), q1.reshape((*batch_shape, 4)), np.full(batch_shape, INTERP_RATIO))
-    assert_allclose(lerp_true.reshape((*batch_shape, 4)), lerp, tol=tol)
+    ratio = np.full(batch_shape, INTERP_RATIO)
+    for convert in (lambda x: x, lambda x: gs.tensor(x, dtype=gs.tc_float)):
+        q0_batch, q1_batch = convert(q0.reshape((*batch_shape, 4))), convert(q1.reshape((*batch_shape, 4)))
+        lerp = gu.slerp(q0_batch, q1_batch, convert(ratio))
+        assert_allclose(lerp_true.reshape((*batch_shape, 4)), lerp, tol=tol)
+        # A single start quaternion is interpolated towards every end quaternion of the batch.
+        lerp = gu.slerp(convert(q0[0]), q1_batch, convert(ratio))
+        assert_allclose(lerp_from_one_true.reshape((*batch_shape, 4)), lerp, tol=tol)
 
 
 @pytest.mark.required
@@ -743,7 +763,13 @@ def test_genuine_interpenetration(show_viewer):
     # Real-asset cases, both representations (watertight wraps and convex decompositions) built as separate
     # entities of a single scene, all placements done by rigid-transforming the extracted geoms. Real meshes
     # have no analytical truth: bounds only, to catch garbage estimates.
-    scene = gs.Scene()
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            # Collision disabled to not overflow the contact budget on the step taken by the build.
+            # This test is not stepping physics.
+            enable_collision=False,
+        ),
+    )
     asset_entities = {
         convexify: [
             scene.add_entity(
@@ -917,6 +943,16 @@ def test_genuine_interpenetration(show_viewer):
 
 
 @pytest.mark.required
+@pytest.mark.parametrize("backend", [None])
+def test_as_grayscale_image():
+    for batch_shape in ((), (2,)):
+        depth = np.broadcast_to(array=[[1.0, 3.0, 7.0]], shape=(*batch_shape, 1, 3))
+        for is_black_to_white, depth_expected in ((False, [[255, 127, 0]]), (True, [[0, 127, 255]])):
+            depth_image = as_grayscale_image(depth, enable_log_scale=True, black_to_white=is_black_to_white)
+            assert_equal(depth_image, depth_expected)
+
+
+@pytest.mark.required
 def test_fps_tracker():
     n_envs = 23
     tracker = FPSTracker(alpha=0.0, minimum_interval_seconds=0.1, n_envs=n_envs)
@@ -941,6 +977,41 @@ def test_fps_tracker():
     fps = tracker.step(current_time=10.45)
     # num envs * [num steps] / (delta time)
     assert math.isclose(fps, n_envs * 4 / 0.14)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [None])
+def test_logger_prints_once_with_root_logging(backend):
+    script = (
+        "import logging; logging.basicConfig(level=logging.INFO); "
+        "import genesis as gs; gs.init(backend=gs.cpu); gs.logger.warning('Genesis warning')"
+    )
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, encoding="utf-8")
+    assert proc.returncode == 0, proc.stderr
+    assert (proc.stdout + proc.stderr).count("Genesis warning") == 1
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [None])
+def test_logger_raw_theme_plain_text(capsys):
+    gs.init(backend=gs.cpu, theme="raw", logging_level="info")
+    try:
+        scene = gs.Scene(show_viewer=False)
+        scene.add_entity(
+            morph=gs.morphs.Box(
+                size=(0.1, 0.1, 0.1),
+            ),
+            name="box",
+        )
+        gs.logger.warning("Watch ~<this>~.")
+    finally:
+        gs.destroy()
+    out = capsys.readouterr().out
+    assert out.isascii() and "\x1b" not in out
+    lines = out.splitlines()
+    assert all(re.match(r"\[Genesis \d{2}:\d{2}:\d{2}( [A-Z]+)?\] ", line) for line in lines)
+    assert any(re.fullmatch(r"\[Genesis \d{2}:\d{2}:\d{2} WARNING\] Watch this\.", line) for line in lines)
+    assert any(re.search(r"\] Adding <gs\.engine\.entities\.RigidEntity> 'box'\. idx: 0, ", line) for line in lines)
 
 
 @pytest.mark.required

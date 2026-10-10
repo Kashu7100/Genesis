@@ -23,29 +23,15 @@ class BaseFileWriter(Recorder):
     """
     Base class for file writers.
 
-    Handles filename counter when save_on_reset is True.
     """
 
     def build(self):
         super().build()
-        self.counter = 0
 
         os.makedirs(os.path.abspath(os.path.dirname(self._options.filename)), exist_ok=True)
         self._initialize_writer()
 
-    def reset(self, envs_idx=None):
-        super().reset(envs_idx)
-
-        # no envs specific saving supported
-        if self._options.save_on_reset:
-            self.cleanup()
-            self.counter += 1
-            self._initialize_writer()
-
     def _get_filename(self):
-        if self._options.save_on_reset:
-            path, ext = os.path.splitext(self._options.filename)
-            return f"{path}_{self.counter}{ext}"
         return self._options.filename
 
     def _initialize_writer(self):
@@ -109,7 +95,7 @@ class CSVFileWriter(BaseFileWriter):
     def _sanitize_to_list(self, value):
         if isinstance(value, np.ndarray):
             return value.reshape((-1,)).tolist()
-        elif isinstance(value, (int, float, bool)):
+        elif isinstance(value, (int, float, bool, np.generic)):
             return [value]
         elif isinstance(value, (list, tuple)):
             return value
@@ -171,7 +157,7 @@ class NPZFileWriter(BaseFileWriter):
         self.all_data["timestamp"].append(cur_time)
         if isinstance(data, dict):
             for key, value in data.items():
-                assert isinstance(value, (int, float, bool, list, tuple, np.ndarray))
+                assert isinstance(value, (int, float, bool, list, tuple, np.ndarray, np.generic))
                 self.all_data[key].append(value)
         else:
             self.all_data["data"].append(np.asarray(data))

@@ -12,6 +12,7 @@ from genesis.ext.isaacgym import terrain_utils as isaacgym_terrain_utils
 from genesis.options.morphs import Terrain
 
 from .mesh import get_gnd_path
+from .misc import tensor_to_array
 
 
 def parse_terrain(morph: Terrain, surface):
@@ -46,6 +47,7 @@ def parse_terrain(morph: Terrain, surface):
                 morph.horizontal_scale,
                 morph.vertical_scale,
                 morph.n_subterrains,
+                morph.subterrain_parameters,
             )
         )
 
@@ -166,8 +168,8 @@ def parse_terrain(morph: Terrain, surface):
             with open(gnd_file_path, "wb") as file:
                 pkl.dump(heightfield, file)
 
-    heightfield = np.asarray(heightfield, dtype=gs.np_float)
     need_uvs = getattr(surface, "diffuse_texture", None) is not None
+    heightfield = heightfield.astype(gs.np_float)
     tmesh, sdf_tmesh = convert_heightfield_to_watertight_trimesh(
         heightfield,
         horizontal_scale=morph.horizontal_scale,
@@ -386,8 +388,11 @@ def convert_heightfield_to_watertight_trimesh(
 
     sdf_mesh = trimesh.Trimesh(vertices, triangles, process=False, visual=visual)
 
-    # This is the mesh used for non-sdf purposes.
-    # It's losslessly simplified from the full mesh, to save memory cost for storing verts and faces.
+    # This is the mesh used for non-sdf purposes. A single-sided surface uses the top face alone. A double-sided surface
+    # uses the full mesh, losslessly simplified to save memory cost for storing verts and faces.
+    if not surface.double_sided:
+        return vmesh_single, sdf_mesh
+
     v_simp, f_simp = fast_simplification.simplify(sdf_mesh.vertices, sdf_mesh.faces, target_count=0, lossless=True)
 
     if uvs is not None:
@@ -400,8 +405,7 @@ def convert_heightfield_to_watertight_trimesh(
         visual = trimesh.visual.TextureVisuals(uv=uv_simp)
     vmesh_full = trimesh.Trimesh(v_simp, f_simp, visual=visual)
 
-    vmesh_out = vmesh_single if not surface.double_sided else vmesh_full
-    return vmesh_out, sdf_mesh
+    return vmesh_full, sdf_mesh
 
 
 def mesh_to_heightfield(
