@@ -1086,8 +1086,10 @@ class MochiOptions(GravityMixin, TimeBasedMixin):
         controller and rods never sleep. Defaults to False.
     sleep_threshold : float, optional
         A step counts as at rest for a body when the solve reduced its residual by less than this factor from the
-        warm start, which an unforced body at equilibrium does not improve on. Higher values sleep sooner. Defaults
-        to 0.5.
+        warm start, which an unforced body at equilibrium does not improve on. Higher values sleep sooner. Only steps
+        whose solve meets the Newton tolerances count: in single precision, a soft body at rest can stall just above
+        the default `newton_abs_tol` and then never sleeps. A looser tolerance such as 5e-3 lets it sleep, at the cost
+        of accuracy. Defaults to 0.5.
     sleep_min_steps : int, optional
         Consecutive steps at rest after which every body of an island at rest goes to sleep. Fewer steps sleep sooner
         but can freeze a body at the turning point of a slow swing. Defaults to 20.
