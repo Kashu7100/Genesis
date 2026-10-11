@@ -6,6 +6,12 @@ stays frozen exactly: it skips the warm start, its residual is zeroed, so its ro
 right-hand side and the linear solvers leave it in place, and its contact and element work is skipped. Sleeping nodes
 keep their conservative bounds in the broadphase, so an awake body whose bounds reach a sleeping one joins its island
 and wakes the whole island before the solve.
+
+The API wakes what it changes: a state setter wakes its environments, a control command or a degree-of-freedom
+parameter wakes the nodes of its degrees of freedom, a kinematic vertex target wakes its entity, and a change of gravity
+or of contact settings wakes every node of the environments it reaches. Commands, issued at every step to a driven
+body, wake that body alone so that the resting bodies of its environment sleep on. A fixed link belongs to no island, so
+a contact setting changed on it must reach every body.
 """
 
 import quadrants as qd
@@ -196,21 +202,28 @@ def kernel_update_sleep(
 
 
 @qd.kernel
-def kernel_wake_envs(
+def kernel_wake_nodes(
     envs_idx: qd.types.ndarray(),
+    idx: qd.types.ndarray(),
     n_rigid_entities: int,
+    idx_node: qd.types.ndarray(),
     mochi_state: MochiState,
     soft_state: MochiSoftState,
     island_state: MochiIslandState,
     rigid_config: qd.template(),
     has_soft: qd.template(),
 ):
-    """Wake every node of the given environments and restart their rest counts, after their state was set."""
-    n_nodes = island_state.nodes_parent.shape[0]
+    """Wake the island nodes of the given items in the given environments and restart their rest counts.
+
+    `idx` selects items (degrees of freedom, or nodes themselves) and `idx_node` maps every item to its island node.
+    The island of a woken node wakes with it at the next step (see func_wake_islands).
+    """
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
     for i_b_ in range(envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
-        for i_n in range(n_nodes):
+        for i_ in range(idx.shape[0]):
+            i_x = idx[i_]
+            i_n = idx_node[i_x]
             island_state.nodes_is_asleep[i_n, i_b] = False
             island_state.nodes_rest_steps[i_n, i_b] = 0
         func_sync_asleep_flags(i_b, n_rigid_entities, mochi_state, soft_state, island_state, has_soft)

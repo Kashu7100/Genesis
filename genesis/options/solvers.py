@@ -1080,10 +1080,10 @@ class MochiOptions(GravityMixin, TimeBasedMixin):
         allocated at the first readback. Defaults to True.
     use_sleeping : bool, optional
         Whether bodies at rest are put to sleep: a sleeping body keeps its pose exactly and costs neither contact nor
-        element work until a body that is awake comes near it or its state is set. It pays off for scenes with many
-        settled objects. The cost is physical: slow motion stops for good, such as creep on a slope or the slow
-        settling of a soft body, and the trajectory differs from a run without sleeping. Bodies under an active
-        controller and rods never sleep. Defaults to False.
+        element work until an awake body comes near it or a setter changes its state, its controls, the gravity or the
+        contact settings. It pays off for scenes with many settled objects. The cost is physical: slow motion stops for
+        good, such as creep on a slope or the slow settling of a soft body, and the trajectory differs from a run
+        without sleeping. Bodies under an active controller and rods never sleep. Defaults to False.
     sleep_threshold : float, optional
         A step counts as at rest for a body when the solve reduced its residual by less than this factor from the
         warm start, which an unforced body at equilibrium does not improve on. Higher values sleep sooner. Only steps
