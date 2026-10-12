@@ -10,6 +10,7 @@ from .pbd_entity import (
     PBDParticleEntity,
 )
 from .rigid_entity import DroneEntity, KinematicEntity, RigidEntity, TerrainEntity
+from .shell_entity import ShellEntity
 from .sph_entity import SPHEntity
 from .sf_entity import SFParticleEntity
 from .tool_entity import ToolEntity
