@@ -3751,7 +3751,6 @@ class SteelStaticConfig(metaclass=AutoInitMeta):
     has_free_and_articulated_bodies: bool
     has_friction_anchors: bool
     has_contact_warmstart: bool
-    has_warmstart_decay: bool
     has_sorted_contacts: bool
     contact_shared_anchor: bool
     contact_friction_shared_anchor: bool
@@ -3779,11 +3778,13 @@ class SteelInfo:
 
     rebound_velocity_threshold is the minimum incident speed of a rebound (the float32 maximum when restitution is
     disabled), contact_w the regularization weight 1 / (1 + contact_regularization), contact_gap_limit and
-    friction_gap_limit the gap above which a contact gets no rows, or no friction rows. geoms_mu is the friction
-    coefficient of every geom scaled by contact_friction_scale. A non-finite velocity bound disables it.
-    geoms_is_torsion_supported flags the geoms whose contacts admit torsion rows (contact torsion only), and
-    geoms_contact_stiffness / geoms_contact_damping hold the compliant contact material of every geom, a zero stiffness
-    for a rigid geom (contact compliance only).
+    friction_gap_limit the gap above which a contact gets no rows, or no friction rows. The step options are written
+    again by the setters of the solver (see SteelSolver.baumgarte). geoms_mu is the friction coefficient of every geom
+    scaled by contact_friction_scale. The material arrays of the geoms and links hold one value per environment, written
+    by the material setters of the solver: geoms_restitution, links_angular_damping, the velocity bounds of the links,
+    a non-finite bound disabling it, and geoms_contact_stiffness / geoms_contact_damping, the compliant contact
+    material of every geom, a zero stiffness for a rigid geom (contact compliance only). geoms_is_torsion_supported
+    flags the geoms whose contacts admit torsion rows (contact torsion only).
 
     The remaining scalars are the tolerances, bounds and iteration counts of the Steel algorithms, documented where
     get_steel_info sets them.
@@ -3867,29 +3868,21 @@ def get_steel_info(solver):
             tensor.from_numpy(array)
         return tensor
 
-    rebound_velocity_threshold = (
-        options.restitution_velocity_threshold if options.enable_restitution else float(np.finfo(np.float32).max)
-    )
     return SteelInfo(
-        baumgarte=V_SCALAR_FROM(dtype=gs.qd_float, value=options.baumgarte),
+        baumgarte=V_SCALAR_FROM(dtype=gs.qd_float, value=solver.baumgarte),
         cfm=V_SCALAR_FROM(dtype=gs.qd_float, value=options.cfm),
-        relaxation=V_SCALAR_FROM(dtype=gs.qd_float, value=options.relaxation),
+        relaxation=V_SCALAR_FROM(dtype=gs.qd_float, value=solver.relaxation),
         friction_anchor_beta=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._steel_friction_anchor_beta),
         contact_w=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._steel_contact_w),
-        contact_speculative_scale=V_SCALAR_FROM(dtype=gs.qd_float, value=options.contact_speculative_scale),
-        rebound_velocity_threshold=V_SCALAR_FROM(dtype=gs.qd_float, value=rebound_velocity_threshold),
-        contact_gap_limit=V_SCALAR_FROM(
-            dtype=gs.qd_float, value=float("inf") if options.contact_gap_gate is None else options.contact_gap_gate
-        ),
-        friction_gap_limit=V_SCALAR_FROM(
-            dtype=gs.qd_float,
-            value=float("inf") if options.contact_friction_gap_max is None else options.contact_friction_gap_max,
-        ),
+        contact_speculative_scale=V_SCALAR_FROM(dtype=gs.qd_float, value=solver.contact_speculative_scale),
+        rebound_velocity_threshold=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._rebound_velocity_threshold),
+        contact_gap_limit=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._contact_gap_limit),
+        friction_gap_limit=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._friction_gap_limit),
         joint_limit_activation_gap=V_SCALAR_FROM(dtype=gs.qd_float, value=options.joint_limit_activation_gap),
         velocity_limit_activation_fraction=V_SCALAR_FROM(
             dtype=gs.qd_float, value=options.velocity_limit_activation_fraction
         ),
-        warmstart_decay=V_SCALAR_FROM(dtype=gs.qd_float, value=options.contact_warmstart_decay),
+        warmstart_decay=V_SCALAR_FROM(dtype=gs.qd_float, value=solver.contact_warmstart_decay),
         geoms_mu=V(dtype=gs.qd_float, shape=(solver.n_geoms_, solver._B)),
         geoms_restitution=from_numpy(solver._steel_geoms_restitution),
         links_angular_damping=from_numpy(solver._steel_links_angular_damping),

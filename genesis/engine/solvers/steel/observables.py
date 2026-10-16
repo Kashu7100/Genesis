@@ -176,11 +176,21 @@ def func_steel_update_status(
 @qd.kernel(fastcache=True)
 def kernel_steel_reset_status(
     envs_idx: qd.types.ndarray(),
+    steel_state: array_class.SteelState,
+    steel_rows: array_class.SteelRows,
     steel_status: array_class.SteelStatus,
     steel_config: qd.template(),
 ):
-    """Clear the capacity status of the selected environments."""
+    """Clear the capacity status and the compliant contact counts of the selected environments, and request a mass
+    matrix refresh of their articulations on the next step."""
+    n_arts = steel_state.arts_mass_update_requested.shape[0]
     qd.loop_config(serialize=qd.static(steel_config.para_level < gs.PARA_LEVEL.ALL))
     for i_b_ in range(envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
         steel_status.envs_overflow[i_b] = 0
+        steel_rows.compliance_n_active[i_b] = 0
+        steel_rows.compliance_n_skipped[i_b] = 0
+    qd.loop_config(serialize=qd.static(steel_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_a, i_b_ in qd.ndrange(n_arts, envs_idx.shape[0]):
+        i_b = envs_idx[i_b_]
+        steel_state.arts_mass_update_requested[i_a, i_b] = 1

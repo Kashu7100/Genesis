@@ -684,6 +684,12 @@ class SteelOptions(RigidOptions):
     stay those of 'RigidOptions'. The options of 'RigidOptions' that configure its own constraint solver have no
     meaning here and raise when set.
 
+    The options are fixed once the scene is built, and assigning one then raises. The step options 'baumgarte',
+    'relaxation', 'warn_constraint_overflow', 'velocity_drive_mode', 'contact_warmstart_decay',
+    'restitution_velocity_threshold', 'contact_speculative_scale', 'contact_gap_gate' and 'contact_friction_gap_max'
+    are read at every step: assigning the property of the same name of the solver ('scene.rigid_solver') changes them
+    from the next step on, with the validation of the options.
+
     Parameters
     ----------
     solve_mode : str, optional
@@ -925,6 +931,16 @@ class SteelOptions(RigidOptions):
     )
     propagation_same_articulation_rows: StrictBool = False
 
+    _is_built: bool = PrivateAttr(default=False)
+
+    def __setattr__(self, name: str, value) -> None:
+        if self._is_built:
+            gs.raise_exception(
+                f"'SteelOptions.{name}' is fixed once the scene is built. The step options are changed through the "
+                "property of the same name of the solver ('scene.rigid_solver'), see 'SteelOptions'."
+            )
+        super().__setattr__(name, value)
+
     def model_post_init(self, context):
         super().model_post_init(context)
         # The options of 'RigidOptions' that configure its own constraint solver, integrator and hibernation.
@@ -952,11 +968,23 @@ class SteelOptions(RigidOptions):
         if rigid_only_set:
             gs.raise_exception(f"'SteelOptions' does not support the 'RigidOptions' fields {rigid_only_set}.")
         if not np.isfinite(
-            (self.baumgarte, self.cfm, self.relaxation, self.contact_friction_scale, self.contact_gap)
+            (
+                self.baumgarte,
+                self.cfm,
+                self.relaxation,
+                self.contact_friction_scale,
+                self.contact_gap,
+                self.contact_warmstart_decay,
+                self.restitution_velocity_threshold,
+                self.contact_speculative_scale,
+            )
         ).all():
             gs.raise_exception(
-                "'baumgarte', 'cfm', 'relaxation', 'contact_friction_scale' and 'contact_gap' must be finite."
+                "'baumgarte', 'cfm', 'relaxation', 'contact_friction_scale', 'contact_gap', 'contact_warmstart_decay', "
+                "'restitution_velocity_threshold' and 'contact_speculative_scale' must be finite."
             )
+        if self.contact_gap_gate is not None and not np.isfinite(self.contact_gap_gate):
+            gs.raise_exception("'contact_gap_gate' must be finite or None.")
         if np.isnan(self.joint_limit_activation_gap) or self.joint_limit_activation_gap < 0.0:
             gs.raise_exception("'joint_limit_activation_gap' must be non-negative.")
         fraction = self.velocity_limit_activation_fraction

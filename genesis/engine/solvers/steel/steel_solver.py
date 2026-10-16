@@ -8,9 +8,16 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.array_class as array_class
 from genesis.options.solvers import SteelOptions
-from genesis.utils.misc import qd_to_numpy, qd_to_torch, tensor_to_array
+from genesis.utils.misc import (
+    assign_indexed_tensor,
+    broadcast_tensor,
+    indices_to_mask,
+    qd_to_numpy,
+    qd_to_torch,
+    tensor_to_array,
+)
 
-from ..base_solver import StateChange, Subscriber, mutates
+from ..base_solver import MODEL_CHANGES, StateChange, Subscriber, mutates
 from ..rigid.abd.forward_kinematics import (
     func_forward_velocity,
     func_update_cartesian_space,
@@ -110,6 +117,14 @@ TORSION_GEOM_TYPES = (
 )
 
 
+def _validate_step_option(name: str, value: float, *, allow_negative: bool) -> float:
+    """Return the value of a step option as a float, raising unless it is finite, and non-negative unless allowed."""
+    value = float(value)
+    if not np.isfinite(value) or (not allow_negative and value < 0.0):
+        gs.raise_exception(f"'{name}' must be finite{'' if allow_negative else ' and non-negative'}, got {value}.")
+    return value
+
+
 class SteelRowFamilyWatermarks(NamedTuple):
     """High-water marks of one row family over every environment and step since the scene was built.
 
@@ -145,7 +160,8 @@ class SteelSolver(RigidSolver):
     Steel state (joint coordinates and velocities in Steel conventions) advances by one Steel step per substep, then is
     written back to the Genesis state, whose Cartesian quantities are updated for the getters, the sensors, the
     rendering and the next collision detection. A Genesis setter of the state reloads the Steel state of the
-    environments it changed and discards their solver history.
+    environments it changed and keeps their solver history (warm start, friction anchors, capacity status), which
+    'scene.reset' and 'reset' discard. A setter of the model refreshes what the change enters (see _on_model_change).
     """
 
     def __init__(self, scene: "Scene", sim: "Simulator", options: SteelOptions) -> None:
@@ -178,6 +194,16 @@ class SteelSolver(RigidSolver):
             gs.raise_exception("Friction patches ('friction_anchor_beta' > 0) require friction_mode='fixed_normal'.")
         self._steel_friction_anchor_beta = beta
         self._steel_contact_w = float(np.float32(1.0 / (1.0 + options.contact_regularization)))
+        # The step options, which the properties of the same name change after the build (see 'SteelOptions').
+        self._steel_baumgarte = options.baumgarte
+        self._steel_relaxation = options.relaxation
+        self._steel_warn_constraint_overflow = options.warn_constraint_overflow
+        self._steel_velocity_drive_mode = options.velocity_drive_mode
+        self._steel_contact_warmstart_decay = options.contact_warmstart_decay
+        self._steel_restitution_velocity_threshold = options.restitution_velocity_threshold
+        self._steel_contact_speculative_scale = options.contact_speculative_scale
+        self._steel_contact_gap_gate = options.contact_gap_gate
+        self._steel_contact_friction_gap_max = options.contact_friction_gap_max
 
         if options.solve_mode == "split":
             split_features = {
@@ -265,6 +291,8 @@ class SteelSolver(RigidSolver):
         self._steel_plan = None
         self._steel_step = 0
         self._steel_last_dt = None
+        # The Steel material inputs at build, one value per environment, which get_steel_info copies into SteelInfo.
+        # The material setters write SteelInfo afterwards.
         self._steel_links_angular_damping = None
         self._steel_links_max_linear_velocity = None
         self._steel_links_max_angular_velocity = None
@@ -294,14 +322,15 @@ class SteelSolver(RigidSolver):
 
         # Every free root is damped by the default rate, free bodies are unbounded in velocity and geoms do not bounce,
         # unless their material states otherwise.
-        self._steel_links_angular_damping = np.full(self.n_links_, DEFAULT_ANGULAR_DAMPING, dtype=gs.np_float)
-        self._steel_links_max_linear_velocity = np.full(self.n_links_, np.inf, dtype=gs.np_float)
-        self._steel_links_max_angular_velocity = np.full(self.n_links_, np.inf, dtype=gs.np_float)
-        self._steel_links_max_depenetration_velocity = np.full(self.n_links_, np.inf, dtype=gs.np_float)
-        self._steel_geoms_restitution = np.zeros(self.n_geoms_, dtype=gs.np_float)
+        _B = self._B
+        self._steel_links_angular_damping = np.full((self.n_links_, _B), DEFAULT_ANGULAR_DAMPING, dtype=gs.np_float)
+        self._steel_links_max_linear_velocity = np.full((self.n_links_, _B), np.inf, dtype=gs.np_float)
+        self._steel_links_max_angular_velocity = np.full((self.n_links_, _B), np.inf, dtype=gs.np_float)
+        self._steel_links_max_depenetration_velocity = np.full((self.n_links_, _B), np.inf, dtype=gs.np_float)
+        self._steel_geoms_restitution = np.zeros((self.n_geoms_, _B), dtype=gs.np_float)
         self._steel_dofs_velocity_limit = np.full(self.n_dofs_, np.inf, dtype=gs.np_float)
-        self._steel_geoms_contact_stiffness = np.zeros(self.n_geoms_, dtype=gs.np_float)
-        self._steel_geoms_contact_damping = np.zeros(self.n_geoms_, dtype=gs.np_float)
+        self._steel_geoms_contact_stiffness = np.zeros((self.n_geoms_, _B), dtype=gs.np_float)
+        self._steel_geoms_contact_damping = np.zeros((self.n_geoms_, _B), dtype=gs.np_float)
         for entity in self._entities:
             material = entity.material
             links_idx = slice(entity.link_start, entity.link_end)
@@ -348,13 +377,7 @@ class SteelSolver(RigidSolver):
             )
         self._steel_propagation_active = self._build_propagation_plan()
         arts_preelim_idx = self._build_preelimination_plan()
-        free_links_idx = self._steel_plan.joints_link[
-            self._steel_plan.arts_joint_start[:-1][self._steel_plan.arts_is_free_rigid != 0]
-        ]
-        self._has_free_velocity_limits = bool(
-            np.isfinite(self._steel_links_max_linear_velocity[free_links_idx]).any()
-            or np.isfinite(self._steel_links_max_angular_velocity[free_links_idx]).any()
-        )
+        self._warn_persistent_row_capacity()
 
         self.steel_config = array_class.SteelStaticConfig(
             para_level=self.rigid_config.para_level,
@@ -376,7 +399,6 @@ class SteelSolver(RigidSolver):
             ),
             has_friction_anchors=self._steel_friction_anchor_beta > 0.0,
             has_contact_warmstart=options.contact_warmstart,
-            has_warmstart_decay=options.contact_warmstart_decay > 0.0,
             has_sorted_contacts=options.contact_warmstart
             or self.collider.collider_config.has_non_box_plane_convex_convex,
             contact_shared_anchor=options.contact_shared_anchor,
@@ -390,7 +412,9 @@ class SteelSolver(RigidSolver):
             ),
             has_connects=self._steel_plan.n_connects > 0,
             has_fused_velocity_limits=self.velocity_limits_fused,
-            has_free_velocity_limits=self._has_free_velocity_limits,
+            # The velocity bounds of free rigid bodies are material inputs read at every step, so their rows are
+            # compiled in whenever free rigid bodies exist, each body getting rows for its finite bounds alone.
+            has_free_velocity_limits=self._steel_plan.has_free_rigid_bodies,
             has_propagation=self._steel_propagation_active,
             has_internal_rows=(
                 options.drive_mode == "rows"
@@ -399,7 +423,9 @@ class SteelSolver(RigidSolver):
                 or self._steel_plan.n_connects > 0
             ),
             has_velocity_limit_rows=(
-                options.enable_joint_velocity_limits or self.velocity_limits_fused or self._has_free_velocity_limits
+                options.enable_joint_velocity_limits
+                or self.velocity_limits_fused
+                or self._steel_plan.has_free_rigid_bodies
             )
             and np.isfinite(options.velocity_limit_activation_fraction),
             propagation_same_articulation_rows=options.propagation_same_articulation_rows,
@@ -430,8 +456,11 @@ class SteelSolver(RigidSolver):
         self._refresh_steel_materials()
 
         self.subscribe(Subscriber(frozenset({StateChange.GEOMETRY, StateChange.DYNAMICS}), self._on_state_change))
-        self.subscribe(Subscriber(frozenset({StateChange.MODEL}), self._on_model_change))
+        self.subscribe(Subscriber(MODEL_CHANGES, self._on_model_change))
         self._on_state_change(StateChange.GEOMETRY, None)
+        self.reset()
+        # The step options are changed through the properties of the solver from now on (see 'SteelOptions').
+        options._is_built = True
 
     def _build_propagation_plan(self) -> bool:
         """Return whether a propagation contact response is active, after checking that the model supports it.
@@ -579,7 +608,7 @@ class SteelSolver(RigidSolver):
             and np.isfinite(options.velocity_limit_activation_fraction)
         )
 
-    @mutates(StateChange.MODEL)
+    @mutates(StateChange.ACTUATION)
     def set_dofs_velocity_limit(self, limit, dofs_idx=None) -> None:
         """Set the joint velocity limit [m/s or rad/s] of the given degrees of freedom, shared by every environment.
 
@@ -596,6 +625,338 @@ class SteelSolver(RigidSolver):
             slice(None) if dofs_idx is None else dofs_idx
         ]
 
+    # ------------------------------------------------------------------------------------
+    # ----------------------------------- step options -----------------------------------
+    # ------------------------------------------------------------------------------------
+
+    @property
+    def baumgarte(self) -> float:
+        """Fraction of the error of a row removed per step (see 'SteelOptions'), finite."""
+        return self._steel_baumgarte
+
+    @baumgarte.setter
+    @gs.assert_built
+    def baumgarte(self, baumgarte: float) -> None:
+        self._steel_baumgarte = _validate_step_option("baumgarte", baumgarte, allow_negative=True)
+        self.steel_info.baumgarte.fill(self._steel_baumgarte)
+
+    @property
+    def relaxation(self) -> float:
+        """Successive over-relaxation factor of the sweeps (see 'SteelOptions'), finite."""
+        return self._steel_relaxation
+
+    @relaxation.setter
+    @gs.assert_built
+    def relaxation(self, relaxation: float) -> None:
+        self._steel_relaxation = _validate_step_option("relaxation", relaxation, allow_negative=True)
+        self.steel_info.relaxation.fill(self._steel_relaxation)
+
+    @property
+    def warn_constraint_overflow(self) -> bool:
+        """Whether the first loss of rows of each row family warns (see 'SteelOptions')."""
+        return self._steel_warn_constraint_overflow
+
+    @warn_constraint_overflow.setter
+    @gs.assert_built
+    def warn_constraint_overflow(self, warn_constraint_overflow: bool) -> None:
+        if not isinstance(warn_constraint_overflow, bool):
+            gs.raise_exception(f"'warn_constraint_overflow' must be a bool, got {warn_constraint_overflow!r}.")
+        self._steel_warn_constraint_overflow = warn_constraint_overflow
+
+    @property
+    def velocity_drive_mode(self) -> str:
+        """Treatment of the drive rows in the velocity sweeps, 'freeze' or 'active' (see 'SteelOptions')."""
+        return self._steel_velocity_drive_mode
+
+    @velocity_drive_mode.setter
+    @gs.assert_built
+    def velocity_drive_mode(self, velocity_drive_mode: str) -> None:
+        if velocity_drive_mode not in ("freeze", "active"):
+            gs.raise_exception(f"'velocity_drive_mode' must be 'freeze' or 'active', got {velocity_drive_mode!r}.")
+        self._steel_velocity_drive_mode = velocity_drive_mode
+
+    @property
+    def contact_warmstart_decay(self) -> float:
+        """Scale of the carried warm-start impulses (see 'SteelOptions'), finite and non-negative."""
+        return self._steel_contact_warmstart_decay
+
+    @contact_warmstart_decay.setter
+    @gs.assert_built
+    def contact_warmstart_decay(self, contact_warmstart_decay: float) -> None:
+        self._steel_contact_warmstart_decay = _validate_step_option(
+            "contact_warmstart_decay", contact_warmstart_decay, allow_negative=False
+        )
+        self.steel_info.warmstart_decay.fill(self._steel_contact_warmstart_decay)
+
+    @property
+    def restitution_velocity_threshold(self) -> float:
+        """Minimum incident normal speed [m/s] of a rebound (see 'SteelOptions'), finite and non-negative."""
+        return self._steel_restitution_velocity_threshold
+
+    @restitution_velocity_threshold.setter
+    @gs.assert_built
+    def restitution_velocity_threshold(self, restitution_velocity_threshold: float) -> None:
+        self._steel_restitution_velocity_threshold = _validate_step_option(
+            "restitution_velocity_threshold", restitution_velocity_threshold, allow_negative=False
+        )
+        self.steel_info.rebound_velocity_threshold.fill(self._rebound_velocity_threshold)
+
+    @property
+    def contact_speculative_scale(self) -> float:
+        """Fraction of a positive contact gap closed within a step (see 'SteelOptions'), finite and non-negative."""
+        return self._steel_contact_speculative_scale
+
+    @contact_speculative_scale.setter
+    @gs.assert_built
+    def contact_speculative_scale(self, contact_speculative_scale: float) -> None:
+        self._steel_contact_speculative_scale = _validate_step_option(
+            "contact_speculative_scale", contact_speculative_scale, allow_negative=False
+        )
+        self.steel_info.contact_speculative_scale.fill(self._steel_contact_speculative_scale)
+
+    @property
+    def contact_gap_gate(self) -> float | None:
+        """Gap [m] above which a contact gets no rows, None for no gate (see 'SteelOptions')."""
+        return self._steel_contact_gap_gate
+
+    @contact_gap_gate.setter
+    @gs.assert_built
+    def contact_gap_gate(self, contact_gap_gate: float | None) -> None:
+        if contact_gap_gate is not None:
+            contact_gap_gate = _validate_step_option("contact_gap_gate", contact_gap_gate, allow_negative=False)
+        self._steel_contact_gap_gate = contact_gap_gate
+        self.steel_info.contact_gap_limit.fill(self._contact_gap_limit)
+
+    @property
+    def contact_friction_gap_max(self) -> float | None:
+        """Gap [m] above which a contact gets no friction rows, None for friction rows on every contact.
+
+        Whether every contact gets friction rows (None or inf) is fixed at build: the setter rejects a switch between
+        a finite gap and None or inf.
+        """
+        return self._steel_contact_friction_gap_max
+
+    @contact_friction_gap_max.setter
+    @gs.assert_built
+    def contact_friction_gap_max(self, contact_friction_gap_max: float | None) -> None:
+        if contact_friction_gap_max is not None:
+            contact_friction_gap_max = float(contact_friction_gap_max)
+            if np.isnan(contact_friction_gap_max):
+                gs.raise_exception("'contact_friction_gap_max' must not be NaN.")
+        is_every_contact = contact_friction_gap_max is None or np.isposinf(contact_friction_gap_max)
+        if is_every_contact != np.isposinf(self._friction_gap_limit):
+            gs.raise_exception("'contact_friction_gap_max' cannot switch to or from None (or inf) after the build.")
+        self._steel_contact_friction_gap_max = contact_friction_gap_max
+        self.steel_info.friction_gap_limit.fill(self._friction_gap_limit)
+
+    @property
+    def _rebound_velocity_threshold(self) -> float:
+        """Minimum incident speed of a rebound as the kernels read it, the largest float32 without restitution."""
+        if self._options.enable_restitution:
+            return self._steel_restitution_velocity_threshold
+        return float(np.finfo(np.float32).max)
+
+    @property
+    def _contact_gap_limit(self) -> float:
+        """Gap [m] above which a contact gets no rows, as the kernels read it."""
+        return float("inf") if self._steel_contact_gap_gate is None else self._steel_contact_gap_gate
+
+    @property
+    def _friction_gap_limit(self) -> float:
+        """Gap [m] above which a contact gets no friction rows, as the kernels read it."""
+        return float("inf") if self._steel_contact_friction_gap_max is None else self._steel_contact_friction_gap_max
+
+    # ------------------------------------------------------------------------------------
+    # ------------------------------------ materials -------------------------------------
+    # ------------------------------------------------------------------------------------
+
+    def _set_steel_material(self, values, material: qd.Tensor, idx, idx_max: int, idx_name: str, envs_idx) -> None:
+        """Write one Steel material input of the given geoms or links of the given environments.
+
+        material holds one value per geom or link and environment, idx selects the geoms or links among idx_max and
+        idx_name names them in the errors.
+        """
+        if gs.use_zerocopy:
+            if envs_idx is not None and self.n_envs == 0:
+                gs.raise_exception("`envs_idx` is not supported for non-parallelized scene.")
+            if isinstance(envs_idx, (int, np.integer)) and not -self.n_envs <= envs_idx < self.n_envs:
+                gs.raise_exception(f"`envs_idx` out of range: {envs_idx} not in [{-self.n_envs}, {self.n_envs}).")
+            mask = indices_to_mask(envs_idx, idx)
+            material_t = qd_to_torch(material, transpose=True, copy=False)
+            assign_indexed_tensor(material_t, mask, broadcast_tensor(values, gs.tc_float, material_t[mask].shape))
+            if gs.backend == gs.metal:
+                torch.mps.synchronize()
+            return
+        values, idx, envs_idx = self._sanitize_io_variables(
+            values, idx, idx_max, idx_name, envs_idx, skip_allocation=True
+        )
+        if self.n_envs == 0:
+            values = values[None]
+        kernel_steel_set_material(idx, envs_idx, values, material, self.steel_config)
+
+    @mutates(StateChange.MATERIAL)
+    def set_geoms_restitution(self, restitution, geoms_idx=None, envs_idx=None) -> None:
+        """Set the restitution coefficient of the given geoms in the given environments (see 'gs.materials.Rigid').
+
+        The restitution of a contact is the mean of the coefficients of its two geoms clamped to [0, 1], a non-finite
+        coefficient counting as 0. A positive coefficient requires solve_mode='matrix_free' and no 'contact_compliance'
+        unless 'enable_restitution' is off.
+        """
+        options = self._options
+        if (
+            options.enable_restitution
+            and (options.solve_mode == "split" or options.contact_compliance)
+            and (torch.as_tensor(restitution) > 0.0).any()
+        ):
+            gs.raise_exception(
+                "A positive restitution requires solve_mode='matrix_free' and no 'contact_compliance': set "
+                "'enable_restitution=False' to ignore the restitution of the materials."
+            )
+        self._set_steel_material(
+            restitution, self.steel_info.geoms_restitution, geoms_idx, self.n_geoms, "geoms_idx", envs_idx
+        )
+
+    def get_geoms_restitution(self, geoms_idx=None, envs_idx=None):
+        """Return the restitution coefficient of the given geoms in the given environments."""
+        tensor = qd_to_torch(self.steel_info.geoms_restitution, envs_idx, geoms_idx, transpose=True, copy=True)
+        return tensor[0] if self.n_envs == 0 else tensor
+
+    @mutates(StateChange.MATERIAL)
+    def set_geoms_contact_stiffness(self, stiffness, geoms_idx=None, envs_idx=None) -> None:
+        """Set the contact stiffness [N/m] of the given geoms in the given environments (see 'gs.materials.Rigid').
+
+        A zero stiffness makes the contacts of the geom rigid. Requires 'contact_compliance', and a positive stiffness
+        is rejected with 'enable_torsional_friction'.
+        """
+        options = self._options
+        if not options.contact_compliance:
+            gs.raise_exception("The contact stiffness and damping of the geoms require 'contact_compliance'.")
+        if options.enable_torsional_friction and (torch.as_tensor(stiffness) > 0.0).any():
+            gs.raise_exception("'enable_torsional_friction' does not support compliant contacts.")
+        self._set_steel_material(
+            stiffness, self.steel_info.geoms_contact_stiffness, geoms_idx, self.n_geoms, "geoms_idx", envs_idx
+        )
+
+    def get_geoms_contact_stiffness(self, geoms_idx=None, envs_idx=None):
+        """Return the contact stiffness of the given geoms in the given environments, zero for a rigid geom."""
+        if not self._options.contact_compliance:
+            gs.raise_exception("The contact stiffness and damping of the geoms require 'contact_compliance'.")
+        tensor = qd_to_torch(self.steel_info.geoms_contact_stiffness, envs_idx, geoms_idx, transpose=True, copy=True)
+        return tensor[0] if self.n_envs == 0 else tensor
+
+    @mutates(StateChange.MATERIAL)
+    def set_geoms_contact_damping(self, damping, geoms_idx=None, envs_idx=None) -> None:
+        """Set the contact damping [N s/m] of the given geoms in the given environments (see 'gs.materials.Rigid').
+
+        It acts on the contacts of the geoms with a positive contact stiffness. Requires 'contact_compliance'.
+        """
+        if not self._options.contact_compliance:
+            gs.raise_exception("The contact stiffness and damping of the geoms require 'contact_compliance'.")
+        self._set_steel_material(
+            damping, self.steel_info.geoms_contact_damping, geoms_idx, self.n_geoms, "geoms_idx", envs_idx
+        )
+
+    def get_geoms_contact_damping(self, geoms_idx=None, envs_idx=None):
+        """Return the contact damping of the given geoms in the given environments."""
+        if not self._options.contact_compliance:
+            gs.raise_exception("The contact stiffness and damping of the geoms require 'contact_compliance'.")
+        tensor = qd_to_torch(self.steel_info.geoms_contact_damping, envs_idx, geoms_idx, transpose=True, copy=True)
+        return tensor[0] if self.n_envs == 0 else tensor
+
+    @mutates(StateChange.MODEL)
+    def set_links_angular_damping(self, angular_damping, links_idx=None, envs_idx=None) -> None:
+        """Set the angular velocity damping rate [1/s] of the given links in the given environments.
+
+        It damps the root link of a free-floating entity, as w *= 1 - angular_damping * dt every step (see
+        'gs.materials.Rigid'), and is read at every step.
+        """
+        self._set_steel_material(
+            angular_damping, self.steel_info.links_angular_damping, links_idx, self.n_links, "links_idx", envs_idx
+        )
+
+    def get_links_angular_damping(self, links_idx=None, envs_idx=None):
+        """Return the angular velocity damping rate of the given links in the given environments."""
+        tensor = qd_to_torch(self.steel_info.links_angular_damping, envs_idx, links_idx, transpose=True, copy=True)
+        return tensor[0] if self.n_envs == 0 else tensor
+
+    @mutates(StateChange.MODEL)
+    def set_links_max_linear_velocity(self, max_linear_velocity, links_idx=None, envs_idx=None) -> None:
+        """Set the bound [m/s] of the center of mass speed of the given links in the given environments.
+
+        It bounds every world axis of the velocity of a free rigid body, enforced by velocity rows, and is read at every
+        step. A non-finite or non-positive bound disables it.
+        """
+        self._set_steel_material(
+            max_linear_velocity,
+            self.steel_info.links_max_linear_velocity,
+            links_idx,
+            self.n_links,
+            "links_idx",
+            envs_idx,
+        )
+
+    def get_links_max_linear_velocity(self, links_idx=None, envs_idx=None):
+        """Return the bound of the center of mass speed of the given links in the given environments."""
+        tensor = qd_to_torch(self.steel_info.links_max_linear_velocity, envs_idx, links_idx, transpose=True, copy=True)
+        return tensor[0] if self.n_envs == 0 else tensor
+
+    @mutates(StateChange.MODEL)
+    def set_links_max_angular_velocity(self, max_angular_velocity, links_idx=None, envs_idx=None) -> None:
+        """Set the bound [rad/s] of the angular speed of the given links in the given environments.
+
+        It bounds every world axis of the angular velocity of a free rigid body, enforced by velocity rows, and is read
+        at every step. A non-finite or non-positive bound disables it.
+        """
+        self._set_steel_material(
+            max_angular_velocity,
+            self.steel_info.links_max_angular_velocity,
+            links_idx,
+            self.n_links,
+            "links_idx",
+            envs_idx,
+        )
+
+    def get_links_max_angular_velocity(self, links_idx=None, envs_idx=None):
+        """Return the bound of the angular speed of the given links in the given environments."""
+        tensor = qd_to_torch(self.steel_info.links_max_angular_velocity, envs_idx, links_idx, transpose=True, copy=True)
+        return tensor[0] if self.n_envs == 0 else tensor
+
+    @mutates(StateChange.MODEL)
+    def set_links_max_depenetration_velocity(self, max_depenetration_velocity, links_idx=None, envs_idx=None) -> None:
+        """Set the bound [m/s] of the penetration correction velocity of the given links in the given environments.
+
+        It bounds the correction of the contacts of free rigid bodies, the smaller bound of the two bodies of a contact
+        applying, and is read at every step. A non-finite or non-positive bound disables it.
+        """
+        self._set_steel_material(
+            max_depenetration_velocity,
+            self.steel_info.links_max_depenetration_velocity,
+            links_idx,
+            self.n_links,
+            "links_idx",
+            envs_idx,
+        )
+
+    def get_links_max_depenetration_velocity(self, links_idx=None, envs_idx=None):
+        """Return the bound of the penetration correction velocity of the given links in the given environments."""
+        tensor = qd_to_torch(
+            self.steel_info.links_max_depenetration_velocity, envs_idx, links_idx, transpose=True, copy=True
+        )
+        return tensor[0] if self.n_envs == 0 else tensor
+
+    def get_links_parent_wrench(self, links_idx=None, envs_idx=None):
+        """Return the wrench the inbound joint of each given link transmits to it, about its center of mass.
+
+        It is the net wrench of the subtree of the link from the inverse dynamics at the start of the last step, in
+        world axes: the force [N] in the first three components, the torque [N m] in the last three. It leaves out the
+        constraint and contact impulses of the step. The world link of a model and the links of an entity without degree
+        of freedom report zero, and a sleeping link the wrench of the last step it was awake.
+        """
+        force = qd_to_torch(self.steel_state.links_parent_f_lin, envs_idx, links_idx, transpose=True)
+        torque = qd_to_torch(self.steel_state.links_parent_f_ang, envs_idx, links_idx, transpose=True)
+        tensor = torch.cat((force, torque), dim=-1)
+        return tensor[0] if self.n_envs == 0 else tensor
+
     def _refresh_steel_materials(self) -> None:
         """Copy the friction coefficients of the geoms, scaled by 'contact_friction_scale', into the Steel materials."""
         friction = qd_to_numpy(self.dyn_info.geoms.friction)
@@ -603,19 +964,67 @@ class SteelSolver(RigidSolver):
         geoms_mu = (friction[:, None] if friction.ndim == 1 else friction) * friction_ratio
         self.steel_info.geoms_mu.from_numpy((geoms_mu * self._options.contact_friction_scale).astype(gs.np_float))
 
-    def _on_model_change(self, change: StateChange, envs_idx) -> None:
-        """Refresh the Steel materials, request a mass matrix refresh and discard the warm-start impulses of every
-        environment after a change of the model parameters.
+    # ------------------------------------------------------------------------------------
+    # ------------------------------ history and notifications ---------------------------
+    # ------------------------------------------------------------------------------------
 
-        With sleeping, every island of the changed environments wakes and is vetoed at the next step, the gravity
-        included: the notification names environments, not the entities whose parameters changed.
+    def reset(self, envs_idx=None) -> None:
+        """Discard the solver history of the given environments, leaving their state unchanged.
+
+        It clears the capacity status ('constraint_overflow') and the compliant contact counts, discards the warm-start
+        impulses and the friction anchors, wakes the sleeping bodies and requests a mass matrix refresh on the next
+        step, so a teleported articulation reuses no stale factorization or anchor. The other environments keep their
+        history. 'scene.reset' resets the environments it restores, a setter of the state keeps their history.
         """
-        self._refresh_steel_materials()
-        steel_state = self.steel_state
-        mass_update_requested = qd_to_numpy(steel_state.arts_mass_update_requested, copy=True)
-        mass_update_requested[...] = 1
-        steel_state.arts_mass_update_requested.from_numpy(mass_update_requested)
+        is_masked = envs_idx is not None
+        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+        if self._steel_friction_anchor_beta > 0.0:
+            kernel_steel_reset_patches(envs_idx, self.steel_patch_history, self.steel_config)
         if self._options.contact_warmstart:
+            kernel_steel_reset_warmstart(envs_idx, self.steel_contact_history, self.steel_config)
+        kernel_steel_reset_status(envs_idx, self.steel_state, self.steel_rows, self.steel_status, self.steel_config)
+        if self._options.enable_sleeping:
+            # A reset of every environment restarts the sleep history, a reset of some of them only wakes them.
+            kernel_steel_sleep_wake(
+                envs_idx,
+                self.steel_state,
+                self.steel_sleep,
+                self.steel_config,
+                mark_changed=False,
+                clear_asleep_steps=not is_masked,
+            )
+            if not is_masked:
+                self._steel_sleep_is_history_valid = False
+
+    def set_state(self, f, state, envs_idx=None, *, partial: bool = False) -> None:
+        """Restore the state of the given environments, then discard their solver history (see 'reset')."""
+        super().set_state(f, state, envs_idx, partial=partial)
+        if self.is_active:
+            self.reset(envs_idx)
+
+    def add_weld_constraint(self, link1_idx, link2_idx, envs_idx=None):
+        """Reject the weld constraint: the Steel solver builds its equality constraints once, from the model."""
+        gs.raise_exception("The Steel solver does not support adding weld constraints after the build.")
+
+    def delete_weld_constraint(self, link1_idx, link2_idx, envs_idx=None):
+        """Reject the deletion: the Steel solver builds its equality constraints once, from the model."""
+        gs.raise_exception("The Steel solver does not support deleting weld constraints after the build.")
+
+    def _on_model_change(self, change: StateChange, envs_idx) -> None:
+        """Refresh the Steel data that a change of the model parameters enters.
+
+        A change of the mass distribution or of the joint-space force laws (the drive gains enter the augmented mass
+        matrix) requests a mass matrix refresh of every articulation on the next step. A change of the contact material
+        refreshes the friction coefficients of the geoms. Changes of the mass distribution and of the contact material
+        discard the warm-start impulses of every environment, the other changes keep them. With sleeping, every island
+        of the changed environments wakes and is vetoed at the next step, the gravity included: the notification names
+        environments, not the entities whose parameters changed.
+        """
+        if change in (StateChange.INERTIA, StateChange.ACTUATION):
+            self.steel_state.arts_mass_update_requested.fill(1)
+        if change == StateChange.MATERIAL:
+            self._refresh_steel_materials()
+        if change in (StateChange.INERTIA, StateChange.MATERIAL) and self._options.contact_warmstart:
             kernel_steel_reset_warmstart(self._scene._envs_idx, self.steel_contact_history, self.steel_config)
         if self._options.enable_sleeping:
             kernel_steel_sleep_wake(
@@ -628,23 +1037,17 @@ class SteelSolver(RigidSolver):
             )
 
     def _on_state_change(self, change: StateChange, envs_idx) -> None:
-        """Reload the Steel state of the environments a Genesis setter changed and discard their friction anchors and
-        warm-start impulses.
+        """Reload the Steel state of the environments a Genesis setter changed, keeping their solver history.
 
-        With sleeping, the change is a reset of the islands of those environments: they wake and drop their row
-        overflow status. A change of selected environments also vetoes their islands at the next step, the
-        notification naming environments, not the entities whose state changed. A change of every environment
-        restarts the sleep history instead, so it wakes the islands without vetoing them.
+        With sleeping, the change wakes the islands of those environments. A change of selected environments also
+        vetoes their islands at the next step, the notification naming environments, not the entities whose state
+        changed. A change of every environment restarts the sleep history instead, so it wakes the islands without
+        vetoing them.
         """
-        is_masked = envs_idx is not None
-        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
-        if self._steel_friction_anchor_beta > 0.0:
-            kernel_steel_reset_patches(envs_idx, self.steel_patch_history, self.steel_config)
-        if self._options.contact_warmstart:
-            kernel_steel_reset_warmstart(envs_idx, self.steel_contact_history, self.steel_config)
-        kernel_steel_reset_status(envs_idx, self.steel_status, self.steel_config)
         if self._steel_plan.n_arts == 0:
             return
+        is_masked = envs_idx is not None
+        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
         kernel_steel_pull(
             envs_idx,
             self.dyn_state,
@@ -666,6 +1069,33 @@ class SteelSolver(RigidSolver):
             )
             if not is_masked:
                 self._steel_sleep_is_history_valid = False
+
+    def _warn_persistent_row_capacity(self) -> None:
+        """Warn if every step is certain to request more joint-space rows than 'articulation_constraint_max'.
+
+        With 'enable_joint_limit' and an infinite 'joint_limit_activation_gap', every finite position limit of a
+        prismatic, revolute or multi-axis degree of freedom is a row in every step.
+        """
+        options = self._options
+        plan = self._steel_plan
+        if not options.enable_joint_limit or np.isfinite(options.joint_limit_activation_gap) or self.n_dofs == 0:
+            return
+        dofs_is_scalar_axis = np.isin(
+            plan.joints_type[plan.dofs_joint],
+            (STEEL_JOINT_TYPE.PRISMATIC, STEEL_JOINT_TYPE.REVOLUTE, STEEL_JOINT_TYPE.D6),
+        )
+        dofs_n_finite_limits = np.isfinite(qd_to_numpy(self.dyn_info.dofs.limit)).sum(axis=-1)
+        envs_n_rows = np.broadcast_to(dofs_n_finite_limits[dofs_is_scalar_axis].sum(axis=0), (self._B,))
+        envs_idx = np.flatnonzero(envs_n_rows > options.articulation_constraint_max)
+        if envs_idx.size:
+            gs.logger.warning(
+                f"Environments {envs_idx[:16].tolist()} need at least {envs_n_rows.max()} joint-space rows in every "
+                f"step for their finite joint position limits alone, more than articulation_constraint_max="
+                f"{options.articulation_constraint_max}. The rows beyond the capacity are dropped and flagged in "
+                "'constraint_overflow'. Increase 'articulation_constraint_max', set a finite "
+                "'joint_limit_activation_gap' so that only the limits near the joint position create rows, or set the "
+                "unbounded limits to +/-inf."
+            )
 
     def substep(self, f):
         if not self._is_forward_pos_updated:
@@ -754,7 +1184,7 @@ class SteelSolver(RigidSolver):
 
     def check_errno(self):
         super().check_errno()
-        if not self._options.warn_constraint_overflow:
+        if not self._steel_warn_constraint_overflow:
             return
         # The warnings ride the host synchronization of the error check instead of adding one per step.
         overflow = int(np.bitwise_or.reduce(qd_to_numpy(self.steel_status.envs_overflow)))
@@ -869,7 +1299,7 @@ class SteelSolver(RigidSolver):
                 steel_config=self.steel_config,
                 propagate_warmstart=False,
                 regularize=False,
-                freeze_drive_rows=options.velocity_drive_mode == "freeze",
+                freeze_drive_rows=self._steel_velocity_drive_mode == "freeze",
             )
             kernel_steel_step_end(
                 dt,
@@ -1439,7 +1869,7 @@ def kernel_steel_step(
             steel_config=steel_config,
         )
         # The carried patch impulses replace the matched friction impulses of their anchors last.
-        if qd.static(steel_config.has_friction_anchors and steel_config.has_warmstart_decay):
+        if qd.static(steel_config.has_friction_anchors):
             func_steel_seed_patch_impulses(
                 CONTACT_PATH.DENSE,
                 dt,
@@ -1691,3 +2121,19 @@ def kernel_steel_step_end(
         sleep_angular_threshold,
         sleep_quiet_time,
     )
+
+
+@qd.kernel(fastcache=True)
+def kernel_steel_set_material(
+    idx: qd.types.ndarray(),
+    envs_idx: qd.types.ndarray(),
+    values: qd.types.ndarray(),
+    material: qd.Tensor,
+    steel_config: qd.template(),
+):
+    """Write the values of one Steel material input of the given geoms or links of the given environments."""
+    qd.loop_config(serialize=qd.static(steel_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_, i_b_ in qd.ndrange(idx.shape[0], envs_idx.shape[0]):
+        i = idx[i_]
+        i_b = envs_idx[i_b_]
+        material[i, i_b] = values[i_b_, i_]

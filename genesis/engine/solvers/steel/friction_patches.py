@@ -967,7 +967,8 @@ def func_steel_seed_patch_impulses(
 
     It runs after every contact normal is seeded by the warm start. The carried impulse, scaled by the warm-start decay
     and the ratio of the step to the last one, is expressed in the tangent basis of the row normal and clamped to the
-    disk of the pooled normal load of its region. Anchors without history keep the impulses of the contact warm start.
+    disk of the pooled normal load of its region. Anchors without history, and every anchor when the decay is zero, keep
+    the impulses of the contact warm start.
     """
     max_contacts = steel_contacts.shape0.shape[0]
     _B = steel_contacts.n.shape[0]
@@ -980,6 +981,7 @@ def func_steel_seed_patch_impulses(
             and steel_contacts.path[i_c, i_b] == route
             and steel_contacts.slot[i_c, i_b] >= 0
             and steel_contacts.slots_needed[i_c, i_b] == 3
+            and decay > 0.0
         ):
             i_src = steel_patch_frame.source[i_c, i_b]
         if i_src >= 0:

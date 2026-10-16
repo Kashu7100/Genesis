@@ -649,9 +649,9 @@ def func_steel_propagation_row_setup(
                     bias = baumgarte * phi * inv_dt
                     max_depenetration = steel_info.unbounded_depenetration[None]
                     if i_la >= 0:
-                        max_depenetration = steel_info.links_max_depenetration_velocity[i_la]
+                        max_depenetration = steel_info.links_max_depenetration_velocity[i_la, i_b]
                     if i_lb >= 0:
-                        v_b = steel_info.links_max_depenetration_velocity[i_lb]
+                        v_b = steel_info.links_max_depenetration_velocity[i_lb, i_b]
                         if v_b > 0.0 and not qd.math.isinf(v_b) and v_b < max_depenetration:
                             max_depenetration = v_b
                     if max_depenetration > 0.0 and not qd.math.isinf(max_depenetration):

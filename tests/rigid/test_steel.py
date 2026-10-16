@@ -94,13 +94,20 @@ def test_contact_dynamics(steel_kwargs, n_envs, show_viewer):
 
 @pytest.mark.required
 @pytest.mark.parametrize("n_envs", [0, 2])
-def test_restitution(n_envs, show_viewer):
-    # A sphere hitting the ground faster than the restitution threshold leaves it at RESTITUTION times its incident
-    # speed, the incident speed including the gravity of the impact step.
+def test_material_inputs(n_envs, show_viewer):
+    # A sphere hitting the ground faster than the restitution threshold leaves it at the restitution of the contact
+    # times its incident speed, the incident speed including the gravity of the impact step. The restitution of a
+    # contact is the mean of those of its two geoms, set per environment after the build for the second sphere. A
+    # falling sphere whose speed is bounded falls at the bound, the spin of a sphere decays by 1 - damping * DT per
+    # step, and a sphere released deep in the ground rises at the bound of its penetration correction velocity.
     GRAVITY = 9.81
     DT = 0.005
     RESTITUTION = 0.5
     RADIUS = 0.05
+    MAX_LINEAR_VELOCITY = 0.5
+    SPIN = 10.0
+    MAX_DEPENETRATION_VELOCITY = 0.1
+    DEPTH = 0.02
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
@@ -109,8 +116,8 @@ def test_restitution(n_envs, show_viewer):
         ),
         rigid_options=gs.options.SteelOptions(),
         viewer_options=gs.options.ViewerOptions(
-            camera_pos=(0.0, -1.5, 0.5),
-            camera_lookat=(0.0, 0.0, 0.2),
+            camera_pos=(1.0, -2.5, 0.8),
+            camera_lookat=(1.0, 0.0, 0.2),
         ),
         show_viewer=show_viewer,
     )
@@ -121,24 +128,122 @@ def test_restitution(n_envs, show_viewer):
         morph=gs.morphs.Plane(),
         material=material,
     )
+    spheres = []
+    for pos, sphere_material in (
+        ((0.0, 0.0, 0.3), material),
+        ((0.5, 0.0, 0.3), gs.materials.Rigid()),
+        ((1.0, 0.0, 1.0), gs.materials.Rigid()),
+        ((1.5, 0.0, 1.0), gs.materials.Rigid()),
+        ((2.0, 0.0, RADIUS - DEPTH), gs.materials.Rigid()),
+    ):
+        spheres.append(
+            scene.add_entity(
+                morph=gs.morphs.Sphere(
+                    pos=pos,
+                    radius=RADIUS,
+                ),
+                material=sphere_material,
+            )
+        )
+    scene.build(n_envs=n_envs)
+    sphere, sphere_set, sphere_capped, sphere_spun, sphere_deep = spheres
+
+    restitution_set = [0.1, 0.3] if n_envs else 0.1
+    sphere_set.set_geoms_restitution(restitution_set)
+    assert_allclose(sphere_set.get_geoms_restitution()[..., 0], restitution_set, tol=gs.EPS)
+    sphere_capped.set_links_max_linear_velocity(MAX_LINEAR_VELOCITY)
+    angular_damping = [1.0, 4.0] if n_envs else 1.0
+    sphere_spun.set_links_angular_damping(angular_damping)
+    sphere_spun.set_dofs_velocity([SPIN], dofs_idx_local=[5])
+    sphere_deep.set_links_max_depenetration_velocity(MAX_DEPENETRATION_VELOCITY)
+
+    scene.step()
+    assert_allclose(sphere_deep.get_dofs_velocity()[..., 2], MAX_DEPENETRATION_VELOCITY, tol=1e-4)
+    n_steps = 1
+    restitution_contact = 0.5 * (RESTITUTION + torch.tensor(restitution_set, dtype=gs.tc_float, device=gs.device))
+    vz_prev = torch.stack([sphere.get_dofs_velocity()[..., 2], sphere_set.get_dofs_velocity()[..., 2]])
+    vz_rebound = torch.zeros_like(vz_prev)
+    for _ in range(60):
+        scene.step()
+        n_steps += 1
+        vz = torch.stack([sphere.get_dofs_velocity()[..., 2], sphere_set.get_dofs_velocity()[..., 2]])
+        is_rebound = (vz > 0.0) & (vz_rebound == 0.0)
+        vz_rebound = torch.where(is_rebound, vz / (GRAVITY * DT - vz_prev), vz_rebound)
+        if (vz_rebound > 0.0).all():
+            break
+        vz_prev = vz
+    assert_allclose(vz_rebound[0], RESTITUTION, rtol=0.02)
+    assert_allclose(vz_rebound[1], restitution_contact, rtol=0.02)
+    assert_allclose(sphere_capped.get_dofs_velocity()[..., 2], -MAX_LINEAR_VELOCITY, tol=1e-5)
+    spin_decay = (1.0 - torch.tensor(angular_damping, dtype=gs.tc_float, device=gs.device) * DT) ** n_steps
+    assert_allclose(sphere_spun.get_dofs_velocity()[..., 5], SPIN * spin_decay, rtol=1e-4)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_step_options(n_envs, show_viewer):
+    # The step options change through the solver after the build. Without position correction a box released into
+    # the ground keeps its penetration, which 'baumgarte' then reduces by that fraction in one step. A restitution
+    # threshold above the impact speed of a bouncy sphere keeps it on the ground. The options themselves are fixed.
+    DT = 0.005
+    HALF_SIZE = 0.05
+    DEPTH = 0.01
+    BAUMGARTE = 0.2
+    RADIUS = 0.05
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=DT,
+        ),
+        rigid_options=gs.options.SteelOptions(),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.25, -1.5, 0.5),
+            camera_lookat=(0.25, 0.0, 0.05),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
+    box = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, HALF_SIZE - DEPTH),
+            size=(2 * HALF_SIZE, 2 * HALF_SIZE, 2 * HALF_SIZE),
+        ),
+    )
     sphere = scene.add_entity(
         morph=gs.morphs.Sphere(
-            pos=(0.0, 0.0, 0.3),
+            pos=(0.5, 0.0, RADIUS + 0.1),
             radius=RADIUS,
         ),
-        material=material,
+        material=gs.materials.Rigid(
+            restitution=1.0,
+        ),
     )
     scene.build(n_envs=n_envs)
 
-    vz_prev = sphere.get_dofs_velocity()[..., 2]
-    for _ in range(60):
+    rigid_solver = scene.rigid_solver
+    rigid_solver.baumgarte = 0.0
+    rigid_solver.restitution_velocity_threshold = 100.0
+    for _ in range(40):
         scene.step()
-        vz = sphere.get_dofs_velocity()[..., 2]
-        if (vz > 0.0).all():
-            break
-        vz_prev = vz
-    assert (vz > 0.0).all()
-    assert_allclose(vz, -RESTITUTION * (vz_prev - GRAVITY * DT), rtol=0.02)
+    assert_allclose(HALF_SIZE - box.get_pos()[..., 2], DEPTH, tol=1e-4)
+    assert_allclose(sphere.get_dofs_velocity()[..., 2], 0.0, tol=1e-3)
+
+    rigid_solver.baumgarte = BAUMGARTE
+    scene.step()
+    assert_allclose(HALF_SIZE - box.get_pos()[..., 2], DEPTH * (1.0 - BAUMGARTE), tol=1e-5)
+
+    with pytest.raises(gs.GenesisException):
+        scene.options.rigid.baumgarte = BAUMGARTE
+    with pytest.raises(gs.GenesisException):
+        rigid_solver.contact_warmstart_decay = -1.0
+    with pytest.raises(gs.GenesisException):
+        rigid_solver.relaxation = float("nan")
+    with pytest.raises(gs.GenesisException):
+        rigid_solver.velocity_drive_mode = "solve"
+    with pytest.raises(gs.GenesisException):
+        rigid_solver.contact_friction_gap_max = 0.01
 
 
 @pytest.mark.required
@@ -147,13 +252,16 @@ def test_joint_constraints(mimic_hinges, four_bar_linkage, pendulum, n_envs, sho
     # A position drive carries joint2 of the mimic hinges toward a target beyond its limit: the limit holds it at 45
     # degrees and the mimic equality keeps joint1 equal to it. A velocity limit bounds the speed of a pendulum falling
     # from upright. The loop closure of the four-bar linkage keeps the rocker tip on its anchor of the base, (0.2, 0, 0)
-    # in the base frame, while the crank spins.
+    # in the base frame, while the crank spins. At rest, the inbound joint of every link of the linkage carries the
+    # weight of the subtree of the link, whose moment about the center of mass of the link it balances.
+    GRAVITY = 9.81
     LIMIT = np.deg2rad(45.0)
     VELOCITY_LIMIT = 1.0
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=0.005,
+            gravity=(0.0, 0.0, -GRAVITY),
         ),
         rigid_options=gs.options.SteelOptions(
             enable_joint_limit=True,
@@ -184,6 +292,20 @@ def test_joint_constraints(mimic_hinges, four_bar_linkage, pendulum, n_envs, sho
         ),
     )
     scene.build(n_envs=n_envs)
+
+    links_pos = linkage.get_links_pos()
+    links_com = links_pos + gu.transform_by_quat(linkage.get_links_COM().expand_as(links_pos), linkage.get_links_quat())
+    links_weight = linkage.get_links_mass() * GRAVITY
+    scene.step()
+    links_parent_wrench = linkage.get_links_parent_wrench()
+    for i_l in range(linkage.get_link("base").idx_local, linkage.n_links):
+        subtree_weight = links_weight[i_l:]
+        lever = links_com[..., i_l:, :] - links_com[..., i_l : i_l + 1, :]
+        torque = torch.stack((lever[..., 1], -lever[..., 0]), dim=-1) * subtree_weight[:, None]
+        assert_allclose(links_parent_wrench[..., i_l, :2], 0.0, tol=1e-4)
+        assert_allclose(links_parent_wrench[..., i_l, 2], subtree_weight.sum(), tol=1e-4)
+        assert_allclose(links_parent_wrench[..., i_l, 3:5], torque.sum(dim=-2), tol=1e-4)
+        assert_allclose(links_parent_wrench[..., i_l, 5], 0.0, tol=1e-4)
 
     mimic.set_dofs_kp([0.0, 200.0])
     mimic.set_dofs_kv([0.0, 20.0])
@@ -264,7 +386,8 @@ def test_sleeping(n_envs, show_viewer):
 def test_contact_models(feature, yaw_puck, show_viewer):
     # With torsional friction, a puck under a yaw torque below MU * m * g * RADIUS keeps still and spins above it: its
     # footprint is too small for the friction of its corners alone to hold half that torque. With contact compliance, a
-    # resting box sinks by its weight over the stiffness of its four corner contacts, each the series of two springs.
+    # resting box sinks by its weight over the stiffness of its four corner contacts, each the series of two springs,
+    # the second box with the stiffness its geom is set to after the build.
     GRAVITY = 9.81
     MU = 0.5
     RADIUS = 0.02
@@ -321,6 +444,8 @@ def test_contact_models(feature, yaw_puck, show_viewer):
             )
         )
     scene.build()
+    if feature == "compliance":
+        bodies[1].set_geoms_contact_stiffness(2.0 * STIFFNESS)
 
     weight = bodies[0].get_mass() * GRAVITY
     for _ in range(60):
@@ -332,15 +457,17 @@ def test_contact_models(feature, yaw_puck, show_viewer):
         assert_allclose(bodies[0].get_dofs_velocity()[3], 0.0, atol=1e-3)
         assert bodies[1].get_dofs_velocity()[3] > 0.5
     else:
-        penetration = HALF_SIZE - bodies[0].get_pos()[2]
-        assert_allclose(penetration, weight / (4 * 0.5 * STIFFNESS), rtol=0.02)
+        for body, stiffness in zip(bodies, (0.5 * STIFFNESS, 2.0 / 3.0 * STIFFNESS)):
+            penetration = HALF_SIZE - body.get_pos()[2]
+            assert_allclose(penetration, weight / (4 * stiffness), rtol=0.02)
 
 
 @pytest.mark.required
 @pytest.mark.parametrize("n_envs", [0, 2])
 def test_constraint_capacity(n_envs, show_viewer):
     # Four boxes resting on the ground need 3 rows per corner contact, far more than the 8 free-body rows allowed: the
-    # rows beyond the capacity are dropped and reported, until a reset clears the status.
+    # rows beyond the capacity are dropped and reported, until a reset of the environment clears the status. A setter of
+    # the state keeps it.
     scene = gs.Scene(
         rigid_options=gs.options.SteelOptions(
             free_body_constraint_max=8,
@@ -355,12 +482,15 @@ def test_constraint_capacity(n_envs, show_viewer):
     scene.add_entity(
         morph=gs.morphs.Plane(),
     )
+    boxes = []
     for i_b in range(4):
-        scene.add_entity(
-            morph=gs.morphs.Box(
-                pos=(0.5 * i_b, 0.0, 0.049),
-                size=(0.1, 0.1, 0.1),
-            ),
+        boxes.append(
+            scene.add_entity(
+                morph=gs.morphs.Box(
+                    pos=(0.5 * i_b, 0.0, 0.049),
+                    size=(0.1, 0.1, 0.1),
+                ),
+            )
         )
     scene.build(n_envs=n_envs)
 
@@ -375,6 +505,11 @@ def test_constraint_capacity(n_envs, show_viewer):
     assert watermarks.free_body.high_water <= 8 < watermarks.free_body.raw_high_water
     assert watermarks.free_body.overflow_env_steps > 0
     assert watermarks.contact_high_water >= 16
+    boxes[0].set_dofs_velocity([0.1], dofs_idx_local=[0])
+    assert rigid_solver.constraint_overflow.all()
+    if n_envs:
+        rigid_solver.reset(envs_idx=[0])
+        assert_equal(rigid_solver.constraint_overflow, [False, True])
     scene.reset()
     assert not rigid_solver.constraint_overflow.any()
 

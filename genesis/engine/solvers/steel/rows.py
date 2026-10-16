@@ -126,7 +126,7 @@ def func_contact_restitution(
     e = gs.qd_float(0.0)
     for side in qd.static(range(2)):
         i_g = steel_contacts.shape0[i_c, i_b] if qd.static(side == 0) else steel_contacts.shape1[i_c, i_b]
-        e_g = steel_info.geoms_restitution[i_g]
+        e_g = steel_info.geoms_restitution[i_g, i_b]
         if not (qd.math.isnan(e_g) or qd.math.isinf(e_g)):
             e = e + qd.math.clamp(e_g, 0.0, 1.0)
     return 0.5 * e
@@ -577,9 +577,9 @@ def func_steel_allocate_rows(
                         i_l = steel_model.joints_link[i_j]
                         dof_start = steel_model.arts_dof_start[i_a]
                         for axis in range(6):
-                            limit = steel_info.links_max_linear_velocity[i_l]
+                            limit = steel_info.links_max_linear_velocity[i_l, i_b]
                             if axis >= 3:
-                                limit = steel_info.links_max_angular_velocity[i_l]
+                                limit = steel_info.links_max_angular_velocity[i_l, i_b]
                             is_active = limit > 0.0 and not qd.math.isinf(limit)
                             if fraction > 0.0:
                                 if qd.abs(steel_dyn.v_hat[dof_start + axis, i_b]) < fraction * limit:
@@ -825,12 +825,12 @@ def func_steel_build_rows(
                     sign = 1.0 if steel_free_rows.row_axis[i_r, i_b] % 2 == 0 else -1.0
                     J_lin = qd.Vector.zero(gs.qd_float, 3)
                     J_ang = qd.Vector.zero(gs.qd_float, 3)
-                    limit = steel_info.links_max_linear_velocity[i_l]
+                    limit = steel_info.links_max_linear_velocity[i_l, i_b]
                     if axis < 3:
                         J_lin[axis] = sign
                     else:
                         J_ang[axis - 3] = sign
-                        limit = steel_info.links_max_angular_velocity[i_l]
+                        limit = steel_info.links_max_angular_velocity[i_l, i_b]
                     steel_free_rows.body_a[i_r, i_b] = i_l
                     steel_free_rows.body_b[i_r, i_b] = -1
                     i_a = steel_model.links_art[i_l]
@@ -1128,9 +1128,9 @@ def func_steel_row_setup(
                         i_la = steel_free_rows.body_a[i_r, i_b]
                         i_lb = steel_free_rows.body_b[i_r, i_b]
                         if i_la >= 0:
-                            max_depenetration = steel_info.links_max_depenetration_velocity[i_la]
+                            max_depenetration = steel_info.links_max_depenetration_velocity[i_la, i_b]
                         if i_lb >= 0:
-                            v_b = steel_info.links_max_depenetration_velocity[i_lb]
+                            v_b = steel_info.links_max_depenetration_velocity[i_lb, i_b]
                             if v_b > 0.0 and not qd.math.isinf(v_b) and v_b < max_depenetration:
                                 max_depenetration = v_b
                         if max_depenetration > 0.0 and not qd.math.isinf(max_depenetration):

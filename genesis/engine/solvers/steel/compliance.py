@@ -30,10 +30,10 @@ def func_contact_compliance(
     """
     i_g0 = steel_contacts.shape0[i_c, i_b]
     i_g1 = steel_contacts.shape1[i_c, i_b]
-    k_a = steel_info.geoms_contact_stiffness[i_g0]
-    k_b = steel_info.geoms_contact_stiffness[i_g1]
-    c_a = steel_info.geoms_contact_damping[i_g0]
-    c_b = steel_info.geoms_contact_damping[i_g1]
+    k_a = steel_info.geoms_contact_stiffness[i_g0, i_b]
+    k_b = steel_info.geoms_contact_stiffness[i_g1, i_b]
+    c_a = steel_info.geoms_contact_damping[i_g0, i_b]
+    c_b = steel_info.geoms_contact_damping[i_g1, i_b]
     k = k_b
     c = c_b
     if k_b <= 0.0:

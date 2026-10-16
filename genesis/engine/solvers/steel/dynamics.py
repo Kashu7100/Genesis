@@ -877,7 +877,7 @@ def func_integrate_joint(
         r_new = (r + drdt * dt).normalized()
         x_com_new = p + gu.qd_transform_by_quat(r_ac, r) + v * dt
         p_new = x_com_new - gu.qd_transform_by_quat(r_ac, r_new)
-        w = w * (1.0 - steel_info.links_angular_damping[i_l] * dt)
+        w = w * (1.0 - steel_info.links_angular_damping[i_l, i_b] * dt)
         for k in qd.static(range(3)):
             steel_state.q[i_q + k, i_b] = p_new[k]
             steel_state.qd[i_d + k, i_b] = v[k]
@@ -1109,7 +1109,7 @@ def func_steel_publish_refined_velocity(
             i_j = steel_model.free_root_joints[i_r]
             i_d = steel_model.joints_dof_start[i_j]
             i_l = steel_model.joints_link[i_j]
-            scale = 1.0 - steel_info.links_angular_damping[i_l] * dt
+            scale = 1.0 - steel_info.links_angular_damping[i_l, i_b] * dt
             for k in qd.static(range(3, 6)):
                 steel_dyn.v_out[i_d + k, i_b] = steel_dyn.v_out[i_d + k, i_b] * scale
 
@@ -1208,8 +1208,7 @@ def kernel_steel_pull(
 ):
     """Load the joint state of the selected environments from the Genesis coordinates and velocities.
 
-    The inverse of func_steel_publish. The link poses and twists are evaluated from it, and the mass matrix of every
-    articulation is refreshed on the next step.
+    The inverse of func_steel_publish. The link poses and twists are evaluated from it.
     """
     n_joints = steel_model.joints_link.shape[0]
     qd.loop_config(serialize=qd.static(steel_config.para_level < gs.PARA_LEVEL.PARTIAL))
@@ -1249,4 +1248,3 @@ def kernel_steel_pull(
     for i_a, i_b_ in qd.ndrange(n_arts, envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
         func_eval_fk_articulation(i_a, i_b, dyn_state, steel_state, steel_dyn, dyn_info, steel_model, steel_config)
-        steel_state.arts_mass_update_requested[i_a, i_b] = 1

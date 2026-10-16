@@ -36,13 +36,23 @@ class StateChange(enum.Enum):
 
     Solver-agnostic: it names what kind of state changed, never an index space (links, dofs, particles, ...), which
     differs from one solver to the next. GEOMETRY is the kinematic configuration that places or deforms the world
-    surface (link poses, qpos, vertices). DYNAMICS is the velocity state. MODEL is the model parameters (mass,
-    inertia, friction, gains, limits, gravity).
+    surface (link poses, qpos, vertices). DYNAMICS is the velocity state. The model parameters split by what they
+    enter: INERTIA is the mass distribution (mass, center of mass and inertia of the links, armature of the degrees of
+    freedom), ACTUATION the joint-space force laws (drive gains and biases, force ranges, joint stiffness, damping and
+    friction loss, position and velocity limits), MATERIAL the contact material of the geometries (friction,
+    restitution, compliance) and MODEL every other model parameter (gravity, constraint solver parameters, equality
+    constraints). MODEL_CHANGES gathers the four.
     """
 
     GEOMETRY = enum.auto()
     DYNAMICS = enum.auto()
     MODEL = enum.auto()
+    INERTIA = enum.auto()
+    ACTUATION = enum.auto()
+    MATERIAL = enum.auto()
+
+
+MODEL_CHANGES = frozenset((StateChange.MODEL, StateChange.INERTIA, StateChange.ACTUATION, StateChange.MATERIAL))
 
 
 class MutatedLinks(enum.Enum):
