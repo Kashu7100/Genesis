@@ -11,6 +11,88 @@ from ..utils.assertions import assert_allclose, assert_equal
 
 
 @pytest.mark.required
+@pytest.mark.parametrize(
+    "steel_kwargs",
+    [
+        {},
+        {"friction_anchor_beta": 0.0},
+        {"solve_mode": "split", "enable_restitution": False},
+        {"articulated_contact_response": "propagation", "contact_warmstart": True},
+    ],
+)
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_contact_dynamics(steel_kwargs, n_envs, show_viewer):
+    # A box sliding at V0 decelerates at MU * g, a resting box is held by a contact force equal to its weight, and a
+    # sphere far above the ground falls freely under semi-implicit Euler: z_n = z_0 - g dt^2 n (n + 1) / 2.
+    GRAVITY = 9.81
+    DT = 0.005
+    MU = 0.5
+    V0 = 2.0
+    HALF_SIZE = 0.05
+    Z0 = 3.0
+    N_STEPS = 40
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=DT,
+            gravity=(0.0, 0.0, -GRAVITY),
+        ),
+        rigid_options=gs.options.SteelOptions(
+            **steel_kwargs,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.5, -2.5, 1.0),
+            camera_lookat=(0.5, 0.0, 0.2),
+        ),
+        show_viewer=show_viewer,
+    )
+    material = gs.materials.Rigid(
+        friction=MU,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+        material=material,
+    )
+    box_slide = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, HALF_SIZE),
+            size=(2 * HALF_SIZE, 2 * HALF_SIZE, 2 * HALF_SIZE),
+        ),
+        material=material,
+    )
+    box_rest = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(1.0, 0.0, HALF_SIZE),
+            size=(2 * HALF_SIZE, 2 * HALF_SIZE, 2 * HALF_SIZE),
+        ),
+        material=material,
+    )
+    sphere = scene.add_entity(
+        morph=gs.morphs.Sphere(
+            pos=(0.5, 1.0, Z0),
+            radius=HALF_SIZE,
+        ),
+        material=material,
+    )
+    scene.build(n_envs=n_envs)
+
+    box_slide.set_dofs_velocity([V0, 0.0, 0.0], dofs_idx_local=slice(0, 3))
+    support_forces = []
+    for _ in range(N_STEPS):
+        scene.step()
+        support_forces.append(box_rest.get_links_net_contact_force()[..., 0, 2])
+
+    t = N_STEPS * DT
+    assert_allclose(box_slide.get_dofs_velocity()[..., 0], V0 - MU * GRAVITY * t, atol=2e-3)
+    assert_allclose(box_slide.get_dofs_velocity()[..., 1:3], 0.0, atol=2e-3)
+    assert_allclose(box_rest.get_dofs_velocity(), 0.0, atol=2e-3)
+    # The contact force of a resting body fluctuates around its weight from one step to the next.
+    assert_allclose(torch.stack(support_forces[N_STEPS // 2 :]).mean(dim=0), box_rest.get_mass() * GRAVITY, rtol=0.01)
+    z_free_fall = Z0 - GRAVITY * DT**2 * N_STEPS * (N_STEPS + 1) / 2
+    assert_allclose(sphere.get_pos()[..., 2], z_free_fall, tol=gs.EPS * 10.0 + 1e-5)
+
+
+@pytest.mark.required
 @pytest.mark.parametrize("n_envs", [0, 2])
 def test_restitution(n_envs, show_viewer):
     # A sphere hitting the ground faster than the restitution threshold leaves it at RESTITUTION times its incident

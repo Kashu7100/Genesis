@@ -87,10 +87,23 @@ def func_point_in_geom_aabb(
 
 
 @qd.func
-def func_is_geom_aabbs_overlap(i_ga: int, i_gb: int, i_b: int, dyn_state: array_class.DynState):
+def func_is_geom_aabbs_overlap(
+    i_ga: int,
+    i_gb: int,
+    i_b: int,
+    dyn_state: array_class.DynState,
+    collider_info: array_class.ColliderInfo,
+    collider_static_config: qd.template(),
+):
+    """Return whether the bounding boxes of two geoms overlap, or lie closer than the contact gap when there is one."""
+    aabb_min_b = dyn_state.geoms.aabb_min[i_gb, i_b]
+    aabb_max_b = dyn_state.geoms.aabb_max[i_gb, i_b]
+    if qd.static(collider_static_config.has_contact_gap):
+        aabb_min_b = aabb_min_b - collider_info.contact_gap[None]
+        aabb_max_b = aabb_max_b + collider_info.contact_gap[None]
     return not (
-        (dyn_state.geoms.aabb_max[i_ga, i_b] <= dyn_state.geoms.aabb_min[i_gb, i_b]).any()
-        or (dyn_state.geoms.aabb_min[i_ga, i_b] >= dyn_state.geoms.aabb_max[i_gb, i_b]).any()
+        (dyn_state.geoms.aabb_max[i_ga, i_b] <= aabb_min_b).any()
+        or (dyn_state.geoms.aabb_min[i_ga, i_b] >= aabb_max_b).any()
     )
 
 

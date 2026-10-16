@@ -107,13 +107,16 @@ def _func_broad_phase_sap(
             I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
             env_n_geoms = env_n_geoms + dyn_info.links.geom_end[I_l] - dyn_info.links.geom_start[I_l]
 
-        # copy updated geom aabbs to buffer for sorting
+        # copy updated geom aabbs to buffer for sorting. Lowering the lower bounds by the contact gap makes the intervals
+        # of geoms closer than the gap overlap, as growing every interval by half of it would.
         if collider_state.first_time[i_b]:
             i_buffer = 0
             for i_l in range(n_links):
                 I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
                 for i_g in range(dyn_info.links.geom_start[I_l], dyn_info.links.geom_end[I_l]):
                     collider_state.sort_buffer.value[2 * i_buffer, i_b] = dyn_state.geoms.aabb_min[i_g, i_b][axis]
+                    if qd.static(collider_static_config.has_contact_gap):
+                        collider_state.sort_buffer.value[2 * i_buffer, i_b] -= collider_info.contact_gap[None]
                     collider_state.sort_buffer.i_g[2 * i_buffer, i_b] = i_g
                     collider_state.sort_buffer.is_max[2 * i_buffer, i_b] = False
 
@@ -139,6 +142,8 @@ def _func_broad_phase_sap(
                         collider_state.sort_buffer.value[i, i_b] = dyn_state.geoms.aabb_min[
                             collider_state.sort_buffer.i_g[i, i_b], i_b
                         ][axis]
+                        if qd.static(collider_static_config.has_contact_gap):
+                            collider_state.sort_buffer.value[i, i_b] -= collider_info.contact_gap[None]
             else:
                 for i in range(env_n_geoms * 2):
                     i_g = collider_state.sort_buffer.i_g[i, i_b]
@@ -147,6 +152,8 @@ def _func_broad_phase_sap(
                             collider_state.sort_buffer.value[i, i_b] = dyn_state.geoms.aabb_max[i_g, i_b][axis]
                         else:
                             collider_state.sort_buffer.value[i, i_b] = dyn_state.geoms.aabb_min[i_g, i_b][axis]
+                            if qd.static(collider_static_config.has_contact_gap):
+                                collider_state.sort_buffer.value[i, i_b] -= collider_info.contact_gap[None]
 
         # insertion sort, which has complexity near O(n) for nearly sorted array
         for i in range(1, 2 * env_n_geoms):
@@ -189,7 +196,9 @@ def _func_broad_phase_sap(
                         ):
                             continue
 
-                        if not func_is_geom_aabbs_overlap(i_ga, i_gb, i_b, dyn_state):
+                        if not func_is_geom_aabbs_overlap(
+                            i_ga, i_gb, i_b, dyn_state, collider_info, collider_static_config
+                        ):
                             # Clear collision normal cache if not in contact
                             if qd.static(
                                 collider_static_config.has_non_box_plane_convex_convex
@@ -248,7 +257,9 @@ def _func_broad_phase_sap(
                             ):
                                 continue
 
-                            if not func_is_geom_aabbs_overlap(i_ga, i_gb, i_b, dyn_state):
+                            if not func_is_geom_aabbs_overlap(
+                                i_ga, i_gb, i_b, dyn_state, collider_info, collider_static_config
+                            ):
                                 # Clear collision normal cache if not in contact
                                 if qd.static(
                                     collider_static_config.has_non_box_plane_convex_convex
@@ -287,7 +298,9 @@ def _func_broad_phase_sap(
                                 ):
                                     continue
 
-                                if not func_is_geom_aabbs_overlap(i_ga, i_gb, i_b, dyn_state):
+                                if not func_is_geom_aabbs_overlap(
+                                    i_ga, i_gb, i_b, dyn_state, collider_info, collider_static_config
+                                ):
                                     # Clear collision normal cache if not in contact
                                     if qd.static(collider_static_config.has_non_box_plane_convex_convex):
                                         i_pair = collider_info.collision_pair_idx[i_ga, i_gb]
@@ -375,7 +388,7 @@ def _func_broad_phase_all_vs_all(
         ):
             continue
 
-        if not func_is_geom_aabbs_overlap(i_ga, i_gb, i_b, dyn_state):
+        if not func_is_geom_aabbs_overlap(i_ga, i_gb, i_b, dyn_state, collider_info, collider_static_config):
             if qd.static(
                 collider_static_config.has_non_box_plane_convex_convex and not rigid_config.enable_mujoco_compatibility
             ):

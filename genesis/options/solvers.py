@@ -790,6 +790,14 @@ class SteelOptions(RigidOptions):
         'restitution_velocity_threshold'. Defaults to True.
     restitution_velocity_threshold : float, optional
         Minimum incident normal speed [m/s] for a rebound, so resting contacts do not bounce. Defaults to 0.5.
+    contact_gap : float, optional
+        Distance [m] between two geometries below which collision detection reports their contact before they touch,
+        with a positive gap (a negative penetration). Such a contact lets the bodies close the gap within the step but
+        not overlap, so resting bodies keep their contacts from one step to the next and fast bodies land without
+        sinking in. A larger value catches faster approaches, at the cost of more contacts, each one taking collision
+        detection work and rows of the row capacities, including contacts between nearby links of one articulation. 0
+        reports touching geometries only, which makes resting bodies lose and regain their contacts every few steps
+        and jitter. Defaults to 0.1.
     contact_speculative_scale : float, optional
         Fraction of a positive contact gap a contact may close within the step. Defaults to 1.0.
     contact_gap_gate : float, optional
@@ -898,6 +906,7 @@ class SteelOptions(RigidOptions):
     contact_warmstart_decay: NonNegativeFloat = 1.0
     enable_restitution: StrictBool = True
     restitution_velocity_threshold: NonNegativeFloat = 0.5
+    contact_gap: NonNegativeFloat = 0.1
     contact_speculative_scale: NonNegativeFloat = 1.0
     contact_gap_gate: NonNegativeFloat | None = None
     contact_friction_scale: NonNegativeFloat = 1.0
@@ -942,8 +951,12 @@ class SteelOptions(RigidOptions):
         rigid_only_set = [name for name in rigid_only_fields if name in self.model_fields_set]
         if rigid_only_set:
             gs.raise_exception(f"'SteelOptions' does not support the 'RigidOptions' fields {rigid_only_set}.")
-        if not np.isfinite((self.baumgarte, self.cfm, self.relaxation, self.contact_friction_scale)).all():
-            gs.raise_exception("'baumgarte', 'cfm', 'relaxation' and 'contact_friction_scale' must be finite.")
+        if not np.isfinite(
+            (self.baumgarte, self.cfm, self.relaxation, self.contact_friction_scale, self.contact_gap)
+        ).all():
+            gs.raise_exception(
+                "'baumgarte', 'cfm', 'relaxation', 'contact_friction_scale' and 'contact_gap' must be finite."
+            )
         if np.isnan(self.joint_limit_activation_gap) or self.joint_limit_activation_gap < 0.0:
             gs.raise_exception("'joint_limit_activation_gap' must be non-negative.")
         fraction = self.velocity_limit_activation_fraction

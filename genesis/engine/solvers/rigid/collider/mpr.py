@@ -275,6 +275,10 @@ def compute_support(
             v2 = v
 
     v = v1 - v2
+    if qd.static(collider_static_config.has_contact_gap):
+        # Support of the Minkowski difference grown by a sphere of radius the contact gap along the unit 'direction',
+        # the support points of each geom staying on its surface (see contact_gap in ColliderInfo)
+        v = v + collider_info.contact_gap[None] * direction
     return v, v1, v2
 
 
@@ -960,6 +964,9 @@ def func_mpr_contact_from_centers(
                 rigid_config,
                 collider_static_config,
             )
+    if qd.static(collider_static_config.has_contact_gap):
+        # The depth of the grown Minkowski difference exceeds the signed penetration of the geoms by the gap
+        penetration = penetration - collider_info.contact_gap[None]
     return is_col, normal, penetration, pos
 
 
