@@ -165,6 +165,28 @@ def test_batched_envs_are_independent(show_viewer):
 
 
 @pytest.mark.precision("64")
+def test_resetting_an_errored_environment_clears_its_error(show_viewer):
+    from genesis.utils.array_class import ErrorCode
+
+    scene = _mochi_scene(show_viewer, 0.02)
+    scene.add_entity(gs.morphs.Plane(), material=gs.materials.Mochi.Rigid())
+    scene.add_entity(gs.morphs.Box(size=(0.2, 0.2, 0.2), pos=(0.0, 0.0, 0.3)), material=gs.materials.Mochi.Rigid())
+    scene.build(n_envs=3)
+    state = scene.get_state()
+    solver = scene.mochi_solver
+    # Environment 1 diverged: the mask names it alone, and the next error check raises.
+    solver._errno.from_numpy(np.array([0, int(ErrorCode.MOCHI_DIVERGED), 0], dtype=gs.np_int))
+    assert tensor_to_array(solver.get_error_envs_mask()).tolist() == [False, True, False]
+    with pytest.raises(gs.GenesisException, match="diverged"):
+        solver.check_errno()
+    # Resetting it clears the error, so the other environments go on.
+    scene.reset(state=state, envs_idx=[1])
+    assert not tensor_to_array(solver.get_error_envs_mask()).any()
+    solver.check_errno()
+    scene.step()
+
+
+@pytest.mark.precision("64")
 @pytest.mark.parametrize("integrator", ["backward_euler", "bdf2"])
 @pytest.mark.parametrize("use_newton_euler_inertia", [False, True])
 def test_free_rotation_angular_momentum(integrator, use_newton_euler_inertia, show_viewer):

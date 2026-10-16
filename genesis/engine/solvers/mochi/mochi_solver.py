@@ -2328,6 +2328,15 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             )
         self._external_state_dirty_mask[tensor_to_array(envs_idx)] = False
         self._is_contacts_recorded = False
+        # A restored environment starts over: whatever error it raised (a diverged solve) is cleared, as the rigid
+        # solver clears its own, so that resetting the environments `get_error_envs_mask` names lets the others go on.
+        _kernel_clear_errno(envs_idx, self._errno)
+
+    def get_error_envs_mask(self):
+        """Mask (n_envs,) of the environments that raised an error since their last reset (a diverged solve, a
+        contact-capacity overflow). `check_errno` raises for any of them at the start of a later step unless they
+        are reset first."""
+        return qd_to_torch(self._errno) > 0
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- contact API ------------------------------------
@@ -3020,6 +3029,12 @@ def _kernel_activate_all_envs(mochi_state: MochiState, rigid_config: qd.template
     for i_b in range(mochi_state.is_active.shape[0]):
         mochi_state.is_active[i_b] = True
         mochi_state.ls_is_done[i_b] = False
+
+
+@qd.kernel
+def _kernel_clear_errno(envs_idx: qd.types.ndarray(), errno: qd.Tensor):
+    for i_b_ in range(envs_idx.shape[0]):
+        errno[envs_idx[i_b_]] = 0
 
 
 @qd.kernel
