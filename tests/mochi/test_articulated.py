@@ -241,3 +241,31 @@ def test_double_pendulum_matches_mochi(double_pendulum_urdf_path, show_viewer):
     # Revolute joint velocities are exact angle rates, as mochi reports them since it dropped the sine-based finite
     # difference sin(dq) / dt that the reference recorded.
     assert_allclose(velocities, np.arcsin(reference["velocities"] * dt) / dt, atol=1e-6, rtol=0.0)
+
+
+@pytest.mark.required
+def test_static_collider_after_articulated_body_is_placed(double_pendulum_urdf_path, show_viewer):
+    # The table is the third kinematic root but not the third link: the pendulum's two links come before it.
+    scene = _mochi_scene(show_viewer, 0.01, n_newton_iterations=6)
+    scene.add_entity(gs.morphs.Plane(), material=gs.materials.Mochi.Rigid())
+    scene.add_entity(
+        gs.morphs.URDF(file=double_pendulum_urdf_path, pos=(3.0, 0.0, 3.0), fixed=True, default_armature=0.0),
+        material=gs.materials.Mochi.Rigid(),
+    )
+    table = scene.add_entity(
+        gs.morphs.Box(size=(1.0, 1.0, 0.2), pos=(0.0, 0.0, 0.1), fixed=True),
+        material=gs.materials.Mochi.Rigid(collider_type="sdf"),
+    )
+    sphere = scene.add_entity(gs.morphs.Sphere(radius=0.1, pos=(0.0, 0.0, 0.5)), material=gs.materials.Mochi.Rigid())
+    scene.build()
+
+    # The table's grid collider stands where the table is from the build on.
+    distances, _, is_valid = scene.mochi_solver.get_collider_distances(
+        table.geoms[0].idx, [[0.0, 0.0, 0.2], [0.0, 0.0, 0.3]]
+    )
+    assert bool(is_valid.all())
+    assert_allclose(distances, [0.0, 0.1], atol=1e-3)
+    # A sphere dropped on it comes to rest on its top (z = 0.2), not on the floor under it.
+    for _ in range(100):
+        scene.step()
+    assert -3e-3 < sphere.get_pos()[2].item() - 0.3 < 1e-3
