@@ -200,6 +200,14 @@ def qd_rotvec_to_quat_grad_rotvec(rotvec, eps, out_grad):
 
 
 @qd.func
+def qd_axis_angle_to_quat(axis, angle):
+    """Return the quaternion of the rotation by angle about axis, exact for any angle and unnormalized."""
+    half = 0.5 * angle
+    s = qd.sin(half)
+    return qd.Vector([qd.cos(half), axis[0] * s, axis[1] * s, axis[2] * s], dt=gs.qd_float)
+
+
+@qd.func
 def qd_quat_to_R(quat, eps):
     """
     Converts quaternion to 3x3 rotation matrix.

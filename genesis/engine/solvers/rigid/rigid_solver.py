@@ -1412,6 +1412,27 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             gs.raise_exception("Invalid constraint forces causing 'nan'. Please decrease Rigid simulation timestep.")
         if errno & array_class.ErrorCode.INVALID_ACC_NAN:
             gs.raise_exception("Invalid accelerations causing 'nan'. Please decrease Rigid simulation timestep.")
+        if errno & array_class.ErrorCode.STEEL_ROWS_DROPPED:
+            gs.raise_exception(
+                "Steel dropped constraint rows for lack of capacity, which contact torsion and contact compliance do "
+                "not tolerate. Please increase the value of SteelOptions' 'articulation_constraint_max' or "
+                "'free_body_constraint_max'."
+            )
+        if errno & array_class.ErrorCode.STEEL_TORSION_ROWS_OVERFLOW:
+            gs.raise_exception(
+                "Steel contact torsion rows exceed the row capacity. Please increase the value of SteelOptions' "
+                "'articulation_constraint_max'."
+            )
+        if errno & array_class.ErrorCode.STEEL_TORSION_PATCH_RING:
+            gs.raise_exception(
+                "The load ring of a Steel friction patch does not match its contact torsion group. This is a "
+                "solver-internal error, please report it."
+            )
+        if errno & array_class.ErrorCode.STEEL_COMPLIANCE_INVALID:
+            gs.raise_exception(
+                "A Steel compliant contact has a compliance or a bias beyond the float32 range, or no response. Please "
+                "increase the 'contact_stiffness' of the rigid materials or the simulation timestep."
+            )
 
     def _kernel_detect_collision(self):
         self.collider.clear()
