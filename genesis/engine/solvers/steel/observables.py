@@ -9,8 +9,8 @@ import genesis.utils.array_class as array_class
 from .rows import CONTACT_PATH, func_contact_tangent_basis
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_contact_forces(
+@qd.func
+def func_steel_contact_forces(
     dt: float,
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
@@ -96,8 +96,8 @@ def func_accumulate_row_watermarks(
         qd.atomic_add(row_watermarks[base + 4], 1)
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_update_status(
+@qd.func
+def func_steel_update_status(
     collider_state: array_class.ColliderState,
     steel_rows: array_class.SteelRows,
     steel_free_rows: array_class.SteelFreeRows,

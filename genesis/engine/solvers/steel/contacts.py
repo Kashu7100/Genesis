@@ -72,8 +72,8 @@ def func_pair_lower_bound(
     return lo
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_match_contacts(
+@qd.func
+def func_steel_match_contacts(
     steel_state: array_class.SteelState,
     steel_contacts: array_class.SteelContacts,
     steel_contact_history: array_class.SteelContactHistory,
@@ -187,8 +187,8 @@ def func_transport_warmstart_contact(
             impulses[slot + 2, i_b] = tangent[1]
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_gather_warmstart(
+@qd.func
+def func_steel_gather_warmstart(
     route: int,
     dt: float,
     count: qd.Tensor,
@@ -255,8 +255,8 @@ def kernel_steel_gather_warmstart(
             )
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_warmstart_velocity(
+@qd.func
+def func_steel_warmstart_velocity(
     steel_rows: array_class.SteelRows,
     steel_free_rows: array_class.SteelFreeRows,
     steel_dyn: array_class.SteelDynamics,
@@ -298,8 +298,8 @@ def kernel_steel_warmstart_velocity(
                     steel_dyn.v_out[dof_start + 3 + k, i_b] = steel_dyn.v_out[dof_start + 3 + k, i_b] + delta_ang[k]
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_snapshot_warmstart_rows(
+@qd.func
+def func_steel_snapshot_warmstart_rows(
     count: qd.Tensor,
     row_type: qd.Tensor,
     row_parent: qd.Tensor,
@@ -325,8 +325,8 @@ def kernel_steel_snapshot_warmstart_rows(
         prev_row_parent[i_r, i_b] = row_parent[i_r, i_b]
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_snapshot_warmstart(
+@qd.func
+def func_steel_snapshot_warmstart(
     dt: float,
     steel_state: array_class.SteelState,
     steel_contacts: array_class.SteelContacts,

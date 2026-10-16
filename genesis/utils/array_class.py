@@ -3751,18 +3751,23 @@ class SteelStaticConfig(metaclass=AutoInitMeta):
     has_free_and_articulated_bodies: bool
     has_friction_anchors: bool
     has_contact_warmstart: bool
+    has_warmstart_decay: bool
     has_sorted_contacts: bool
     contact_shared_anchor: bool
     contact_friction_shared_anchor: bool
     has_mimics: bool
     has_connects: bool
+    has_preelim: bool
     has_preelim_mimics: bool
     has_fused_velocity_limits: bool
     has_free_velocity_limits: bool
     has_propagation: bool
+    has_internal_rows: bool
+    has_velocity_limit_rows: bool
     propagation_same_articulation_rows: bool
     has_torsion: bool
     has_compliance: bool
+    has_sleeping: bool
     sleep_skip_constraints: bool
     has_row_watermark: bool
     preelim_max_rows: int

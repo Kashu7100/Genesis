@@ -49,8 +49,8 @@ def func_split_accumulate_rhs(
             steel_rows.rhs[i_r, i_b] = steel_rows.rhs[i_r, i_b] + jv
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_split_setup(
+@qd.func
+def func_steel_split_setup(
     steel_contacts: array_class.SteelContacts,
     steel_rows: array_class.SteelRows,
     steel_split: array_class.SteelSplit,
@@ -271,8 +271,8 @@ def func_split_free_sweeps(
                     func_free_apply_impulse(i_r, i_b, new - old, steel_free_rows, steel_dyn)
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_split_solve(
+@qd.func
+def func_steel_split_solve(
     n_iterations: int,
     friction_start_iteration: int,
     steel_contacts: array_class.SteelContacts,

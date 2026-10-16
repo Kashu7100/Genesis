@@ -11,69 +11,74 @@ from genesis.options.solvers import SteelOptions
 from genesis.utils.misc import qd_to_numpy, qd_to_torch, tensor_to_array
 
 from ..base_solver import StateChange, Subscriber, mutates
-from ..rigid.abd.forward_kinematics import kernel_forward_kinematics_links_geoms, kernel_forward_velocity
-from ..rigid.rigid_solver import RigidSolver, kernel_substep_collision
-from .contacts import (
-    kernel_steel_gather_warmstart,
-    kernel_steel_match_contacts,
-    kernel_steel_reset_warmstart,
-    kernel_steel_snapshot_warmstart,
-    kernel_steel_snapshot_warmstart_rows,
-    kernel_steel_warmstart_velocity,
+from ..rigid.abd.forward_kinematics import (
+    func_forward_velocity,
+    func_update_cartesian_space,
+    kernel_forward_kinematics_links_geoms,
+    kernel_forward_velocity,
 )
-from .compliance import kernel_steel_compliance_rows
+from ..rigid.rigid_solver import RigidSolver, kernel_substep_collision
+from .compliance import func_steel_compliance_rows
+from .contacts import (
+    func_steel_gather_warmstart,
+    func_steel_match_contacts,
+    func_steel_snapshot_warmstart,
+    func_steel_snapshot_warmstart_rows,
+    func_steel_warmstart_velocity,
+    kernel_steel_reset_warmstart,
+)
 from .dynamics import (
-    kernel_steel_cartesian_space,
-    kernel_steel_fk_id,
-    kernel_steel_forward_kinematics,
-    kernel_steel_inputs,
-    kernel_steel_integrate,
-    kernel_steel_mass_matrix,
-    kernel_steel_prescale_velocity,
-    kernel_steel_publish,
-    kernel_steel_publish_refined_velocity,
+    func_steel_fk_id,
+    func_steel_forward_kinematics,
+    func_steel_inputs,
+    func_steel_integrate,
+    func_steel_mass_matrix,
+    func_steel_prescale_velocity,
+    func_steel_publish,
+    func_steel_publish_refined_velocity,
+    func_steel_tau,
+    func_steel_unconstrained,
     kernel_steel_pull,
-    kernel_steel_tau,
-    kernel_steel_unconstrained,
 )
 from .friction_patches import (
-    kernel_steel_build_patches,
-    kernel_steel_finish_patch_impulses,
-    kernel_steel_link_patch_rows,
-    kernel_steel_prepare_patches,
+    func_steel_build_patches,
+    func_steel_finish_patch_impulses,
+    func_steel_link_patch_rows,
+    func_steel_prepare_patches,
+    func_steel_seed_patch_impulses,
+    func_steel_store_patches,
     kernel_steel_reset_patches,
-    kernel_steel_seed_patch_impulses,
-    kernel_steel_store_patches,
 )
 from .model import STEEL_JOINT_TYPE, build_steel_model_plan
-from .observables import kernel_steel_contact_forces, kernel_steel_reset_status, kernel_steel_update_status
-from .pgs import kernel_steel_pgs
+from .observables import func_steel_contact_forces, func_steel_update_status, kernel_steel_reset_status
+from .pgs import func_pgs_sweeps
 from .propagation import (
-    kernel_steel_propagation_build_rows,
-    kernel_steel_propagation_color,
-    kernel_steel_propagation_factor,
-    kernel_steel_propagation_propagate,
-    kernel_steel_propagation_refresh,
-    kernel_steel_propagation_row_setup,
-    kernel_steel_propagation_sweep,
-    kernel_steel_propagation_velocity_pass_rhs,
-    kernel_steel_propagation_warmstart,
+    func_propagation_propagate_articulation,
+    func_propagation_refresh_articulation,
+    func_propagation_sweep,
+    func_propagation_warmstart,
+    func_steel_propagation_build_rows,
+    func_steel_propagation_color,
+    func_steel_propagation_factor,
+    func_steel_propagation_refresh,
+    func_steel_propagation_row_setup,
+    func_steel_propagation_velocity_pass_rhs,
 )
 from .rows import (
     CONTACT_PATH,
-    kernel_steel_allocate_drive_rows,
-    kernel_steel_allocate_rows,
-    kernel_steel_build_rows,
+    func_steel_allocate_drive_rows,
+    func_steel_allocate_rows,
+    func_steel_build_rows,
+    func_steel_preelim,
+    func_steel_preelim_project_velocity,
+    func_steel_responses,
+    func_steel_row_setup,
+    func_steel_velocity_pass_rhs,
     kernel_steel_gather_contacts,
-    kernel_steel_preelim,
-    kernel_steel_preelim_project_velocity,
-    kernel_steel_responses,
-    kernel_steel_row_setup,
-    kernel_steel_velocity_pass_rhs,
 )
-from .sleeping import kernel_steel_sleep_begin, kernel_steel_sleep_finish, kernel_steel_sleep_wake
-from .split import kernel_steel_split_setup, kernel_steel_split_solve
-from .torsion import kernel_steel_torsion_rows, kernel_steel_torsion_velocity_pass
+from .sleeping import func_steel_sleep_begin, func_steel_sleep_finish, kernel_steel_sleep_wake
+from .split import func_steel_split_setup, func_steel_split_solve
+from .torsion import func_steel_torsion_rows, func_steel_torsion_velocity_pass
 
 if TYPE_CHECKING:
     from genesis.engine.scene import Scene
@@ -131,19 +136,6 @@ class SteelRowWatermarks(NamedTuple):
     free_body: SteelRowFamilyWatermarks
     propagation: SteelRowFamilyWatermarks
     contact_high_water: int
-
-
-class SteelRowFamily(NamedTuple):
-    """A family of rows that can hold contact rows, with the snapshot of its rows the warm start of the next step reads.
-
-    route is the CONTACT_PATH of its contacts, rows the SteelRows, SteelFreeRows or SteelPropagation holding the rows.
-    """
-
-    route: CONTACT_PATH
-    rows: array_class.SteelRows | array_class.SteelFreeRows | array_class.SteelPropagation
-    prev_impulses: qd.Tensor
-    prev_row_type: qd.Tensor
-    prev_row_parent: qd.Tensor
 
 
 class SteelSolver(RigidSolver):
@@ -280,7 +272,6 @@ class SteelSolver(RigidSolver):
         self._steel_geoms_restitution = None
         self._steel_dofs_velocity_limit = None
         self._steel_propagation_active = False
-        self._steel_row_families: list[SteelRowFamily] = []
         # SteelOverflow bits already reported by a warning, each family warning once per solver.
         self._steel_overflow_warned = 0
         self._steel_geoms_is_torsion_supported = None
@@ -385,11 +376,13 @@ class SteelSolver(RigidSolver):
             ),
             has_friction_anchors=self._steel_friction_anchor_beta > 0.0,
             has_contact_warmstart=options.contact_warmstart,
+            has_warmstart_decay=options.contact_warmstart_decay > 0.0,
             has_sorted_contacts=options.contact_warmstart
             or self.collider.collider_config.has_non_box_plane_convex_convex,
             contact_shared_anchor=options.contact_shared_anchor,
             contact_friction_shared_anchor=options.contact_friction_shared_anchor,
             has_mimics=self._steel_plan.n_mimics > 0,
+            has_preelim=self._steel_n_preelim > 0,
             has_preelim_mimics=(
                 self._steel_n_preelim > 0
                 and options.bilateral_preelimination_include_mimics
@@ -399,9 +392,20 @@ class SteelSolver(RigidSolver):
             has_fused_velocity_limits=self.velocity_limits_fused,
             has_free_velocity_limits=self._has_free_velocity_limits,
             has_propagation=self._steel_propagation_active,
+            has_internal_rows=(
+                options.drive_mode == "rows"
+                or options.enable_joint_limit
+                or self._steel_plan.n_mimics > 0
+                or self._steel_plan.n_connects > 0
+            ),
+            has_velocity_limit_rows=(
+                options.enable_joint_velocity_limits or self.velocity_limits_fused or self._has_free_velocity_limits
+            )
+            and np.isfinite(options.velocity_limit_activation_fraction),
             propagation_same_articulation_rows=options.propagation_same_articulation_rows,
             has_torsion=options.enable_torsional_friction,
             has_compliance=options.contact_compliance,
+            has_sleeping=options.enable_sleeping,
             sleep_skip_constraints=options.enable_sleeping and options.sleep_skip_constraints,
             has_row_watermark=options.row_watermark,
             preelim_max_rows=array_class.PREELIM_MAX_ROWS,
@@ -421,37 +425,6 @@ class SteelSolver(RigidSolver):
         self.steel_split = array_class.get_steel_split(self)
         self.steel_prop = array_class.get_steel_propagation(self)
         self.steel_contact_history = array_class.get_steel_contact_history(self, max_contacts)
-        history = self.steel_contact_history
-        self._steel_row_families.clear()
-        self._steel_row_families.append(
-            SteelRowFamily(
-                CONTACT_PATH.DENSE,
-                self.steel_rows,
-                history.dense_impulses,
-                history.dense_row_type,
-                history.dense_row_parent,
-            )
-        )
-        if self._steel_plan.has_free_rigid_bodies:
-            self._steel_row_families.append(
-                SteelRowFamily(
-                    CONTACT_PATH.FREE,
-                    self.steel_free_rows,
-                    history.free_impulses,
-                    history.free_row_type,
-                    history.free_row_parent,
-                )
-            )
-        if self._steel_propagation_active:
-            self._steel_row_families.append(
-                SteelRowFamily(
-                    CONTACT_PATH.PROPAGATION,
-                    self.steel_prop,
-                    history.propagation_impulses,
-                    history.propagation_row_type,
-                    history.propagation_row_parent,
-                )
-            )
         self.steel_sleep = self._build_sleep_state()
         self.steel_status = array_class.get_steel_status(self)
         self._refresh_steel_materials()
@@ -749,21 +722,6 @@ class SteelSolver(RigidSolver):
         )
 
     @property
-    def _has_internal_rows(self) -> bool:
-        """Whether drive, joint-limit, mimic or loop-closure rows can exist."""
-        options = self._options
-        plan = self._steel_plan
-        return options.drive_mode == "rows" or options.enable_joint_limit or plan.n_mimics > 0 or plan.n_connects > 0
-
-    @property
-    def _has_velocity_limit_rows(self) -> bool:
-        """Whether joint or free-body velocity-limit rows, or fused drive clamps, can exist."""
-        options = self._options
-        return (
-            options.enable_joint_velocity_limits or self.velocity_limits_fused or self._has_free_velocity_limits
-        ) and np.isfinite(options.velocity_limit_activation_fraction)
-
-    @property
     def constraint_overflow(self) -> torch.Tensor:
         """Whether every environment lost constraint rows or contacts for lack of capacity since its last reset."""
         return qd_to_torch(self.steel_status.envs_overflow) != 0
@@ -812,185 +770,119 @@ class SteelSolver(RigidSolver):
                     f"'{option}' (see SteelSolver.check_constraint_capacity)."
                 )
 
-    def _steel_link_patch_rows(self) -> None:
-        """Chain the normal rows of every friction patch region into a ring and share its friction coefficient, in every
-        row family (see friction_patches.py)."""
-        for family in self._steel_row_families:
-            kernel_steel_link_patch_rows(
-                int(family.route), family.rows.row_parent, family.rows.row_mu, self.steel_contacts, self.steel_config
-            )
-
-    def _steel_gather_warmstart(self, family: SteelRowFamily, dt: float) -> None:
-        """Seed the rows of the matched contacts of one row family from the last step (see contacts.py)."""
-        rows = family.rows
-        kernel_steel_gather_warmstart(
-            int(family.route),
-            dt,
-            rows.count,
-            rows.row_type,
-            rows.row_parent,
-            rows.row_mu,
-            rows.impulses,
-            family.prev_impulses,
-            family.prev_row_type,
-            family.prev_row_parent,
-            self.steel_contacts,
-            self.steel_contact_history,
-            self.steel_info,
-            self.steel_config,
-        )
-
-    def _launch_pgs_solve(
-        self, rhs_dense, rhs_free, rhs_propagation, n_iterations, *, regularize, freeze_drive_rows, friction_start
-    ):
-        """Run n_iterations Gauss-Seidel sweeps in the row order of 'row_schedule'.
-
-        'interleaved' sweeps every row family in each iteration. 'contact_then_internal' runs every iteration of the
-        contact rows first, then every iteration of the internal rows and the velocity limits. 'phased' solves, in each
-        iteration, the internal rows, then the contact rows, then the velocity limits. A propagation response follows
-        its own schedule (see _launch_propagation_solve).
-        """
-        if n_iterations <= 0:
-            return
-        if self._steel_propagation_active:
-            self._launch_propagation_solve(
-                rhs_dense,
-                rhs_free,
-                rhs_propagation,
-                n_iterations,
-                regularize=regularize,
-                freeze_drive_rows=freeze_drive_rows,
-                friction_start=friction_start,
-            )
-            return
-        options = self._options
-        args = (self.steel_rows, self.steel_free_rows, self.steel_dyn, self.steel_info, self.steel_config)
-        if options.row_schedule == "contact_then_internal":
-            for row_phase in (1, 2):
-                kernel_steel_pgs(
-                    n_iterations,
-                    0,
-                    friction_start,
-                    row_phase,
-                    regularize,
-                    freeze_drive_rows,
-                    rhs_dense,
-                    rhs_free,
-                    *args,
-                )
-        elif options.row_schedule == "phased":
-            for i_iter in range(n_iterations):
-                if self._has_internal_rows:
-                    kernel_steel_pgs(
-                        1, i_iter, friction_start, 3, regularize, freeze_drive_rows, rhs_dense, rhs_free, *args
-                    )
-                kernel_steel_pgs(
-                    1, i_iter, friction_start, 4, regularize, freeze_drive_rows, rhs_dense, rhs_free, *args
-                )
-                if self._has_velocity_limit_rows:
-                    kernel_steel_pgs(
-                        1, i_iter, friction_start, 5, regularize, freeze_drive_rows, rhs_dense, rhs_free, *args
-                    )
-        else:
-            kernel_steel_pgs(
-                n_iterations, 0, friction_start, 0, regularize, freeze_drive_rows, rhs_dense, rhs_free, *args
-            )
-
-    # ------------------------------------------------------------------------------------------------------------------
-    # Propagation articulated contact responses (see steel/propagation.py)
-    # ------------------------------------------------------------------------------------------------------------------
-
-    def _propagation_setup(self, dt: float) -> None:
-        """Factor the articulations, compute the link responses and twists, then the responses and biases of the rows.
-
-        Runs once the solve velocity v_out holds the unconstrained prediction of the step.
-        """
-        kernel_steel_propagation_factor(
-            self.steel_state,
-            self.steel_free_rows,
-            self.steel_prop,
-            self.steel_dyn,
-            self.dyn_info,
-            self.rigid_info,
-            self.steel_info,
-            self.steel_model,
-            self.steel_config,
-        )
-        kernel_steel_propagation_refresh(
-            self.steel_prop, self.steel_dyn, self.steel_model, self.steel_config, refresh_all=True
-        )
-        kernel_steel_propagation_row_setup(
-            dt, self.steel_prop, self.steel_dyn, self.steel_info, self.steel_model, self.steel_config
-        )
-
-    def _launch_propagation_solve(
-        self, rhs_dense, rhs_free, rhs_propagation, n_iterations, *, regularize, freeze_drive_rows, friction_start
-    ):
-        """Run n_iterations iterations of a propagation response.
-
-        Every iteration solves the internal rows (drive, joint-limit and mimic rows), the dense and free-body contact
-        rows, then refreshes the link twists, sweeps the propagation rows, propagates their impulses through the trees,
-        and solves the velocity limits last. With 'contact_then_internal' the iterations leave out the internal rows
-        and the velocity limits, which follow in iterations of their own. 'propagation_fused' recomputes every link
-        twist before each sweep, the others only those an earlier row family of the iteration can have moved.
-        """
-        options = self._options
-        has_internal_rows = self._has_internal_rows
-        has_velocity_limit_rows = self._has_velocity_limit_rows
-        is_contact_then_internal = options.row_schedule == "contact_then_internal"
-        is_refresh_forced = (
-            options.articulated_contact_response == "propagation_fused"
-            or is_contact_then_internal
-            or has_internal_rows
-            or has_velocity_limit_rows
-        )
-        args = (self.steel_rows, self.steel_free_rows, self.steel_dyn, self.steel_info, self.steel_config)
-        for i_iter in range(n_iterations):
-            if has_internal_rows and not is_contact_then_internal:
-                kernel_steel_pgs(
-                    1, i_iter, friction_start, 3, regularize, freeze_drive_rows, rhs_dense, rhs_free, *args
-                )
-            kernel_steel_pgs(1, i_iter, friction_start, 4, regularize, freeze_drive_rows, rhs_dense, rhs_free, *args)
-            kernel_steel_propagation_refresh(
-                self.steel_prop, self.steel_dyn, self.steel_model, self.steel_config, is_refresh_forced
-            )
-            kernel_steel_propagation_sweep(
-                i_iter, friction_start, rhs_propagation, self.steel_prop, self.steel_info, self.steel_config, regularize
-            )
-            kernel_steel_propagation_propagate(self.steel_prop, self.steel_dyn, self.steel_model, self.steel_config)
-            if has_velocity_limit_rows and not is_contact_then_internal:
-                kernel_steel_pgs(
-                    1, i_iter, friction_start, 5, regularize, freeze_drive_rows, rhs_dense, rhs_free, *args
-                )
-        if is_contact_then_internal and (has_internal_rows or has_velocity_limit_rows):
-            kernel_steel_pgs(
-                n_iterations, 0, friction_start, 2, regularize, freeze_drive_rows, rhs_dense, rhs_free, *args
-            )
-
     def _steel_advance(self, dt: float) -> None:
-        """Advance the Steel state by one step of duration dt and write it back to the Genesis state."""
+        """Advance the Steel state by one step of duration dt and write it back to the Genesis state.
+
+        The contacts of the step are gathered first (see _steel_gather_contacts), then kernel_steel_step runs the step.
+        With velocity iterations, it stops after the row setup and the position solve, the velocity pass and the end of
+        the step follow in kernels of their own.
+        """
         options = self._options
         # The augmented mass matrix depends on dt through the implicit drive terms.
         is_dt_changed = self._steel_last_dt is not None and abs(self._steel_last_dt - dt) > 1.0e-8
         self._steel_last_dt = dt
         global_refresh = self._steel_step % options.update_mass_matrix_interval == 0 or is_dt_changed
-
-        # Drive rows come first in the row order and must exist before the velocity scaling of stage 1.
-        kernel_steel_allocate_drive_rows(
-            self.dyn_state, self.steel_rows, self.dyn_info, self.rigid_info, self.steel_model, self.steel_config
+        n_friction_iterations = options.contact_friction_position_iterations
+        friction_start = (
+            0 if n_friction_iterations < 0 else options.iterations - min(n_friction_iterations, options.iterations)
         )
 
-        # The contacts of the step are gathered with its inputs, before the dynamics: the sleeping islands of the step
-        # are built from them.
-        kernel_steel_inputs(
-            self.dyn_state, self.steel_state, self.steel_dyn, self.dyn_info, self.steel_model, self.steel_config
-        )
+        # The contacts are gathered from the poses the step starts from, which only the last stage of the step changes.
         self._steel_gather_contacts()
-        if options.enable_sleeping:
-            kernel_steel_sleep_begin(
+        regularize = self._steel_contact_w < 1.0
+        kernel_steel_step(
+            dt,
+            options.iterations,
+            friction_start,
+            self.dyn_state,
+            self.collider.collider_state,
+            self.steel_state,
+            self.steel_contacts,
+            self.steel_contact_history,
+            self.steel_patch_frame,
+            self.steel_patch_history,
+            self.steel_torsion_witnesses,
+            self.steel_rows,
+            self.steel_free_rows,
+            self.steel_prop,
+            self.steel_split,
+            self.steel_dyn,
+            self.steel_sleep,
+            self.steel_status,
+            self.dyn_info,
+            self.rigid_info,
+            self.steel_patch_geometry,
+            self.steel_info,
+            self.steel_model,
+            self.rigid_config,
+            self.steel_config,
+            PREELIM_REG_REL,
+            max(options.cfm, PREELIM_REG_FLOOR_MIN),
+            options.sleep_linear_threshold,
+            options.sleep_angular_threshold,
+            options.sleep_quiet_time,
+            global_refresh,
+            regularize,
+            self._errno,
+        )
+        if options.velocity_iterations > 0:
+            # Both solves launch the one compiled solve kernel, whose instance would otherwise compile twice.
+            kernel_steel_solve(
+                options.iterations,
+                friction_start,
+                self.steel_rows.rhs,
+                self.steel_free_rows.rhs,
+                self.steel_prop.rhs,
+                self.steel_rows,
+                self.steel_free_rows,
+                self.steel_prop,
+                self.steel_dyn,
+                self.steel_info,
+                self.steel_model,
+                self.steel_config,
+                options.contact_warmstart,
+                regularize,
+                freeze_drive_rows=False,
+            )
+            kernel_steel_velocity_pass(
+                dt,
+                self.steel_rows,
+                self.steel_free_rows,
+                self.steel_prop,
+                self.steel_dyn,
+                self.steel_info,
+                self.steel_model,
+                self.steel_config,
+            )
+            kernel_steel_solve(
+                options.velocity_iterations,
+                friction_start_iteration=0,
+                rhs_dense=self.steel_rows.rhs_unbiased,
+                rhs_free=self.steel_free_rows.rhs_unbiased,
+                rhs_propagation=self.steel_prop.rhs_unbiased,
+                steel_rows=self.steel_rows,
+                steel_free_rows=self.steel_free_rows,
+                steel_prop=self.steel_prop,
+                steel_dyn=self.steel_dyn,
+                steel_info=self.steel_info,
+                steel_model=self.steel_model,
+                steel_config=self.steel_config,
+                propagate_warmstart=False,
+                regularize=False,
+                freeze_drive_rows=options.velocity_drive_mode == "freeze",
+            )
+            kernel_steel_step_end(
+                dt,
                 self.dyn_state,
+                self.collider.collider_state,
                 self.steel_state,
                 self.steel_contacts,
+                self.steel_contact_history,
+                self.steel_patch_frame,
+                self.steel_patch_history,
+                self.steel_rows,
+                self.steel_free_rows,
+                self.steel_prop,
                 self.steel_dyn,
                 self.steel_sleep,
                 self.steel_status,
@@ -998,374 +890,804 @@ class SteelSolver(RigidSolver):
                 self.rigid_info,
                 self.steel_info,
                 self.steel_model,
-                self.steel_config,
-                self._errno,
-            )
-
-        # Stage 1: forward kinematics, inverse dynamics with implicit drives, and mass matrix. Stage 2: factorization.
-        if options.enable_joint_velocity_limits:
-            kernel_steel_prescale_velocity(
-                self.steel_rows, self.steel_dyn, self.steel_sleep, self.steel_info, self.steel_model, self.steel_config
-            )
-        kernel_steel_fk_id(
-            global_refresh,
-            self.dyn_state,
-            self.steel_state,
-            self.steel_dyn,
-            self.steel_sleep,
-            self.dyn_info,
-            self.rigid_info,
-            self.steel_model,
-            self.steel_config,
-        )
-        kernel_steel_tau(
-            dt,
-            self.dyn_state,
-            self.steel_state,
-            self.steel_dyn,
-            self.steel_sleep,
-            self.dyn_info,
-            self.rigid_info,
-            self.steel_model,
-            self.steel_config,
-        )
-        kernel_steel_mass_matrix(self.steel_state, self.steel_dyn, self.dyn_info, self.steel_model, self.steel_config)
-
-        # Stage 3: unconstrained acceleration and velocity prediction.
-        kernel_steel_unconstrained(
-            dt,
-            self.steel_state,
-            self.steel_dyn,
-            self.steel_sleep,
-            self.dyn_info,
-            self.rigid_info,
-            self.steel_info,
-            self.steel_model,
-            self.steel_config,
-        )
-
-        # Stage 4: constraint rows, responses, diagonals and right-hand sides. Friction patches select the contacts
-        # receiving friction rows, so they are built before the row allocation.
-        has_patches = self._steel_friction_anchor_beta > 0.0
-        if options.contact_warmstart:
-            kernel_steel_match_contacts(
-                self.steel_state, self.steel_contacts, self.steel_contact_history, self.steel_info, self.steel_config
-            )
-        if has_patches:
-            kernel_steel_prepare_patches(
-                self.steel_state,
-                self.steel_contacts,
-                self.steel_patch_frame,
-                self.steel_patch_geometry,
-                self.steel_info,
-                self.steel_config,
-            )
-            kernel_steel_build_patches(
-                self.steel_state,
-                self.steel_contacts,
-                self.steel_patch_frame,
-                self.steel_patch_history,
-                self.steel_sleep,
-                self.steel_patch_geometry,
-                self.steel_info,
-                self.steel_config,
-            )
-        kernel_steel_allocate_rows(
-            self.steel_state,
-            self.steel_contacts,
-            self.steel_rows,
-            self.steel_free_rows,
-            self.steel_prop,
-            self.steel_dyn,
-            self.steel_sleep,
-            self.dyn_info,
-            self.rigid_info,
-            self.steel_info,
-            self.steel_model,
-            self.steel_config,
-        )
-        kernel_steel_update_status(
-            self.collider.collider_state,
-            self.steel_rows,
-            self.steel_free_rows,
-            self.steel_prop,
-            self.steel_status,
-            self.steel_config,
-            self._errno,
-        )
-        kernel_steel_build_rows(
-            self.dyn_state,
-            self.steel_state,
-            self.steel_contacts,
-            self.steel_rows,
-            self.steel_free_rows,
-            self.steel_dyn,
-            self.dyn_info,
-            self.rigid_info,
-            self.steel_info,
-            self.steel_model,
-            self.steel_config,
-        )
-        if self._steel_propagation_active:
-            if options.articulated_contact_response == "propagation_colored":
-                kernel_steel_propagation_color(self.steel_contacts, self.steel_prop, self.steel_config)
-            kernel_steel_propagation_build_rows(
-                self.steel_state,
-                self.steel_contacts,
-                self.steel_prop,
-                self.steel_dyn,
-                self.steel_info,
-                self.steel_config,
-            )
-        if has_patches and not options.contact_warmstart:
-            # Without warm start no gather reads the friction coefficients before the regions share them, so the rings
-            # are linked before the torsion rows group the regions.
-            self._steel_link_patch_rows()
-        if options.enable_torsional_friction:
-            kernel_steel_torsion_rows(
-                self.steel_state,
-                self.steel_contacts,
-                self.steel_rows,
-                self.steel_free_rows,
-                self.steel_torsion_witnesses,
-                self.steel_dyn,
-                self.dyn_info,
-                self.steel_info,
-                self.steel_model,
-                self.steel_config,
-                self._errno,
-            )
-        kernel_steel_responses(
-            self.steel_contacts, self.steel_rows, self.steel_dyn, self.steel_model, self.steel_config
-        )
-        if self._steel_n_preelim > 0:
-            kernel_steel_preelim(
-                PREELIM_REG_REL,
-                max(options.cfm, PREELIM_REG_FLOOR_MIN),
-                self.steel_contacts,
-                self.steel_rows,
-                self.steel_model,
-                self.steel_config,
-            )
-        kernel_steel_row_setup(
-            dt,
-            self.steel_state,
-            self.steel_contacts,
-            self.steel_rows,
-            self.steel_free_rows,
-            self.steel_dyn,
-            self.dyn_info,
-            self.steel_info,
-            self.steel_model,
-            self.steel_config,
-        )
-
-        if options.contact_compliance:
-            kernel_steel_compliance_rows(
-                dt,
-                self.steel_contacts,
-                self.steel_rows,
-                self.steel_free_rows,
-                self.steel_info,
-                self.steel_config,
-                self._errno,
-            )
-
-        # The free-body and propagation rows are seeded before the friction coefficients of the patch anchors are
-        # shared, the dense rows after, and the carried patch impulses replace the matched friction impulses of their
-        # anchors last.
-        dense_family, *other_families = self._steel_row_families
-        if options.contact_warmstart:
-            for family in other_families:
-                self._steel_gather_warmstart(family, dt)
-        if has_patches and options.contact_warmstart:
-            self._steel_link_patch_rows()
-        if options.contact_warmstart:
-            self._steel_gather_warmstart(dense_family, dt)
-        if has_patches and options.contact_warmstart and options.contact_warmstart_decay > 0.0:
-            for family in self._steel_row_families:
-                kernel_steel_seed_patch_impulses(
-                    int(family.route),
-                    dt,
-                    family.rows.row_parent,
-                    family.rows.row_mu,
-                    family.rows.impulses,
-                    self.steel_state,
-                    self.steel_contacts,
-                    self.steel_patch_frame,
-                    self.steel_patch_history,
-                    self.steel_contact_history,
-                    self.steel_info,
-                    self.steel_config,
-                )
-
-        # Stages 5 and 6: projected Gauss-Seidel in impulse space, starting from the unconstrained prediction plus the
-        # velocity of the seeded impulses.
-        self.steel_dyn.v_out.copy_from(self.steel_dyn.v_hat)
-        if options.contact_warmstart:
-            kernel_steel_warmstart_velocity(
-                self.steel_rows, self.steel_free_rows, self.steel_dyn, self.steel_model, self.steel_config
-            )
-        if self._steel_n_preelim > 0:
-            kernel_steel_preelim_project_velocity(self.steel_rows, self.steel_dyn, self.steel_model, self.steel_config)
-        if self._steel_propagation_active:
-            self._propagation_setup(dt)
-            # The impulses a contact warm start seeds into the propagation rows act on the velocity before the first
-            # sweep.
-            if options.contact_warmstart:
-                kernel_steel_propagation_warmstart(self.steel_prop, self.steel_config)
-                kernel_steel_propagation_propagate(self.steel_prop, self.steel_dyn, self.steel_model, self.steel_config)
-        n_friction_iterations = options.contact_friction_position_iterations
-        friction_start = (
-            0 if n_friction_iterations < 0 else options.iterations - min(n_friction_iterations, options.iterations)
-        )
-        if options.solve_mode == "split":
-            kernel_steel_split_setup(
-                self.steel_contacts,
-                self.steel_rows,
-                self.steel_split,
-                self.steel_dyn,
-                self.steel_info,
-                self.steel_model,
-                self.steel_config,
-            )
-            kernel_steel_split_solve(
-                options.iterations,
-                friction_start,
-                self.steel_contacts,
-                self.steel_rows,
-                self.steel_free_rows,
-                self.steel_split,
-                self.steel_dyn,
-                self.steel_info,
-                self.steel_model,
-                self.steel_config,
-            )
-        else:
-            self._launch_pgs_solve(
-                self.steel_rows.rhs,
-                self.steel_free_rows.rhs,
-                self.steel_prop.rhs,
-                options.iterations,
-                regularize=self._steel_contact_w < 1.0,
-                freeze_drive_rows=False,
-                friction_start=friction_start,
-            )
-
-        # Stage 7: convert the solved velocity to accelerations and integrate. With velocity-only iterations, positions
-        # follow the position solve, then those iterations refine the velocity without the position bias.
-        integrate_args = (
-            self.dyn_state,
-            self.steel_state,
-            self.steel_dyn,
-            self.steel_sleep,
-            self.dyn_info,
-            self.steel_info,
-            self.steel_model,
-            self.steel_config,
-        )
-        if options.velocity_iterations > 0:
-            self.steel_dyn.v_out_snap.copy_from(self.steel_dyn.v_out)
-            kernel_steel_velocity_pass_rhs(
-                dt, self.steel_rows, self.steel_free_rows, self.steel_dyn, self.steel_info, self.steel_config
-            )
-            if self._steel_propagation_active:
-                kernel_steel_propagation_refresh(
-                    self.steel_prop, self.steel_dyn, self.steel_model, self.steel_config, refresh_all=True
-                )
-                kernel_steel_propagation_velocity_pass_rhs(dt, self.steel_prop, self.steel_info, self.steel_config)
-            if options.enable_torsional_friction:
-                kernel_steel_torsion_velocity_pass(
-                    dt, self.steel_rows, self.steel_dyn, self.steel_info, self.steel_config
-                )
-            self._launch_pgs_solve(
-                self.steel_rows.rhs_unbiased,
-                self.steel_free_rows.rhs_unbiased,
-                self.steel_prop.rhs_unbiased,
-                options.velocity_iterations,
-                regularize=False,
-                freeze_drive_rows=options.velocity_drive_mode == "freeze",
-                friction_start=0,
-            )
-            kernel_steel_integrate(dt, self.steel_dyn.v_out_snap, *integrate_args)
-            kernel_steel_publish_refined_velocity(
-                dt, self.steel_state, self.steel_dyn, self.steel_info, self.steel_model, self.steel_config
-            )
-        else:
-            kernel_steel_integrate(dt, self.steel_dyn.v_out, *integrate_args)
-        kernel_steel_contact_forces(
-            dt,
-            self.dyn_state,
-            self.collider.collider_state,
-            self.steel_contacts,
-            self.steel_rows,
-            self.steel_free_rows,
-            self.steel_prop,
-            self.steel_config,
-        )
-        kernel_steel_forward_kinematics(
-            self.dyn_state,
-            self.steel_state,
-            self.steel_dyn,
-            self.steel_sleep,
-            self.dyn_info,
-            self.steel_model,
-            self.steel_config,
-        )
-        if options.enable_sleeping:
-            kernel_steel_sleep_finish(
-                dt,
-                self.steel_state,
-                self.steel_dyn,
-                self.steel_sleep,
-                self.steel_status,
-                self.steel_model,
+                self.rigid_config,
                 self.steel_config,
                 options.sleep_linear_threshold,
                 options.sleep_angular_threshold,
                 options.sleep_quiet_time,
             )
+        if options.enable_sleeping:
             self._steel_sleep_is_history_valid = True
-        if has_patches:
-            for family in self._steel_row_families:
-                kernel_steel_finish_patch_impulses(
-                    int(family.route),
-                    dt,
-                    family.rows.row_parent,
-                    family.rows.row_mu,
-                    family.rows.impulses,
-                    self.steel_state,
-                    self.steel_contacts,
-                    self.steel_patch_frame,
-                    self.dyn_info,
-                    self.steel_info,
-                    self.steel_config,
-                )
-            kernel_steel_store_patches(
-                self.steel_state,
-                self.steel_contacts,
-                self.steel_patch_frame,
-                self.steel_patch_history,
-                self.steel_config,
-            )
-        if options.contact_warmstart:
-            for family in self._steel_row_families:
-                rows = family.rows
-                kernel_steel_snapshot_warmstart_rows(
-                    rows.count,
-                    rows.row_type,
-                    rows.row_parent,
-                    rows.impulses,
-                    family.prev_row_type,
-                    family.prev_row_parent,
-                    family.prev_impulses,
-                    self.steel_config,
-                )
-            kernel_steel_snapshot_warmstart(
-                dt, self.steel_state, self.steel_contacts, self.steel_contact_history, self.steel_config
-            )
-        kernel_steel_publish(
-            dt, self.dyn_state, self.steel_state, self.dyn_info, self.rigid_info, self.steel_model, self.steel_config
-        )
-        kernel_steel_cartesian_space(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config)
         self._steel_step += 1
+
+
+@qd.func
+def func_steel_solve(
+    n_iterations: int,
+    friction_start_iteration: int,
+    rhs_dense: qd.Tensor,
+    rhs_free: qd.Tensor,
+    rhs_propagation: qd.Tensor,
+    steel_rows: array_class.SteelRows,
+    steel_free_rows: array_class.SteelFreeRows,
+    steel_prop: array_class.SteelPropagation,
+    steel_dyn: array_class.SteelDynamics,
+    steel_info: array_class.SteelInfo,
+    steel_model: array_class.SteelModelInfo,
+    steel_config: qd.template(),
+    propagate_warmstart: bool,
+    regularize: bool,
+    freeze_drive_rows: bool,
+):
+    """Run n_iterations Gauss-Seidel iterations of the rows of every environment in the row order of 'row_schedule'.
+
+    'interleaved' sweeps every row family in each iteration. 'contact_then_internal' runs every iteration of the contact
+    rows first, then every iteration of the internal rows and the velocity limits. 'phased' solves, in each iteration,
+    the internal rows, then the contact rows, then the velocity limits. A propagation response solves, in each
+    iteration, the internal rows, the dense and free-body contact rows, then refreshes the link twists, sweeps the
+    propagation rows, propagates their impulses through the trees, and solves the velocity limits last. With
+    'contact_then_internal' its iterations leave out the internal rows and the velocity limits, which follow in
+    iterations of their own. 'propagation_fused' recomputes every link twist before each sweep, the others only those
+    an earlier row family of the iteration can have moved. propagate_warmstart first propagates the impulses the
+    propagation rows start with through the trees.
+
+    Every environment runs its sequence of passes in one thread, each pass being a run of sweeps of some row families
+    (see func_pgs_sweeps) or a propagation step. A schedule iterated pass by pass holds 4 passes per iteration (internal
+    rows, contact rows, propagation, velocity limits) between a leading propagation warm-start pass and a trailing
+    pass of the rows 'contact_then_internal' defers, the passes a configuration leaves out being inert.
+    """
+    _B = steel_dyn.v_out.shape[1]
+    n_arts = steel_model.arts_dof_start.shape[0]
+    qd.loop_config(serialize=qd.static(steel_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_b in range(_B):
+        n_passes = 1
+        if qd.static(steel_config.has_propagation or steel_config.row_schedule == 2):
+            n_passes = 4 * n_iterations + 2
+        elif qd.static(steel_config.row_schedule == 1):
+            n_passes = 2
+        for i_pass in range(n_passes):
+            pass_iterations = n_iterations
+            iteration_offset = 0
+            row_phase = 0
+            is_sweep_pass = True
+            is_propagation_pass = False
+            if qd.static(steel_config.has_propagation or steel_config.row_schedule == 2):
+                pass_iterations = 1
+                if i_pass == 0:
+                    is_sweep_pass = False
+                    is_propagation_pass = propagate_warmstart
+                elif i_pass == n_passes - 1:
+                    pass_iterations = n_iterations
+                    row_phase = 2
+                    if qd.static(
+                        not (
+                            steel_config.has_propagation
+                            and steel_config.row_schedule == 1
+                            and (steel_config.has_internal_rows or steel_config.has_velocity_limit_rows)
+                        )
+                    ):
+                        is_sweep_pass = False
+                else:
+                    iteration_offset = (i_pass - 1) // 4
+                    i_kind = (i_pass - 1) % 4
+                    if i_kind == 0:
+                        row_phase = 3
+                        if qd.static(
+                            not steel_config.has_internal_rows
+                            or (steel_config.has_propagation and steel_config.row_schedule == 1)
+                        ):
+                            is_sweep_pass = False
+                    elif i_kind == 1:
+                        row_phase = 4
+                    elif i_kind == 2:
+                        is_sweep_pass = False
+                        is_propagation_pass = True
+                    else:
+                        row_phase = 5
+                        if qd.static(
+                            not steel_config.has_velocity_limit_rows
+                            or (steel_config.has_propagation and steel_config.row_schedule == 1)
+                        ):
+                            is_sweep_pass = False
+            elif qd.static(steel_config.row_schedule == 1):
+                row_phase = 1 + i_pass
+            if is_sweep_pass:
+                func_pgs_sweeps(
+                    i_b=i_b,
+                    n_iterations=pass_iterations,
+                    iteration_offset=iteration_offset,
+                    friction_start_iteration=friction_start_iteration,
+                    row_phase=row_phase,
+                    rhs_dense=rhs_dense,
+                    rhs_free=rhs_free,
+                    steel_rows=steel_rows,
+                    steel_free_rows=steel_free_rows,
+                    steel_dyn=steel_dyn,
+                    steel_info=steel_info,
+                    steel_config=steel_config,
+                    regularize=regularize,
+                    freeze_drive_rows=freeze_drive_rows,
+                )
+            if qd.static(steel_config.has_propagation):
+                if is_propagation_pass:
+                    if i_pass == 0:
+                        func_propagation_warmstart(i_b, steel_prop)
+                    else:
+                        for i_a in range(n_arts):
+                            func_propagation_refresh_articulation(
+                                i_a,
+                                i_b,
+                                steel_prop,
+                                steel_dyn,
+                                steel_model,
+                                refresh_all=qd.static(
+                                    steel_config.articulated_contact_response == 2
+                                    or steel_config.row_schedule == 1
+                                    or steel_config.has_internal_rows
+                                    or steel_config.has_velocity_limit_rows
+                                ),
+                            )
+                        func_propagation_sweep(
+                            i_b,
+                            iteration_offset,
+                            friction_start_iteration,
+                            rhs_propagation,
+                            steel_prop,
+                            steel_info,
+                            regularize,
+                        )
+                    for i_a in range(n_arts):
+                        func_propagation_propagate_articulation(i_a, i_b, steel_prop, steel_dyn, steel_model)
+
+
+@qd.func
+def func_steel_step_end(
+    dt: float,
+    dyn_state: array_class.DynState,
+    collider_state: array_class.ColliderState,
+    steel_state: array_class.SteelState,
+    steel_contacts: array_class.SteelContacts,
+    steel_contact_history: array_class.SteelContactHistory,
+    steel_patch_frame: array_class.SteelPatchFrame,
+    steel_patch_history: array_class.SteelPatchHistory,
+    steel_rows: array_class.SteelRows,
+    steel_free_rows: array_class.SteelFreeRows,
+    steel_prop: array_class.SteelPropagation,
+    steel_dyn: array_class.SteelDynamics,
+    steel_sleep: array_class.SteelSleep,
+    steel_status: array_class.SteelStatus,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    steel_info: array_class.SteelInfo,
+    steel_model: array_class.SteelModelInfo,
+    rigid_config: qd.template(),
+    steel_config: qd.template(),
+    sleep_linear_threshold: float,
+    sleep_angular_threshold: float,
+    sleep_quiet_time: float,
+):
+    """Integrate the solved velocity (stage 7), keep the histories of the step and publish the new state to Genesis.
+
+    With velocity iterations, the positions follow the velocity of the position solve held in v_out_snap and the
+    velocity refined by the velocity-only iterations is published. The Cartesian quantities of Genesis are updated from
+    the new state. The sleep thresholds configure the sleeping islands (see func_steel_sleep_finish).
+    """
+    if qd.static(steel_config.has_velocity_iterations):
+        func_steel_integrate(
+            dt=dt,
+            velocity=steel_dyn.v_out_snap,
+            dyn_state=dyn_state,
+            steel_state=steel_state,
+            steel_dyn=steel_dyn,
+            steel_sleep=steel_sleep,
+            dyn_info=dyn_info,
+            steel_info=steel_info,
+            steel_model=steel_model,
+            steel_config=steel_config,
+        )
+        func_steel_publish_refined_velocity(dt, steel_state, steel_dyn, steel_info, steel_model, steel_config)
+    else:
+        func_steel_integrate(
+            dt=dt,
+            velocity=steel_dyn.v_out,
+            dyn_state=dyn_state,
+            steel_state=steel_state,
+            steel_dyn=steel_dyn,
+            steel_sleep=steel_sleep,
+            dyn_info=dyn_info,
+            steel_info=steel_info,
+            steel_model=steel_model,
+            steel_config=steel_config,
+        )
+    func_steel_contact_forces(
+        dt, dyn_state, collider_state, steel_contacts, steel_rows, steel_free_rows, steel_prop, steel_config
+    )
+    func_steel_forward_kinematics(dyn_state, steel_state, steel_dyn, steel_sleep, dyn_info, steel_model, steel_config)
+    if qd.static(steel_config.has_sleeping):
+        func_steel_sleep_finish(
+            dt,
+            steel_state,
+            steel_dyn,
+            steel_sleep,
+            steel_status,
+            steel_model,
+            steel_config,
+            sleep_linear_threshold,
+            sleep_angular_threshold,
+            sleep_quiet_time,
+        )
+    if qd.static(steel_config.has_friction_anchors):
+        func_steel_finish_patch_impulses(
+            CONTACT_PATH.DENSE,
+            dt,
+            steel_rows.row_parent,
+            steel_rows.row_mu,
+            steel_rows.impulses,
+            steel_state,
+            steel_contacts,
+            steel_patch_frame,
+            dyn_info,
+            steel_info,
+            steel_config,
+        )
+        if qd.static(steel_config.has_free_rigid_bodies):
+            func_steel_finish_patch_impulses(
+                CONTACT_PATH.FREE,
+                dt,
+                steel_free_rows.row_parent,
+                steel_free_rows.row_mu,
+                steel_free_rows.impulses,
+                steel_state,
+                steel_contacts,
+                steel_patch_frame,
+                dyn_info,
+                steel_info,
+                steel_config,
+            )
+        if qd.static(steel_config.has_propagation):
+            func_steel_finish_patch_impulses(
+                CONTACT_PATH.PROPAGATION,
+                dt,
+                steel_prop.row_parent,
+                steel_prop.row_mu,
+                steel_prop.impulses,
+                steel_state,
+                steel_contacts,
+                steel_patch_frame,
+                dyn_info,
+                steel_info,
+                steel_config,
+            )
+        func_steel_store_patches(steel_state, steel_contacts, steel_patch_frame, steel_patch_history, steel_config)
+    if qd.static(steel_config.has_contact_warmstart):
+        func_steel_snapshot_warmstart_rows(
+            steel_rows.count,
+            steel_rows.row_type,
+            steel_rows.row_parent,
+            steel_rows.impulses,
+            steel_contact_history.dense_row_type,
+            steel_contact_history.dense_row_parent,
+            steel_contact_history.dense_impulses,
+            steel_config,
+        )
+        if qd.static(steel_config.has_free_rigid_bodies):
+            func_steel_snapshot_warmstart_rows(
+                steel_free_rows.count,
+                steel_free_rows.row_type,
+                steel_free_rows.row_parent,
+                steel_free_rows.impulses,
+                steel_contact_history.free_row_type,
+                steel_contact_history.free_row_parent,
+                steel_contact_history.free_impulses,
+                steel_config,
+            )
+        if qd.static(steel_config.has_propagation):
+            func_steel_snapshot_warmstart_rows(
+                steel_prop.count,
+                steel_prop.row_type,
+                steel_prop.row_parent,
+                steel_prop.impulses,
+                steel_contact_history.propagation_row_type,
+                steel_contact_history.propagation_row_parent,
+                steel_contact_history.propagation_impulses,
+                steel_config,
+            )
+        func_steel_snapshot_warmstart(dt, steel_state, steel_contacts, steel_contact_history, steel_config)
+    func_steel_publish(dt, dyn_state, steel_state, dyn_info, rigid_info, steel_model, steel_config)
+    func_update_cartesian_space(
+        dyn_state, dyn_info, rigid_info, rigid_config, force_update_all_geoms=False, is_backward=False
+    )
+    func_forward_velocity(dyn_state, dyn_info, rigid_info, rigid_config, is_backward=False)
+
+
+@qd.kernel(graph=True, fastcache=True)
+def kernel_steel_step(
+    dt: float,
+    n_iterations: int,
+    friction_start_iteration: int,
+    dyn_state: array_class.DynState,
+    collider_state: array_class.ColliderState,
+    steel_state: array_class.SteelState,
+    steel_contacts: array_class.SteelContacts,
+    steel_contact_history: array_class.SteelContactHistory,
+    steel_patch_frame: array_class.SteelPatchFrame,
+    steel_patch_history: array_class.SteelPatchHistory,
+    steel_torsion_witnesses: array_class.SteelTorsionWitnesses,
+    steel_rows: array_class.SteelRows,
+    steel_free_rows: array_class.SteelFreeRows,
+    steel_prop: array_class.SteelPropagation,
+    steel_split: array_class.SteelSplit,
+    steel_dyn: array_class.SteelDynamics,
+    steel_sleep: array_class.SteelSleep,
+    steel_status: array_class.SteelStatus,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    steel_patch_geometry: array_class.SteelPatchGeometry,
+    steel_info: array_class.SteelInfo,
+    steel_model: array_class.SteelModelInfo,
+    rigid_config: qd.template(),
+    steel_config: qd.template(),
+    preelim_reg_rel: float,
+    preelim_reg_floor: float,
+    sleep_linear_threshold: float,
+    sleep_angular_threshold: float,
+    sleep_quiet_time: float,
+    global_refresh: bool,
+    regularize: bool,
+    errno: qd.Tensor,
+):
+    """Advance the Steel state by one step of duration dt from the gathered contacts and publish it, as one graph.
+
+    Stage 1 evaluates the forward kinematics, the inverse dynamics with implicit drives and the mass matrix (refreshed
+    when global_refresh), stage 2 factors it and stage 3 predicts the unconstrained velocity. Stage 4 builds the
+    constraint rows: friction patches select the contacts receiving friction rows, so they are built before the row
+    allocation. Stages 5 and 6 solve the rows by projected Gauss-Seidel in impulse space over n_iterations iterations,
+    the friction rows from friction_start_iteration on, starting from the unconstrained prediction plus the velocity of
+    the warm-start impulses, regularize applying the contact regularization weight. Stage 7 integrates and the new
+    state is published (see func_steel_step_end). With velocity iterations, the step stops before stages 5 and 6.
+    preelim_reg_rel and preelim_reg_floor regularize the bilateral pre-elimination (see func_steel_preelim) and the
+    sleep thresholds configure the sleeping islands (see func_steel_sleep_finish).
+    """
+    # Drive rows come first in the row order and must exist before the velocity scaling of stage 1. The sleeping
+    # islands of the step are built from its contacts.
+    func_steel_allocate_drive_rows(dyn_state, steel_rows, dyn_info, rigid_info, steel_model, steel_config)
+    func_steel_inputs(dyn_state, steel_state, steel_dyn, dyn_info, steel_model, steel_config)
+    if qd.static(steel_config.has_sleeping):
+        func_steel_sleep_begin(
+            dyn_state,
+            steel_state,
+            steel_contacts,
+            steel_dyn,
+            steel_sleep,
+            steel_status,
+            dyn_info,
+            rigid_info,
+            steel_info,
+            steel_model,
+            steel_config,
+            errno,
+        )
+
+    # Stages 1 to 3.
+    if qd.static(steel_config.enable_joint_velocity_limits):
+        func_steel_prescale_velocity(steel_rows, steel_dyn, steel_sleep, steel_info, steel_model, steel_config)
+    func_steel_fk_id(
+        global_refresh, dyn_state, steel_state, steel_dyn, steel_sleep, dyn_info, rigid_info, steel_model, steel_config
+    )
+    func_steel_tau(dt, dyn_state, steel_state, steel_dyn, steel_sleep, dyn_info, rigid_info, steel_model, steel_config)
+    func_steel_mass_matrix(steel_state, steel_dyn, dyn_info, steel_model, steel_config)
+    func_steel_unconstrained(
+        dt, steel_state, steel_dyn, steel_sleep, dyn_info, rigid_info, steel_info, steel_model, steel_config
+    )
+
+    # Stage 4.
+    if qd.static(steel_config.has_contact_warmstart):
+        func_steel_match_contacts(steel_state, steel_contacts, steel_contact_history, steel_info, steel_config)
+    if qd.static(steel_config.has_friction_anchors):
+        func_steel_prepare_patches(
+            steel_state, steel_contacts, steel_patch_frame, steel_patch_geometry, steel_info, steel_config
+        )
+        func_steel_build_patches(
+            steel_state,
+            steel_contacts,
+            steel_patch_frame,
+            steel_patch_history,
+            steel_sleep,
+            steel_patch_geometry,
+            steel_info,
+            steel_config,
+        )
+    func_steel_allocate_rows(
+        steel_state,
+        steel_contacts,
+        steel_rows,
+        steel_free_rows,
+        steel_prop,
+        steel_dyn,
+        steel_sleep,
+        dyn_info,
+        rigid_info,
+        steel_info,
+        steel_model,
+        steel_config,
+    )
+    func_steel_update_status(collider_state, steel_rows, steel_free_rows, steel_prop, steel_status, steel_config, errno)
+    func_steel_build_rows(
+        dyn_state,
+        steel_state,
+        steel_contacts,
+        steel_rows,
+        steel_free_rows,
+        steel_dyn,
+        dyn_info,
+        rigid_info,
+        steel_info,
+        steel_model,
+        steel_config,
+    )
+    if qd.static(steel_config.has_propagation):
+        if qd.static(steel_config.articulated_contact_response == 3):
+            func_steel_propagation_color(steel_contacts, steel_prop, steel_config)
+        func_steel_propagation_build_rows(steel_state, steel_contacts, steel_prop, steel_dyn, steel_info, steel_config)
+    # Without warm start no gather reads the friction coefficients before the regions share them, so the rings are
+    # linked before the torsion rows group the regions. With warm start, the free-body and propagation rows are seeded
+    # before the friction coefficients of the patch anchors are shared, the dense rows after.
+    if qd.static(steel_config.has_friction_anchors and not steel_config.has_contact_warmstart):
+        func_steel_link_patch_rows(
+            CONTACT_PATH.DENSE, steel_rows.row_parent, steel_rows.row_mu, steel_contacts, steel_config
+        )
+        if qd.static(steel_config.has_free_rigid_bodies):
+            func_steel_link_patch_rows(
+                CONTACT_PATH.FREE, steel_free_rows.row_parent, steel_free_rows.row_mu, steel_contacts, steel_config
+            )
+        if qd.static(steel_config.has_propagation):
+            func_steel_link_patch_rows(
+                CONTACT_PATH.PROPAGATION, steel_prop.row_parent, steel_prop.row_mu, steel_contacts, steel_config
+            )
+    if qd.static(steel_config.has_torsion):
+        func_steel_torsion_rows(
+            steel_state,
+            steel_contacts,
+            steel_rows,
+            steel_free_rows,
+            steel_torsion_witnesses,
+            steel_dyn,
+            dyn_info,
+            steel_info,
+            steel_model,
+            steel_config,
+            errno,
+        )
+    func_steel_responses(steel_contacts, steel_rows, steel_dyn, steel_model, steel_config)
+    if qd.static(steel_config.has_preelim):
+        func_steel_preelim(preelim_reg_rel, preelim_reg_floor, steel_contacts, steel_rows, steel_model, steel_config)
+    func_steel_row_setup(
+        dt,
+        steel_state,
+        steel_contacts,
+        steel_rows,
+        steel_free_rows,
+        steel_dyn,
+        dyn_info,
+        steel_info,
+        steel_model,
+        steel_config,
+    )
+    if qd.static(steel_config.has_compliance):
+        func_steel_compliance_rows(dt, steel_contacts, steel_rows, steel_free_rows, steel_info, steel_config, errno)
+    if qd.static(steel_config.has_contact_warmstart):
+        if qd.static(steel_config.has_free_rigid_bodies):
+            func_steel_gather_warmstart(
+                route=CONTACT_PATH.FREE,
+                dt=dt,
+                count=steel_free_rows.count,
+                row_type=steel_free_rows.row_type,
+                row_parent=steel_free_rows.row_parent,
+                row_mu=steel_free_rows.row_mu,
+                impulses=steel_free_rows.impulses,
+                prev_impulses=steel_contact_history.free_impulses,
+                prev_row_type=steel_contact_history.free_row_type,
+                prev_row_parent=steel_contact_history.free_row_parent,
+                steel_contacts=steel_contacts,
+                steel_contact_history=steel_contact_history,
+                steel_info=steel_info,
+                steel_config=steel_config,
+            )
+        if qd.static(steel_config.has_propagation):
+            func_steel_gather_warmstart(
+                route=CONTACT_PATH.PROPAGATION,
+                dt=dt,
+                count=steel_prop.count,
+                row_type=steel_prop.row_type,
+                row_parent=steel_prop.row_parent,
+                row_mu=steel_prop.row_mu,
+                impulses=steel_prop.impulses,
+                prev_impulses=steel_contact_history.propagation_impulses,
+                prev_row_type=steel_contact_history.propagation_row_type,
+                prev_row_parent=steel_contact_history.propagation_row_parent,
+                steel_contacts=steel_contacts,
+                steel_contact_history=steel_contact_history,
+                steel_info=steel_info,
+                steel_config=steel_config,
+            )
+        if qd.static(steel_config.has_friction_anchors):
+            func_steel_link_patch_rows(
+                CONTACT_PATH.DENSE, steel_rows.row_parent, steel_rows.row_mu, steel_contacts, steel_config
+            )
+            if qd.static(steel_config.has_free_rigid_bodies):
+                func_steel_link_patch_rows(
+                    CONTACT_PATH.FREE, steel_free_rows.row_parent, steel_free_rows.row_mu, steel_contacts, steel_config
+                )
+            if qd.static(steel_config.has_propagation):
+                func_steel_link_patch_rows(
+                    CONTACT_PATH.PROPAGATION, steel_prop.row_parent, steel_prop.row_mu, steel_contacts, steel_config
+                )
+        func_steel_gather_warmstart(
+            route=CONTACT_PATH.DENSE,
+            dt=dt,
+            count=steel_rows.count,
+            row_type=steel_rows.row_type,
+            row_parent=steel_rows.row_parent,
+            row_mu=steel_rows.row_mu,
+            impulses=steel_rows.impulses,
+            prev_impulses=steel_contact_history.dense_impulses,
+            prev_row_type=steel_contact_history.dense_row_type,
+            prev_row_parent=steel_contact_history.dense_row_parent,
+            steel_contacts=steel_contacts,
+            steel_contact_history=steel_contact_history,
+            steel_info=steel_info,
+            steel_config=steel_config,
+        )
+        # The carried patch impulses replace the matched friction impulses of their anchors last.
+        if qd.static(steel_config.has_friction_anchors and steel_config.has_warmstart_decay):
+            func_steel_seed_patch_impulses(
+                CONTACT_PATH.DENSE,
+                dt,
+                steel_rows.row_parent,
+                steel_rows.row_mu,
+                steel_rows.impulses,
+                steel_state,
+                steel_contacts,
+                steel_patch_frame,
+                steel_patch_history,
+                steel_contact_history,
+                steel_info,
+                steel_config,
+            )
+            if qd.static(steel_config.has_free_rigid_bodies):
+                func_steel_seed_patch_impulses(
+                    CONTACT_PATH.FREE,
+                    dt,
+                    steel_free_rows.row_parent,
+                    steel_free_rows.row_mu,
+                    steel_free_rows.impulses,
+                    steel_state,
+                    steel_contacts,
+                    steel_patch_frame,
+                    steel_patch_history,
+                    steel_contact_history,
+                    steel_info,
+                    steel_config,
+                )
+            if qd.static(steel_config.has_propagation):
+                func_steel_seed_patch_impulses(
+                    CONTACT_PATH.PROPAGATION,
+                    dt,
+                    steel_prop.row_parent,
+                    steel_prop.row_mu,
+                    steel_prop.impulses,
+                    steel_state,
+                    steel_contacts,
+                    steel_patch_frame,
+                    steel_patch_history,
+                    steel_contact_history,
+                    steel_info,
+                    steel_config,
+                )
+
+    # Stages 5 and 6.
+    _B = steel_dyn.v_out.shape[1]
+    n_dofs = steel_dyn.v_out.shape[0]
+    qd.loop_config(serialize=qd.static(steel_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_d, i_b in qd.ndrange(n_dofs, _B):
+        steel_dyn.v_out[i_d, i_b] = steel_dyn.v_hat[i_d, i_b]
+    if qd.static(steel_config.has_contact_warmstart):
+        func_steel_warmstart_velocity(steel_rows, steel_free_rows, steel_dyn, steel_model, steel_config)
+    if qd.static(steel_config.has_preelim):
+        func_steel_preelim_project_velocity(steel_rows, steel_dyn, steel_model, steel_config)
+    if qd.static(steel_config.has_propagation):
+        func_steel_propagation_factor(
+            steel_state,
+            steel_free_rows,
+            steel_prop,
+            steel_dyn,
+            dyn_info,
+            rigid_info,
+            steel_info,
+            steel_model,
+            steel_config,
+        )
+        func_steel_propagation_refresh(steel_prop, steel_dyn, steel_model, steel_config)
+        func_steel_propagation_row_setup(dt, steel_prop, steel_dyn, steel_info, steel_model, steel_config)
+    # With velocity iterations, the two solves run from one compiled kernel (see SteelSolver._steel_advance).
+    if qd.static(not steel_config.has_velocity_iterations):
+        if qd.static(steel_config.solve_mode == 1):
+            func_steel_split_setup(
+                steel_contacts, steel_rows, steel_split, steel_dyn, steel_info, steel_model, steel_config
+            )
+            func_steel_split_solve(
+                n_iterations,
+                friction_start_iteration,
+                steel_contacts,
+                steel_rows,
+                steel_free_rows,
+                steel_split,
+                steel_dyn,
+                steel_info,
+                steel_model,
+                steel_config,
+            )
+        else:
+            func_steel_solve(
+                n_iterations=n_iterations,
+                friction_start_iteration=friction_start_iteration,
+                rhs_dense=steel_rows.rhs,
+                rhs_free=steel_free_rows.rhs,
+                rhs_propagation=steel_prop.rhs,
+                steel_rows=steel_rows,
+                steel_free_rows=steel_free_rows,
+                steel_prop=steel_prop,
+                steel_dyn=steel_dyn,
+                steel_info=steel_info,
+                steel_model=steel_model,
+                steel_config=steel_config,
+                propagate_warmstart=qd.static(steel_config.has_contact_warmstart),
+                regularize=regularize,
+                freeze_drive_rows=False,
+            )
+        func_steel_step_end(
+            dt,
+            dyn_state,
+            collider_state,
+            steel_state,
+            steel_contacts,
+            steel_contact_history,
+            steel_patch_frame,
+            steel_patch_history,
+            steel_rows,
+            steel_free_rows,
+            steel_prop,
+            steel_dyn,
+            steel_sleep,
+            steel_status,
+            dyn_info,
+            rigid_info,
+            steel_info,
+            steel_model,
+            rigid_config,
+            steel_config,
+            sleep_linear_threshold,
+            sleep_angular_threshold,
+            sleep_quiet_time,
+        )
+
+
+@qd.kernel(fastcache=True)
+def kernel_steel_solve(
+    n_iterations: int,
+    friction_start_iteration: int,
+    rhs_dense: qd.Tensor,
+    rhs_free: qd.Tensor,
+    rhs_propagation: qd.Tensor,
+    steel_rows: array_class.SteelRows,
+    steel_free_rows: array_class.SteelFreeRows,
+    steel_prop: array_class.SteelPropagation,
+    steel_dyn: array_class.SteelDynamics,
+    steel_info: array_class.SteelInfo,
+    steel_model: array_class.SteelModelInfo,
+    steel_config: qd.template(),
+    propagate_warmstart: bool,
+    regularize: bool,
+    freeze_drive_rows: bool,
+):
+    """Run the Gauss-Seidel iterations of one solve of a step with velocity iterations (see func_steel_solve)."""
+    func_steel_solve(
+        n_iterations,
+        friction_start_iteration,
+        rhs_dense,
+        rhs_free,
+        rhs_propagation,
+        steel_rows,
+        steel_free_rows,
+        steel_prop,
+        steel_dyn,
+        steel_info,
+        steel_model,
+        steel_config,
+        propagate_warmstart,
+        regularize,
+        freeze_drive_rows,
+    )
+
+
+@qd.kernel(graph=True, fastcache=True)
+def kernel_steel_velocity_pass(
+    dt: float,
+    steel_rows: array_class.SteelRows,
+    steel_free_rows: array_class.SteelFreeRows,
+    steel_prop: array_class.SteelPropagation,
+    steel_dyn: array_class.SteelDynamics,
+    steel_info: array_class.SteelInfo,
+    steel_model: array_class.SteelModelInfo,
+    steel_config: qd.template(),
+):
+    """Keep the velocity of the position solve in v_out_snap and set up the velocity-only iterations, as one graph.
+
+    The right-hand sides of the rows drop their position bias (see func_steel_velocity_pass_rhs) and the link twists of
+    a propagation response are recomputed from the solved velocity.
+    """
+    _B = steel_dyn.v_out.shape[1]
+    n_dofs = steel_dyn.v_out.shape[0]
+    qd.loop_config(serialize=qd.static(steel_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_d, i_b in qd.ndrange(n_dofs, _B):
+        steel_dyn.v_out_snap[i_d, i_b] = steel_dyn.v_out[i_d, i_b]
+    func_steel_velocity_pass_rhs(dt, steel_rows, steel_free_rows, steel_dyn, steel_info, steel_config)
+    if qd.static(steel_config.has_propagation):
+        func_steel_propagation_refresh(steel_prop, steel_dyn, steel_model, steel_config)
+        func_steel_propagation_velocity_pass_rhs(dt, steel_prop, steel_info, steel_config)
+    if qd.static(steel_config.has_torsion):
+        func_steel_torsion_velocity_pass(dt, steel_rows, steel_dyn, steel_info, steel_config)
+
+
+@qd.kernel(graph=True, fastcache=True)
+def kernel_steel_step_end(
+    dt: float,
+    dyn_state: array_class.DynState,
+    collider_state: array_class.ColliderState,
+    steel_state: array_class.SteelState,
+    steel_contacts: array_class.SteelContacts,
+    steel_contact_history: array_class.SteelContactHistory,
+    steel_patch_frame: array_class.SteelPatchFrame,
+    steel_patch_history: array_class.SteelPatchHistory,
+    steel_rows: array_class.SteelRows,
+    steel_free_rows: array_class.SteelFreeRows,
+    steel_prop: array_class.SteelPropagation,
+    steel_dyn: array_class.SteelDynamics,
+    steel_sleep: array_class.SteelSleep,
+    steel_status: array_class.SteelStatus,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    steel_info: array_class.SteelInfo,
+    steel_model: array_class.SteelModelInfo,
+    rigid_config: qd.template(),
+    steel_config: qd.template(),
+    sleep_linear_threshold: float,
+    sleep_angular_threshold: float,
+    sleep_quiet_time: float,
+):
+    """Finish a step with velocity iterations once its velocity is refined (see func_steel_step_end), as one graph."""
+    func_steel_step_end(
+        dt,
+        dyn_state,
+        collider_state,
+        steel_state,
+        steel_contacts,
+        steel_contact_history,
+        steel_patch_frame,
+        steel_patch_history,
+        steel_rows,
+        steel_free_rows,
+        steel_prop,
+        steel_dyn,
+        steel_sleep,
+        steel_status,
+        dyn_info,
+        rigid_info,
+        steel_info,
+        steel_model,
+        rigid_config,
+        steel_config,
+        sleep_linear_threshold,
+        sleep_angular_threshold,
+        sleep_quiet_time,
+    )

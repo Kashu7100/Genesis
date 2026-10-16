@@ -14,10 +14,10 @@ logarithm of the pose increment rather than the chord of a rotating material poi
 history is matched by body pair and geometric compatibility, without contact identities. Unloaded regions and
 saturated friction slipping against its impulse release their history, saturation alone does not.
 
-A step runs kernel_steel_prepare_patches and kernel_steel_build_patches before the row allocation, which gives
-friction rows to the anchors alone, kernel_steel_link_patch_rows after the row setup, which chains the normal rows of
-every region into a ring and shares the friction coefficient among its anchors, kernel_steel_seed_patch_impulses with
-contact warm start, then after the integration kernel_steel_finish_patch_impulses and kernel_steel_store_patches.
+A step runs func_steel_prepare_patches and func_steel_build_patches before the row allocation, which gives
+friction rows to the anchors alone, func_steel_link_patch_rows after the row setup, which chains the normal rows of
+every region into a ring and shares the friction coefficient among its anchors, func_steel_seed_patch_impulses with
+contact warm start, then after the integration func_steel_finish_patch_impulses and func_steel_store_patches.
 """
 
 import quadrants as qd
@@ -222,8 +222,8 @@ def func_center_lex_less(p: qd.types.vector(3), q: qd.types.vector(3)):
     return p[0] < q[0] or (p[0] == q[0] and (p[1] < q[1] or (p[1] == q[1] and p[2] < q[2])))
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_prepare_patches(
+@qd.func
+def func_steel_prepare_patches(
     steel_state: array_class.SteelState,
     steel_contacts: array_class.SteelContacts,
     steel_patch_frame: array_class.SteelPatchFrame,
@@ -846,8 +846,8 @@ def func_build_pair_patches(
                         steel_contacts.patch_phi[i_c, i_b] = qd.Vector([t0.dot(error), t1.dot(error)], dt=gs.qd_float)
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_build_patches(
+@qd.func
+def func_steel_build_patches(
     steel_state: array_class.SteelState,
     steel_contacts: array_class.SteelContacts,
     steel_patch_frame: array_class.SteelPatchFrame,
@@ -891,8 +891,8 @@ def kernel_steel_build_patches(
             )
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_link_patch_rows(
+@qd.func
+def func_steel_link_patch_rows(
     route: int,
     row_parent: qd.Tensor,
     row_mu: qd.Tensor,
@@ -948,8 +948,8 @@ def func_warmstart_dt_scale(dt: float, history_dt: float):
     return scale
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_seed_patch_impulses(
+@qd.func
+def func_steel_seed_patch_impulses(
     route: int,
     dt: float,
     row_parent: qd.Tensor,
@@ -1002,8 +1002,8 @@ def kernel_steel_seed_patch_impulses(
             impulses[slot + 2, i_b] = value[1]
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_finish_patch_impulses(
+@qd.func
+def func_steel_finish_patch_impulses(
     route: int,
     dt: float,
     row_parent: qd.Tensor,
@@ -1079,8 +1079,8 @@ def kernel_steel_finish_patch_impulses(
                     steel_patch_frame.valid[i_c, i_b] = 0
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_store_patches(
+@qd.func
+def func_steel_store_patches(
     steel_state: array_class.SteelState,
     steel_contacts: array_class.SteelContacts,
     steel_patch_frame: array_class.SteelPatchFrame,
@@ -1090,31 +1090,33 @@ def kernel_steel_store_patches(
     """Keep the friction anchors of the step as the history of the next one.
 
     The normal of an anchor is stored in the frame of its body a at the start of the step, and the poses of the start
-    of the step stay in links_pos_prev / links_quat_prev for the pose increments of the next one.
+    of the step stay in links_pos_prev / links_quat_prev for the pose increments of the next one. Only the contacts of
+    the step are kept: the next step reads the history through its sorted indices, which address those alone.
     """
     max_contacts = steel_contacts.shape0.shape[0]
     _B = steel_contacts.n.shape[0]
     qd.loop_config(serialize=qd.static(steel_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_c, i_b in qd.ndrange(max_contacts, _B):
-        normal = steel_patch_frame.normal[i_c, i_b]
-        if steel_patch_frame.valid[i_c, i_b] != 0:
-            normal = func_inv_rotate(steel_patch_frame.body_a[i_c, i_b], i_b, normal, steel_state.links_quat_prev)
-        steel_patch_history.key[i_c, i_b] = steel_patch_frame.key[i_c, i_b]
-        steel_patch_history.indices[i_c, i_b] = steel_patch_frame.indices[i_c, i_b]
-        steel_patch_history.normal[i_c, i_b] = normal
-        steel_patch_history.displacement[i_c, i_b] = steel_patch_frame.displacement[i_c, i_b]
-        steel_patch_history.mu[i_c, i_b] = steel_patch_frame.mu[i_c, i_b]
-        steel_patch_history.body_a[i_c, i_b] = steel_patch_frame.body_a[i_c, i_b]
-        steel_patch_history.body_b[i_c, i_b] = steel_patch_frame.body_b[i_c, i_b]
-        steel_patch_history.owner[i_c, i_b] = steel_patch_frame.owner[i_c, i_b]
-        steel_patch_history.shape_a[i_c, i_b] = steel_patch_frame.shape_a[i_c, i_b]
-        steel_patch_history.shape_b[i_c, i_b] = steel_patch_frame.shape_b[i_c, i_b]
-        steel_patch_history.anchor_a[i_c, i_b] = steel_patch_frame.anchor_a[i_c, i_b]
-        steel_patch_history.anchor_b[i_c, i_b] = steel_patch_frame.anchor_b[i_c, i_b]
-        steel_patch_history.surface_a[i_c, i_b] = steel_patch_frame.surface_a[i_c, i_b]
-        steel_patch_history.surface_b[i_c, i_b] = steel_patch_frame.surface_b[i_c, i_b]
-        steel_patch_history.valid[i_c, i_b] = steel_patch_frame.valid[i_c, i_b]
-        steel_patch_history.tangent_impulse[i_c, i_b] = steel_patch_frame.tangent_impulse[i_c, i_b]
+        if i_c < steel_contacts.n[i_b]:
+            normal = steel_patch_frame.normal[i_c, i_b]
+            if steel_patch_frame.valid[i_c, i_b] != 0:
+                normal = func_inv_rotate(steel_patch_frame.body_a[i_c, i_b], i_b, normal, steel_state.links_quat_prev)
+            steel_patch_history.key[i_c, i_b] = steel_patch_frame.key[i_c, i_b]
+            steel_patch_history.indices[i_c, i_b] = steel_patch_frame.indices[i_c, i_b]
+            steel_patch_history.normal[i_c, i_b] = normal
+            steel_patch_history.displacement[i_c, i_b] = steel_patch_frame.displacement[i_c, i_b]
+            steel_patch_history.mu[i_c, i_b] = steel_patch_frame.mu[i_c, i_b]
+            steel_patch_history.body_a[i_c, i_b] = steel_patch_frame.body_a[i_c, i_b]
+            steel_patch_history.body_b[i_c, i_b] = steel_patch_frame.body_b[i_c, i_b]
+            steel_patch_history.owner[i_c, i_b] = steel_patch_frame.owner[i_c, i_b]
+            steel_patch_history.shape_a[i_c, i_b] = steel_patch_frame.shape_a[i_c, i_b]
+            steel_patch_history.shape_b[i_c, i_b] = steel_patch_frame.shape_b[i_c, i_b]
+            steel_patch_history.anchor_a[i_c, i_b] = steel_patch_frame.anchor_a[i_c, i_b]
+            steel_patch_history.anchor_b[i_c, i_b] = steel_patch_frame.anchor_b[i_c, i_b]
+            steel_patch_history.surface_a[i_c, i_b] = steel_patch_frame.surface_a[i_c, i_b]
+            steel_patch_history.surface_b[i_c, i_b] = steel_patch_frame.surface_b[i_c, i_b]
+            steel_patch_history.valid[i_c, i_b] = steel_patch_frame.valid[i_c, i_b]
+            steel_patch_history.tangent_impulse[i_c, i_b] = steel_patch_frame.tangent_impulse[i_c, i_b]
     qd.loop_config(serialize=qd.static(steel_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_b in range(_B):
         steel_patch_history.n[i_b] = steel_contacts.n[i_b]
@@ -1130,4 +1132,5 @@ def kernel_steel_reset_patches(
     max_contacts = steel_patch_history.valid.shape[0]
     qd.loop_config(serialize=qd.static(steel_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_c, i_b_ in qd.ndrange(max_contacts, envs_idx.shape[0]):
-        steel_patch_history.valid[i_c, envs_idx[i_b_]] = 0
+        i_b = envs_idx[i_b_]
+        steel_patch_history.valid[i_c, i_b] = 0

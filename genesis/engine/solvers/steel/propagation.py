@@ -193,8 +193,8 @@ def func_propagation_apply_impulse(i_r: int, i_b: int, dlam: float, steel_prop: 
         steel_prop.links_impulse[i_lb, i_b] = steel_prop.links_impulse[i_lb, i_b] + steel_prop.J_b[i_r, i_b] * dlam
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_propagation_color(
+@qd.func
+def func_steel_propagation_color(
     steel_contacts: array_class.SteelContacts,
     steel_prop: array_class.SteelPropagation,
     steel_config: qd.template(),
@@ -282,8 +282,8 @@ def kernel_steel_propagation_color(
             slot = slot + steel_contacts.slots_needed[i_c, i_b]
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_propagation_build_rows(
+@qd.func
+def func_steel_propagation_build_rows(
     steel_state: array_class.SteelState,
     steel_contacts: array_class.SteelContacts,
     steel_prop: array_class.SteelPropagation,
@@ -354,8 +354,8 @@ def kernel_steel_propagation_build_rows(
                     steel_prop.restitution[i_r, i_b] = 0.0
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_propagation_factor(
+@qd.func
+def func_steel_propagation_factor(
     steel_state: array_class.SteelState,
     steel_free_rows: array_class.SteelFreeRows,
     steel_prop: array_class.SteelPropagation,
@@ -531,36 +531,48 @@ def kernel_steel_propagation_factor(
                 steel_prop.links_response[i_l, i_b] = response
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_propagation_refresh(
+@qd.func
+def func_propagation_refresh_articulation(
+    i_a: int,
+    i_b: int,
     steel_prop: array_class.SteelPropagation,
     steel_dyn: array_class.SteelDynamics,
     steel_model: array_class.SteelModelInfo,
-    steel_config: qd.template(),
     refresh_all: bool,
 ):
-    """Recompute the twists of every link from the joint velocity v_out.
+    """Recompute the twists of the links of articulation i_a from the joint velocity v_out.
 
     Unless refresh_all, the articulations of environments without dense contact rows keep their twists: their joint
     velocity only changes through the tree propagation, which leaves the twists consistent. Free rigid bodies always
     copy their velocity, which is their COM twist.
     """
+    if steel_model.arts_is_free_rigid[i_a] != 0:
+        i_l = func_free_body_link(i_a, steel_model)
+        dof_start = steel_model.arts_dof_start[i_a]
+        steel_prop.links_qd[i_l, i_b] = qd.Vector(
+            [steel_dyn.v_out[dof_start + k, i_b] for k in qd.static(range(6))], dt=gs.qd_float
+        )
+    elif refresh_all or steel_prop.has_dense_contacts[i_b] != 0:
+        func_tree_twists(i_a, i_b, steel_prop, steel_dyn, steel_model, clear_impulse=False)
+
+
+@qd.func
+def func_steel_propagation_refresh(
+    steel_prop: array_class.SteelPropagation,
+    steel_dyn: array_class.SteelDynamics,
+    steel_model: array_class.SteelModelInfo,
+    steel_config: qd.template(),
+):
+    """Recompute the twists of every link of every environment from the joint velocity v_out."""
     n_arts = steel_model.arts_dof_start.shape[0]
     _B = steel_prop.count.shape[0]
     qd.loop_config(serialize=qd.static(steel_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_a, i_b in qd.ndrange(n_arts, _B):
-        if steel_model.arts_is_free_rigid[i_a] != 0:
-            i_l = func_free_body_link(i_a, steel_model)
-            dof_start = steel_model.arts_dof_start[i_a]
-            steel_prop.links_qd[i_l, i_b] = qd.Vector(
-                [steel_dyn.v_out[dof_start + k, i_b] for k in qd.static(range(6))], dt=gs.qd_float
-            )
-        elif refresh_all or steel_prop.has_dense_contacts[i_b] != 0:
-            func_tree_twists(i_a, i_b, steel_prop, steel_dyn, steel_model, clear_impulse=False)
+        func_propagation_refresh_articulation(i_a, i_b, steel_prop, steel_dyn, steel_model, refresh_all=True)
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_propagation_row_setup(
+@qd.func
+def func_steel_propagation_row_setup(
     dt: float,
     steel_prop: array_class.SteelPropagation,
     steel_dyn: array_class.SteelDynamics,
@@ -572,7 +584,7 @@ def kernel_steel_propagation_row_setup(
 
     The response of side x is MiJt_x = s_x Phi_x J_x^T, s_x being the number of distinct row-bearing links in the
     coupling group of its link (mass splitting), and the diagonal d = cfm + sum_x J_x . MiJt_x. Contact biases follow
-    the free-body rows (see kernel_steel_row_setup), the incident velocity of a rebound being read from the link
+    the free-body rows (see func_steel_row_setup), the incident velocity of a rebound being read from the link
     twists. Penetrating contacts take the regularization weight w * d / (w * d + (1 - w) * d_u), d_u being the
     unsplit diagonal, so the compliance of the fixed point follows the unsplit response. With
     propagation_same_articulation_rows, a row between two links of one articulation takes instead the exact response
@@ -696,146 +708,135 @@ def kernel_steel_propagation_row_setup(
                             steel_prop.row_w[i_r, i_b] = contact_w
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_propagation_sweep(
+@qd.func
+def func_propagation_sweep(
+    i_b: int,
     global_iter: int,
     friction_start_iteration: int,
     rhs: qd.Tensor,
     steel_prop: array_class.SteelPropagation,
     steel_info: array_class.SteelInfo,
-    steel_config: qd.template(),
     regularize: bool,
 ):
-    """Run one Gauss-Seidel sweep of the propagation rows of every environment, in row order.
+    """Run one Gauss-Seidel sweep of the propagation rows of environment i_b, in row order.
 
     A row update is lambda += omega * (w * (-r / d) - (1 - w) * lambda) with the residual r = J v + rhs from the link
     twists, the regularization weight w applying to contact rows under regularize, projected on lambda >= 0 for
     contacts. The first tangent row of a contact solves both tangent impulses on the friction disk of its pooled normal
     impulse, the second one is left as is, and tangent rows hold a zero impulse before friction_start_iteration. Every
     impulse change moves the twist estimates of the row's links by MiJt dlambda and accumulates J^T dlambda on them,
-    which kernel_steel_propagation_propagate applies to the joint velocities. The rows of 'propagation_colored' lie in
-    color order, the contacts of one color sharing no link.
+    which func_propagation_propagate_articulation applies to the joint velocities. The rows of 'propagation_colored' lie
+    in color order, the contacts of one color sharing no link.
     """
-    _B = steel_prop.count.shape[0]
     omega = steel_info.relaxation[None]
-    qd.loop_config(serialize=qd.static(steel_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_b in range(_B):
-        for i_r in range(steel_prop.count[i_b]):
-            row_type = steel_prop.row_type[i_r, i_b]
-            is_friction = row_type == ROW_TYPE.FRICTION
-            eff_inv = steel_prop.eff_mass_inv[i_r, i_b]
-            is_skipped = eff_inv <= 0.0 and not is_friction
-            if is_friction and global_iter < friction_start_iteration:
-                steel_prop.impulses[i_r, i_b] = 0.0
-                is_skipped = True
-            if not is_skipped:
-                res = func_propagation_row_dot(i_r, i_b, steel_prop) + rhs[i_r, i_b]
-                old = steel_prop.impulses[i_r, i_b]
-                delta = -res * eff_inv
-                if row_type == ROW_TYPE.CONTACT and regularize:
-                    w = steel_prop.row_w[i_r, i_b]
-                    delta = delta * w - (1.0 - w) * old
-                new = old + omega * delta
-                if row_type == ROW_TYPE.CONTACT:
-                    new = qd.max(new, 0.0)
-                elif is_friction:
-                    new = old
-                    i_p = steel_prop.row_parent[i_r, i_b]
-                    if i_r == i_p + 1:
-                        i_s = i_p + 2
-                        load = func_pooled_normal_impulse(i_p, i_b, steel_prop.row_parent, steel_prop.impulses)
-                        radius = qd.max(steel_prop.row_mu[i_r, i_b] * load, 0.0)
-                        old_s = steel_prop.impulses[i_s, i_b]
-                        res_s = func_propagation_row_dot(i_s, i_b, steel_prop) + rhs[i_s, i_b]
-                        cross = gs.qd_float(0.0)
-                        if steel_prop.body_a[i_r, i_b] >= 0:
-                            cross = cross + steel_prop.J_a[i_r, i_b].dot(steel_prop.MiJt_a[i_s, i_b])
-                        if steel_prop.body_b[i_r, i_b] >= 0:
-                            cross = cross + steel_prop.J_b[i_r, i_b].dot(steel_prop.MiJt_b[i_s, i_b])
-                        eff_inv_s = steel_prop.eff_mass_inv[i_s, i_b]
-                        pair = func_friction_pair_candidate(
-                            1.0 / eff_inv if eff_inv > 0.0 else 0.0,
-                            cross,
-                            1.0 / eff_inv_s if eff_inv_s > 0.0 else 0.0,
-                            qd.Vector([res, res_s], dt=gs.qd_float),
-                            qd.Vector([old, old_s], dt=gs.qd_float),
-                            radius,
-                            omega,
-                            steel_info,
-                        )
-                        norm = pair.norm()
-                        if norm > radius:
-                            pair = pair * (radius / norm)
-                        new = pair[0]
-                        dlam_s = pair[1] - old_s
-                        steel_prop.impulses[i_s, i_b] = pair[1]
-                        if dlam_s != 0.0:
-                            func_propagation_apply_impulse(i_s, i_b, dlam_s, steel_prop)
-                dlam = new - old
-                steel_prop.impulses[i_r, i_b] = new
-                if dlam != 0.0:
-                    func_propagation_apply_impulse(i_r, i_b, dlam, steel_prop)
+    for i_r in range(steel_prop.count[i_b]):
+        row_type = steel_prop.row_type[i_r, i_b]
+        is_friction = row_type == ROW_TYPE.FRICTION
+        eff_inv = steel_prop.eff_mass_inv[i_r, i_b]
+        is_skipped = eff_inv <= 0.0 and not is_friction
+        if is_friction and global_iter < friction_start_iteration:
+            steel_prop.impulses[i_r, i_b] = 0.0
+            is_skipped = True
+        if not is_skipped:
+            res = func_propagation_row_dot(i_r, i_b, steel_prop) + rhs[i_r, i_b]
+            old = steel_prop.impulses[i_r, i_b]
+            delta = -res * eff_inv
+            if row_type == ROW_TYPE.CONTACT and regularize:
+                w = steel_prop.row_w[i_r, i_b]
+                delta = delta * w - (1.0 - w) * old
+            new = old + omega * delta
+            if row_type == ROW_TYPE.CONTACT:
+                new = qd.max(new, 0.0)
+            elif is_friction:
+                new = old
+                i_p = steel_prop.row_parent[i_r, i_b]
+                if i_r == i_p + 1:
+                    i_s = i_p + 2
+                    load = func_pooled_normal_impulse(i_p, i_b, steel_prop.row_parent, steel_prop.impulses)
+                    radius = qd.max(steel_prop.row_mu[i_r, i_b] * load, 0.0)
+                    old_s = steel_prop.impulses[i_s, i_b]
+                    res_s = func_propagation_row_dot(i_s, i_b, steel_prop) + rhs[i_s, i_b]
+                    cross = gs.qd_float(0.0)
+                    if steel_prop.body_a[i_r, i_b] >= 0:
+                        cross = cross + steel_prop.J_a[i_r, i_b].dot(steel_prop.MiJt_a[i_s, i_b])
+                    if steel_prop.body_b[i_r, i_b] >= 0:
+                        cross = cross + steel_prop.J_b[i_r, i_b].dot(steel_prop.MiJt_b[i_s, i_b])
+                    eff_inv_s = steel_prop.eff_mass_inv[i_s, i_b]
+                    pair = func_friction_pair_candidate(
+                        1.0 / eff_inv if eff_inv > 0.0 else 0.0,
+                        cross,
+                        1.0 / eff_inv_s if eff_inv_s > 0.0 else 0.0,
+                        qd.Vector([res, res_s], dt=gs.qd_float),
+                        qd.Vector([old, old_s], dt=gs.qd_float),
+                        radius,
+                        omega,
+                        steel_info,
+                    )
+                    norm = pair.norm()
+                    if norm > radius:
+                        pair = pair * (radius / norm)
+                    new = pair[0]
+                    dlam_s = pair[1] - old_s
+                    steel_prop.impulses[i_s, i_b] = pair[1]
+                    if dlam_s != 0.0:
+                        func_propagation_apply_impulse(i_s, i_b, dlam_s, steel_prop)
+            dlam = new - old
+            steel_prop.impulses[i_r, i_b] = new
+            if dlam != 0.0:
+                func_propagation_apply_impulse(i_r, i_b, dlam, steel_prop)
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_propagation_propagate(
+@qd.func
+def func_propagation_propagate_articulation(
+    i_a: int,
+    i_b: int,
     steel_prop: array_class.SteelPropagation,
     steel_dyn: array_class.SteelDynamics,
     steel_model: array_class.SteelModelInfo,
-    steel_config: qd.template(),
 ):
-    """Apply the impulses accumulated on the links by the sweep to the joint velocity v_out, exactly.
+    """Apply the impulses the sweep accumulated on the links of articulation i_a to the joint velocity v_out, exactly.
 
-    Every articulation holding an impulse runs the backward and forward passes of its factorization on them, which
-    adds H^-1 J^T I to its joint velocity, then recomputes the twists of its links from it, replacing the estimates of
-    the sweep, and clears the impulses. A free rigid body writes its twist, exact, back to its velocity.
+    An articulation holding an impulse runs the backward and forward passes of its factorization on them, which adds
+    H^-1 J^T I to its joint velocity, then recomputes the twists of its links from it, replacing the estimates of the
+    sweep, and clears the impulses. A free rigid body writes its twist, exact, back to its velocity.
     """
-    n_arts = steel_model.arts_dof_start.shape[0]
-    _B = steel_prop.count.shape[0]
-    qd.loop_config(serialize=qd.static(steel_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_a, i_b in qd.ndrange(n_arts, _B):
-        if steel_model.arts_is_free_rigid[i_a] != 0:
-            i_l = func_free_body_link(i_a, steel_model)
-            dof_start = steel_model.arts_dof_start[i_a]
-            twist = steel_prop.links_qd[i_l, i_b]
+    if steel_model.arts_is_free_rigid[i_a] != 0:
+        i_l = func_free_body_link(i_a, steel_model)
+        dof_start = steel_model.arts_dof_start[i_a]
+        twist = steel_prop.links_qd[i_l, i_b]
+        for k in qd.static(range(6)):
+            steel_dyn.v_out[dof_start + k, i_b] = twist[k]
+        steel_prop.links_impulse[i_l, i_b] = qd.Vector.zero(gs.qd_float, 6)
+    else:
+        has_impulse = False
+        for i_j in range(steel_model.arts_joint_start[i_a], steel_model.arts_joint_start[i_a + 1]):
+            i_l = steel_model.joints_link[i_j]
+            impulse = steel_prop.links_impulse[i_l, i_b]
             for k in qd.static(range(6)):
-                steel_dyn.v_out[dof_start + k, i_b] = twist[k]
-            steel_prop.links_impulse[i_l, i_b] = qd.Vector.zero(gs.qd_float, 6)
-        else:
-            has_impulse = False
-            for i_j in range(steel_model.arts_joint_start[i_a], steel_model.arts_joint_start[i_a + 1]):
-                i_l = steel_model.joints_link[i_j]
-                impulse = steel_prop.links_impulse[i_l, i_b]
-                for k in qd.static(range(6)):
-                    if impulse[k] != 0.0:
-                        has_impulse = True
-                steel_prop.links_pA[i_l, i_b] = -impulse
-            if has_impulse:
-                func_tree_backward(i_a, i_b, steel_prop, steel_model)
-                func_tree_forward(i_a, i_b, steel_prop, steel_dyn, steel_model, update_velocity=True)
-                func_tree_twists(i_a, i_b, steel_prop, steel_dyn, steel_model, clear_impulse=True)
+                if impulse[k] != 0.0:
+                    has_impulse = True
+            steel_prop.links_pA[i_l, i_b] = -impulse
+        if has_impulse:
+            func_tree_backward(i_a, i_b, steel_prop, steel_model)
+            func_tree_forward(i_a, i_b, steel_prop, steel_dyn, steel_model, update_velocity=True)
+            func_tree_twists(i_a, i_b, steel_prop, steel_dyn, steel_model, clear_impulse=True)
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_propagation_warmstart(
-    steel_prop: array_class.SteelPropagation,
-    steel_config: qd.template(),
-):
-    """Move the twist estimates and accumulate the link impulses of the impulses the rows start the step with.
+@qd.func
+def func_propagation_warmstart(i_b: int, steel_prop: array_class.SteelPropagation):
+    """Apply the impulses the propagation rows of environment i_b start the step with to the twists and link impulses.
 
-    kernel_steel_propagation_propagate then installs their velocity in v_out before the first sweep.
+    The twist estimates move and the link impulses accumulate, which func_propagation_propagate_articulation then
+    installs in the velocity v_out before the first sweep.
     """
-    _B = steel_prop.count.shape[0]
-    qd.loop_config(serialize=qd.static(steel_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_b in range(_B):
-        for i_r in range(steel_prop.count[i_b]):
-            impulse = steel_prop.impulses[i_r, i_b]
-            if impulse != 0.0:
-                func_propagation_apply_impulse(i_r, i_b, impulse, steel_prop)
+    for i_r in range(steel_prop.count[i_b]):
+        impulse = steel_prop.impulses[i_r, i_b]
+        if impulse != 0.0:
+            func_propagation_apply_impulse(i_r, i_b, impulse, steel_prop)
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_propagation_velocity_pass_rhs(
+@qd.func
+def func_steel_propagation_velocity_pass_rhs(
     dt: float,
     steel_prop: array_class.SteelPropagation,
     steel_info: array_class.SteelInfo,

@@ -20,7 +20,6 @@ import genesis as gs
 import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 
-from ..rigid.abd.forward_kinematics import func_forward_velocity, func_update_cartesian_space
 from .model import STEEL_JOINT_TYPE
 
 
@@ -296,8 +295,8 @@ def func_link_transform(
     steel_dyn.links_com_pos[i_l, i_b] = pos + gu.qd_transform_by_quat(dyn_info.links.inertial_pos[I_l], wcj_quat)
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_prescale_velocity(
+@qd.func
+def func_steel_prescale_velocity(
     steel_rows: array_class.SteelRows,
     steel_dyn: array_class.SteelDynamics,
     steel_sleep: array_class.SteelSleep,
@@ -345,8 +344,8 @@ def kernel_steel_prescale_velocity(
                                     steel_dyn.dofs_qd_work[i_d, i_b] = steel_dyn.dofs_qd_work[i_d, i_b] * ratio
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_fk_id(
+@qd.func
+def func_steel_fk_id(
     global_refresh: bool,
     dyn_state: array_class.DynState,
     steel_state: array_class.SteelState,
@@ -383,7 +382,8 @@ def kernel_steel_fk_id(
                 steel_dyn.links_ft_lin[i_l, i_b] = qd.Vector.zero(gs.qd_float, 3)
                 steel_dyn.links_ft_ang[i_l, i_b] = qd.Vector.zero(gs.qd_float, 3)
 
-            origin = steel_dyn.links_com_pos[steel_model.joints_link[i_j_start], i_b]
+            i_l_root = steel_model.joints_link[i_j_start]
+            origin = steel_dyn.links_com_pos[i_l_root, i_b]
             steel_dyn.arts_origin[i_a, i_b] = origin
             is_write_inertia = is_refresh or steel_model.arts_is_free_rigid[i_a] != 0
             gravity = rigid_info.gravity[i_b]
@@ -477,8 +477,8 @@ def func_drive_params(
     return ke, kd, dyn_state.dofs.ctrl_pos[i_d, i_b], dyn_state.dofs.ctrl_vel[i_d, i_b]
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_tau(
+@qd.func
+def func_steel_tau(
     dt: float,
     dyn_state: array_class.DynState,
     steel_state: array_class.SteelState,
@@ -568,8 +568,8 @@ def kernel_steel_tau(
             steel_dyn.arts_aug_count[i_a, i_b] = n_aug
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_mass_matrix(
+@qd.func
+def func_steel_mass_matrix(
     steel_state: array_class.SteelState,
     steel_dyn: array_class.SteelDynamics,
     dyn_info: array_class.DynInfo,
@@ -716,8 +716,8 @@ def func_gyroscopic_velocity(
     return w
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_unconstrained(
+@qd.func
+def func_steel_unconstrained(
     dt: float,
     steel_state: array_class.SteelState,
     steel_dyn: array_class.SteelDynamics,
@@ -965,8 +965,8 @@ def func_eval_fk_articulation(
         )
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_inputs(
+@qd.func
+def func_steel_inputs(
     dyn_state: array_class.DynState,
     steel_state: array_class.SteelState,
     steel_dyn: array_class.SteelDynamics,
@@ -1024,8 +1024,8 @@ def kernel_steel_inputs(
                 steel_dyn.dofs_tau[i_d + 3 + k, i_b] = torque[k]
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_integrate(
+@qd.func
+def func_steel_integrate(
     dt: float,
     velocity: qd.Tensor,
     dyn_state: array_class.DynState,
@@ -1082,8 +1082,8 @@ def kernel_steel_integrate(
             func_integrate_joint(i_j, i_b, dt, steel_state, dyn_info, steel_info, steel_model, steel_config)
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_publish_refined_velocity(
+@qd.func
+def func_steel_publish_refined_velocity(
     dt: float,
     steel_state: array_class.SteelState,
     steel_dyn: array_class.SteelDynamics,
@@ -1108,7 +1108,8 @@ def kernel_steel_publish_refined_velocity(
         for i_r, i_b in qd.ndrange(n_roots, _B):
             i_j = steel_model.free_root_joints[i_r]
             i_d = steel_model.joints_dof_start[i_j]
-            scale = 1.0 - steel_info.links_angular_damping[steel_model.joints_link[i_j]] * dt
+            i_l = steel_model.joints_link[i_j]
+            scale = 1.0 - steel_info.links_angular_damping[i_l] * dt
             for k in qd.static(range(3, 6)):
                 steel_dyn.v_out[i_d + k, i_b] = steel_dyn.v_out[i_d + k, i_b] * scale
 
@@ -1117,8 +1118,8 @@ def kernel_steel_publish_refined_velocity(
         steel_state.qd[i_d, i_b] = steel_dyn.v_out[i_d, i_b]
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_forward_kinematics(
+@qd.func
+def func_steel_forward_kinematics(
     dyn_state: array_class.DynState,
     steel_state: array_class.SteelState,
     steel_dyn: array_class.SteelDynamics,
@@ -1143,8 +1144,8 @@ def kernel_steel_forward_kinematics(
             func_eval_fk_articulation(i_a, i_b, dyn_state, steel_state, steel_dyn, dyn_info, steel_model, steel_config)
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_publish(
+@qd.func
+def func_steel_publish(
     dt: float,
     dyn_state: array_class.DynState,
     steel_state: array_class.SteelState,
@@ -1207,7 +1208,7 @@ def kernel_steel_pull(
 ):
     """Load the joint state of the selected environments from the Genesis coordinates and velocities.
 
-    The inverse of kernel_steel_publish. The link poses and twists are evaluated from it, and the mass matrix of every
+    The inverse of func_steel_publish. The link poses and twists are evaluated from it, and the mass matrix of every
     articulation is refreshed on the next step.
     """
     n_joints = steel_model.joints_link.shape[0]
@@ -1249,17 +1250,3 @@ def kernel_steel_pull(
         i_b = envs_idx[i_b_]
         func_eval_fk_articulation(i_a, i_b, dyn_state, steel_state, steel_dyn, dyn_info, steel_model, steel_config)
         steel_state.arts_mass_update_requested[i_a, i_b] = 1
-
-
-@qd.kernel(fastcache=True)
-def kernel_steel_cartesian_space(
-    dyn_state: array_class.DynState,
-    dyn_info: array_class.DynInfo,
-    rigid_info: array_class.RigidInfo,
-    rigid_config: qd.template(),
-):
-    """Update the Genesis link, geom and velocity quantities from the coordinates and velocities Steel wrote."""
-    func_update_cartesian_space(
-        dyn_state, dyn_info, rigid_info, rigid_config, force_update_all_geoms=False, is_backward=False
-    )
-    func_forward_velocity(dyn_state, dyn_info, rigid_info, rigid_config, False)

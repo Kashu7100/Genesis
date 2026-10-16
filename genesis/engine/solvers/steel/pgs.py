@@ -352,14 +352,13 @@ def func_coulomb_newton_contact(
     return new
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_pgs(
+@qd.func
+def func_pgs_sweeps(
+    i_b: int,
     n_iterations: int,
     iteration_offset: int,
     friction_start_iteration: int,
     row_phase: int,
-    regularize: bool,
-    freeze_drive_rows: bool,
     rhs_dense: qd.Tensor,
     rhs_free: qd.Tensor,
     steel_rows: array_class.SteelRows,
@@ -367,115 +366,187 @@ def kernel_steel_pgs(
     steel_dyn: array_class.SteelDynamics,
     steel_info: array_class.SteelInfo,
     steel_config: qd.template(),
+    regularize: bool,
+    freeze_drive_rows: bool,
 ):
-    """Run n_iterations Gauss-Seidel sweeps of the rows of every environment, updating the velocity v_out.
+    """Run n_iterations Gauss-Seidel sweeps of the rows of environment i_b, updating the velocity v_out.
 
     A row update is lambda += omega * (w * (-r / D) - (1 - w) * lambda) with the residual r = J v + rhs, the diagonal D
     and the regularization weight w (1 unless regularize), projected on lambda >= 0 for contacts and joint limits.
     Drive rows follow their force-drive update, and keep their impulse under freeze_drive_rows. Friction rows hold a
-    zero impulse before friction_start_iteration. The tangent rows of a contact are solved together at the first one
-    (see the friction modes). Velocity limits are stateless clamps solved after the contact rows, each visit applying
-    the impulse that removes the current overshoot. row_phase selects the row families of the sweep: 0 every family, 1
-    and 4 the contacts, 2 the internal rows and the velocity limits, 3 the internal rows, 5 the velocity limits.
-    Contact torsion rows are solved after the free-body rows (see func_torsion_sweep). With contact compliance, every
-    sweep starts by refreshing the right-hand sides from the current impulses (see func_compliance_refresh_rhs).
+    zero impulse before friction_start_iteration, the sweeps counting from iteration_offset. The tangent rows of a
+    contact are solved together at the first one (see the friction modes). Velocity limits are stateless clamps solved
+    after the contact rows, each visit applying the impulse that removes the current overshoot. row_phase selects the
+    row families of the sweep: 0 every family, 1 and 4 the contacts, 2 the internal rows and the velocity limits, 3 the
+    internal rows, 5 the velocity limits. Contact torsion rows are solved after the free-body rows (see
+    func_torsion_sweep). With contact compliance, every sweep starts by refreshing the right-hand sides from the current
+    impulses (see func_compliance_refresh_rhs).
     """
-    _B = steel_dyn.v_out.shape[1]
     omega = steel_info.relaxation[None]
     is_contact_phase = row_phase == 0 or row_phase == 1 or row_phase == 4
     is_internal_phase = row_phase == 0 or row_phase == 2 or row_phase == 3
     is_velocity_limit_phase = row_phase == 0 or row_phase == 2 or row_phase == 5
-    for i_b in range(_B):
-        m_dense = steel_rows.count[i_b]
-        dense_main_end = m_dense if row_phase != 5 else 0
-        m_free = 0
-        free_contact_end = 0
-        if qd.static(steel_config.has_free_rigid_bodies):
-            m_free = steel_free_rows.count[i_b]
-            free_contact_end = qd.min(steel_free_rows.contact_rows_end[i_b], m_free)
-        free_main_end = free_contact_end if is_contact_phase else 0
-        for it in range(n_iterations):
-            global_iter = iteration_offset + it
-            is_changed = False
-            if qd.static(steel_config.has_compliance):
-                func_compliance_refresh_rhs(
-                    i_b, m_dense, m_free, rhs_dense, rhs_free, steel_rows, steel_free_rows, steel_config
-                )
-            for i_r in range(dense_main_end):
-                row_type = steel_rows.row_type[i_r, i_b]
-                is_friction = row_type == ROW_TYPE.FRICTION
-                is_contact_row = row_type == ROW_TYPE.CONTACT or is_friction
-                is_skipped = row_type == ROW_TYPE.JOINT_VELOCITY_LIMIT or row_type == ROW_TYPE.TORSION
-                if freeze_drive_rows and row_type == ROW_TYPE.JOINT_TARGET:
-                    is_skipped = True
-                if (is_contact_row and not is_contact_phase) or (not is_contact_row and not is_internal_phase):
-                    is_skipped = True
-                if not is_skipped and is_friction and global_iter < friction_start_iteration:
-                    steel_rows.impulses[i_r, i_b] = 0.0
-                    is_skipped = True
-                denom = steel_rows.diag[i_r, i_b]
-                if denom <= 0.0 and not (qd.static(steel_config.friction_mode == 0) and is_friction):
-                    is_skipped = True
-                if not is_skipped:
-                    jv = gs.qd_float(0.0)
-                    for i_d in range(steel_rows.J.shape[1]):
-                        jv = jv + steel_rows.J[i_r, i_d, i_b] * steel_dyn.v_out[i_d, i_b]
-                    res = jv + rhs_dense[i_r, i_b]
-                    old = steel_rows.impulses[i_r, i_b]
-                    w = steel_rows.row_w[i_r, i_b] if regularize else 1.0
-                    delta = gs.qd_float(0.0)
-                    if denom > 0.0:
-                        delta = -res / denom * w - (1.0 - w) * old
-                    new = old + omega * delta
-                    if row_type == ROW_TYPE.JOINT_TARGET:
-                        if qd.static(steel_config.drive_mode == 1):
-                            new = (
-                                old * steel_rows.drive_impulse_multiplier[i_r, i_b]
-                                + jv * steel_rows.drive_vel_multiplier[i_r, i_b]
-                                + steel_rows.drive_target_vel_bias[i_r, i_b]
-                            )
-                            impulse_range = steel_rows.drive_impulse_range[i_r, i_b]
-                            new = qd.math.clamp(new, impulse_range[0], impulse_range[1])
-                    elif is_friction:
-                        new = old
-                        i_p = steel_rows.row_parent[i_r, i_b]
-                        if i_r == i_p + 1:
-                            i_s = i_p + 2
-                            if qd.static(steel_config.friction_mode == 1 or steel_config.friction_mode == 2):
-                                # Bisection: the normal and both tangent impulses of the contact are solved together.
-                                u = qd.Vector.zero(gs.qd_float, 3)
-                                G = qd.Matrix.zero(gs.qd_float, 3, 3)
-                                for k in qd.static(range(3)):
-                                    for i_d in range(steel_rows.J.shape[1]):
-                                        u[k] = u[k] + steel_rows.J[i_p + k, i_d, i_b] * steel_dyn.v_out[i_d, i_b]
-                                for k in qd.static(range(3)):
-                                    for m in qd.static(range(k, 3)):
-                                        G[k, m] = func_dense_row_cross(i_p + k, i_p + m, i_b, steel_rows)
-                                old3 = qd.Vector(
-                                    [steel_rows.impulses[i_p + k, i_b] for k in qd.static(range(3))], dt=gs.qd_float
-                                )
-                                new3 = func_bisection_contact(
-                                    u, G, old3, -rhs_dense[i_p, i_b], steel_rows.row_mu[i_r, i_b], steel_info
-                                )
-                                for k in qd.static((0, 2)):
-                                    dlam_k = new3[k] - old3[k]
-                                    steel_rows.impulses[i_p + k, i_b] = new3[k]
-                                    if dlam_k != 0.0:
-                                        is_changed = True
-                                        func_dense_apply_impulse(i_p + k, i_b, dlam_k, steel_rows, steel_dyn)
-                                new = new3[1]
-                            else:
-                                load = func_pooled_normal_impulse(i_p, i_b, steel_rows.row_parent, steel_rows.impulses)
-                                radius = qd.max(steel_rows.row_mu[i_r, i_b] * load, 0.0)
-                                r1 = gs.qd_float(0.0)
+    m_dense = steel_rows.count[i_b]
+    dense_main_end = m_dense if row_phase != 5 else 0
+    m_free = 0
+    free_contact_end = 0
+    if qd.static(steel_config.has_free_rigid_bodies):
+        m_free = steel_free_rows.count[i_b]
+        free_contact_end = qd.min(steel_free_rows.contact_rows_end[i_b], m_free)
+    free_main_end = free_contact_end if is_contact_phase else 0
+    for it in range(n_iterations):
+        global_iter = iteration_offset + it
+        is_changed = False
+        if qd.static(steel_config.has_compliance):
+            func_compliance_refresh_rhs(
+                i_b, m_dense, m_free, rhs_dense, rhs_free, steel_rows, steel_free_rows, steel_config
+            )
+        for i_r in range(dense_main_end):
+            row_type = steel_rows.row_type[i_r, i_b]
+            is_friction = row_type == ROW_TYPE.FRICTION
+            is_contact_row = row_type == ROW_TYPE.CONTACT or is_friction
+            is_skipped = row_type == ROW_TYPE.JOINT_VELOCITY_LIMIT or row_type == ROW_TYPE.TORSION
+            if freeze_drive_rows and row_type == ROW_TYPE.JOINT_TARGET:
+                is_skipped = True
+            if (is_contact_row and not is_contact_phase) or (not is_contact_row and not is_internal_phase):
+                is_skipped = True
+            if not is_skipped and is_friction and global_iter < friction_start_iteration:
+                steel_rows.impulses[i_r, i_b] = 0.0
+                is_skipped = True
+            denom = steel_rows.diag[i_r, i_b]
+            if denom <= 0.0 and not (qd.static(steel_config.friction_mode == 0) and is_friction):
+                is_skipped = True
+            if not is_skipped:
+                jv = gs.qd_float(0.0)
+                for i_d in range(steel_rows.J.shape[1]):
+                    jv = jv + steel_rows.J[i_r, i_d, i_b] * steel_dyn.v_out[i_d, i_b]
+                res = jv + rhs_dense[i_r, i_b]
+                old = steel_rows.impulses[i_r, i_b]
+                w = steel_rows.row_w[i_r, i_b] if regularize else 1.0
+                delta = gs.qd_float(0.0)
+                if denom > 0.0:
+                    delta = -res / denom * w - (1.0 - w) * old
+                new = old + omega * delta
+                if row_type == ROW_TYPE.JOINT_TARGET:
+                    if qd.static(steel_config.drive_mode == 1):
+                        new = (
+                            old * steel_rows.drive_impulse_multiplier[i_r, i_b]
+                            + jv * steel_rows.drive_vel_multiplier[i_r, i_b]
+                            + steel_rows.drive_target_vel_bias[i_r, i_b]
+                        )
+                        impulse_range = steel_rows.drive_impulse_range[i_r, i_b]
+                        new = qd.math.clamp(new, impulse_range[0], impulse_range[1])
+                elif is_friction:
+                    new = old
+                    i_p = steel_rows.row_parent[i_r, i_b]
+                    if i_r == i_p + 1:
+                        i_s = i_p + 2
+                        if qd.static(steel_config.friction_mode == 1 or steel_config.friction_mode == 2):
+                            # Bisection: the normal and both tangent impulses of the contact are solved together.
+                            u = qd.Vector.zero(gs.qd_float, 3)
+                            G = qd.Matrix.zero(gs.qd_float, 3, 3)
+                            for k in qd.static(range(3)):
                                 for i_d in range(steel_rows.J.shape[1]):
-                                    r1 = r1 + steel_rows.J[i_s, i_d, i_b] * steel_dyn.v_out[i_d, i_b]
-                                r1 = r1 + rhs_dense[i_s, i_b]
-                                old_s = steel_rows.impulses[i_s, i_b]
+                                    u[k] = u[k] + steel_rows.J[i_p + k, i_d, i_b] * steel_dyn.v_out[i_d, i_b]
+                            for k in qd.static(range(3)):
+                                for m in qd.static(range(k, 3)):
+                                    G[k, m] = func_dense_row_cross(i_p + k, i_p + m, i_b, steel_rows)
+                            old3 = qd.Vector(
+                                [steel_rows.impulses[i_p + k, i_b] for k in qd.static(range(3))], dt=gs.qd_float
+                            )
+                            new3 = func_bisection_contact(
+                                u, G, old3, -rhs_dense[i_p, i_b], steel_rows.row_mu[i_r, i_b], steel_info
+                            )
+                            for k in qd.static((0, 2)):
+                                dlam_k = new3[k] - old3[k]
+                                steel_rows.impulses[i_p + k, i_b] = new3[k]
+                                if dlam_k != 0.0:
+                                    is_changed = True
+                                    func_dense_apply_impulse(i_p + k, i_b, dlam_k, steel_rows, steel_dyn)
+                            new = new3[1]
+                        else:
+                            load = func_pooled_normal_impulse(i_p, i_b, steel_rows.row_parent, steel_rows.impulses)
+                            radius = qd.max(steel_rows.row_mu[i_r, i_b] * load, 0.0)
+                            r1 = gs.qd_float(0.0)
+                            for i_d in range(steel_rows.J.shape[1]):
+                                r1 = r1 + steel_rows.J[i_s, i_d, i_b] * steel_dyn.v_out[i_d, i_b]
+                            r1 = r1 + rhs_dense[i_s, i_b]
+                            old_s = steel_rows.impulses[i_s, i_b]
+                            pair = func_friction_pair_candidate(
+                                denom,
+                                func_dense_row_cross(i_r, i_s, i_b, steel_rows),
+                                steel_rows.diag[i_s, i_b],
+                                qd.Vector([res, r1], dt=gs.qd_float),
+                                qd.Vector([old, old_s], dt=gs.qd_float),
+                                radius,
+                                omega,
+                                steel_info,
+                            )
+                            norm = pair.norm()
+                            if norm > radius:
+                                pair = pair * (radius / norm)
+                            new = pair[0]
+                            dlam_s = pair[1] - old_s
+                            steel_rows.impulses[i_s, i_b] = pair[1]
+                            if dlam_s != 0.0:
+                                is_changed = True
+                                func_dense_apply_impulse(i_s, i_b, dlam_s, steel_rows, steel_dyn)
+                elif row_type == ROW_TYPE.CONTACT or row_type == ROW_TYPE.JOINT_LIMIT:
+                    new = qd.max(new, 0.0)
+                dlam = new - old
+                steel_rows.impulses[i_r, i_b] = new
+                if dlam != 0.0:
+                    is_changed = True
+                    func_dense_apply_impulse(i_r, i_b, dlam, steel_rows, steel_dyn)
+
+        if qd.static(steel_config.has_free_rigid_bodies):
+            for i_r in range(free_main_end):
+                row_type = steel_free_rows.row_type[i_r, i_b]
+                i_p = steel_free_rows.row_parent[i_r, i_b]
+                is_friction = row_type == ROW_TYPE.FRICTION
+                is_skipped = is_friction and i_r != i_p + 1
+                if is_friction and global_iter < friction_start_iteration:
+                    steel_free_rows.impulses[i_r, i_b] = 0.0
+                    is_skipped = True
+                inv_diag = steel_free_rows.eff_mass_inv[i_r, i_b]
+                if inv_diag <= 0.0 and not (qd.static(steel_config.friction_mode == 0) and is_friction):
+                    is_skipped = True
+                radius = gs.qd_float(0.0)
+                if qd.static(steel_config.friction_mode == 0):
+                    if not is_skipped and is_friction:
+                        load = func_pooled_normal_impulse(
+                            i_p, i_b, steel_free_rows.row_parent, steel_free_rows.impulses
+                        )
+                        radius = qd.max(steel_free_rows.row_mu[i_r, i_b] * load, 0.0)
+                        if (
+                            radius == 0.0
+                            and steel_free_rows.impulses[i_r, i_b] == 0.0
+                            and steel_free_rows.impulses[i_r + 1, i_b] == 0.0
+                        ):
+                            is_skipped = True
+                if not is_skipped:
+                    jv = func_free_row_dot(i_r, i_b, steel_dyn.v_out, steel_free_rows)
+                    res = jv + rhs_free[i_r, i_b]
+                    old = steel_free_rows.impulses[i_r, i_b]
+                    delta = -res * inv_diag
+                    if row_type == ROW_TYPE.CONTACT:
+                        w = steel_free_rows.row_w[i_r, i_b] if regularize else 1.0
+                        delta = -res * inv_diag * w - (1.0 - w) * old
+                    new = old + omega * delta
+                    if row_type == ROW_TYPE.CONTACT:
+                        new = qd.max(new, 0.0)
+                    elif is_friction:
+                        i_s = i_r + 1
+                        if qd.static(steel_config.friction_mode == 0):
+                            old_s = steel_free_rows.impulses[i_s, i_b]
+                            pair = qd.Vector.zero(gs.qd_float, 2)
+                            if radius > 0.0:
+                                inv_s = steel_free_rows.eff_mass_inv[i_s, i_b]
+                                r1 = func_free_row_dot(i_s, i_b, steel_dyn.v_out, steel_free_rows) + rhs_free[i_s, i_b]
                                 pair = func_friction_pair_candidate(
-                                    denom,
-                                    func_dense_row_cross(i_r, i_s, i_b, steel_rows),
-                                    steel_rows.diag[i_s, i_b],
+                                    1.0 / inv_diag if inv_diag > 0.0 else 0.0,
+                                    func_free_row_cross(i_r, i_s, i_b, steel_free_rows),
+                                    1.0 / inv_s if inv_s > 0.0 else 0.0,
                                     qd.Vector([res, r1], dt=gs.qd_float),
                                     qd.Vector([old, old_s], dt=gs.qd_float),
                                     radius,
@@ -485,162 +556,88 @@ def kernel_steel_pgs(
                                 norm = pair.norm()
                                 if norm > radius:
                                     pair = pair * (radius / norm)
-                                new = pair[0]
-                                dlam_s = pair[1] - old_s
-                                steel_rows.impulses[i_s, i_b] = pair[1]
-                                if dlam_s != 0.0:
+                            new = pair[0]
+                            dlam_s = pair[1] - old_s
+                            steel_free_rows.impulses[i_s, i_b] = pair[1]
+                            if dlam_s != 0.0:
+                                is_changed = True
+                                func_free_apply_impulse(i_s, i_b, dlam_s, steel_free_rows, steel_dyn)
+                        else:
+                            u = qd.Vector.zero(gs.qd_float, 3)
+                            G = qd.Matrix.zero(gs.qd_float, 3, 3)
+                            for k in qd.static(range(3)):
+                                u[k] = func_free_row_dot(i_p + k, i_b, steel_dyn.v_out, steel_free_rows)
+                                for m in qd.static(range(k, 3)):
+                                    G[k, m] = func_free_row_cross(i_p + k, i_p + m, i_b, steel_free_rows)
+                                    G[m, k] = G[k, m]
+                            old3 = qd.Vector(
+                                [steel_free_rows.impulses[i_p + k, i_b] for k in qd.static(range(3))],
+                                dt=gs.qd_float,
+                            )
+                            mu = steel_free_rows.row_mu[i_r, i_b]
+                            target_n = -rhs_free[i_p, i_b]
+                            if qd.static(steel_config.friction_mode == 2):
+                                # de Saxce maximum-dissipation bias.
+                                target_n = target_n + mu * qd.sqrt(u[1] * u[1] + u[2] * u[2])
+                            new3 = old3
+                            if qd.static(steel_config.friction_mode == 3):
+                                new3 = func_coulomb_newton_contact(u, G, old3, target_n, mu, steel_info)
+                            else:
+                                new3 = func_bisection_contact(u, G, old3, target_n, mu, steel_info)
+                            for k in qd.static((0, 2)):
+                                dlam_k = new3[k] - old3[k]
+                                steel_free_rows.impulses[i_p + k, i_b] = new3[k]
+                                if dlam_k != 0.0:
                                     is_changed = True
-                                    func_dense_apply_impulse(i_s, i_b, dlam_s, steel_rows, steel_dyn)
-                    elif row_type == ROW_TYPE.CONTACT or row_type == ROW_TYPE.JOINT_LIMIT:
-                        new = qd.max(new, 0.0)
+                                    func_free_apply_impulse(i_p + k, i_b, dlam_k, steel_free_rows, steel_dyn)
+                            new = new3[1]
                     dlam = new - old
-                    steel_rows.impulses[i_r, i_b] = new
+                    steel_free_rows.impulses[i_r, i_b] = new
                     if dlam != 0.0:
                         is_changed = True
-                        func_dense_apply_impulse(i_r, i_b, dlam, steel_rows, steel_dyn)
+                        func_free_apply_impulse(i_r, i_b, dlam, steel_free_rows, steel_dyn)
 
-            if qd.static(steel_config.has_free_rigid_bodies):
-                for i_r in range(free_main_end):
-                    row_type = steel_free_rows.row_type[i_r, i_b]
-                    i_p = steel_free_rows.row_parent[i_r, i_b]
-                    is_friction = row_type == ROW_TYPE.FRICTION
-                    is_skipped = is_friction and i_r != i_p + 1
-                    if is_friction and global_iter < friction_start_iteration:
-                        steel_free_rows.impulses[i_r, i_b] = 0.0
-                        is_skipped = True
+        if qd.static(steel_config.has_torsion):
+            if is_contact_phase:
+                if func_torsion_sweep(i_b, m_dense, omega, rhs_dense, steel_rows, steel_dyn):
+                    is_changed = True
+
+        if is_velocity_limit_phase:
+            if qd.static(steel_config.enable_joint_velocity_limits):
+                for i_r in range(m_dense):
+                    denom = steel_rows.diag[i_r, i_b]
+                    if steel_rows.row_type[i_r, i_b] == ROW_TYPE.JOINT_VELOCITY_LIMIT and denom > 0.0:
+                        res = rhs_dense[i_r, i_b]
+                        for i_d in range(steel_rows.J.shape[1]):
+                            res = res + steel_rows.J[i_r, i_d, i_b] * steel_dyn.v_out[i_d, i_b]
+                        dlam = -res / denom if res < 0.0 else 0.0
+                        steel_rows.impulses[i_r, i_b] = dlam
+                        if dlam != 0.0:
+                            is_changed = True
+                            func_dense_apply_impulse(i_r, i_b, dlam, steel_rows, steel_dyn)
+            if qd.static(steel_config.has_fused_velocity_limits):
+                for i_r in range(m_dense):
+                    denom = steel_rows.diag[i_r, i_b]
+                    if steel_rows.row_type[i_r, i_b] == ROW_TYPE.JOINT_TARGET and denom > 0.0:
+                        qdot_max = steel_rows.drive_vel_limit[i_r, i_b]
+                        jv = gs.qd_float(0.0)
+                        for i_d in range(steel_rows.J.shape[1]):
+                            jv = jv + steel_rows.J[i_r, i_d, i_b] * steel_dyn.v_out[i_d, i_b]
+                        if qd.abs(jv) > qdot_max:
+                            dlam = (qd.math.clamp(jv, -qdot_max, qdot_max) - jv) / denom
+                            if dlam != 0.0:
+                                is_changed = True
+                                func_dense_apply_impulse(i_r, i_b, dlam, steel_rows, steel_dyn)
+            if qd.static(steel_config.has_free_velocity_limits):
+                for i_r in range(free_contact_end, m_free):
                     inv_diag = steel_free_rows.eff_mass_inv[i_r, i_b]
-                    if inv_diag <= 0.0 and not (qd.static(steel_config.friction_mode == 0) and is_friction):
-                        is_skipped = True
-                    radius = gs.qd_float(0.0)
-                    if qd.static(steel_config.friction_mode == 0):
-                        if not is_skipped and is_friction:
-                            load = func_pooled_normal_impulse(
-                                i_p, i_b, steel_free_rows.row_parent, steel_free_rows.impulses
-                            )
-                            radius = qd.max(steel_free_rows.row_mu[i_r, i_b] * load, 0.0)
-                            if (
-                                radius == 0.0
-                                and steel_free_rows.impulses[i_r, i_b] == 0.0
-                                and steel_free_rows.impulses[i_r + 1, i_b] == 0.0
-                            ):
-                                is_skipped = True
-                    if not is_skipped:
-                        jv = func_free_row_dot(i_r, i_b, steel_dyn.v_out, steel_free_rows)
-                        res = jv + rhs_free[i_r, i_b]
-                        old = steel_free_rows.impulses[i_r, i_b]
-                        delta = -res * inv_diag
-                        if row_type == ROW_TYPE.CONTACT:
-                            w = steel_free_rows.row_w[i_r, i_b] if regularize else 1.0
-                            delta = -res * inv_diag * w - (1.0 - w) * old
-                        new = old + omega * delta
-                        if row_type == ROW_TYPE.CONTACT:
-                            new = qd.max(new, 0.0)
-                        elif is_friction:
-                            i_s = i_r + 1
-                            if qd.static(steel_config.friction_mode == 0):
-                                old_s = steel_free_rows.impulses[i_s, i_b]
-                                pair = qd.Vector.zero(gs.qd_float, 2)
-                                if radius > 0.0:
-                                    inv_s = steel_free_rows.eff_mass_inv[i_s, i_b]
-                                    r1 = (
-                                        func_free_row_dot(i_s, i_b, steel_dyn.v_out, steel_free_rows)
-                                        + rhs_free[i_s, i_b]
-                                    )
-                                    pair = func_friction_pair_candidate(
-                                        1.0 / inv_diag if inv_diag > 0.0 else 0.0,
-                                        func_free_row_cross(i_r, i_s, i_b, steel_free_rows),
-                                        1.0 / inv_s if inv_s > 0.0 else 0.0,
-                                        qd.Vector([res, r1], dt=gs.qd_float),
-                                        qd.Vector([old, old_s], dt=gs.qd_float),
-                                        radius,
-                                        omega,
-                                        steel_info,
-                                    )
-                                    norm = pair.norm()
-                                    if norm > radius:
-                                        pair = pair * (radius / norm)
-                                new = pair[0]
-                                dlam_s = pair[1] - old_s
-                                steel_free_rows.impulses[i_s, i_b] = pair[1]
-                                if dlam_s != 0.0:
-                                    is_changed = True
-                                    func_free_apply_impulse(i_s, i_b, dlam_s, steel_free_rows, steel_dyn)
-                            else:
-                                u = qd.Vector.zero(gs.qd_float, 3)
-                                G = qd.Matrix.zero(gs.qd_float, 3, 3)
-                                for k in qd.static(range(3)):
-                                    u[k] = func_free_row_dot(i_p + k, i_b, steel_dyn.v_out, steel_free_rows)
-                                    for m in qd.static(range(k, 3)):
-                                        G[k, m] = func_free_row_cross(i_p + k, i_p + m, i_b, steel_free_rows)
-                                        G[m, k] = G[k, m]
-                                old3 = qd.Vector(
-                                    [steel_free_rows.impulses[i_p + k, i_b] for k in qd.static(range(3))],
-                                    dt=gs.qd_float,
-                                )
-                                mu = steel_free_rows.row_mu[i_r, i_b]
-                                target_n = -rhs_free[i_p, i_b]
-                                if qd.static(steel_config.friction_mode == 2):
-                                    # de Saxce maximum-dissipation bias.
-                                    target_n = target_n + mu * qd.sqrt(u[1] * u[1] + u[2] * u[2])
-                                new3 = old3
-                                if qd.static(steel_config.friction_mode == 3):
-                                    new3 = func_coulomb_newton_contact(u, G, old3, target_n, mu, steel_info)
-                                else:
-                                    new3 = func_bisection_contact(u, G, old3, target_n, mu, steel_info)
-                                for k in qd.static((0, 2)):
-                                    dlam_k = new3[k] - old3[k]
-                                    steel_free_rows.impulses[i_p + k, i_b] = new3[k]
-                                    if dlam_k != 0.0:
-                                        is_changed = True
-                                        func_free_apply_impulse(i_p + k, i_b, dlam_k, steel_free_rows, steel_dyn)
-                                new = new3[1]
-                        dlam = new - old
-                        steel_free_rows.impulses[i_r, i_b] = new
+                    if steel_free_rows.row_type[i_r, i_b] == ROW_TYPE.JOINT_VELOCITY_LIMIT and inv_diag > 0.0:
+                        res = func_free_row_dot(i_r, i_b, steel_dyn.v_out, steel_free_rows) + rhs_free[i_r, i_b]
+                        dlam = -res * inv_diag if res < 0.0 else 0.0
+                        steel_free_rows.impulses[i_r, i_b] = dlam
                         if dlam != 0.0:
                             is_changed = True
                             func_free_apply_impulse(i_r, i_b, dlam, steel_free_rows, steel_dyn)
 
-            if qd.static(steel_config.has_torsion):
-                if is_contact_phase:
-                    if func_torsion_sweep(i_b, m_dense, omega, rhs_dense, steel_rows, steel_dyn):
-                        is_changed = True
-
-            if is_velocity_limit_phase:
-                if qd.static(steel_config.enable_joint_velocity_limits):
-                    for i_r in range(m_dense):
-                        denom = steel_rows.diag[i_r, i_b]
-                        if steel_rows.row_type[i_r, i_b] == ROW_TYPE.JOINT_VELOCITY_LIMIT and denom > 0.0:
-                            res = rhs_dense[i_r, i_b]
-                            for i_d in range(steel_rows.J.shape[1]):
-                                res = res + steel_rows.J[i_r, i_d, i_b] * steel_dyn.v_out[i_d, i_b]
-                            dlam = -res / denom if res < 0.0 else 0.0
-                            steel_rows.impulses[i_r, i_b] = dlam
-                            if dlam != 0.0:
-                                is_changed = True
-                                func_dense_apply_impulse(i_r, i_b, dlam, steel_rows, steel_dyn)
-                if qd.static(steel_config.has_fused_velocity_limits):
-                    for i_r in range(m_dense):
-                        denom = steel_rows.diag[i_r, i_b]
-                        if steel_rows.row_type[i_r, i_b] == ROW_TYPE.JOINT_TARGET and denom > 0.0:
-                            qdot_max = steel_rows.drive_vel_limit[i_r, i_b]
-                            jv = gs.qd_float(0.0)
-                            for i_d in range(steel_rows.J.shape[1]):
-                                jv = jv + steel_rows.J[i_r, i_d, i_b] * steel_dyn.v_out[i_d, i_b]
-                            if qd.abs(jv) > qdot_max:
-                                dlam = (qd.math.clamp(jv, -qdot_max, qdot_max) - jv) / denom
-                                if dlam != 0.0:
-                                    is_changed = True
-                                    func_dense_apply_impulse(i_r, i_b, dlam, steel_rows, steel_dyn)
-                if qd.static(steel_config.has_free_velocity_limits):
-                    for i_r in range(free_contact_end, m_free):
-                        inv_diag = steel_free_rows.eff_mass_inv[i_r, i_b]
-                        if steel_free_rows.row_type[i_r, i_b] == ROW_TYPE.JOINT_VELOCITY_LIMIT and inv_diag > 0.0:
-                            res = func_free_row_dot(i_r, i_b, steel_dyn.v_out, steel_free_rows) + rhs_free[i_r, i_b]
-                            dlam = -res * inv_diag if res < 0.0 else 0.0
-                            steel_free_rows.impulses[i_r, i_b] = dlam
-                            if dlam != 0.0:
-                                is_changed = True
-                                func_free_apply_impulse(i_r, i_b, dlam, steel_free_rows, steel_dyn)
-
-            if global_iter >= friction_start_iteration and not is_changed:
-                break
+        if global_iter >= friction_start_iteration and not is_changed:
+            break

@@ -113,10 +113,9 @@ def func_contact_row_points(
 @qd.func
 def func_contact_mu(i_c: int, i_b: int, steel_contacts: array_class.SteelContacts, steel_info: array_class.SteelInfo):
     """Return the friction coefficient of contact i_c: the mean of the coefficients of its two geoms."""
-    return 0.5 * (
-        steel_info.geoms_mu[steel_contacts.shape0[i_c, i_b], i_b]
-        + steel_info.geoms_mu[steel_contacts.shape1[i_c, i_b], i_b]
-    )
+    i_g0 = steel_contacts.shape0[i_c, i_b]
+    i_g1 = steel_contacts.shape1[i_c, i_b]
+    return 0.5 * (steel_info.geoms_mu[i_g0, i_b] + steel_info.geoms_mu[i_g1, i_b])
 
 
 @qd.func
@@ -316,8 +315,8 @@ def func_init_dense_row(
     steel_rows.restitution[i_r, i_b] = 0.0
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_allocate_drive_rows(
+@qd.func
+def func_steel_allocate_drive_rows(
     dyn_state: array_class.DynState,
     steel_rows: array_class.SteelRows,
     dyn_info: array_class.DynInfo,
@@ -356,8 +355,8 @@ def kernel_steel_allocate_drive_rows(
         steel_rows.first_rejected[i_b] = ROW_SLOT.UNBOUNDED
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_allocate_rows(
+@qd.func
+def func_steel_allocate_rows(
     steel_state: array_class.SteelState,
     steel_contacts: array_class.SteelContacts,
     steel_rows: array_class.SteelRows,
@@ -503,9 +502,12 @@ def kernel_steel_allocate_rows(
                 if phi <= steel_info.contact_gap_limit[None]:
                     is_free = False
                     if qd.static(steel_config.has_free_rigid_bodies):
-                        is_free = (i_l0 < 0 or steel_model.arts_is_free_rigid[steel_model.links_art[i_l0]] != 0) and (
-                            i_l1 < 0 or steel_model.arts_is_free_rigid[steel_model.links_art[i_l1]] != 0
-                        )
+                        is_free = True
+                        for side in qd.static(range(2)):
+                            i_l = i_l0 if qd.static(side == 0) else i_l1
+                            if i_l >= 0:
+                                i_a = steel_model.links_art[i_l]
+                                is_free = is_free and steel_model.arts_is_free_rigid[i_a] != 0
                     is_propagation = False
                     if qd.static(steel_config.has_propagation):
                         is_propagation = func_is_propagation_contact(i_l0, i_l1, is_free, steel_model, steel_config)
@@ -571,7 +573,8 @@ def kernel_steel_allocate_rows(
                     if qd.static(steel_config.sleep_skip_constraints):
                         is_active = steel_sleep.arts_is_step_asleep[i_a, i_b] == 0
                     if is_active and steel_model.arts_is_free_rigid[i_a] != 0:
-                        i_l = steel_model.joints_link[steel_model.arts_joint_start[i_a]]
+                        i_j = steel_model.arts_joint_start[i_a]
+                        i_l = steel_model.joints_link[i_j]
                         dof_start = steel_model.arts_dof_start[i_a]
                         for axis in range(6):
                             limit = steel_info.links_max_linear_velocity[i_l]
@@ -621,8 +624,8 @@ def func_connect_anchors(
     return p_a, p_b
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_build_rows(
+@qd.func
+def func_steel_build_rows(
     dyn_state: array_class.DynState,
     steel_state: array_class.SteelState,
     steel_contacts: array_class.SteelContacts,
@@ -640,7 +643,7 @@ def kernel_steel_build_rows(
     A contact row acts along the normal from shape 1 toward shape 0 (normal row) or along a tangent (friction rows),
     side A positive and side B negative, so J v > 0 separates. A friction row points at its normal row. A drive row
     selects its degree of freedom and carries its drive parameters, its force range turned into an impulse range by
-    kernel_steel_responses. A limit row selects its degree of freedom, positive
+    func_steel_responses. A limit row selects its degree of freedom, positive
     for the lower bound and negative for the upper one. A velocity-limit row asks J v >= -qdot_max. A mimic row
     enforces q - c1 q_leader - c0 = 0 on the coordinates relative to the neutral configuration. A loop-closure row is
     one world axis of the coincidence of the two anchors, normalized, inert when its Jacobian vanishes.
@@ -695,9 +698,8 @@ def kernel_steel_build_rows(
                 i_d = steel_rows.row_ref[i_r, i_b]
                 I_d = [i_d, i_b] if qd.static(steel_config.batch_dofs_info) else i_d
                 ke, kd, q_target, v_target = func_drive_params(i_d, i_b, dyn_state, dyn_info, rigid_info, steel_config)
-                i_q = steel_model.joints_q_start[steel_model.dofs_joint[i_d]] + (
-                    i_d - steel_model.joints_dof_start[steel_model.dofs_joint[i_d]]
-                )
+                i_j = steel_model.dofs_joint[i_d]
+                i_q = steel_model.joints_q_start[i_j] + (i_d - steel_model.joints_dof_start[i_j])
                 steel_rows.J[i_r, i_d, i_b] = 1.0
                 steel_rows.target_velocity[i_r, i_b] = v_target
                 if qd.static(steel_config.drive_mode == 1):
@@ -718,15 +720,16 @@ def kernel_steel_build_rows(
                     steel_rows.target_velocity[i_r, i_b] = -steel_info.dofs_velocity_limit[i_d]
             elif row_type == ROW_TYPE.MIMIC:
                 i_m = steel_rows.row_ref[i_r, i_b]
-                eq_data = dyn_info.equalities.eq_data[steel_model.mimics_eq[i_m], i_b]
+                i_e = steel_model.mimics_eq[i_m]
+                i_d = steel_model.mimics_dof[i_m]
+                i_d_leader = steel_model.mimics_leader_dof[i_m]
+                i_q = steel_model.mimics_q[i_m]
+                i_q_leader = steel_model.mimics_leader_q[i_m]
+                eq_data = dyn_info.equalities.eq_data[i_e, i_b]
                 c0, c1 = eq_data[0], eq_data[1]
-                steel_rows.J[i_r, steel_model.mimics_dof[i_m], i_b] = 1.0
-                steel_rows.J[i_r, steel_model.mimics_leader_dof[i_m], i_b] = -c1
-                steel_rows.phi[i_r, i_b] = (
-                    steel_state.q[steel_model.mimics_q[i_m], i_b]
-                    - c1 * steel_state.q[steel_model.mimics_leader_q[i_m], i_b]
-                    - c0
-                )
+                steel_rows.J[i_r, i_d, i_b] = 1.0
+                steel_rows.J[i_r, i_d_leader, i_b] = -c1
+                steel_rows.phi[i_r, i_b] = steel_state.q[i_q, i_b] - c1 * steel_state.q[i_q_leader, i_b] - c0
             elif row_type == ROW_TYPE.CONNECT:
                 i_k = steel_rows.row_ref[i_r, i_b]
                 axis = steel_rows.row_axis[i_r, i_b]
@@ -830,7 +833,8 @@ def kernel_steel_build_rows(
                         limit = steel_info.links_max_angular_velocity[i_l]
                     steel_free_rows.body_a[i_r, i_b] = i_l
                     steel_free_rows.body_b[i_r, i_b] = -1
-                    steel_free_rows.dof_a[i_r, i_b] = steel_model.arts_dof_start[steel_model.links_art[i_l]]
+                    i_a = steel_model.links_art[i_l]
+                    steel_free_rows.dof_a[i_r, i_b] = steel_model.arts_dof_start[i_a]
                     steel_free_rows.dof_b[i_r, i_b] = -1
                     steel_free_rows.J_a_lin[i_r, i_b] = J_lin
                     steel_free_rows.J_a_ang[i_r, i_b] = J_ang
@@ -895,12 +899,15 @@ def func_row_articulations(
             i_a1 = steel_model.links_art[i_l1]
         if i_a1 == i_a0:
             i_a1 = -1
-    elif row_type == ROW_TYPE.MIMIC:
-        i_a0 = steel_model.mimics_art[steel_rows.row_ref[i_r, i_b]]
-    elif row_type == ROW_TYPE.CONNECT:
-        i_a0 = steel_model.connects_art[steel_rows.row_ref[i_r, i_b]]
     else:
-        i_a0 = steel_model.joints_art[steel_model.dofs_joint[steel_rows.row_ref[i_r, i_b]]]
+        i_ref = steel_rows.row_ref[i_r, i_b]
+        if row_type == ROW_TYPE.MIMIC:
+            i_a0 = steel_model.mimics_art[i_ref]
+        elif row_type == ROW_TYPE.CONNECT:
+            i_a0 = steel_model.connects_art[i_ref]
+        else:
+            i_j = steel_model.dofs_joint[i_ref]
+            i_a0 = steel_model.joints_art[i_j]
     return i_a0, i_a1
 
 
@@ -927,8 +934,8 @@ def func_free_row_dot(i_r: int, i_b: int, velocity: qd.Tensor, steel_free_rows: 
     return jv
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_responses(
+@qd.func
+def func_steel_responses(
     steel_contacts: array_class.SteelContacts,
     steel_rows: array_class.SteelRows,
     steel_dyn: array_class.SteelDynamics,
@@ -948,8 +955,8 @@ def kernel_steel_responses(
                     func_solve_articulation_block(i_r, i_b, i_a, steel_rows, steel_dyn, steel_model)
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_row_setup(
+@qd.func
+def func_steel_row_setup(
     dt: float,
     steel_state: array_class.SteelState,
     steel_contacts: array_class.SteelContacts,
@@ -1050,7 +1057,8 @@ def kernel_steel_row_setup(
         qd.loop_config(serialize=qd.static(steel_config.para_level < gs.PARA_LEVEL.PARTIAL))
         for i_a, i_b in qd.ndrange(n_arts, _B):
             if steel_model.arts_is_free_rigid[i_a] != 0:
-                i_l = steel_model.joints_link[steel_model.arts_joint_start[i_a]]
+                i_j = steel_model.arts_joint_start[i_a]
+                i_l = steel_model.joints_link[i_j]
                 dof_start = steel_model.arts_dof_start[i_a]
                 arm_lin = qd.Vector.zero(gs.qd_float, 3)
                 arm_ang = qd.Vector.zero(gs.qd_float, 3)
@@ -1144,8 +1152,8 @@ def kernel_steel_row_setup(
                 steel_free_rows.impulses[i_r, i_b] = 0.0
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_velocity_pass_rhs(
+@qd.func
+def func_steel_velocity_pass_rhs(
     dt: float,
     steel_rows: array_class.SteelRows,
     steel_free_rows: array_class.SteelFreeRows,
@@ -1240,8 +1248,8 @@ def func_preelim_solve(
     return x
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_preelim(
+@qd.func
+def func_steel_preelim(
     reg_rel: float,
     reg_floor: float,
     steel_contacts: array_class.SteelContacts,
@@ -1358,12 +1366,13 @@ def kernel_steel_preelim(
                             for i_d in range(dof_start, dof_end):
                                 acc = gs.qd_float(0.0)
                                 for p in range(m):
-                                    acc = acc + steel_rows.Y[steel_rows.preelim_slots[base + p, i_b], i_d, i_b] * z[p]
+                                    i_sp = steel_rows.preelim_slots[base + p, i_b]
+                                    acc = acc + steel_rows.Y[i_sp, i_d, i_b] * z[p]
                                 steel_rows.Y[i_r, i_d, i_b] = steel_rows.Y[i_r, i_d, i_b] - acc
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_preelim_project_velocity(
+@qd.func
+def func_steel_preelim_project_velocity(
     steel_rows: array_class.SteelRows,
     steel_dyn: array_class.SteelDynamics,
     steel_model: array_class.SteelModelInfo,
@@ -1396,6 +1405,7 @@ def kernel_steel_preelim_project_velocity(
                 for i_d in range(dof_start, dof_end):
                     acc = gs.qd_float(0.0)
                     for p in range(m):
-                        acc = acc + steel_rows.Y[steel_rows.preelim_slots[base + p, i_b], i_d, i_b] * z[p]
+                        i_sp = steel_rows.preelim_slots[base + p, i_b]
+                        acc = acc + steel_rows.Y[i_sp, i_d, i_b] * z[p]
                     if acc != 0.0:
                         steel_dyn.v_out[i_d, i_b] = steel_dyn.v_out[i_d, i_b] - acc

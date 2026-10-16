@@ -50,8 +50,8 @@ def func_island_union(i_a0: int, i_a1: int, i_b: int, arts_parent: qd.Tensor):
         arts_parent[i_r0, i_b] = i_r1
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_sleep_begin(
+@qd.func
+def func_steel_sleep_begin(
     dyn_state: array_class.DynState,
     steel_state: array_class.SteelState,
     steel_contacts: array_class.SteelContacts,
@@ -223,8 +223,8 @@ def kernel_steel_sleep_begin(
             steel_sleep.links_is_frozen[i_l, i_b] = is_frozen
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_sleep_finish(
+@qd.func
+def func_steel_sleep_finish(
     dt: float,
     steel_state: array_class.SteelState,
     steel_dyn: array_class.SteelDynamics,

@@ -46,8 +46,8 @@ def func_contact_compliance(
     return k, c
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_compliance_rows(
+@qd.func
+def func_steel_compliance_rows(
     dt: float,
     steel_contacts: array_class.SteelContacts,
     steel_rows: array_class.SteelRows,

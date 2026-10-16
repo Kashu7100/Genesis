@@ -99,8 +99,8 @@ def func_accumulate_angular_jacobian_row(
             i_j = steel_model.joints_ancestor[i_j]
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_torsion_rows(
+@qd.func
+def func_steel_torsion_rows(
     steel_state: array_class.SteelState,
     steel_contacts: array_class.SteelContacts,
     steel_rows: array_class.SteelRows,
@@ -369,8 +369,8 @@ def kernel_steel_torsion_rows(
             steel_rows.n_requested[i_b] = i_r
 
 
-@qd.kernel(fastcache=True)
-def kernel_steel_torsion_velocity_pass(
+@qd.func
+def func_steel_torsion_velocity_pass(
     dt: float,
     steel_rows: array_class.SteelRows,
     steel_dyn: array_class.SteelDynamics,
