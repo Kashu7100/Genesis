@@ -159,8 +159,10 @@ from .soft import (
     kernel_soft_set_pair_enabled,
     kernel_soft_set_state,
     kernel_soft_set_vertices_fixed,
+    kernel_soft_set_vertices_fixed_per_env,
     kernel_soft_set_vertices_positions,
     kernel_soft_set_vertices_target,
+    kernel_soft_set_vertices_target_per_env,
     kernel_soft_set_vertices_velocities,
     kernel_soft_step_start,
     kernel_soft_store_ls_ref,
@@ -2936,24 +2938,52 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         kernel_soft_set_vertices_velocities(envs_idx, entity.v_start, vel, self.soft_state, self.rigid_config)
         self._mark_external_state_dirty(envs_idx)
 
+    def _per_env_vertices(self, entity, verts_idx, envs_idx):
+        """Solver indices of a per-environment vertex set (n_envs_idx, n) of `entity`, -1 entries kept as -1."""
+        if verts_idx.shape[0] != len(envs_idx):
+            gs.raise_exception(
+                f"A per-environment vertex set must have one row per environment: got {verts_idx.shape[0]} rows "
+                f"for {len(envs_idx)} environments."
+            )
+        return torch.where(verts_idx >= 0, verts_idx + entity.v_start, -1).to(dtype=gs.tc_int).contiguous()
+
     def set_soft_vertices_fixed(self, entity, verts_idx, is_fixed, envs_idx=None):
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+        if verts_idx.ndim == 2:
+            verts_idx = self._per_env_vertices(entity, verts_idx, envs_idx)
+            kernel_soft_set_vertices_fixed_per_env(
+                envs_idx, verts_idx, int(bool(is_fixed)), self.soft_state, self.rigid_config
+            )
+            # Releasing leaves the state as it is; only fixing zeroes the velocities.
+            if is_fixed:
+                self._mark_external_state_dirty(envs_idx)
+            return
         verts_idx = np.asarray(verts_idx, dtype=gs.np_int) + entity.v_start
         kernel_soft_set_vertices_fixed(envs_idx, verts_idx, int(bool(is_fixed)), self.soft_state, self.rigid_config)
         self._mark_external_state_dirty(envs_idx)
 
     def set_soft_vertices_target(self, entity, verts_idx, pos, envs_idx=None):
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
-        verts_idx = np.asarray(verts_idx, dtype=gs.np_int) + entity.v_start
-        pos = torch.as_tensor(tensor_to_array(pos), dtype=gs.tc_float, device=gs.device)
-        if pos.shape == (len(verts_idx), 3):
+        if verts_idx.ndim == 2:
+            verts_idx = self._per_env_vertices(entity, verts_idx, envs_idx)
+        n_verts = verts_idx.shape[-1]
+        # A tensor already on the device goes straight to the kernel: this is called every control step.
+        pos = torch.as_tensor(pos, dtype=gs.tc_float, device=gs.device)
+        if verts_idx.ndim == 1 and pos.shape == (n_verts, 3):
             pos = pos[None].expand(len(envs_idx), -1, -1)
-        if pos.shape != (len(envs_idx), len(verts_idx), 3):
+        if pos.shape != (len(envs_idx), n_verts, 3):
             gs.raise_exception(
-                f"Expected an array of shape ({len(envs_idx)}, {len(verts_idx)}, 3) or ({len(verts_idx)}, 3), got "
-                f"{tuple(pos.shape)}."
+                f"Expected an array of shape ({len(envs_idx)}, {n_verts}, 3)"
+                + (f" or ({n_verts}, 3)" if verts_idx.ndim == 1 else "")
+                + f", got {tuple(pos.shape)}."
             )
-        kernel_soft_set_vertices_target(envs_idx, verts_idx, pos.contiguous(), self.soft_state, self.rigid_config)
+        if verts_idx.ndim == 2:
+            kernel_soft_set_vertices_target_per_env(
+                envs_idx, verts_idx, pos.contiguous(), self.soft_state, self.rigid_config
+            )
+        else:
+            verts_idx = np.asarray(verts_idx, dtype=gs.np_int) + entity.v_start
+            kernel_soft_set_vertices_target(envs_idx, verts_idx, pos.contiguous(), self.soft_state, self.rigid_config)
         if self.mochi_config.use_sleeping:
             i_n = len(self._entities) + entity.idx_in_solver
             self._wake_nodes(self._nodes_idx[i_n : i_n + 1], self._nodes_idx, envs_idx)

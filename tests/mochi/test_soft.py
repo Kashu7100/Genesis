@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 import pytest
 import quadrants as qd
 import trimesh
@@ -155,6 +156,48 @@ def test_soft_fixed_vertices_hang(show_viewer):
     for _ in range(10):
         scene.step()
     assert tensor_to_array(bar.get_vertices_velocity())[:, 2].max() < -0.5
+
+
+@pytest.mark.precision("64")
+def test_soft_per_env_vertex_targets(show_viewer):
+    scene = _mochi_scene(show_viewer, 0.02, n_newton_iterations=8, linear_solver="pcg")
+    bar = scene.add_entity(
+        gs.morphs.Box(size=(0.1, 0.1, 0.2), pos=(0.0, 0.0, 1.0), maxvolume=0.0005),
+        material=gs.materials.Mochi.Elastic(E=1e5, nu=0.3, rho=1000.0, mass_damping=5.0),
+    )
+    scene.build(n_envs=2)
+    rest = tensor_to_array(bar.get_vertices_position())[0]
+    top = np.flatnonzero(rest[:, 2] > rest[:, 2].max() - 1e-6)
+    # Environment 0 carries its whole top face 5 cm up; environment 1 carries one vertex sideways, the rest of its row
+    # being padding.
+    verts_idx = torch.full((2, len(top)), -1, dtype=gs.tc_int, device=gs.device)
+    verts_idx[0] = torch.as_tensor(top, device=gs.device)
+    verts_idx[1, 0] = int(top[0])
+    target = torch.as_tensor(rest[top], dtype=gs.tc_float, device=gs.device).repeat(2, 1, 1)
+    target[0, :, 2] += 0.05
+    target[1, 0, 0] += 0.05
+    for _ in range(60):
+        bar.set_vertices_target(verts_idx, target)
+        scene.step()
+    pos = tensor_to_array(bar.get_vertices_position())
+    assert_allclose(pos[0, top], tensor_to_array(target[0]), tol=1e-9)
+    assert_allclose(pos[1, top[0]], tensor_to_array(target[1, 0]), tol=1e-9)
+    # The padded vertices of environment 1 were never pinned: its free top vertices sag below their rest height.
+    assert (pos[1, top[1:], 2] < rest[top[1:], 2] - 1e-4).all()
+    # Releasing environment 0 only lets its bar fall, while environment 1 still hangs from its one vertex.
+    release = torch.full_like(verts_idx, -1)
+    release[0] = verts_idx[0]
+    bar.set_vertices_fixed(release, is_fixed=False)
+    for _ in range(10):
+        bar.set_vertices_target(verts_idx[1:], target[1:], envs_idx=[1])
+        scene.step()
+    vel = tensor_to_array(bar.get_vertices_velocity())
+    assert vel[0, :, 2].max() < -0.5
+    assert_allclose(tensor_to_array(bar.get_vertices_position())[1, top[0]], tensor_to_array(target[1, 0]), tol=1e-9)
+    with pytest.raises(gs.GenesisException, match="out of range"):
+        bar.set_vertices_target(torch.full((2, 1), bar.n_vertices, device=gs.device), target[:, :1])
+    with pytest.raises(gs.GenesisException, match="one row per environment"):
+        bar.set_vertices_target(verts_idx[:1], target[:1])
 
 
 @pytest.mark.precision("64")
