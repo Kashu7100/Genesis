@@ -14,6 +14,7 @@ from .solvers import (
     SFOptions,
     SimOptions,
     SPHOptions,
+    SteelOptions,
     ToolOptions,
 )
 from .vis import ViewerOptions, VisOptions
@@ -35,6 +36,7 @@ __all__ = [
     "SFOptions",
     "SimOptions",
     "SPHOptions",
+    "SteelOptions",
     "ToolOptions",
     "ViewerOptions",
     "VisOptions",

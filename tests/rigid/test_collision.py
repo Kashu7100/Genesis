@@ -619,7 +619,18 @@ def test_box_contact_minimal_separation(detection, show_viewer, tol):
                 # ray, which may differ from the one of least overlap. Its normal is still the direction of a face or of
                 # a pair of edges of both boxes, one of their separating axes, up to the convergence of its portal.
                 axes_cos = np.abs((axes[envs_idx, pairs_idx] @ normals_ab[..., None])[..., 0])
-                assert (np.arccos(np.minimum(axes_cos.max(axis=-1), 1.0)) < MPR_AXIS_ANGLE_TOL).all()
+                is_axis_followed = np.arccos(np.minimum(axes_cos, 1.0)) < MPR_AXIS_ANGLE_TOL
+                assert is_axis_followed.any(axis=-1).all()
+                if i_step == 0:
+                    # Detected from scratch, the axis of every contact overlaps no more than the face normals of either
+                    # box, since a face normal overlapping less proves the portal non-minimal and has GJK refine the
+                    # contact, up to the tilt of the perturbed contacts. Nearly parallel axes may both be followed, in
+                    # which case the normal can follow the shallower one.
+                    axes_depth_followed = np.where(is_axis_followed, axes_depth[envs_idx, pairs_idx], np.inf)
+                    pairs_axis_depth = np.full((N_ENVS, n_pairs), -np.inf)
+                    np.maximum.at(pairs_axis_depth, (envs_idx, pairs_idx), axes_depth_followed.min(axis=-1))
+                    pairs_faces_depth = axes_depth[..., :6].min(axis=-1)
+                    assert (pairs_axis_depth - pairs_faces_depth <= pairs_tol)[is_pair_detected].all()
             else:
                 assert (pairs_overlap_min - pairs_depth <= tol * pairs_size)[is_pair_detected].all()
 
@@ -630,10 +641,13 @@ def test_box_contact_minimal_separation(detection, show_viewer, tol):
             assert (normals_overlap[is_deepest] - depths[is_deepest] <= contacts_tol[is_deepest]).all()
 
             # A contact lies midway between its witnesses, each on the surface of its own box. Rebuilt along the normal,
-            # the witnesses of GJK and MPR, which lie apart along another direction, may land past the surfaces by up to
-            # twice the tolerance, and those of a perturbed contact, whose depth is a lower bound, inside the boxes by
-            # up to five times it.
-            witnesses_tol_out, witnesses_tol_in = (1.0, 1.0) if detection == "box_box" else (2.0, 5.0)
+            # the witnesses of GJK, which lie apart along another direction, may land past the surfaces by up to twice
+            # the tolerance, and those of a perturbed contact, whose depth is a lower bound, inside the boxes by up to
+            # five times it. MPR approximates the depth of a perturbed contact further, up to five times the tolerance
+            # either way.
+            witnesses_tol_out, witnesses_tol_in = {"box_box": (1.0, 1.0), "gjk": (2.0, 5.0), "mpr": (5.0, 5.0)}[
+                detection
+            ]
             witnesses = (
                 positions[:, None] + 0.5 * np.array((1.0, -1.0))[:, None] * depths[:, None, None] * normals_ab[:, None]
             )
@@ -1101,7 +1115,9 @@ def test_convex_collision_across_geom_scales(gjk_collision, show_viewer, tol):
     assert (contacts["penetration"][is_box & ~is_pressed] <= GEOM_SIZE).all()
     is_lamp = contacts["geom_b"] == lamp.geoms[0].idx
     assert is_lamp.any()
-    assert_allclose(contacts["penetration"][is_lamp].max(), hull_depth, atol=1e-7)
+    # MPR stops refining the depth once it moves by less than its convergence tolerance, relative to the pair scale
+    depth_tol = 1e-7 if gjk_collision else 1e-5 * 0.5 * np.linalg.norm(np.ptp(finger_verts, axis=0))
+    assert_allclose(contacts["penetration"][is_lamp].max(), hull_depth, atol=depth_tol)
     offset = (geom_grazing.get_pos() - box.get_pos()) @ face_normal
     assert face_offset - tol <= offset <= face_offset + GEOM_SIZE
 

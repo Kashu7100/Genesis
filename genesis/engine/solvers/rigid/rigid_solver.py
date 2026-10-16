@@ -12,7 +12,7 @@ import genesis.utils.geom as gu
 from genesis.constants import link_ref_frame
 from genesis.engine.entities import DroneEntity, RigidEntity, TerrainEntity
 from genesis.engine.materials import Rigid
-from genesis.engine.states import KinematicSolverCheckpoint, RigidSolverState
+from genesis.engine.states import RigidSolverState, SolverCheckpoint
 from genesis.options.morphs import Drone, Morph, Terrain
 from genesis.options.solvers import RigidOptions
 from genesis.utils.misc import (
@@ -1412,6 +1412,27 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             gs.raise_exception("Invalid constraint forces causing 'nan'. Please decrease Rigid simulation timestep.")
         if errno & array_class.ErrorCode.INVALID_ACC_NAN:
             gs.raise_exception("Invalid accelerations causing 'nan'. Please decrease Rigid simulation timestep.")
+        if errno & array_class.ErrorCode.STEEL_ROWS_DROPPED:
+            gs.raise_exception(
+                "Steel dropped constraint rows for lack of capacity, which contact torsion and contact compliance do "
+                "not tolerate. Please increase the value of SteelOptions' 'articulation_constraint_max' or "
+                "'free_body_constraint_max'."
+            )
+        if errno & array_class.ErrorCode.STEEL_TORSION_ROWS_OVERFLOW:
+            gs.raise_exception(
+                "Steel contact torsion rows exceed the row capacity. Please increase the value of SteelOptions' "
+                "'articulation_constraint_max'."
+            )
+        if errno & array_class.ErrorCode.STEEL_TORSION_PATCH_RING:
+            gs.raise_exception(
+                "The load ring of a Steel friction patch does not match its contact torsion group. This is a "
+                "solver-internal error, please report it."
+            )
+        if errno & array_class.ErrorCode.STEEL_COMPLIANCE_INVALID:
+            gs.raise_exception(
+                "A Steel compliant contact has a compliance or a bias beyond the float32 range, or no response. Please "
+                "increase the 'contact_stiffness' of the rigid materials or the simulation timestep."
+            )
 
     def _kernel_detect_collision(self):
         self.collider.clear()
@@ -1934,7 +1955,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self._restart()
 
     @property
-    def data(self) -> Iterator[array_class.DataItem]:
+    def data(self) -> Iterator[array_class.DataItem | array_class.ConfigItem]:
         yield from super().data
         yield from self.collider.data
         yield from self.constraint_solver.data
@@ -1950,7 +1971,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 entity._prev_prop_t = -1
 
     @mutates(StateChange.GEOMETRY, StateChange.DYNAMICS)
-    def __setstate__(self, state: KinematicSolverCheckpoint) -> None:
+    def __setstate__(self, state: SolverCheckpoint) -> None:
         super().__setstate__(state)
         self._restart()
 
@@ -2270,6 +2291,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             self._is_forward_pos_updated = False
             self._is_forward_vel_updated = False
 
+    @mutates(StateChange.INERTIA)
     def _set_links_info(self, values, links_idx, name, envs_idx=None, *, scale_inertia=False):
         """Write one inertial property of the given links, then recompute the inverse weights of their trees once.
 
@@ -2442,6 +2464,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         """Set the center of mass (COM) of the given links, as an offset from the origin of their local frame."""
         self._set_links_info(com, links_idx, "COM", envs_idx)
 
+    @mutates(StateChange.MATERIAL)
     def set_geoms_friction_ratio(self, friction_ratio, geoms_idx=None, envs_idx=None):
         friction_ratio, geoms_idx, envs_idx = self._sanitize_io_variables(
             friction_ratio, geoms_idx, self.n_geoms, "geoms_idx", envs_idx, skip_allocation=True
@@ -2523,6 +2546,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             self._is_forward_pos_updated = False
             self._is_forward_vel_updated = False
 
+    @mutates(StateChange.MODEL)
     def set_global_sol_params(self, sol_params):
         """
         Set constraint solver parameters.
@@ -2539,6 +2563,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         sol_params_ = _sanitize_sol_params(sol_params_.clone(), self._sol_min_timeconst)
         kernel_set_global_sol_params(sol_params_, self.dyn_info, self.rigid_config)
 
+    @mutates(StateChange.MODEL)
     def set_sol_params(self, sol_params, geoms_idx=None, envs_idx=None, *, joints_idx=None, eqs_idx=None):
         """
         Set constraint solver parameters.
@@ -2669,33 +2694,43 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         else:
             gs.raise_exception(f"Invalid `name` {name}.")
 
+    @mutates(StateChange.ACTUATION)
     def set_dofs_kp(self, kp, dofs_idx=None, envs_idx=None):
         self._set_dofs_info([kp], dofs_idx, "kp", envs_idx)
 
+    @mutates(StateChange.ACTUATION)
     def set_dofs_kv(self, kv, dofs_idx=None, envs_idx=None):
         self._set_dofs_info([kv], dofs_idx, "kv", envs_idx)
 
+    @mutates(StateChange.ACTUATION)
     def set_dofs_act_gain(self, act_gain, dofs_idx=None, envs_idx=None):
         self._set_dofs_info([act_gain], dofs_idx, "act_gain", envs_idx)
 
+    @mutates(StateChange.ACTUATION)
     def set_dofs_act_bias(self, bias0, bias1, bias2, dofs_idx=None, envs_idx=None):
         self._set_dofs_info([bias0, bias1, bias2], dofs_idx, "act_bias", envs_idx)
 
+    @mutates(StateChange.ACTUATION)
     def set_dofs_force_range(self, lower, upper, dofs_idx=None, envs_idx=None):
         self._set_dofs_info([lower, upper], dofs_idx, "force_range", envs_idx)
 
+    @mutates(StateChange.ACTUATION)
     def set_dofs_stiffness(self, stiffness, dofs_idx=None, envs_idx=None):
         self._set_dofs_info([stiffness], dofs_idx, "stiffness", envs_idx)
 
+    @mutates(StateChange.INERTIA)
     def set_dofs_armature(self, armature, dofs_idx=None, envs_idx=None):
         self._set_dofs_info([armature], dofs_idx, "armature", envs_idx)
 
+    @mutates(StateChange.ACTUATION)
     def set_dofs_damping(self, damping, dofs_idx=None, envs_idx=None):
         self._set_dofs_info([damping], dofs_idx, "damping", envs_idx)
 
+    @mutates(StateChange.ACTUATION)
     def set_dofs_frictionloss(self, frictionloss, dofs_idx=None, envs_idx=None):
         self._set_dofs_info([frictionloss], dofs_idx, "frictionloss", envs_idx)
 
+    @mutates(StateChange.ACTUATION)
     def set_dofs_limit(self, lower, upper, dofs_idx=None, envs_idx=None):
         self._set_dofs_info([lower, upper], dofs_idx, "limit", envs_idx)
 
@@ -3346,36 +3381,44 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
         return aabb[0] if self.n_envs == 0 else aabb
 
+    @mutates(StateChange.MATERIAL)
     def set_geom_friction(self, friction, geoms_idx):
         kernel_set_geom_friction(geoms_idx, friction, self.dyn_info)
 
+    @mutates(StateChange.MATERIAL)
     def set_geom_friction_torsional(self, friction_torsional, geoms_idx):
         kernel_set_geom_friction_torsional(geoms_idx, friction_torsional, self.dyn_info)
 
+    @mutates(StateChange.MATERIAL)
     def set_geom_friction_rolling(self, friction_rolling, geoms_idx):
         kernel_set_geom_friction_rolling(geoms_idx, friction_rolling, self.dyn_info)
 
+    @mutates(StateChange.MATERIAL)
     def set_geoms_friction(self, friction, geoms_idx=None):
         friction, geoms_idx, _ = self._sanitize_io_variables(
             friction, geoms_idx, self.n_geoms, "geoms_idx", envs_idx=None, batched=False, skip_allocation=True
         )
         kernel_set_geoms_friction(geoms_idx, friction, self.dyn_info, self.rigid_config)
 
+    @mutates(StateChange.MATERIAL)
     def set_geoms_friction_torsional(self, friction_torsional, geoms_idx=None):
         friction_torsional, geoms_idx, _ = self._sanitize_io_variables(
             friction_torsional, geoms_idx, self.n_geoms, "geoms_idx", envs_idx=None, batched=False, skip_allocation=True
         )
         kernel_set_geoms_friction_torsional(geoms_idx, friction_torsional, self.dyn_info, self.rigid_config)
 
+    @mutates(StateChange.MATERIAL)
     def set_geoms_friction_rolling(self, friction_rolling, geoms_idx=None):
         friction_rolling, geoms_idx, _ = self._sanitize_io_variables(
             friction_rolling, geoms_idx, self.n_geoms, "geoms_idx", envs_idx=None, batched=False, skip_allocation=True
         )
         kernel_set_geoms_friction_rolling(geoms_idx, friction_rolling, self.dyn_info, self.rigid_config)
 
+    @mutates(StateChange.MODEL)
     def add_weld_constraint(self, link1_idx, link2_idx, envs_idx=None):
         return self.constraint_solver.add_weld_constraint(link1_idx, link2_idx, envs_idx)
 
+    @mutates(StateChange.MODEL)
     def delete_weld_constraint(self, link1_idx, link2_idx, envs_idx=None):
         return self.constraint_solver.delete_weld_constraint(link1_idx, link2_idx, envs_idx)
 

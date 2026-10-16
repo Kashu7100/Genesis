@@ -13,7 +13,7 @@ import quadrants as qd
 from quadrants.lang import impl
 
 import genesis as gs
-from genesis.utils.misc import qd_to_torch
+from genesis.utils.misc import data_to_array
 
 
 def _tensor_backend():
@@ -118,31 +118,33 @@ def V_SCALAR_FROM(dtype, value):
 
 
 class DataKind(IntEnum):
-    """The kind of every array or static config a solver yields (see 'Solver.data'), which checkpoints and trajectories
+    """The kind of every array or scalar a solver yields (see 'Solver.data'), which checkpoints and trajectories
     select by.
 
-    CONFIG is a static config of plain Python natives that keys the compiled kernels, recorded as provenance only.
     CONSTANT is an array the build computes from the scene description once. INFO is a model parameter the setters
-    write, such as mass, friction, gains or limits. STATE is the reduced-space configuration, velocities,
-    accelerations, control inputs, contacts and constraint solution. WARMSTART is a cache the next solve reads to
-    reproduce the previous result bit-for-bit. Forward kinematics and dynamics recompute DERIVED from STATE. A step or
-    a solve writes SCRATCH before it reads it.
+    write, such as mass, friction, gains or limits. STATE is what specifies the scene with INFO: the reduced-space
+    configuration, velocities, accelerations, control inputs and the warm starts of the collision detection and the
+    constraint solve, which change the result of the next step. DERIVED is what the next step or forward kinematics
+    recomputes from STATE and INFO, such as the link poses, the contacts and the constraint forces, and recomputing it
+    changes the result at the last bits at most. A step or a solve writes SCRATCH before it reads it.
+
+    The kinds decide what a minimal trajectory records (see TrajectoryFile), so every solver classifies its arrays by
+    one rule: an array the next step reads before writing it is STATE or INFO, and a DERIVED array is recomputed
+    before it is read, by the next step or by the restore of a record without it (see 'Solver.__setstate__').
     """
 
-    CONFIG = 0
-    CONSTANT = 1
-    INFO = 2
-    STATE = 3
-    WARMSTART = 4
-    DERIVED = 5
-    SCRATCH = 6
+    CONSTANT = 0
+    INFO = 1
+    STATE = 2
+    DERIVED = 3
+    SCRATCH = 4
 
 
 # Metadata key under which 'of_kind' stores the kind of a field.
 KIND = "kind"
-# The kinds a checkpoint carries: INFO, STATE, WARMSTART and DERIVED. The static configs travel in a separate field of
-# the checkpoint as provenance.
-CHECKPOINT_KINDS = frozenset((DataKind.INFO, DataKind.STATE, DataKind.WARMSTART, DataKind.DERIVED))
+# The kinds a checkpoint carries: INFO, STATE and DERIVED. The static configs travel in a separate field of the
+# checkpoint as provenance.
+CHECKPOINT_KINDS = frozenset((DataKind.INFO, DataKind.STATE, DataKind.DERIVED))
 
 
 def of_kind(kind: DataKind):
@@ -150,92 +152,144 @@ def of_kind(kind: DataKind):
     return dataclasses.field(metadata={KIND: kind})
 
 
-class DataItem(NamedTuple):
-    """One array or static config a solver holds, under the dotted name of the slot and fields reaching it."""
+class ArrayItem(NamedTuple):
+    """An array of a solver or of the simulator, under the dotted name of the slot and fields reaching it.
+
+    It lives on the device of the backend, and a restore fills it in place (see 'iter_data'). It is a quadrants array,
+    or a torch tensor such as the step counts of the simulator. An unused quadrants array is the 0-d placeholder of a
+    feature switched off (see 'maybe_shape'), which a restore leaves as built (see 'check_data').
+    """
 
     name: str
-    value: object
     kind: DataKind
+    array: qd.Tensor | qd.Field | qd.Ndarray | torch.Tensor
 
 
-def iter_data(struct, name: str, kind: DataKind | None = None) -> Iterator[DataItem]:
-    """Yield a DataItem for every array in a struct of arrays, named by 'name' plus field names joined with dots.
+class ScalarItem(NamedTuple):
+    """A Python native scalar of a solver, such as a flag, under the name of its attribute (see 'iter_data').
 
-    Structs are the frozen dataclasses and named tuples of this module, nested to any depth. The class attribute
-    'kind' gives the default kind of a struct's fields, and 'of_kind' on a field overrides it. An override on a
-    struct-valued field applies to every array of that struct. An array carrying gradients yields them as one more item
-    of its kind, named 'grad'. A static config yields one item of kind CONFIG, and anything else raises and names the
-    offending slot.
+    It is the attribute 'attr' of 'owner', a property with a setter included, which a restore sets back.
     """
-    if isinstance(struct, (qd.Tensor, qd.Field, qd.Ndarray)):
+
+    name: str
+    kind: DataKind
+    owner: object
+    attr: str
+
+
+# What a solver yields among its data, which a checkpoint or a trajectory reads and writes back (see 'iter_data')
+DataItem = ArrayItem | ScalarItem
+
+
+class ConfigItem(NamedTuple):
+    """A static config of plain Python natives that keys the compiled kernels of a solver, under its name.
+
+    A checkpoint and a trajectory record it as provenance alone, and never write it back.
+    """
+
+    name: str
+    config: object
+
+
+def iter_data(owner: object, attr: str, kind: DataKind | None = None) -> Iterator[DataItem | ConfigItem]:
+    """Yield the data of an attribute, one item per array if it is a struct, named by the fields reaching it.
+
+    The attribute is 'attr' of 'owner', and an item of a struct is named by 'attr' plus field names joined with dots.
+    Structs are the frozen dataclasses and named tuples of this module, nested to any depth. The class attribute 'kind'
+    gives the default kind of a struct's fields, and 'of_kind' on a field overrides it. An override on a struct-valued
+    field applies to every array of that struct. An array is a quadrants array or a torch tensor, and a quadrants array
+    carrying gradients yields them as one more item of its kind, named 'grad'. A Python native scalar of an object that
+    is no struct, such as a flag, yields an item of the given kind, which a restore sets back as the attribute. A static
+    config yields a ConfigItem. Anything else raises and names the offending attribute.
+    """
+    value = getattr(owner, attr)
+    if isinstance(type(value), AutoInitMeta):
+        yield ConfigItem(attr, value)
+    elif isinstance(value, (qd.Tensor, qd.Field, qd.Ndarray, torch.Tensor)):
         if kind is None:
-            gs.raise_exception(f"'{name}' holds an array that no struct or annotation gives a kind.")
-        yield DataItem(name, struct, kind)
-        if struct.has_grad():
-            yield DataItem(f"{name}.grad", struct.grad, kind)
-    elif isinstance(type(struct), AutoInitMeta):
-        yield DataItem(name, struct, DataKind.CONFIG)
-    elif dataclasses.is_dataclass(struct) or isinstance(struct, tuple):
-        if dataclasses.is_dataclass(struct):
-            values = vars(struct)
-            members = [
-                (field.name, values[field.name], field.metadata.get(KIND)) for field in dataclasses.fields(struct)
-            ]
+            gs.raise_exception(f"'{attr}' holds an array that no struct or annotation gives a kind.")
+        yield ArrayItem(attr, kind, value)
+        if not isinstance(value, torch.Tensor) and value.has_grad():
+            yield ArrayItem(f"{attr}.grad", kind, value.grad)
+    elif dataclasses.is_dataclass(value) or isinstance(value, tuple):
+        if dataclasses.is_dataclass(value):
+            members = [(field.name, field.metadata.get(KIND)) for field in dataclasses.fields(value)]
         else:
-            members = [(member, value, None) for member, value in zip(struct._fields, struct)]
-        for member, value, stated_kind in members:
-            if stated_kind is None and kind is None and isinstance(value, (qd.Tensor, qd.Field, qd.Ndarray)):
-                stated_kind = type(struct).kind
-            yield from iter_data(value, f"{name}.{member}", kind if stated_kind is None else stated_kind)
+            members = [(member, None) for member in value._fields]
+        for member, stated_kind in members:
+            is_member_array = isinstance(getattr(value, member), (qd.Tensor, qd.Field, qd.Ndarray, torch.Tensor))
+            if stated_kind is None and kind is None and is_member_array:
+                stated_kind = type(value).kind
+            for item in iter_data(value, member, kind if stated_kind is None else stated_kind):
+                yield item._replace(name=f"{attr}.{item.name}")
+    elif isinstance(value, (bool, int, float)) and not (dataclasses.is_dataclass(owner) or isinstance(owner, tuple)):
+        if kind is None:
+            gs.raise_exception(f"'{attr}' holds a {type(value).__name__} that no annotation gives a kind.")
+        yield ScalarItem(attr, kind, owner, attr)
     else:
-        gs.raise_exception(f"'{name}' holds a {type(struct).__name__} where an array or a struct of arrays stands.")
+        gs.raise_exception(f"'{attr}' holds a {type(value).__name__} where an array, a struct or a scalar stands.")
 
 
-def check_data(items: Iterable[DataItem], values: Mapping[str, np.ndarray | torch.Tensor]) -> list[tuple]:
-    """Return the (array, value) pairs 'fill_data' writes, rejecting a record made for another scene.
+def check_data(items: Iterable[DataItem], values: Mapping[str, np.ndarray | torch.Tensor]) -> list[DataItem]:
+    """Return the items 'fill_data' writes, rejecting a record made for another scene.
 
-    A value with the array's shape fills it, cast to its dtype, so a one-byte boolean fills an int32 flag. A floating
-    value for an integer array, or the reverse, raises. 'maybe_shape' shapes an unused array as (), so an array with
-    that shape on either side stays as built. Any other shape mismatch raises, since the record comes from a different
-    build. A name on one side only raises, since the record comes from another build or version.
+    A value read from a record has the shape of its item, and is floating exactly when its item is. Its dtype may
+    differ otherwise, as it is cast when written: a one-byte boolean fills an int32 flag. Any other mismatch raises,
+    and so does a name on one side only, since the record comes from another build or version. 'maybe_shape' shapes an
+    unused array as (), so an array with that shape on either side stays as built, and is left out.
     """
     items = tuple(items)
-    unshared = sorted({name for name, _, _ in items} ^ set(values))
+    unshared = sorted({item.name for item in items} ^ set(values))
     if unshared:
         gs.raise_exception(f"The record and this scene do not share {unshared}: another build or version wrote it.")
     writes = []
-    for name, array, _ in items:
-        value = values[name]
-        element_shape = array.element_shape if isinstance(array, (qd.VectorTensor, qd.MatrixTensor)) else ()
-        if tuple(array.shape) == () or tuple(value.shape) == element_shape:
-            continue
-        shape = (*array.shape, *element_shape)
+    for item in items:
+        value = values[item.name]
+        if isinstance(item, ArrayItem) and isinstance(item.array, torch.Tensor):
+            shape, dtype = tuple(item.array.shape), item.array.dtype
+            is_item_real = dtype.is_floating_point
+        elif isinstance(item, ArrayItem):
+            array = item.array
+            element_shape = array.element_shape if isinstance(array, (qd.VectorTensor, qd.MatrixTensor)) else ()
+            if tuple(array.shape) == () or tuple(value.shape) == element_shape:
+                continue
+            shape, dtype = (*array.shape, *element_shape), array.dtype
+            is_item_real = dtype in qd.types.primitive_types.real_types
+        else:
+            scalar = getattr(item.owner, item.attr)
+            shape, dtype = (), type(scalar).__name__
+            is_item_real = isinstance(scalar, float)
         if tuple(value.shape) != shape:
-            gs.raise_exception(f"'{name}' is shaped {shape} here and {value.shape} in the record: another build.")
+            gs.raise_exception(f"'{item.name}' is shaped {shape} here and {value.shape} in the record: another build.")
         if isinstance(value, torch.Tensor):
             is_real = value.dtype.is_floating_point
         else:
             is_real = np.issubdtype(value.dtype, np.floating)
-        if is_real != (array.dtype in qd.types.primitive_types.real_types):
-            gs.raise_exception(f"'{name}' holds {array.dtype} values here where {value.dtype} ones were recorded.")
-        writes.append((array, value))
+        if is_real != is_item_real:
+            gs.raise_exception(f"'{item.name}' holds {dtype} values here where {value.dtype} ones were recorded.")
+        writes.append(item)
     return writes
 
 
 def fill_data(items: Iterable[DataItem], values: Mapping[str, np.ndarray | torch.Tensor]) -> None:
-    """Write into each array the value recorded under its name, once every value passed 'check_data', so a record
-    from another build leaves the scene as it was.
+    """Write back into each item the value recorded under its name, once every value passed 'check_data', so that a
+    record made for another scene leaves the scene as it was.
 
-    Where zero-copy views exist the values go through them, so a device-resident record stays on the device. On Metal
-    these writes stay on the torch stream, so the caller must call 'torch.mps.synchronize' once before the next kernel.
+    An array is filled in place, through its zero-copy view where one exists, so that a device-resident record stays on
+    the device. On Metal these writes stay on the torch stream, so the caller must call 'torch.mps.synchronize' once
+    before the next kernel. A scalar is set back as the Python native the host code reading it expects.
     """
-    # A value is cast to the dtype of its array as it reaches the device, which may support no other precision
-    for array, value in check_data(items, values):
-        if gs.use_zerocopy:
-            view = qd_to_torch(array, copy=False)
+    for item in check_data(items, values):
+        value = values[item.name]
+        if isinstance(item, ScalarItem):
+            # 'check_data' admits a boolean record for an integer, so the value takes the native type of the attribute
+            setattr(item.owner, item.attr, type(getattr(item.owner, item.attr))(value.item()))
+        elif isinstance(item.array, torch.Tensor) or gs.use_zerocopy:
+            view = data_to_array(item.array, to_torch=True, copy=False)
+            # A value is cast to the dtype of its array as it reaches the device, which may support no other precision
             view.copy_(torch.as_tensor(value, dtype=view.dtype, device=view.device))
         else:
-            array.from_numpy(value)
+            item.array.from_numpy(value)
 
 
 # =========================================== ErrorCode ===========================================
@@ -249,6 +303,10 @@ class ErrorCode(IntEnum):
     INVALID_CONTACT_NAN = 0b00000000000000000000000000010000
     INVALID_FORCE_NAN = 0b00000000000000000000000000100000
     INVALID_ACC_NAN = 0b00000000000000000000000001000000
+    STEEL_ROWS_DROPPED = 0b00000000000000000000000010000000
+    STEEL_TORSION_ROWS_OVERFLOW = 0b00000000000000000000000100000000
+    STEEL_TORSION_PATCH_RING = 0b00000000000000000000001000000000
+    STEEL_COMPLIANCE_INVALID = 0b00000000000000000000010000000000
 
 
 # =========================================== RigidInfo ===========================================
@@ -863,20 +921,20 @@ class ConstraintState:
 
     # Union-find partition of links into contact islands, read by the per-island Newton solve and hibernation.
     island: IslandState
-    is_warmstart: qd.Tensor = of_kind(DataKind.WARMSTART)
-    n_constraints: qd.Tensor = of_kind(DataKind.STATE)
+    is_warmstart: qd.Tensor = of_kind(DataKind.STATE)
+    n_constraints: qd.Tensor = of_kind(DataKind.DERIVED)
     qd_n_equalities: qd.Tensor = of_kind(DataKind.STATE)
     jac: qd.Tensor
     diag: qd.Tensor
     aref: qd.Tensor
     jac_dofs_idx: qd.Tensor
     jac_n_dofs: qd.Tensor
-    n_constraints_equality: qd.Tensor = of_kind(DataKind.STATE)
-    n_constraints_frictionloss: qd.Tensor = of_kind(DataKind.STATE)
+    n_constraints_equality: qd.Tensor = of_kind(DataKind.DERIVED)
+    n_constraints_frictionloss: qd.Tensor = of_kind(DataKind.DERIVED)
     # Number of elliptic-cone contact rows (rows_per_contact per contact), laid out contiguously at the start of the
     # collision segment. Zero for the pyramidal cone. The cone rows occupy
     # [ne + n_frictionloss, ne + n_frictionloss + n_cone).
-    n_constraints_cone: qd.Tensor = of_kind(DataKind.STATE)
+    n_constraints_cone: qd.Tensor = of_kind(DataKind.DERIVED)
     improved: qd.Tensor
     Jaref: qd.Tensor
     Ma: qd.Tensor
@@ -896,12 +954,12 @@ class ConstraintState:
     # contact sliding friction coefficient read by the cone solver, and with torsional friction the spin row carries
     # the torsional coefficient the same way (the tangent rows hold 0).
     efc_frictionloss: qd.Tensor
-    efc_force: qd.Tensor = of_kind(DataKind.STATE)
-    active: qd.Tensor = of_kind(DataKind.STATE)
+    efc_force: qd.Tensor = of_kind(DataKind.DERIVED)
+    active: qd.Tensor = of_kind(DataKind.DERIVED)
     prev_active: qd.Tensor
     qfrc_constraint: qd.Tensor = of_kind(DataKind.STATE)
     qacc: qd.Tensor = of_kind(DataKind.STATE)
-    qacc_ws: qd.Tensor = of_kind(DataKind.WARMSTART)
+    qacc_ws: qd.Tensor = of_kind(DataKind.STATE)
     cost_ws: qd.Tensor
     cost: qd.Tensor
     mv: qd.Tensor
@@ -1162,7 +1220,7 @@ def get_constraint_state(constraint_solver, solver, collider):
 
 @dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
 class ContactData:
-    kind: ClassVar[DataKind] = DataKind.STATE
+    kind: ClassVar[DataKind] = DataKind.DERIVED
 
     geom_a: qd.Tensor
     geom_b: qd.Tensor
@@ -1252,7 +1310,7 @@ def get_diff_contact_input(_B, max_contacts_per_pair, is_active, requires_grad=F
 
 @dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
 class SortBuffer:
-    kind: ClassVar[DataKind] = DataKind.WARMSTART
+    kind: ClassVar[DataKind] = DataKind.STATE
 
     value: qd.Tensor
     i_g: qd.Tensor
@@ -1271,7 +1329,7 @@ def get_sort_buffer(solver):
 
 @dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
 class ContactCache:
-    kind: ClassVar[DataKind] = DataKind.WARMSTART
+    kind: ClassVar[DataKind] = DataKind.STATE
 
     normal: qd.Tensor
     # Previous-step penetration per pair (reset to 0 when out of contact), the warm-start for the MPR->GJK gate.
@@ -1354,19 +1412,19 @@ class ColliderState:
     box_pu: qd.Tensor
     xyz_max_min: qd.Tensor
     prism: qd.Tensor
-    n_contacts: qd.Tensor = of_kind(DataKind.STATE)
+    n_contacts: qd.Tensor = of_kind(DataKind.DERIVED)
     # Kept contacts of the sleepers, at the front of the contact buffer with the identity permutation: a hibernated
     # link's contacts against fixed bodies are carried from step to step with the force of the last solve they took
     # part in, for the contact getters and the per-link contact force alone. Every per-step pass (prune, sort, island
     # edges, constraint rows, noslip) walks the live contacts after them, [n_contacts_hibernated, n_contacts).
-    n_contacts_hibernated: qd.Tensor = of_kind(DataKind.STATE)
-    first_time: qd.Tensor = of_kind(DataKind.WARMSTART)
+    n_contacts_hibernated: qd.Tensor = of_kind(DataKind.DERIVED)
+    first_time: qd.Tensor = of_kind(DataKind.STATE)
     contact_cache: ContactCache
     # Input data for differentiable contact detection used in the backward pass
     diff_contact_input: DiffContactInput
     narrowphase_work_queues: NarrowphaseWorkQueues
     contact_sort_key: qd.Tensor
-    contact_sort_idx: qd.Tensor = of_kind(DataKind.STATE)
+    contact_sort_idx: qd.Tensor = of_kind(DataKind.DERIVED)
     contact_proj_v: qd.Tensor
     contact_keep: qd.Tensor
     contact_hull_stack: qd.Tensor
@@ -1487,6 +1545,8 @@ class ColliderStaticConfig(metaclass=AutoInitMeta):
     n_contacts_per_nonconvex_pair: int
     # ccd algorithm
     ccd_algorithm: int
+    # Whether the narrowphase reports the pairs separated by less than the contact gap (see contact_gap in ColliderInfo)
+    has_contact_gap: bool
     # GPU core count and cores per compute unit, sizing the split narrow phase launches and scratch states
     gpu_cores: int
     gpu_cores_per_unit: int
@@ -1538,7 +1598,6 @@ class MPRInfo:
     CCD_EPS: qd.Tensor
     CCD_TOLERANCE: qd.Tensor
     CCD_ITERATIONS: qd.Tensor
-    CCD_EXTRAPOLATION_TOL: qd.Tensor
 
 
 def get_mpr_info(**kwargs):
@@ -1546,7 +1605,6 @@ def get_mpr_info(**kwargs):
         CCD_EPS=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["CCD_EPS"]),
         CCD_TOLERANCE=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["CCD_TOLERANCE"]),
         CCD_ITERATIONS=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["CCD_ITERATIONS"]),
-        CCD_EXTRAPOLATION_TOL=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["CCD_EXTRAPOLATION_TOL"]),
     )
 
 
@@ -2109,15 +2167,17 @@ class ColliderInfo:
     # multi contact perturbation and tolerance
     mc_perturbation: qd.Tensor
     mc_tolerance: qd.Tensor
-    mpr_to_gjk_overlap_ratio: qd.Tensor
-    mpr_to_gjk_overlap_ratio_valid: qd.Tensor
-    mpr_to_gjk_penetration_ratio: qd.Tensor
     # differentiable contact tolerance
     diff_pos_tolerance: qd.Tensor
     diff_normal_tolerance: qd.Tensor
     # link-pair contact pruning
     contact_pruning_tolerance: qd.Tensor
     prune_deep_penetration_ratio: qd.Tensor
+    # Separation below which a pair is reported as a contact of negative penetration, the speculative contacts of the
+    # Steel solver. The convex narrowphase measures it on both geoms grown by half of it, whose Minkowski difference is
+    # the original one grown by a sphere of this radius: their depth minus the gap is the signed separation of the
+    # original geoms, and their witness midpoint is the original one.
+    contact_gap: qd.Tensor
 
 
 def get_collider_info(
@@ -2161,13 +2221,11 @@ def get_collider_info(
         terrain_xyz_maxmin=V(dtype=gs.qd_float, shape=(6,)),
         mc_perturbation=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["mc_perturbation"]),
         mc_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["mc_tolerance"]),
-        mpr_to_gjk_overlap_ratio=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["mpr_to_gjk_overlap_ratio"]),
-        mpr_to_gjk_overlap_ratio_valid=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["mpr_to_gjk_overlap_ratio_valid"]),
-        mpr_to_gjk_penetration_ratio=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["mpr_to_gjk_penetration_ratio"]),
         diff_pos_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["diff_pos_tolerance"]),
         diff_normal_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["diff_normal_tolerance"]),
         contact_pruning_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["contact_pruning_tolerance"]),
         prune_deep_penetration_ratio=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["prune_deep_penetration_ratio"]),
+        contact_gap=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["contact_gap"]),
     )
 
 
@@ -3427,3 +3485,1368 @@ class SAPContactQueriesState:
     fem_self: BVHQueryState
     rigid_tri: BVHQueryState
     rigid_tet: BVHQueryState
+
+
+# =========================================== Steel ===========================================
+
+# Capacity of the bilateral block an articulation can pre-eliminate, for example one mimic row and two loop closures
+# of a parallel gripper.
+PREELIM_MAX_ROWS = 8
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class SteelModelInfo:
+    """Topology of the Steel model, shared by every environment (see SteelModelPlan in steel/model.py).
+
+    Joint i_j moves the link joints_link[i_j], one joint per Steel body, numbered articulation by articulation with
+    parents first. Spatial quantities of an articulation are expressed in its solve frame: world axes, origin at the
+    center of mass of the child link of its first joint. Every degree of freedom belongs to an articulation, in
+    articulation order, so the generalized velocity of an environment is indexed by the Genesis DOF index.
+    """
+
+    kind: ClassVar[DataKind] = DataKind.CONSTANT
+
+    arts_joint_start: qd.Tensor
+    arts_dof_start: qd.Tensor
+    arts_n_dofs: qd.Tensor
+    arts_is_free_rigid: qd.Tensor
+    arts_H_offset: qd.Tensor
+    arts_preelim_idx: qd.Tensor
+    joints_link: qd.Tensor
+    joints_parent_link: qd.Tensor
+    joints_static_parent_link: qd.Tensor
+    joints_ancestor: qd.Tensor
+    joints_art: qd.Tensor
+    joints_type: qd.Tensor
+    joints_q_start: qd.Tensor
+    joints_dof_start: qd.Tensor
+    joints_n_lin: qd.Tensor
+    joints_n_ang: qd.Tensor
+    joints_anchor: qd.Tensor
+    dofs_axis: qd.Tensor
+    dofs_joint: qd.Tensor
+    links_joint: qd.Tensor
+    links_art: qd.Tensor
+    links_has_response_dofs: qd.Tensor
+    links_coupling_group: qd.Tensor
+    links_single_response_dof: qd.Tensor
+    free_root_joints: qd.Tensor
+    mimics_eq: qd.Tensor
+    mimics_art: qd.Tensor
+    mimics_dof: qd.Tensor
+    mimics_leader_dof: qd.Tensor
+    mimics_q: qd.Tensor
+    mimics_leader_q: qd.Tensor
+    connects_eq: qd.Tensor
+    connects_art: qd.Tensor
+    connects_link_p: qd.Tensor
+    connects_static_link_p: qd.Tensor
+    connects_link_c: qd.Tensor
+    connects_anchor_p_offset: qd.Tensor
+
+
+def get_steel_model_info(plan, arts_preelim_idx):
+    def from_numpy(array, dtype, n_vec=0):
+        array = array if array.size else np.zeros((1, n_vec) if n_vec else (1,), dtype=array.dtype)
+        tensor = V_VEC(n_vec, dtype=dtype, shape=array.shape[:1]) if n_vec else V(dtype=dtype, shape=array.shape)
+        tensor.from_numpy(array)
+        return tensor
+
+    return SteelModelInfo(
+        arts_joint_start=from_numpy(plan.arts_joint_start, gs.qd_int),
+        arts_dof_start=from_numpy(plan.arts_dof_start, gs.qd_int),
+        arts_n_dofs=from_numpy(plan.arts_n_dofs, gs.qd_int),
+        arts_is_free_rigid=from_numpy(plan.arts_is_free_rigid, gs.qd_int),
+        arts_H_offset=from_numpy(plan.arts_H_offset, gs.qd_int),
+        arts_preelim_idx=from_numpy(arts_preelim_idx, gs.qd_int),
+        joints_link=from_numpy(plan.joints_link, gs.qd_int),
+        joints_parent_link=from_numpy(plan.joints_parent_link, gs.qd_int),
+        joints_static_parent_link=from_numpy(plan.joints_static_parent_link, gs.qd_int),
+        joints_ancestor=from_numpy(plan.joints_ancestor, gs.qd_int),
+        joints_art=from_numpy(plan.joints_art, gs.qd_int),
+        joints_type=from_numpy(plan.joints_type, gs.qd_int),
+        joints_q_start=from_numpy(plan.joints_q_start, gs.qd_int),
+        joints_dof_start=from_numpy(plan.joints_dof_start, gs.qd_int),
+        joints_n_lin=from_numpy(plan.joints_n_lin, gs.qd_int),
+        joints_n_ang=from_numpy(plan.joints_n_ang, gs.qd_int),
+        joints_anchor=from_numpy(plan.joints_anchor, gs.qd_int),
+        dofs_axis=from_numpy(plan.dofs_axis, gs.qd_float, 3),
+        dofs_joint=from_numpy(plan.dofs_joint, gs.qd_int),
+        links_joint=from_numpy(plan.links_joint, gs.qd_int),
+        links_art=from_numpy(plan.links_art, gs.qd_int),
+        links_has_response_dofs=from_numpy(plan.links_has_response_dofs, gs.qd_int),
+        links_coupling_group=from_numpy(plan.links_coupling_group, gs.qd_int),
+        links_single_response_dof=from_numpy(plan.links_single_response_dof, gs.qd_int),
+        free_root_joints=from_numpy(plan.free_root_joints, gs.qd_int),
+        mimics_eq=from_numpy(plan.mimics_eq, gs.qd_int),
+        mimics_art=from_numpy(plan.mimics_art, gs.qd_int),
+        mimics_dof=from_numpy(plan.mimics_dof, gs.qd_int),
+        mimics_leader_dof=from_numpy(plan.mimics_leader_dof, gs.qd_int),
+        mimics_q=from_numpy(plan.mimics_q, gs.qd_int),
+        mimics_leader_q=from_numpy(plan.mimics_leader_q, gs.qd_int),
+        connects_eq=from_numpy(plan.connects_eq, gs.qd_int),
+        connects_art=from_numpy(plan.connects_art, gs.qd_int),
+        connects_link_p=from_numpy(plan.connects_link_p, gs.qd_int),
+        connects_static_link_p=from_numpy(plan.connects_static_link_p, gs.qd_int),
+        connects_link_c=from_numpy(plan.connects_link_c, gs.qd_int),
+        connects_anchor_p_offset=from_numpy(plan.connects_anchor_p_offset, gs.qd_int),
+    )
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class SteelState:
+    """State of the Steel solver carried from step to step.
+
+    q and qd are the joint coordinates and velocities in Steel conventions: scalar coordinates relative to the
+    neutral configuration, quaternions in the Genesis slot order, FREE velocities (center-of-mass velocity, angular
+    velocity) in world axes, BALL angular velocities in the parent anchor axes. links_pos / links_quat are the poses of
+    the link origins, links_vel / links_ang their center-of-mass twists in world axes. links_pos_prev / links_quat_prev
+    hold the poses at the start of the last step.
+    """
+
+    kind: ClassVar[DataKind] = DataKind.STATE
+
+    q: qd.Tensor
+    qd: qd.Tensor
+    qdd: qd.Tensor
+    links_pos: qd.Tensor
+    links_quat: qd.Tensor
+    links_vel: qd.Tensor
+    links_ang: qd.Tensor
+    links_pos_prev: qd.Tensor
+    links_quat_prev: qd.Tensor
+    links_parent_f_lin: qd.Tensor
+    links_parent_f_ang: qd.Tensor
+    arts_mass_update_requested: qd.Tensor
+
+
+def get_steel_state(solver):
+    _B = solver._B
+    return SteelState(
+        q=V(dtype=gs.qd_float, shape=(solver.n_qs_, _B)),
+        qd=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B)),
+        qdd=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B)),
+        links_pos=V(dtype=gs.qd_vec3, shape=(solver.n_links_, _B)),
+        links_quat=V(dtype=gs.qd_vec4, shape=(solver.n_links_, _B)),
+        links_vel=V(dtype=gs.qd_vec3, shape=(solver.n_links_, _B)),
+        links_ang=V(dtype=gs.qd_vec3, shape=(solver.n_links_, _B)),
+        links_pos_prev=V(dtype=gs.qd_vec3, shape=(solver.n_links_, _B)),
+        links_quat_prev=V(dtype=gs.qd_vec4, shape=(solver.n_links_, _B)),
+        links_parent_f_lin=V(dtype=gs.qd_vec3, shape=(solver.n_links_, _B)),
+        links_parent_f_ang=V(dtype=gs.qd_vec3, shape=(solver.n_links_, _B)),
+        arts_mass_update_requested=V(dtype=gs.qd_int, shape=(solver._steel_plan.n_arts_, _B)),
+    )
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class SteelDynamics:
+    """Per-step quantities of the articulated dynamics (stages 1 to 3 and 7 of a Steel step).
+
+    Spatial vectors are split into their linear and angular parts, expressed in the solve frame of the articulation.
+    A spatial inertia is held compactly as (mass, first moment h = mass * com, rotational inertia about the origin).
+    dofs_qd_prev holds the joint velocity of the start of the step, dofs_qd_work the one the kinematics and the
+    predictor see (scaled by the joint velocity limits).
+    H and L are the per-articulation mass matrices and their lower Cholesky factors, row-major, articulation a
+    starting at arts_H_offset[a]. joint_* arrays of the augmented drives hold up to max_art_dofs entries per
+    articulation.
+    """
+
+    kind: ClassVar[DataKind] = DataKind.SCRATCH
+
+    dofs_S_lin: qd.Tensor
+    dofs_S_ang: qd.Tensor
+    dofs_tau: qd.Tensor
+    dofs_qd_prev: qd.Tensor
+    dofs_qd_work: qd.Tensor
+    v_hat: qd.Tensor
+    v_out: qd.Tensor
+    v_out_snap: qd.Tensor
+    links_v_lin: qd.Tensor
+    links_v_ang: qd.Tensor
+    links_a_lin: qd.Tensor
+    links_a_ang: qd.Tensor
+    links_f_lin: qd.Tensor
+    links_f_ang: qd.Tensor
+    links_ft_lin: qd.Tensor
+    links_ft_ang: qd.Tensor
+    links_com_pos: qd.Tensor
+    links_f_ext_lin: qd.Tensor
+    links_f_ext_ang: qd.Tensor
+    links_I_mass: qd.Tensor
+    links_I_h: qd.Tensor
+    links_I_o: qd.Tensor
+    links_Ic_mass: qd.Tensor
+    links_Ic_h: qd.Tensor
+    links_Ic_o: qd.Tensor
+    arts_origin: qd.Tensor
+    arts_mass_update_mask: qd.Tensor
+    arts_aug_count: qd.Tensor
+    aug_dof: qd.Tensor
+    aug_K: qd.Tensor
+    H: qd.Tensor
+    L: qd.Tensor
+
+
+def get_steel_dynamics(solver):
+    _B = solver._B
+    plan = solver._steel_plan
+    n_links, n_dofs = solver.n_links_, solver.n_dofs_
+    return SteelDynamics(
+        dofs_S_lin=V(dtype=gs.qd_vec3, shape=(n_dofs, _B)),
+        dofs_S_ang=V(dtype=gs.qd_vec3, shape=(n_dofs, _B)),
+        dofs_tau=V(dtype=gs.qd_float, shape=(n_dofs, _B)),
+        dofs_qd_prev=V(dtype=gs.qd_float, shape=(n_dofs, _B)),
+        dofs_qd_work=V(dtype=gs.qd_float, shape=(n_dofs, _B)),
+        v_hat=V(dtype=gs.qd_float, shape=(n_dofs, _B)),
+        v_out=V(dtype=gs.qd_float, shape=(n_dofs, _B)),
+        v_out_snap=V(dtype=gs.qd_float, shape=maybe_shape((n_dofs, _B), solver._options.velocity_iterations > 0)),
+        links_v_lin=V(dtype=gs.qd_vec3, shape=(n_links, _B)),
+        links_v_ang=V(dtype=gs.qd_vec3, shape=(n_links, _B)),
+        links_a_lin=V(dtype=gs.qd_vec3, shape=(n_links, _B)),
+        links_a_ang=V(dtype=gs.qd_vec3, shape=(n_links, _B)),
+        links_f_lin=V(dtype=gs.qd_vec3, shape=(n_links, _B)),
+        links_f_ang=V(dtype=gs.qd_vec3, shape=(n_links, _B)),
+        links_ft_lin=V(dtype=gs.qd_vec3, shape=(n_links, _B)),
+        links_ft_ang=V(dtype=gs.qd_vec3, shape=(n_links, _B)),
+        links_com_pos=V(dtype=gs.qd_vec3, shape=(n_links, _B)),
+        links_f_ext_lin=V(dtype=gs.qd_vec3, shape=(n_links, _B)),
+        links_f_ext_ang=V(dtype=gs.qd_vec3, shape=(n_links, _B)),
+        links_I_mass=V(dtype=gs.qd_float, shape=(n_links, _B)),
+        links_I_h=V(dtype=gs.qd_vec3, shape=(n_links, _B)),
+        links_I_o=V(dtype=gs.qd_mat3, shape=(n_links, _B)),
+        links_Ic_mass=V(dtype=gs.qd_float, shape=(n_links, _B)),
+        links_Ic_h=V(dtype=gs.qd_vec3, shape=(n_links, _B)),
+        links_Ic_o=V(dtype=gs.qd_mat3, shape=(n_links, _B)),
+        arts_origin=V(dtype=gs.qd_vec3, shape=(plan.n_arts_, _B)),
+        arts_mass_update_mask=V(dtype=gs.qd_int, shape=(plan.n_arts_, _B)),
+        arts_aug_count=V(dtype=gs.qd_int, shape=(plan.n_arts_, _B)),
+        aug_dof=V(dtype=gs.qd_int, shape=(plan.n_arts_ * max(plan.max_art_dofs, 1), _B)),
+        aug_K=V(dtype=gs.qd_float, shape=(plan.n_arts_ * max(plan.max_art_dofs, 1), _B)),
+        H=V(dtype=gs.qd_float, shape=(max(plan.H_size, 1), _B)),
+        L=V(dtype=gs.qd_float, shape=(max(plan.H_size, 1), _B)),
+    )
+
+
+@qd.data_oriented
+class SteelStaticConfig(metaclass=AutoInitMeta):
+    """Compile-time configuration of the Steel kernels: booleans and enums of the solver options.
+
+    preelim_max_rows is the size of the bilateral block of one articulation in the pre-elimination (PREELIM_MAX_ROWS).
+    """
+
+    para_level: int
+    batch_links_info: bool
+    batch_joints_info: bool
+    batch_dofs_info: bool
+    solve_mode: int
+    drive_mode: int
+    friction_mode: int
+    row_schedule: int
+    articulated_contact_response: int
+    enable_joint_limits: bool
+    enable_joint_velocity_limits: bool
+    has_velocity_iterations: bool
+    has_free_roots: bool
+    has_free_rigid_bodies: bool
+    has_free_and_articulated_bodies: bool
+    has_friction_anchors: bool
+    has_contact_warmstart: bool
+    has_sorted_contacts: bool
+    contact_shared_anchor: bool
+    contact_friction_shared_anchor: bool
+    has_mimics: bool
+    has_connects: bool
+    has_preelim: bool
+    has_preelim_mimics: bool
+    has_fused_velocity_limits: bool
+    has_free_velocity_limits: bool
+    has_propagation: bool
+    has_internal_rows: bool
+    has_velocity_limit_rows: bool
+    propagation_same_articulation_rows: bool
+    has_torsion: bool
+    has_compliance: bool
+    has_sleeping: bool
+    sleep_skip_constraints: bool
+    has_row_watermark: bool
+    preelim_max_rows: int
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class SteelInfo:
+    """Runtime parameters of the Steel solver: the step options and the Steel material data of links and geoms.
+
+    rebound_velocity_threshold is the minimum incident speed of a rebound (the float32 maximum when restitution is
+    disabled), contact_w the regularization weight 1 / (1 + contact_regularization), contact_gap_limit and
+    friction_gap_limit the gap above which a contact gets no rows, or no friction rows. The step options are written
+    again by the setters of the solver (see SteelSolver.baumgarte). geoms_mu is the friction coefficient of every geom
+    scaled by contact_friction_scale. The material arrays of the geoms and links hold one value per environment, written
+    by the material setters of the solver: geoms_restitution, links_angular_damping, the velocity bounds of the links,
+    a non-finite bound disabling it, and geoms_contact_stiffness / geoms_contact_damping, the compliant contact
+    material of every geom, a zero stiffness for a rigid geom (contact compliance only). geoms_is_torsion_supported
+    flags the geoms whose contacts admit torsion rows (contact torsion only).
+
+    The remaining scalars are the tolerances, bounds and iteration counts of the Steel algorithms, documented where
+    get_steel_info sets them.
+    """
+
+    kind: ClassVar[DataKind] = DataKind.INFO
+
+    baumgarte: qd.Tensor
+    cfm: qd.Tensor
+    relaxation: qd.Tensor
+    friction_anchor_beta: qd.Tensor
+    contact_w: qd.Tensor
+    contact_speculative_scale: qd.Tensor
+    rebound_velocity_threshold: qd.Tensor
+    contact_gap_limit: qd.Tensor
+    friction_gap_limit: qd.Tensor
+    joint_limit_activation_gap: qd.Tensor
+    velocity_limit_activation_fraction: qd.Tensor
+    warmstart_decay: qd.Tensor
+    geoms_mu: qd.Tensor
+    geoms_restitution: qd.Tensor
+    links_angular_damping: qd.Tensor
+    links_max_linear_velocity: qd.Tensor
+    links_max_angular_velocity: qd.Tensor
+    links_max_depenetration_velocity: qd.Tensor
+    dofs_velocity_limit: qd.Tensor
+    geoms_is_torsion_supported: qd.Tensor
+    geoms_contact_stiffness: qd.Tensor
+    geoms_contact_damping: qd.Tensor
+    float32_max: qd.Tensor
+    touch_tolerance: qd.Tensor
+    torsion_normal_cosine: qd.Tensor
+    gyroscopic_max_iterations: qd.Tensor
+    gyroscopic_tolerance: qd.Tensor
+    gyroscopic_max_microsteps: qd.Tensor
+    match_position_threshold: qd.Tensor
+    match_normal_cosine: qd.Tensor
+    binary_search_iterations: qd.Tensor
+    patch_normal_cosine_min: qd.Tensor
+    region_plane_distance: qd.Tensor
+    region_extent_sq: qd.Tensor
+    adjacency_slack: qd.Tensor
+    radius_ceiling: qd.Tensor
+    radius_floor: qd.Tensor
+    two_anchor_separation: qd.Tensor
+    isotropy_tolerance: qd.Tensor
+    support_edge_fraction: qd.Tensor
+    support_edge_floor: qd.Tensor
+    history_distance_sq: qd.Tensor
+    history_separation: qd.Tensor
+    history_height: qd.Tensor
+    history_gap_slack: qd.Tensor
+    history_slip_sq: qd.Tensor
+    partner_span_sq: qd.Tensor
+    pose_motion_sine: qd.Tensor
+    release_saturation: qd.Tensor
+    release_slip: qd.Tensor
+    extreme_projection: qd.Tensor
+    friction_pair_tolerance: qd.Tensor
+    friction_pair_newton_iterations: qd.Tensor
+    friction_pair_bisection_iterations: qd.Tensor
+    friction_pair_scale_floor: qd.Tensor
+    bisection_iterations: qd.Tensor
+    bisection_guard: qd.Tensor
+    coulomb_newton_bracket_doublings: qd.Tensor
+    coulomb_newton_iterations: qd.Tensor
+    coulomb_newton_tolerance: qd.Tensor
+    pivot_floor: qd.Tensor
+    contact_end_gap_slop: qd.Tensor
+    unbounded_depenetration: qd.Tensor
+    drive_unbounded_impulse: qd.Tensor
+    support_gap: qd.Tensor
+
+
+def get_steel_info(solver):
+    options = solver._options
+
+    def from_numpy(array, dtype=gs.qd_float, is_on=True):
+        tensor = V(dtype=dtype, shape=maybe_shape(array.shape, is_on))
+        if is_on:
+            tensor.from_numpy(array)
+        return tensor
+
+    return SteelInfo(
+        baumgarte=V_SCALAR_FROM(dtype=gs.qd_float, value=solver.baumgarte),
+        cfm=V_SCALAR_FROM(dtype=gs.qd_float, value=options.cfm),
+        relaxation=V_SCALAR_FROM(dtype=gs.qd_float, value=solver.relaxation),
+        friction_anchor_beta=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._steel_friction_anchor_beta),
+        contact_w=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._steel_contact_w),
+        contact_speculative_scale=V_SCALAR_FROM(dtype=gs.qd_float, value=solver.contact_speculative_scale),
+        rebound_velocity_threshold=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._rebound_velocity_threshold),
+        contact_gap_limit=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._contact_gap_limit),
+        friction_gap_limit=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._friction_gap_limit),
+        joint_limit_activation_gap=V_SCALAR_FROM(dtype=gs.qd_float, value=options.joint_limit_activation_gap),
+        velocity_limit_activation_fraction=V_SCALAR_FROM(
+            dtype=gs.qd_float, value=options.velocity_limit_activation_fraction
+        ),
+        warmstart_decay=V_SCALAR_FROM(dtype=gs.qd_float, value=solver.contact_warmstart_decay),
+        geoms_mu=V(dtype=gs.qd_float, shape=(solver.n_geoms_, solver._B)),
+        geoms_restitution=from_numpy(solver._steel_geoms_restitution),
+        links_angular_damping=from_numpy(solver._steel_links_angular_damping),
+        links_max_linear_velocity=from_numpy(solver._steel_links_max_linear_velocity),
+        links_max_angular_velocity=from_numpy(solver._steel_links_max_angular_velocity),
+        links_max_depenetration_velocity=from_numpy(solver._steel_links_max_depenetration_velocity),
+        dofs_velocity_limit=from_numpy(solver._steel_dofs_velocity_limit),
+        geoms_is_torsion_supported=from_numpy(
+            solver._steel_geoms_is_torsion_supported, gs.qd_bool, options.enable_torsional_friction
+        ),
+        geoms_contact_stiffness=from_numpy(solver._steel_geoms_contact_stiffness, is_on=options.contact_compliance),
+        geoms_contact_damping=from_numpy(solver._steel_geoms_contact_damping, is_on=options.contact_compliance),
+        # Largest finite float32, the bound of the compliance and bias of a row.
+        float32_max=V_SCALAR_FROM(dtype=gs.qd_float, value=float(np.finfo(np.float32).max)),
+        # Gap [m] under which a contact counts as touching, and tolerance of the contact plane of a point friction
+        # cluster.
+        touch_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-5),
+        # Minimum cosine between the normals of the members of a point friction cluster.
+        torsion_normal_cosine=V_SCALAR_FROM(dtype=gs.qd_float, value=0.999),
+        # Number of fixed-point iterations and convergence tolerance of the gyroscopic update of a free rigid body.
+        gyroscopic_max_iterations=V_SCALAR_FROM(dtype=gs.qd_int, value=8),
+        gyroscopic_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-12),
+        # Upper bound of the gyroscopic microsteps of one step.
+        gyroscopic_max_microsteps=V_SCALAR_FROM(dtype=gs.qd_float, value=32.0),
+        # Distance [m] between the witness midpoints of a contact in two consecutive steps below which they may match.
+        match_position_threshold=V_SCALAR_FROM(dtype=gs.qd_float, value=0.0005),
+        # Minimum cosine between the normals of a contact in two consecutive steps.
+        match_normal_cosine=V_SCALAR_FROM(dtype=gs.qd_float, value=0.995),
+        # Iterations bounding a binary search over at most 2^31 entries.
+        binary_search_iterations=V_SCALAR_FROM(dtype=gs.qd_int, value=32),
+        # Minimum cosine between the normals of a region, of a history entry and of a partner anchor.
+        patch_normal_cosine_min=V_SCALAR_FROM(dtype=gs.qd_float, value=0.995),
+        # Distance of a region member to the contact plane of its seed, relative to the body radius.
+        region_plane_distance=V_SCALAR_FROM(dtype=gs.qd_float, value=0.02),
+        # Squared distance of a region member to its seed, relative to the squared body radius.
+        region_extent_sq=V_SCALAR_FROM(dtype=gs.qd_float, value=4.0),
+        # Relative slack of the bounding-sphere overlap test of two geoms.
+        adjacency_slack=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-5),
+        # Upper bound of the body radius of a pair with a static side, and floor of the radius of every pair.
+        radius_ceiling=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e10),
+        radius_floor=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-4),
+        # Squared separation of the farthest member, relative to the squared body radius, above which a region has two
+        # anchors.
+        two_anchor_separation=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-8),
+        # Anisotropy of the footprint covariance, relative to its trace, below which the footprint has no principal
+        # axis.
+        isotropy_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-6),
+        # Fraction of the principal extent of a footprint grouping the members of each end into its support edge, and
+        # its floor relative to the body radius. Each anchor takes its axial position from the extreme member and its
+        # transverse offset and height from the mean of its support edge.
+        support_edge_fraction=V_SCALAR_FROM(dtype=gs.qd_float, value=0.05),
+        support_edge_floor=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-5),
+        # History gates relative to the body radius: squared distance to the anchor, separation of the anchor points
+        # along the normal, height of the anchor above the location, slack of the support gap and squared tangential
+        # slip.
+        history_distance_sq=V_SCALAR_FROM(dtype=gs.qd_float, value=4.0),
+        history_separation=V_SCALAR_FROM(dtype=gs.qd_float, value=0.1),
+        history_height=V_SCALAR_FROM(dtype=gs.qd_float, value=0.05),
+        history_gap_slack=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-5),
+        # The tangential gate bounds the uncorrected slip of a carried anchor at a tenth of the radius of the smaller
+        # body, a few times the equilibrium separation of a held body. Tighter gates re-anchor below that equilibrium
+        # and turn the correction into creep, genuine sliding being released by kernel_steel_finish_patch_impulses.
+        history_slip_sq=V_SCALAR_FROM(dtype=gs.qd_float, value=0.01),
+        # Squared span of two partner anchors, relative to the squared body radius, above which they carry a twist.
+        partner_span_sq=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-8),
+        # Sine of the half rotation angle of a pose increment below which its logarithm takes the small-angle form.
+        pose_motion_sine=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-6),
+        # A friction impulse within this fraction of its disk radius is saturated, and it slips when the tangential
+        # velocity opposes it by more than this fraction of the body radius per step.
+        release_saturation=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-5),
+        release_slip=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-5),
+        # Initial bounds of the extreme projections of a footprint and of the nearest history distance.
+        extreme_projection=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e30),
+        # Relative accuracy of the sliding friction solve, and its Newton and bisection iteration counts.
+        friction_pair_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=2.0e-7),
+        friction_pair_newton_iterations=V_SCALAR_FROM(dtype=gs.qd_int, value=8),
+        friction_pair_bisection_iterations=V_SCALAR_FROM(dtype=gs.qd_int, value=24),
+        # Floor of the scale normalizing the tangent block.
+        friction_pair_scale_floor=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-20),
+        # Normal bisections per contact of the bisection friction modes, and the guard of their degenerate blocks.
+        bisection_iterations=V_SCALAR_FROM(dtype=gs.qd_int, value=20),
+        bisection_guard=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-20),
+        # Bracket doublings, Newton iterations and relative tolerance of the coulomb_newton friction mode.
+        coulomb_newton_bracket_doublings=V_SCALAR_FROM(dtype=gs.qd_int, value=30),
+        coulomb_newton_iterations=V_SCALAR_FROM(dtype=gs.qd_int, value=50),
+        coulomb_newton_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-6),
+        # Floor of the pivots of the joint-space block D = S^T Ia S + armature + K of every joint.
+        pivot_floor=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-12),
+        # Positive gaps below this slop [m] count as touching: it absorbs float32 residuals of rows landing exactly at
+        # contact.
+        contact_end_gap_slop=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-6),
+        # Bias of a free-body contact whose bodies state no depenetration bound.
+        unbounded_depenetration=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e20),
+        # Bound of the impulse of a drive row whose force range is unbounded.
+        drive_unbounded_impulse=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e20),
+        # A contact with static geometry supports an island while its gap [m] does not exceed this distance.
+        support_gap=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-5),
+    )
+
+
+class SteelOverflow(IntEnum):
+    """Bits of the capacity status of an environment (SteelStatus.envs_overflow)."""
+
+    DENSE_ROWS = 1 << 0
+    FREE_ROWS = 1 << 1
+    PROPAGATION_ROWS = 1 << 2
+    CONTACTS_INCOMPLETE = 1 << 3
+
+
+class SteelRowWatermark(IntEnum):
+    """Layout of the row watermarks (SteelStatus.row_watermarks).
+
+    Per row family (dense, free-body, propagation), from slot FAMILY_STRIDE * family: the retained rows, the requested
+    rows, the dropped rows, the excess over the capacity (maxima) and the overflowing environment-steps (a sum). The
+    largest contact count of an environment follows at CONTACT_SLOT.
+    """
+
+    FAMILY_STRIDE = 5
+    CONTACT_SLOT = 15
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class SteelStatus:
+    """The capacity status of the Steel solver, latched across steps until a reset of the environment.
+
+    envs_overflow is a SteelOverflow bitmask per environment: a row family that requested more rows than its capacity
+    or dropped rows, or collision buffers that overflowed. row_watermarks holds the high-water marks of the row counts
+    with 'row_watermark' (see SteelRowWatermark), never reset.
+    """
+
+    kind: ClassVar[DataKind] = DataKind.STATE
+
+    envs_overflow: qd.Tensor
+    row_watermarks: qd.Tensor
+
+
+def get_steel_status(solver):
+    return SteelStatus(
+        envs_overflow=V(dtype=gs.qd_int, shape=(solver._B,)),
+        row_watermarks=V(
+            dtype=gs.qd_int, shape=maybe_shape((SteelRowWatermark.CONTACT_SLOT + 1,), solver._options.row_watermark)
+        ),
+    )
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class SteelContacts:
+    """The contacts of the step in Steel terms, one buffer per environment, in the Genesis contact order.
+
+    Contact k pairs shape0 (geom) of body0 with shape1 of body1 (Steel body, -1 for static geometry), with witness
+    points point0 / point1 in the frame of their body origin (world points for static geometry) and the normal from
+    shape0 toward shape1. path, slot and slots_needed record the rows of the contact: path 0 dense rows, 1 free-body
+    rows, 2 propagation rows, -1 none; rows [slot, slot + slots_needed), the normal row first then the two tangent rows.
+
+    With friction patches (see friction_patches.py), patch_weight is positive for the contacts anchoring the friction
+    of their region, patch_next links the contacts of a region into a ring (-1 outside any region), patch_point is the
+    world point the friction rows of an anchor act at and patch_phi its carried tangential displacement in the
+    tangent basis of the row normal. With contact warm start (see contacts.py), match_index is the index of the same
+    contact in the contacts of the previous step (a MATCH value of contacts.py otherwise), match_candidate and
+    match_dist_sq the closest previous contact and its squared distance before the one-to-one resolution.
+    """
+
+    kind: ClassVar[DataKind] = DataKind.SCRATCH
+
+    n: qd.Tensor
+    shape0: qd.Tensor
+    shape1: qd.Tensor
+    body0: qd.Tensor
+    body1: qd.Tensor
+    point0: qd.Tensor
+    point1: qd.Tensor
+    normal: qd.Tensor
+    path: qd.Tensor
+    slot: qd.Tensor
+    slots_needed: qd.Tensor
+    patch_weight: qd.Tensor
+    patch_next: qd.Tensor
+    patch_point: qd.Tensor
+    patch_phi: qd.Tensor
+    match_index: qd.Tensor
+    match_candidate: qd.Tensor
+    match_dist_sq: qd.Tensor
+
+
+def get_steel_contacts(solver, max_contacts):
+    _B = solver._B
+    shape = (max(max_contacts, 1), _B)
+    patch_shape = maybe_shape(shape, solver._steel_friction_anchor_beta > 0.0)
+    match_shape = maybe_shape(shape, solver._options.contact_warmstart)
+    return SteelContacts(
+        n=V(dtype=gs.qd_int, shape=(_B,)),
+        shape0=V(dtype=gs.qd_int, shape=shape),
+        shape1=V(dtype=gs.qd_int, shape=shape),
+        body0=V(dtype=gs.qd_int, shape=shape),
+        body1=V(dtype=gs.qd_int, shape=shape),
+        point0=V(dtype=gs.qd_vec3, shape=shape),
+        point1=V(dtype=gs.qd_vec3, shape=shape),
+        normal=V(dtype=gs.qd_vec3, shape=shape),
+        path=V(dtype=gs.qd_int, shape=shape),
+        slot=V(dtype=gs.qd_int, shape=shape),
+        slots_needed=V(dtype=gs.qd_int, shape=shape),
+        patch_weight=V(dtype=gs.qd_float, shape=patch_shape),
+        patch_next=V(dtype=gs.qd_int, shape=patch_shape),
+        patch_point=V(dtype=gs.qd_vec3, shape=patch_shape),
+        patch_phi=V(dtype=gs.qd_vec2, shape=patch_shape),
+        match_index=V(dtype=gs.qd_int, shape=match_shape),
+        match_candidate=V(dtype=gs.qd_int, shape=match_shape),
+        match_dist_sq=V(dtype=gs.qd_float, shape=match_shape),
+    )
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class SteelRows:
+    """The dense constraint rows of the step: rows touching at least one articulated body, up to
+    articulation_constraint_max per environment.
+
+    Row i of an environment has the Jacobian J[i, :] over every degree of freedom of the environment and the response
+    Y[i, :] = H^-1 J[i, :]^T, H being the mass matrix (with implicit drives and armature) of the articulations. The
+    solve enforces J v + rhs >= 0 for unilateral rows, rhs holding only the bias. row_contact maps a contact row to its
+    contact (-1 for other rows), row_ref a joint row to its degree of freedom, a mimic row to its mimic and a connect
+    row to its closure, row_axis gives the side of a limit (0 lower, 1 upper) or the world axis of a connect row.
+    n_requested counts the reserved rows, rejected reservations included, first_rejected is the first slot of a rejected
+    reservation and n_dropped counts the rows of the rejected mimic, loop closure and contact reservations. Drive rows
+    carry the parameters of their force-drive
+    update, and dofs_drive_slot the drive row of every driven degree of freedom (-1 for none). mimics_slot and
+    connects_slot give the first row of every mimic joint and loop closure (-1 if rejected). The preelim_* arrays hold
+    the bilateral block of every pre-eliminating articulation: its rows, their count, the block S = J_B Y_B, its
+    Cholesky factor L L^T = S + diag(reg), row-major, and its regularization.
+
+    With contact torsion, torsion_group holds the torsion row of the group of every contact normal row (-1 for none),
+    and for a torsion row -1 while admitted, -2 once the velocity pass retires it. torsion_radius holds the effective
+    radius of every torsion row. With contact compliance, the solve refreshes rhs = compliance_base +
+    compliance_gamma * impulses before every sweep, compliance_gamma being the impulse-space compliance of a compliant
+    normal row (0 for every other row). compliance_n_active and compliance_n_skipped count the compliant contacts of
+    every environment that got rows, and those the allocator gave none.
+    """
+
+    kind: ClassVar[DataKind] = DataKind.SCRATCH
+
+    count: qd.Tensor
+    n_requested: qd.Tensor
+    first_rejected: qd.Tensor
+    n_dropped: qd.Tensor
+    J: qd.Tensor
+    Y: qd.Tensor
+    row_type: qd.Tensor
+    row_parent: qd.Tensor
+    row_mu: qd.Tensor
+    row_contact: qd.Tensor
+    row_ref: qd.Tensor
+    row_axis: qd.Tensor
+    phi: qd.Tensor
+    target_velocity: qd.Tensor
+    restitution: qd.Tensor
+    rhs: qd.Tensor
+    rhs_unbiased: qd.Tensor
+    row_w: qd.Tensor
+    diag: qd.Tensor
+    impulses: qd.Tensor
+    dofs_drive_slot: qd.Tensor
+    drive_stiffness: qd.Tensor
+    drive_damping: qd.Tensor
+    drive_geom_error: qd.Tensor
+    drive_impulse_range: qd.Tensor
+    drive_vel_limit: qd.Tensor
+    drive_target_vel_bias: qd.Tensor
+    drive_vel_multiplier: qd.Tensor
+    drive_impulse_multiplier: qd.Tensor
+    mimics_slot: qd.Tensor
+    connects_slot: qd.Tensor
+    preelim_slots: qd.Tensor
+    preelim_n: qd.Tensor
+    preelim_S: qd.Tensor
+    preelim_L: qd.Tensor
+    preelim_reg: qd.Tensor
+    torsion_group: qd.Tensor
+    torsion_radius: qd.Tensor
+    compliance_base: qd.Tensor
+    compliance_gamma: qd.Tensor
+    compliance_n_active: qd.Tensor
+    compliance_n_skipped: qd.Tensor
+
+
+def get_steel_rows(solver):
+    _B = solver._B
+    options = solver._options
+    n_rows = options.articulation_constraint_max
+    shape = (n_rows, _B)
+    has_drive_rows = options.drive_mode == "rows"
+    drive_shape = maybe_shape(shape, has_drive_rows)
+    plan = solver._steel_plan
+    n_preelim = solver._steel_n_preelim
+    return SteelRows(
+        count=V(dtype=gs.qd_int, shape=(_B,)),
+        n_requested=V(dtype=gs.qd_int, shape=(_B,)),
+        first_rejected=V(dtype=gs.qd_int, shape=(_B,)),
+        n_dropped=V(dtype=gs.qd_int, shape=(_B,)),
+        J=V(dtype=gs.qd_float, shape=(n_rows, solver.n_dofs_, _B)),
+        Y=V(dtype=gs.qd_float, shape=(n_rows, solver.n_dofs_, _B)),
+        row_type=V(dtype=gs.qd_int, shape=shape),
+        row_parent=V(dtype=gs.qd_int, shape=shape),
+        row_mu=V(dtype=gs.qd_float, shape=shape),
+        row_contact=V(dtype=gs.qd_int, shape=shape),
+        row_ref=V(dtype=gs.qd_int, shape=shape),
+        row_axis=V(dtype=gs.qd_int, shape=shape),
+        phi=V(dtype=gs.qd_float, shape=shape),
+        target_velocity=V(dtype=gs.qd_float, shape=shape),
+        restitution=V(dtype=gs.qd_float, shape=shape),
+        rhs=V(dtype=gs.qd_float, shape=shape),
+        rhs_unbiased=V(dtype=gs.qd_float, shape=maybe_shape(shape, options.velocity_iterations > 0)),
+        row_w=V(dtype=gs.qd_float, shape=shape),
+        diag=V(dtype=gs.qd_float, shape=shape),
+        impulses=V(dtype=gs.qd_float, shape=shape),
+        dofs_drive_slot=V(dtype=gs.qd_int, shape=maybe_shape((solver.n_dofs_, _B), has_drive_rows)),
+        drive_stiffness=V(dtype=gs.qd_float, shape=drive_shape),
+        drive_damping=V(dtype=gs.qd_float, shape=drive_shape),
+        drive_geom_error=V(dtype=gs.qd_float, shape=drive_shape),
+        drive_impulse_range=V(dtype=gs.qd_vec2, shape=drive_shape),
+        drive_vel_limit=V(dtype=gs.qd_float, shape=drive_shape),
+        drive_target_vel_bias=V(dtype=gs.qd_float, shape=drive_shape),
+        drive_vel_multiplier=V(dtype=gs.qd_float, shape=drive_shape),
+        drive_impulse_multiplier=V(dtype=gs.qd_float, shape=drive_shape),
+        mimics_slot=V(dtype=gs.qd_int, shape=maybe_shape((plan.n_mimics, _B), plan.n_mimics > 0)),
+        connects_slot=V(dtype=gs.qd_int, shape=maybe_shape((plan.n_connects, _B), plan.n_connects > 0)),
+        preelim_slots=V(dtype=gs.qd_int, shape=maybe_shape((n_preelim * PREELIM_MAX_ROWS, _B), n_preelim > 0)),
+        preelim_n=V(dtype=gs.qd_int, shape=maybe_shape((n_preelim, _B), n_preelim > 0)),
+        preelim_S=V(dtype=gs.qd_float, shape=maybe_shape((n_preelim * PREELIM_MAX_ROWS**2, _B), n_preelim > 0)),
+        preelim_L=V(dtype=gs.qd_float, shape=maybe_shape((n_preelim * PREELIM_MAX_ROWS**2, _B), n_preelim > 0)),
+        preelim_reg=V(dtype=gs.qd_float, shape=maybe_shape((n_preelim * PREELIM_MAX_ROWS, _B), n_preelim > 0)),
+        torsion_group=V(dtype=gs.qd_int, shape=maybe_shape(shape, options.enable_torsional_friction)),
+        torsion_radius=V(dtype=gs.qd_float, shape=maybe_shape(shape, options.enable_torsional_friction)),
+        compliance_base=V(dtype=gs.qd_float, shape=maybe_shape(shape, options.contact_compliance)),
+        compliance_gamma=V(dtype=gs.qd_float, shape=maybe_shape(shape, options.contact_compliance)),
+        compliance_n_active=V(dtype=gs.qd_int, shape=(_B,)),
+        compliance_n_skipped=V(dtype=gs.qd_int, shape=(_B,)),
+    )
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class SteelFreeRows:
+    """The free-body constraint rows of the step: rows whose responding sides are only free rigid bodies, up to
+    free_body_constraint_max per environment, contacts first then the velocity limits of free bodies.
+
+    Side x of row i acts on the six degrees of freedom (center of mass velocity, angular velocity) starting at
+    dof_x[i] of body body_x[i] (-1 for no body) with the Jacobian (J_x_lin, J_x_ang) and the response MiJt_x = H_x^-1
+    J_x^T. eff_mass_inv is the inverse of the diagonal J H^-1 J^T + cfm. compliance_base and compliance_gamma hold the
+    compliant right-hand side of every row (see SteelRows). n_requested and n_dropped count the reserved and the
+    rejected rows as in SteelRows.
+    """
+
+    kind: ClassVar[DataKind] = DataKind.SCRATCH
+
+    count: qd.Tensor
+    n_requested: qd.Tensor
+    n_dropped: qd.Tensor
+    contact_rows_end: qd.Tensor
+    body_a: qd.Tensor
+    body_b: qd.Tensor
+    dof_a: qd.Tensor
+    dof_b: qd.Tensor
+    J_a_lin: qd.Tensor
+    J_a_ang: qd.Tensor
+    J_b_lin: qd.Tensor
+    J_b_ang: qd.Tensor
+    MiJt_a_lin: qd.Tensor
+    MiJt_a_ang: qd.Tensor
+    MiJt_b_lin: qd.Tensor
+    MiJt_b_ang: qd.Tensor
+    row_type: qd.Tensor
+    row_parent: qd.Tensor
+    row_mu: qd.Tensor
+    row_contact: qd.Tensor
+    row_ref: qd.Tensor
+    row_axis: qd.Tensor
+    phi: qd.Tensor
+    target_velocity: qd.Tensor
+    restitution: qd.Tensor
+    rhs: qd.Tensor
+    rhs_unbiased: qd.Tensor
+    row_w: qd.Tensor
+    eff_mass_inv: qd.Tensor
+    impulses: qd.Tensor
+    links_Hinv_tl: qd.Tensor
+    links_Hinv_tr: qd.Tensor
+    links_Hinv_bl: qd.Tensor
+    links_Hinv_br: qd.Tensor
+    compliance_base: qd.Tensor
+    compliance_gamma: qd.Tensor
+
+
+def get_steel_free_rows(solver):
+    _B = solver._B
+    options = solver._options
+    is_active = solver._steel_plan.has_free_rigid_bodies
+    shape = maybe_shape((options.free_body_constraint_max, _B), is_active)
+    links_shape = maybe_shape((solver.n_links_, _B), is_active)
+    return SteelFreeRows(
+        count=V(dtype=gs.qd_int, shape=(_B,)),
+        n_requested=V(dtype=gs.qd_int, shape=(_B,)),
+        n_dropped=V(dtype=gs.qd_int, shape=(_B,)),
+        contact_rows_end=V(dtype=gs.qd_int, shape=(_B,)),
+        body_a=V(dtype=gs.qd_int, shape=shape),
+        body_b=V(dtype=gs.qd_int, shape=shape),
+        dof_a=V(dtype=gs.qd_int, shape=shape),
+        dof_b=V(dtype=gs.qd_int, shape=shape),
+        J_a_lin=V(dtype=gs.qd_vec3, shape=shape),
+        J_a_ang=V(dtype=gs.qd_vec3, shape=shape),
+        J_b_lin=V(dtype=gs.qd_vec3, shape=shape),
+        J_b_ang=V(dtype=gs.qd_vec3, shape=shape),
+        MiJt_a_lin=V(dtype=gs.qd_vec3, shape=shape),
+        MiJt_a_ang=V(dtype=gs.qd_vec3, shape=shape),
+        MiJt_b_lin=V(dtype=gs.qd_vec3, shape=shape),
+        MiJt_b_ang=V(dtype=gs.qd_vec3, shape=shape),
+        row_type=V(dtype=gs.qd_int, shape=shape),
+        row_parent=V(dtype=gs.qd_int, shape=shape),
+        row_mu=V(dtype=gs.qd_float, shape=shape),
+        row_contact=V(dtype=gs.qd_int, shape=shape),
+        row_ref=V(dtype=gs.qd_int, shape=shape),
+        row_axis=V(dtype=gs.qd_int, shape=shape),
+        phi=V(dtype=gs.qd_float, shape=shape),
+        target_velocity=V(dtype=gs.qd_float, shape=shape),
+        restitution=V(dtype=gs.qd_float, shape=shape),
+        rhs=V(dtype=gs.qd_float, shape=shape),
+        rhs_unbiased=V(dtype=gs.qd_float, shape=maybe_shape(shape, is_active and options.velocity_iterations > 0)),
+        row_w=V(dtype=gs.qd_float, shape=shape),
+        eff_mass_inv=V(dtype=gs.qd_float, shape=shape),
+        impulses=V(dtype=gs.qd_float, shape=shape),
+        links_Hinv_tl=V(dtype=gs.qd_mat3, shape=links_shape),
+        links_Hinv_tr=V(dtype=gs.qd_mat3, shape=links_shape),
+        links_Hinv_bl=V(dtype=gs.qd_mat3, shape=links_shape),
+        links_Hinv_br=V(dtype=gs.qd_mat3, shape=links_shape),
+        compliance_base=V(dtype=gs.qd_float, shape=maybe_shape(shape, is_active and options.contact_compliance)),
+        compliance_gamma=V(dtype=gs.qd_float, shape=maybe_shape(shape, is_active and options.contact_compliance)),
+    )
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class SteelTorsionWitnesses:
+    """Per-contact scratch of the contact torsion grouping, one buffer per environment in the Steel contact order.
+
+    eligible is 1 for a dense contact normal row admitted to grouping, -1 for one rejected, 0 otherwise. normal, point
+    and gap are the normal from shape 1 toward shape 0, the midpoint of the witness points and the signed gap of an
+    admitted contact, is_anchor whether its normal row is followed by its own tangent pair. group is the representative
+    contact of its group (the group's first contact), next_member and tail the linked list of the members of a point
+    friction cluster, first_pair the first admitted contact of its geom pair. A representative holds the lead contact
+    (first touching member, -1 when the group gets no row), the undivided friction coefficient and effective radius of
+    the group and its torsion row (spin_row, -1 for none). is_rejected and is_ring_broken flag a friction patch region
+    holding a rejected member, or whose load ring leaves its admitted normal rows.
+    """
+
+    kind: ClassVar[DataKind] = DataKind.SCRATCH
+
+    eligible: qd.Tensor
+    is_anchor: qd.Tensor
+    normal: qd.Tensor
+    point: qd.Tensor
+    gap: qd.Tensor
+    group: qd.Tensor
+    next_member: qd.Tensor
+    tail: qd.Tensor
+    first_pair: qd.Tensor
+    lead: qd.Tensor
+    coefficient: qd.Tensor
+    radius: qd.Tensor
+    spin_row: qd.Tensor
+    is_rejected: qd.Tensor
+    is_ring_broken: qd.Tensor
+
+
+def get_steel_torsion_witnesses(solver, max_contacts):
+    _B = solver._B
+    is_active = solver._options.enable_torsional_friction
+    shape = maybe_shape((max(max_contacts, 1), _B), is_active)
+    patch_shape = maybe_shape(shape, is_active and solver._steel_friction_anchor_beta > 0.0)
+    return SteelTorsionWitnesses(
+        eligible=V(dtype=gs.qd_int, shape=shape),
+        is_anchor=V(dtype=gs.qd_bool, shape=shape),
+        normal=V(dtype=gs.qd_vec3, shape=shape),
+        point=V(dtype=gs.qd_vec3, shape=shape),
+        gap=V(dtype=gs.qd_float, shape=shape),
+        group=V(dtype=gs.qd_int, shape=shape),
+        next_member=V(dtype=gs.qd_int, shape=shape),
+        tail=V(dtype=gs.qd_int, shape=shape),
+        first_pair=V(dtype=gs.qd_int, shape=shape),
+        lead=V(dtype=gs.qd_int, shape=shape),
+        coefficient=V(dtype=gs.qd_float, shape=shape),
+        radius=V(dtype=gs.qd_float, shape=shape),
+        spin_row=V(dtype=gs.qd_int, shape=shape),
+        is_rejected=V(dtype=gs.qd_bool, shape=patch_shape),
+        is_ring_broken=V(dtype=gs.qd_bool, shape=patch_shape),
+    )
+
+
+# Color cap of the contact coloring of 'propagation_colored', also the index of the serial tail bucket of the contacts
+# left without a color, and the words of the used-color bitmask of a link.
+PROPAGATION_COLOR_TAIL = 512
+PROPAGATION_COLOR_MASK_WORDS = PROPAGATION_COLOR_TAIL // 32
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class SteelPropagation:
+    """The propagation rows of the step and the articulated-body terms of every link (see steel/propagation.py).
+
+    Row i of an environment acts on the links body_a[i] and body_b[i] (-1 for none) with the COM Jacobians J_a, J_b
+    (6-vectors, linear then angular) and the responses MiJt_a, MiJt_b. Rows hold up to free_body_constraint_max plus
+    articulation_constraint_max rows per environment ('propagation_fused': articulation_constraint_max), counted as the
+    dense rows, and so are n_requested, first_rejected and n_dropped (see SteelRows). has_dense_contacts flags the
+    environments holding dense contact rows.
+
+    Per link: the COM relative to the articulation origin, the articulated inertia Ia, the inverse D^-1 of the
+    joint-space block of its inbound joint (its first rows and columns), the 6x6 COM response, the twist estimate
+    links_qd, the impulse accumulated by the sweep, the scratch wrench pA and twist change delta of the tree passes,
+    and the mass-splitting counters. Per degree of freedom: the motion subspace S at the COM of its link, U = Ia S and
+    the joint term u of the tree passes. The units_* and colors_count arrays and the used-color bitmasks are the
+    scratch of the coloring of 'propagation_colored'.
+    """
+
+    kind: ClassVar[DataKind] = DataKind.SCRATCH
+
+    count: qd.Tensor
+    n_requested: qd.Tensor
+    first_rejected: qd.Tensor
+    n_dropped: qd.Tensor
+    has_dense_contacts: qd.Tensor
+    body_a: qd.Tensor
+    body_b: qd.Tensor
+    J_a: qd.Tensor
+    J_b: qd.Tensor
+    MiJt_a: qd.Tensor
+    MiJt_b: qd.Tensor
+    row_type: qd.Tensor
+    row_parent: qd.Tensor
+    row_mu: qd.Tensor
+    row_contact: qd.Tensor
+    phi: qd.Tensor
+    target_velocity: qd.Tensor
+    restitution: qd.Tensor
+    restitution_bias: qd.Tensor
+    rhs: qd.Tensor
+    rhs_unbiased: qd.Tensor
+    row_w: qd.Tensor
+    eff_mass_inv: qd.Tensor
+    impulses: qd.Tensor
+    links_com_rel: qd.Tensor
+    links_Ia: qd.Tensor
+    links_D_inv: qd.Tensor
+    links_response: qd.Tensor
+    links_qd: qd.Tensor
+    links_impulse: qd.Tensor
+    links_pA: qd.Tensor
+    links_delta: qd.Tensor
+    links_split_seen: qd.Tensor
+    links_group_count: qd.Tensor
+    dofs_S: qd.Tensor
+    dofs_U: qd.Tensor
+    dofs_u: qd.Tensor
+    units_contact: qd.Tensor
+    units_color: qd.Tensor
+    units_order: qd.Tensor
+    colors_count: qd.Tensor
+    links_color_mask: qd.Tensor
+
+
+def get_steel_propagation(solver):
+    _B = solver._B
+    options = solver._options
+    is_active = solver._steel_propagation_active
+    is_colored = is_active and options.articulated_contact_response == "propagation_colored"
+    n_rows = options.articulation_constraint_max
+    if options.articulated_contact_response in ("propagation", "propagation_colored"):
+        n_rows += options.free_body_constraint_max
+    shape = maybe_shape((n_rows, _B), is_active)
+    links_shape = maybe_shape((solver.n_links_, _B), is_active)
+    dofs_shape = maybe_shape((solver.n_dofs_, _B), is_active)
+    units_shape = maybe_shape((n_rows, _B), is_colored)
+    return SteelPropagation(
+        count=V(dtype=gs.qd_int, shape=(_B,)),
+        n_requested=V(dtype=gs.qd_int, shape=(_B,)),
+        first_rejected=V(dtype=gs.qd_int, shape=(_B,)),
+        n_dropped=V(dtype=gs.qd_int, shape=(_B,)),
+        has_dense_contacts=V(dtype=gs.qd_int, shape=(_B,)),
+        body_a=V(dtype=gs.qd_int, shape=shape),
+        body_b=V(dtype=gs.qd_int, shape=shape),
+        J_a=V(dtype=gs.qd_vec6, shape=shape),
+        J_b=V(dtype=gs.qd_vec6, shape=shape),
+        MiJt_a=V(dtype=gs.qd_vec6, shape=shape),
+        MiJt_b=V(dtype=gs.qd_vec6, shape=shape),
+        row_type=V(dtype=gs.qd_int, shape=shape),
+        row_parent=V(dtype=gs.qd_int, shape=shape),
+        row_mu=V(dtype=gs.qd_float, shape=shape),
+        row_contact=V(dtype=gs.qd_int, shape=shape),
+        phi=V(dtype=gs.qd_float, shape=shape),
+        target_velocity=V(dtype=gs.qd_float, shape=shape),
+        restitution=V(dtype=gs.qd_float, shape=shape),
+        restitution_bias=V(dtype=gs.qd_float, shape=shape),
+        rhs=V(dtype=gs.qd_float, shape=shape),
+        rhs_unbiased=V(dtype=gs.qd_float, shape=maybe_shape(shape, is_active and options.velocity_iterations > 0)),
+        row_w=V(dtype=gs.qd_float, shape=shape),
+        eff_mass_inv=V(dtype=gs.qd_float, shape=shape),
+        impulses=V(dtype=gs.qd_float, shape=shape),
+        links_com_rel=V(dtype=gs.qd_vec3, shape=links_shape),
+        links_Ia=V_MAT(n=6, m=6, dtype=gs.qd_float, shape=links_shape),
+        links_D_inv=V_MAT(n=6, m=6, dtype=gs.qd_float, shape=links_shape),
+        links_response=V_MAT(n=6, m=6, dtype=gs.qd_float, shape=links_shape),
+        links_qd=V(dtype=gs.qd_vec6, shape=links_shape),
+        links_impulse=V(dtype=gs.qd_vec6, shape=links_shape),
+        links_pA=V(dtype=gs.qd_vec6, shape=links_shape),
+        links_delta=V(dtype=gs.qd_vec6, shape=links_shape),
+        links_split_seen=V(dtype=gs.qd_int, shape=links_shape),
+        links_group_count=V(dtype=gs.qd_int, shape=links_shape),
+        dofs_S=V(dtype=gs.qd_vec6, shape=dofs_shape),
+        dofs_U=V(dtype=gs.qd_vec6, shape=dofs_shape),
+        dofs_u=V(dtype=gs.qd_float, shape=dofs_shape),
+        units_contact=V(dtype=gs.qd_int, shape=units_shape),
+        units_color=V(dtype=gs.qd_int, shape=units_shape),
+        units_order=V(dtype=gs.qd_int, shape=units_shape),
+        colors_count=V(dtype=gs.qd_int, shape=maybe_shape((PROPAGATION_COLOR_TAIL + 2, _B), is_colored)),
+        links_color_mask=V(
+            dtype=gs.qd_int,
+            shape=maybe_shape((solver.n_links_, PROPAGATION_COLOR_MASK_WORDS, _B), is_colored),
+        ),
+    )
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class SteelSplit:
+    """The dense Delassus systems of the split solve (solve_mode='split').
+
+    C[i, j] = J_i . Y_j couples the dense rows i and j of an environment. When the model holds both articulated and free
+    bodies, v_free_sum accumulates the velocity change of the free-body sweeps of the step and v_free_delta holds the
+    change of the last sweep.
+    """
+
+    kind: ClassVar[DataKind] = DataKind.SCRATCH
+
+    C: qd.Tensor
+    v_free_sum: qd.Tensor
+    v_free_delta: qd.Tensor
+
+
+def get_steel_split(solver):
+    _B = solver._B
+    options = solver._options
+    n_rows = options.articulation_constraint_max
+    is_split = options.solve_mode == "split"
+    is_alternating = is_split and solver.steel_config.has_free_and_articulated_bodies
+    return SteelSplit(
+        C=V(dtype=gs.qd_float, shape=maybe_shape((n_rows, n_rows, _B), is_split)),
+        v_free_sum=V(dtype=gs.qd_float, shape=maybe_shape((solver.n_dofs_, _B), is_alternating)),
+        v_free_delta=V(dtype=gs.qd_float, shape=maybe_shape((solver.n_dofs_, _B), is_alternating)),
+    )
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class SteelPatchGeometry:
+    """Bounding spheres of the geoms and links, which bound the friction regions and their history matching.
+
+    geoms_radius is the radius of a sphere enclosing geom i_g about its origin, geoms_offset the position of that origin
+    in the frame of its link, links_radius the largest geoms_radius + |geoms_offset| over the geoms of a link (0 for a
+    link without geoms).
+    """
+
+    kind: ClassVar[DataKind] = DataKind.CONSTANT
+
+    geoms_radius: qd.Tensor
+    geoms_offset: qd.Tensor
+    links_radius: qd.Tensor
+
+
+def get_steel_patch_geometry(geoms_radius, geoms_offset, links_radius):
+    geometry = SteelPatchGeometry(
+        geoms_radius=V(dtype=gs.qd_float, shape=geoms_radius.shape),
+        geoms_offset=V(dtype=gs.qd_vec3, shape=geoms_radius.shape),
+        links_radius=V(dtype=gs.qd_float, shape=links_radius.shape),
+    )
+    geometry.geoms_radius.from_numpy(geoms_radius)
+    geometry.geoms_offset.from_numpy(geoms_offset)
+    geometry.links_radius.from_numpy(links_radius)
+    return geometry
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class SteelPatchFrame:
+    """The friction regions of the contacts of the step, built from the contacts and the history of the last step.
+
+    Every array is indexed by contact, except indices, the contacts sorted by body-pair key (stable, so the contacts of
+    a pair follow in ascending contact order), members, the member lists of the regions in that sorted order, and the
+    counting-sort scratch sort_order and sort_count (one counter per key value). Side a and side b are the two bodies
+    of the pair ordered by key, flipped telling whether side a is body1 of the contact. normal points from side b
+    toward side a, center is the midpoint of the witness points, surface_a / surface_b the witness points in the frames
+    of their bodies, radius the bounding radius of the smaller body, mu the friction coefficients of the two geoms.
+    owner is the seed contact of the region of a contact. An anchor (valid) stores its location in the frames of both
+    bodies (anchor_a, anchor_b), its carried displacement in the frame of body a, the tangent impulse it carries and
+    the history entry it continues (source, -1 for none).
+    """
+
+    kind: ClassVar[DataKind] = DataKind.SCRATCH
+
+    key: qd.Tensor
+    indices: qd.Tensor
+    sort_order: qd.Tensor
+    sort_count: qd.Tensor
+    center: qd.Tensor
+    normal: qd.Tensor
+    displacement: qd.Tensor
+    mu: qd.Tensor
+    radius: qd.Tensor
+    body_a: qd.Tensor
+    body_b: qd.Tensor
+    shape_a: qd.Tensor
+    shape_b: qd.Tensor
+    flipped: qd.Tensor
+    owner: qd.Tensor
+    anchor_a: qd.Tensor
+    anchor_b: qd.Tensor
+    surface_a: qd.Tensor
+    surface_b: qd.Tensor
+    valid: qd.Tensor
+    source: qd.Tensor
+    eligible: qd.Tensor
+    members: qd.Tensor
+    tangent_impulse: qd.Tensor
+
+
+def get_steel_patch_frame(solver, max_contacts):
+    _B = solver._B
+    shape = maybe_shape((max(max_contacts, 1), _B), solver._steel_friction_anchor_beta > 0.0)
+    # Keys are 1 + link index for a link and n_links + 1 + geom index for a static geom.
+    n_keys = solver.n_links_ + solver.n_geoms_ + 1
+    return SteelPatchFrame(
+        key=V(dtype=gs.qd_ivec2, shape=shape),
+        indices=V(dtype=gs.qd_int, shape=shape),
+        sort_order=V(dtype=gs.qd_int, shape=shape),
+        sort_count=V(dtype=gs.qd_int, shape=maybe_shape((n_keys, _B), solver._steel_friction_anchor_beta > 0.0)),
+        center=V(dtype=gs.qd_vec3, shape=shape),
+        normal=V(dtype=gs.qd_vec3, shape=shape),
+        displacement=V(dtype=gs.qd_vec3, shape=shape),
+        mu=V(dtype=gs.qd_vec2, shape=shape),
+        radius=V(dtype=gs.qd_float, shape=shape),
+        body_a=V(dtype=gs.qd_int, shape=shape),
+        body_b=V(dtype=gs.qd_int, shape=shape),
+        shape_a=V(dtype=gs.qd_int, shape=shape),
+        shape_b=V(dtype=gs.qd_int, shape=shape),
+        flipped=V(dtype=gs.qd_int, shape=shape),
+        owner=V(dtype=gs.qd_int, shape=shape),
+        anchor_a=V(dtype=gs.qd_vec3, shape=shape),
+        anchor_b=V(dtype=gs.qd_vec3, shape=shape),
+        surface_a=V(dtype=gs.qd_vec3, shape=shape),
+        surface_b=V(dtype=gs.qd_vec3, shape=shape),
+        valid=V(dtype=gs.qd_int, shape=shape),
+        source=V(dtype=gs.qd_int, shape=shape),
+        eligible=V(dtype=gs.qd_int, shape=shape),
+        members=V(dtype=gs.qd_int, shape=shape),
+        tangent_impulse=V(dtype=gs.qd_vec3, shape=shape),
+    )
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class SteelPatchHistory:
+    """The friction anchors of the last step, which the friction regions of the next step continue.
+
+    n is the number of contacts of the last step, key and indices their body-pair keys and their sorted order, and every
+    other array is indexed by contact as in SteelPatchFrame, the normal of an anchor being stored in the frame of its
+    body a. used and members are scratch of the history matching: whether an anchor is already continued this step, and
+    the valid anchors of every body pair in sorted order.
+    """
+
+    kind: ClassVar[DataKind] = DataKind.STATE
+
+    n: qd.Tensor
+    key: qd.Tensor
+    indices: qd.Tensor
+    normal: qd.Tensor
+    displacement: qd.Tensor
+    mu: qd.Tensor
+    body_a: qd.Tensor
+    body_b: qd.Tensor
+    shape_a: qd.Tensor
+    shape_b: qd.Tensor
+    owner: qd.Tensor
+    anchor_a: qd.Tensor
+    anchor_b: qd.Tensor
+    surface_a: qd.Tensor
+    surface_b: qd.Tensor
+    valid: qd.Tensor
+    tangent_impulse: qd.Tensor
+    used: qd.Tensor = of_kind(DataKind.SCRATCH)
+    members: qd.Tensor = of_kind(DataKind.SCRATCH)
+
+
+def get_steel_patch_history(solver, max_contacts):
+    _B = solver._B
+    is_active = solver._steel_friction_anchor_beta > 0.0
+    shape = maybe_shape((max(max_contacts, 1), _B), is_active)
+    return SteelPatchHistory(
+        n=V(dtype=gs.qd_int, shape=maybe_shape((_B,), is_active)),
+        key=V(dtype=gs.qd_ivec2, shape=shape),
+        indices=V(dtype=gs.qd_int, shape=shape),
+        normal=V(dtype=gs.qd_vec3, shape=shape),
+        displacement=V(dtype=gs.qd_vec3, shape=shape),
+        mu=V(dtype=gs.qd_vec2, shape=shape),
+        body_a=V(dtype=gs.qd_int, shape=shape),
+        body_b=V(dtype=gs.qd_int, shape=shape),
+        shape_a=V(dtype=gs.qd_int, shape=shape),
+        shape_b=V(dtype=gs.qd_int, shape=shape),
+        owner=V(dtype=gs.qd_int, shape=shape),
+        anchor_a=V(dtype=gs.qd_vec3, shape=shape),
+        anchor_b=V(dtype=gs.qd_vec3, shape=shape),
+        surface_a=V(dtype=gs.qd_vec3, shape=shape),
+        surface_b=V(dtype=gs.qd_vec3, shape=shape),
+        valid=V(dtype=gs.qd_int, shape=shape),
+        tangent_impulse=V(dtype=gs.qd_vec3, shape=shape),
+        used=V(dtype=gs.qd_int, shape=shape),
+        members=V(dtype=gs.qd_int, shape=shape),
+    )
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class SteelContactHistory:
+    """The contacts and the impulses of the last step, which the contact matching and the warm start of the next step
+    read.
+
+    n is the number of contacts of the last step, shape0 / shape1 their geoms, pos the world midpoint of their witness
+    points at detection and normal their normal (from shape0 toward shape1). path and slot give the row family of a
+    contact (see CONTACT_PATH in steel/rows.py) and its first row there (-1 for none). The dense_*, free_* and
+    propagation_* arrays hold the impulses (zero past the row count), row types and row parents of every row slot of
+    each family. dt is the duration of the last step, 0 before the first one.
+    """
+
+    kind: ClassVar[DataKind] = DataKind.STATE
+
+    n: qd.Tensor
+    shape0: qd.Tensor
+    shape1: qd.Tensor
+    pos: qd.Tensor
+    normal: qd.Tensor
+    path: qd.Tensor
+    slot: qd.Tensor
+    dense_impulses: qd.Tensor
+    dense_row_type: qd.Tensor
+    dense_row_parent: qd.Tensor
+    free_impulses: qd.Tensor
+    free_row_type: qd.Tensor
+    free_row_parent: qd.Tensor
+    propagation_impulses: qd.Tensor
+    propagation_row_type: qd.Tensor
+    propagation_row_parent: qd.Tensor
+    dt: qd.Tensor
+
+
+def get_steel_contact_history(solver, max_contacts):
+    _B = solver._B
+    options = solver._options
+    is_active = options.contact_warmstart
+    shape = maybe_shape((max(max_contacts, 1), _B), is_active)
+    dense_shape = maybe_shape((options.articulation_constraint_max, _B), is_active)
+    free_shape = maybe_shape(
+        (options.free_body_constraint_max, _B), is_active and solver._steel_plan.has_free_rigid_bodies
+    )
+    propagation_shape = maybe_shape(solver.steel_prop.row_type.shape, is_active and solver._steel_propagation_active)
+    return SteelContactHistory(
+        n=V(dtype=gs.qd_int, shape=maybe_shape((_B,), is_active)),
+        shape0=V(dtype=gs.qd_int, shape=shape),
+        shape1=V(dtype=gs.qd_int, shape=shape),
+        pos=V(dtype=gs.qd_vec3, shape=shape),
+        normal=V(dtype=gs.qd_vec3, shape=shape),
+        path=V(dtype=gs.qd_int, shape=shape),
+        slot=V(dtype=gs.qd_int, shape=shape),
+        dense_impulses=V(dtype=gs.qd_float, shape=dense_shape),
+        dense_row_type=V(dtype=gs.qd_int, shape=dense_shape),
+        dense_row_parent=V(dtype=gs.qd_int, shape=dense_shape),
+        free_impulses=V(dtype=gs.qd_float, shape=free_shape),
+        free_row_type=V(dtype=gs.qd_int, shape=free_shape),
+        free_row_parent=V(dtype=gs.qd_int, shape=free_shape),
+        propagation_impulses=V(dtype=gs.qd_float, shape=propagation_shape),
+        propagation_row_type=V(dtype=gs.qd_int, shape=propagation_shape),
+        propagation_row_parent=V(dtype=gs.qd_int, shape=propagation_shape),
+        dt=V(dtype=gs.qd_float, shape=()),
+    )
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class SteelSleep:
+    """State of the passive-island sleeping of the Steel solver (see steel/sleeping.py), empty unless enable_sleeping.
+
+    Articulations are the nodes of a union-find over the contacts of each environment. arts_parent holds the island of
+    every articulation for the current contacts, arts_wake_parent the union of that island with the islands the asleep
+    articulations belonged to at the previous step (arts_previous_root), both labeled by their smallest articulation.
+    The roots_* flags are indexed by that label: roots_has_awake (an awake member), roots_is_vetoed (a wake event),
+    roots_is_supported (a fixed root or a touching contact with static geometry), roots_is_ready (every member quiet
+    for sleep_quiet_time) and roots_has_old_wake (a previous island holding a woken member). arts_is_awake is the
+    published sleep state, arts_is_step_asleep the state the step runs with, arts_quiet_age the quiet time of every
+    articulation, arts_asleep_steps the number of steps it has been asleep for, arts_is_changed a pending wake event
+    of a state or model change. arts_is_anchored marks the articulations with a fixed root joint, which support their
+    island, arts_is_pinned those owning a mimic joint or a loop closure, which never sleep.
+    envs_is_incomplete flags the environments whose contacts overflowed the collision buffers this step.
+    links_is_awake and links_island publish the state and the island of every link, links_is_frozen marks the links asleep through the
+    current and the previous step (allocated with sleep_skip_constraints only), whose friction history repeats.
+    q_start holds the joint coordinates of the start of the step, restored for the articulations that sleep, and
+    links_parent_f_*_last the parent wrench published at the last step, which a sleeping link keeps.
+    """
+
+    kind: ClassVar[DataKind] = DataKind.STATE
+
+    arts_parent: qd.Tensor = of_kind(DataKind.SCRATCH)
+    arts_wake_parent: qd.Tensor = of_kind(DataKind.SCRATCH)
+    arts_previous_root: qd.Tensor
+    arts_is_awake: qd.Tensor
+    arts_is_step_asleep: qd.Tensor = of_kind(DataKind.SCRATCH)
+    arts_quiet_age: qd.Tensor
+    arts_asleep_steps: qd.Tensor
+    arts_is_changed: qd.Tensor
+    arts_is_anchored: qd.Tensor = of_kind(DataKind.CONSTANT)
+    arts_is_pinned: qd.Tensor = of_kind(DataKind.CONSTANT)
+    roots_has_awake: qd.Tensor = of_kind(DataKind.SCRATCH)
+    roots_is_vetoed: qd.Tensor = of_kind(DataKind.SCRATCH)
+    roots_is_supported: qd.Tensor = of_kind(DataKind.SCRATCH)
+    roots_is_ready: qd.Tensor = of_kind(DataKind.SCRATCH)
+    roots_has_old_wake: qd.Tensor = of_kind(DataKind.SCRATCH)
+    envs_is_incomplete: qd.Tensor = of_kind(DataKind.SCRATCH)
+    links_is_awake: qd.Tensor = of_kind(DataKind.DERIVED)
+    links_island: qd.Tensor = of_kind(DataKind.DERIVED)
+    links_is_frozen: qd.Tensor = of_kind(DataKind.SCRATCH)
+    links_parent_f_lin_last: qd.Tensor
+    links_parent_f_ang_last: qd.Tensor
+    q_start: qd.Tensor = of_kind(DataKind.SCRATCH)
+
+
+def get_steel_sleep(solver, arts_is_anchored, arts_is_pinned):
+    """Allocate the sleep state with every articulation awake, in its own island and with no pending wake event."""
+    _B = solver._B
+    options = solver._options
+    is_on = options.enable_sleeping
+    n_arts, n_links = solver._steel_plan.n_arts_, solver.n_links_
+
+    def tensor(dtype, shape, value=None):
+        data = V(dtype=dtype, shape=maybe_shape(shape, is_on))
+        if is_on and value is not None:
+            np_dtype = gs.np_int if dtype == gs.qd_int else gs.np_float
+            data.from_numpy(np.ascontiguousarray(np.broadcast_to(value, shape), dtype=np_dtype))
+        return data
+
+    arts_shape = (n_arts, _B)
+    return SteelSleep(
+        arts_parent=tensor(gs.qd_int, arts_shape),
+        arts_wake_parent=tensor(gs.qd_int, arts_shape),
+        arts_previous_root=tensor(gs.qd_int, arts_shape, np.arange(n_arts)[:, None]),
+        arts_is_awake=tensor(gs.qd_int, arts_shape, 1),
+        arts_is_step_asleep=tensor(gs.qd_int, arts_shape),
+        arts_quiet_age=tensor(gs.qd_float, arts_shape, 0.0),
+        arts_asleep_steps=tensor(gs.qd_int, arts_shape, 0),
+        arts_is_changed=tensor(gs.qd_int, arts_shape, 0),
+        arts_is_anchored=tensor(gs.qd_int, (n_arts,), arts_is_anchored),
+        arts_is_pinned=tensor(gs.qd_int, (n_arts,), arts_is_pinned),
+        roots_has_awake=tensor(gs.qd_int, arts_shape),
+        roots_is_vetoed=tensor(gs.qd_int, arts_shape),
+        roots_is_supported=tensor(gs.qd_int, arts_shape),
+        roots_is_ready=tensor(gs.qd_int, arts_shape),
+        roots_has_old_wake=tensor(gs.qd_int, arts_shape),
+        envs_is_incomplete=tensor(gs.qd_int, (_B,)),
+        links_is_awake=tensor(gs.qd_int, (n_links, _B), 1),
+        links_island=tensor(gs.qd_int, (n_links, _B), -1),
+        links_is_frozen=V(dtype=gs.qd_int, shape=maybe_shape((n_links, _B), is_on and options.sleep_skip_constraints)),
+        links_parent_f_lin_last=tensor(gs.qd_vec3, (n_links, _B)),
+        links_parent_f_ang_last=tensor(gs.qd_vec3, (n_links, _B)),
+        q_start=tensor(gs.qd_float, (solver.n_qs_, _B)),
+    )

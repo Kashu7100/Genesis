@@ -672,6 +672,337 @@ class RigidOptions(GravityMixin, TimeBasedMixin):
             gs.raise_exception("'enable_rolling_friction' requires 'enable_torsional_friction'.")
 
 
+class SteelOptions(RigidOptions):
+    """
+    Options selecting and configuring the Steel solver for rigid entities.
+
+    Passing it as `rigid_options` simulates every rigid entity with Steel: reduced-coordinate articulated dynamics
+    (forward kinematics, inverse dynamics, composite rigid body mass matrix and its Cholesky factor), an
+    unconstrained velocity prediction, then a projected Gauss-Seidel (PGS) solve of contacts, joint limits, joint
+    velocity limits, drives, mimic joints and loop closures in impulse space, and symplectic Euler integration.
+    Collision detection and every other rigid option (collision filtering, contact pruning, batching, gravity, dt)
+    stay those of 'RigidOptions'. The options of 'RigidOptions' that configure its own constraint solver have no
+    meaning here and raise when set.
+
+    The options are fixed once the scene is built, and assigning one then raises. The step options 'baumgarte',
+    'relaxation', 'warn_constraint_overflow', 'velocity_drive_mode', 'contact_warmstart_decay',
+    'restitution_velocity_threshold', 'contact_speculative_scale', 'contact_gap_gate' and 'contact_friction_gap_max'
+    are read at every step: assigning the property of the same name of the solver ('scene.rigid_solver') changes them
+    from the next step on, with the validation of the options.
+
+    Parameters
+    ----------
+    solve_mode : str, optional
+        Constraint solve. 'matrix_free' sweeps every row of an environment in turn and recomputes each row's velocity
+        from the current generalized velocity, so it scales with the rows actually present and supports every option
+        below. 'split' assembles the rows of articulated bodies into a dense matrix per environment before solving
+        them, which makes its sweeps independent of the number of degrees of freedom, then solves the rows of free
+        bodies against the resulting velocity: it costs the square of 'articulation_constraint_max' in memory and
+        compute per environment and lacks friction patches, restitution (materials with a positive restitution require
+        'enable_restitution=False'), warm start, velocity iterations, drive rows, joint velocity limits, mimic joints,
+        loop closures, regularization, torsion, compliance and sleeping. Defaults to 'matrix_free'.
+    iterations : int, optional
+        Number of PGS sweeps per step. More sweeps tighten contacts, limits and closures at a cost linear in the count.
+        Defaults to 12.
+    baumgarte : float, optional
+        Fraction of the penetration of a contact (or of the violation of a joint limit, mimic joint or loop closure)
+        removed per step. Larger values remove errors faster but add velocity to the bodies and can make stacks jitter.
+        Defaults to 0.2.
+    cfm : float, optional
+        Constraint force mixing added to the effective mass of every row. It regularizes redundant rows (several
+        contacts sharing one load) at the cost of a slightly softer response. Defaults to 1e-6.
+    relaxation : float, optional
+        Successive over-relaxation factor of the PGS sweep. Values above 1 can converge in fewer sweeps but overshoot
+        on stiff scenes. Defaults to 1.0.
+    update_mass_matrix_interval : int, optional
+        Rebuild and refactor the mass matrix every this many steps. Larger values save the factorization cost but
+        reuse a stale mass matrix in between, which is only accurate while configurations change slowly. Defaults to
+        1 (every step).
+    enable_joint_limit : bool, optional
+        Enforce the finite position limits of revolute, prismatic and multi-axis joints as unilateral rows. Each finite
+        limit uses a row of 'articulation_constraint_max' every step unless 'joint_limit_activation_gap' is finite.
+        Defaults to False.
+    joint_limit_activation_gap : float, optional
+        Distance from a finite limit [m or rad] within which its row is created. inf creates every row every step;
+        a small gap saves rows, at the risk of a fast joint crossing the gap within one step. Defaults to inf.
+    enable_joint_velocity_limits : bool, optional
+        Enforce joint velocity limits (scaling over-limit articulation velocities, then one row pair per limited DOF).
+        Costs rows of 'articulation_constraint_max'. Defaults to False.
+    velocity_limit_activation_fraction : float, optional
+        Create the velocity-limit rows of a DOF only when its speed reaches this fraction of its limit. 0 creates them
+        every step; larger values save rows, at the cost of clamping a DOF that crosses the threshold one step late.
+        Must lie in [0, 1] or be inf. Defaults to 0.0.
+    articulation_constraint_max : int, optional
+        Capacity of rows involving articulated bodies per environment. Rows beyond it are dropped and reported. Larger
+        values cost memory (and, with 'split', a square matrix per environment). Defaults to 32.
+    free_body_constraint_max : int, optional
+        Capacity of contact rows between free bodies and static geometry per environment. Rows beyond it are dropped
+        and reported. Defaults to 512.
+    warn_constraint_overflow : bool, optional
+        Warn the first time an environment exceeds a row capacity. Defaults to True.
+    row_watermark : bool, optional
+        Record the high-water marks of the per-environment row counts, read back with
+        'SteelSolver.constraint_row_watermarks', to size the capacities. Costs one reduction per step. Defaults to
+        False.
+    drive_mode : str, optional
+        Position/velocity control formulation. 'augmented' integrates the drive implicitly in the mass matrix, which is
+        unconditionally stable, but only its explicit part is clamped to the force range, so under a large load the
+        drive force can exceed it. 'rows' solves one PGS row per driven DOF together with contacts and limits, which
+        bounds the complete drive force but costs rows and converges with the sweep. Defaults to 'augmented'.
+    fuse_joint_velocity_limits : bool, optional
+        With drive rows and velocity limits, clamp the velocity of each driven DOF at the end of every sweep instead of
+        solving two velocity-limit rows for it, which saves rows. Defaults to True.
+    enable_bilateral_preelimination : bool, optional
+        Eliminate the mimic and loop-closure rows of each articulation before the sweep, so these couplings depend much
+        less on 'iterations', at the cost of a small dense factorization per articulation and a regularized (not exact)
+        elimination. Defaults to False.
+    bilateral_preelimination_include_mimics : bool, optional
+        Also pre-eliminate mimic rows. Disable it when a mimic row is nearly dependent on a closure, which makes the
+        eliminated block singular. Defaults to True.
+    friction_anchor_beta : float, optional
+        Position-correction gain of persistent friction patches. A positive gain groups the compatible contacts of a
+        body pair into regions whose friction acts at up to two anchors carrying their tangential displacement across
+        steps, so static friction holds without creep, at the cost of a grouping pass per step. 0 selects point
+        friction (two tangent rows per contact), which creeps slowly under static loads. None resolves to 0.2 with
+        'matrix_free' and point friction otherwise. Defaults to None.
+    contact_regularization : float, optional
+        Dimensionless compliance of penetrating contact rows. It makes the split of the load among redundant contacts
+        unique and damps the sweep, at the cost of a resting penetration that grows with it. 0 is rigid. Defaults to
+        0.0.
+    velocity_iterations : int, optional
+        Number of extra sweeps after the position solve that refine the velocity without position correction, so
+        correcting penetration adds no velocity to the bodies. Each costs one sweep. Defaults to 0.
+    velocity_drive_mode : str, optional
+        Drive rows during the velocity sweeps: 'freeze' keeps their impulses, 'active' keeps solving them. Defaults to
+        'freeze'.
+    row_schedule : str, optional
+        Row order of the sweeps. 'interleaved' solves every row family in each sweep. 'contact_then_internal' runs all
+        contact sweeps first, then all drive, mimic, closure and limit sweeps, which favors contacts over internal
+        constraints. 'phased' solves internal rows, then contacts, then velocity limits in each sweep, the order used
+        for grasping by many game engines. Defaults to 'interleaved'.
+    friction_mode : str, optional
+        Coulomb friction update. 'fixed_normal' solves the two tangent impulses on the friction disk of the current
+        normal impulse, the cheapest and the only mode compatible with friction patches, torsion and compliance.
+        'bisection' updates normal and friction impulses together, which resolves sliding more accurately at a higher
+        cost. 'bisection_desaxce' adds the de Saxce maximum-dissipation bias to free-body contacts. 'coulomb_newton'
+        solves the cone of each free-body contact exactly with a scalar Newton iteration. Defaults to 'fixed_normal'.
+    contact_warmstart : bool, optional
+        Start each step from the previous step's contact impulses, matched by contact identity, which converges resting
+        contacts in fewer sweeps but can carry stale impulses through fast changes. Defaults to False.
+    contact_warmstart_decay : float, optional
+        Scale applied to the carried impulses. Defaults to 1.0.
+    enable_restitution : bool, optional
+        Apply the restitution coefficient of the rigid materials to impacts faster than
+        'restitution_velocity_threshold'. Defaults to True.
+    restitution_velocity_threshold : float, optional
+        Minimum incident normal speed [m/s] for a rebound, so resting contacts do not bounce. Defaults to 0.5.
+    contact_gap : float, optional
+        Distance [m] between two geometries below which collision detection reports their contact before they touch,
+        with a positive gap (a negative penetration). Such a contact lets the bodies close the gap within the step but
+        not overlap, so resting bodies keep their contacts from one step to the next and fast bodies land without
+        sinking in. A larger value catches faster approaches, at the cost of more contacts, each one taking collision
+        detection work and rows of the row capacities, including contacts between nearby links of one articulation. 0
+        reports touching geometries only, which makes resting bodies lose and regain their contacts every few steps
+        and jitter. Defaults to 0.1.
+    contact_speculative_scale : float, optional
+        Fraction of a positive contact gap a contact may close within the step. Defaults to 1.0.
+    contact_gap_gate : float, optional
+        Contacts whose gap [m] exceeds this distance get no rows. None keeps every contact. Defaults to None.
+    contact_friction_scale : float, optional
+        Factor applied to the friction coefficient of every geometry. Defaults to 1.0.
+    contact_friction_position_iterations : int, optional
+        Number of final position sweeps that solve friction rows, -1 for every sweep. Fewer friction sweeps converge
+        normal impulses first, at the price of a less accurate friction. Defaults to -1.
+    contact_friction_gap_max : float, optional
+        Contacts with a gap [m] above this distance get a normal row only, which saves rows. None gives every contact
+        friction rows. Defaults to None.
+    contact_shared_anchor : bool, optional
+        Apply every contact row at the midpoint of the two witness points instead of at each body's own point.
+        Defaults to False.
+    contact_friction_shared_anchor : bool, optional
+        Apply the friction rows at the witness midpoint, which removes the torque of witness points separated along
+        the normal. Defaults to False.
+    enable_torsional_friction : bool, optional
+        Resist the relative spin of the articulated bodies in contact about the contact normal. Each coplanar cluster of
+        touching contacts of one geometry pair (one friction patch region with friction patches) gets one angular row
+        bounded by r * (mu * N - S), N being its normal load and S the share of the Coulomb budget its sliding friction
+        uses, so sliding and spin never exceed one friction budget together. r is the effective contact patch radius
+        [m], the largest material option 'friction_torsional' (see 'gs.materials.Rigid') of the geometries of the
+        group, read every step: for uniform pressure on a disk of radius R it is 2 * R / 3. Without it, a point contact
+        transmits no torque about its normal, so a grasped object twists freely in a gripper and a spinning body never
+        slows down. It costs one row of 'articulation_constraint_max' per group and a grouping pass per step whose cost
+        is quadratic in the contacts of an environment. Contacts of free rigid bodies get no torsion. Supported
+        geometries are planes, spheres, ellipsoids, cylinders, capsules, boxes and convex meshes. Requires
+        'contact_warmstart=False', friction_mode='fixed_normal', solve_mode='matrix_free', row_schedule='interleaved'
+        and articulated_contact_response='immediate', and rejects compliant contacts. Running out of row capacity halts
+        the simulation instead of dropping rows. Defaults to False.
+    contact_compliance : bool, optional
+        Solve the contacts of geometries with a positive 'contact_stiffness' (see 'gs.materials.Rigid') with an
+        implicit spring-damper law instead of the rigid law: the contact force is max(0, -k phi - c u) for the gap phi
+        and the separating velocity u at the end of the step, so soft materials penetrate by their load over their
+        stiffness at rest. Contacts of rigid geometries keep the rigid law. It models soft contact, at the cost of the
+        resting penetration and of point friction only ('friction_anchor_beta' resolves to 0). Requires positive
+        'iterations', no velocity iterations, no warm start, no regularization, no shared anchors,
+        friction_mode='fixed_normal', 'contact_friction_position_iterations=-1', solve_mode='matrix_free',
+        row_schedule='interleaved', articulated_contact_response='immediate' and zero restitution with
+        'enable_restitution'. Running out of row capacity halts the simulation instead of dropping rows. Defaults to
+        False.
+    enable_sleeping : bool, optional
+        Put to sleep every group of bodies in contact that rests on static geometry or on a fixed base once its bodies
+        stay below the sleep thresholds for 'sleep_quiet_time', freezing their state until a wake event: a non-zero
+        external force or force control, a drive, a contact with an awake body, or a setter of the state or of the
+        model of their environment. It saves the cost of resting bodies, but freezes a body that a push below the
+        thresholds should have moved. Requires 'contact_warmstart' off, 'velocity_iterations' = 0 and
+        articulated_contact_response='immediate'. Defaults to False.
+    sleep_linear_threshold : float, optional
+        Center-of-mass speed [m/s] below which a body counts as quiet. Defaults to 0.05.
+    sleep_angular_threshold : float, optional
+        Angular speed [rad/s] below which a body counts as quiet. Defaults to 0.15.
+    sleep_quiet_time : float, optional
+        Quiet, supported time [s] after which an island sleeps. Defaults to 0.5.
+    sleep_skip_constraints : bool, optional
+        Skip the rows and the dynamics of sleeping bodies, whose contacts then report a zero force. Disabling it keeps
+        solving them and their contact forces, and only freezes their state, at the cost of the work sleeping saves.
+        Defaults to True.
+    articulated_contact_response : str, optional
+        How contacts of articulated bodies are solved. 'immediate' solves them in joint space with the mass matrix
+        factor, at a cost per contact row growing with the degrees of freedom of the articulation. The propagation
+        responses solve them as fixed-size rows of the touched bodies, each body responding through an articulated-body
+        factorization of its tree, and push the impulses through the trees after every sweep. They scale better with
+        large articulations, but converge more slowly when several contacts load one articulation. 'propagation' solves
+        every contact that way, within 'free_body_constraint_max' plus 'articulation_constraint_max' rows per
+        environment. 'propagation_fused' keeps the contacts between free rigid bodies as free-body rows, its rows count
+        against 'articulation_constraint_max', and it requires every articulation other than free rigid bodies to have
+        the same number of degrees of freedom. 'propagation_colored' solves the contacts of 'propagation' in batches of
+        contacts sharing no body, one batch after the other: another sweep order, whose iterates differ from those of
+        'propagation' until convergence. The propagation responses require friction_mode='fixed_normal' and support
+        neither loop closures, contact compliance nor sleeping. Contacts between two links of one articulation stay
+        joint-space rows (see 'propagation_same_articulation_rows'). Defaults to 'immediate'.
+    propagation_same_articulation_rows : bool, optional
+        Solve the contacts between two links of one articulation as propagation rows with the exact response of the
+        pair instead of joint-space rows, which avoids the joint-space cost on large articulations at the price of one
+        tree solve per row and step. Requires articulated_contact_response='propagation'. Defaults to False.
+    """
+
+    solve_mode: Literal["matrix_free", "split"] = "matrix_free"
+    enable_joint_limit: StrictBool = False
+    iterations: NonNegativeInt = 12
+    baumgarte: float = 0.2
+    cfm: float = 1.0e-6
+    relaxation: float = 1.0
+    update_mass_matrix_interval: PositiveInt = 1
+    joint_limit_activation_gap: float = float("inf")
+    enable_joint_velocity_limits: StrictBool = False
+    velocity_limit_activation_fraction: float = 0.0
+    articulation_constraint_max: PositiveInt = 32
+    free_body_constraint_max: PositiveInt = 512
+    warn_constraint_overflow: StrictBool = True
+    row_watermark: StrictBool = False
+    drive_mode: Literal["augmented", "rows"] = "augmented"
+    fuse_joint_velocity_limits: StrictBool = True
+    enable_bilateral_preelimination: StrictBool = False
+    bilateral_preelimination_include_mimics: StrictBool = True
+    friction_anchor_beta: NonNegativeFloat | None = None
+    contact_regularization: NonNegativeFloat = 0.0
+    velocity_iterations: NonNegativeInt = 0
+    velocity_drive_mode: Literal["freeze", "active"] = "freeze"
+    row_schedule: Literal["interleaved", "contact_then_internal", "phased"] = "interleaved"
+    friction_mode: Literal["fixed_normal", "bisection", "bisection_desaxce", "coulomb_newton"] = "fixed_normal"
+    contact_warmstart: StrictBool = False
+    contact_warmstart_decay: NonNegativeFloat = 1.0
+    enable_restitution: StrictBool = True
+    restitution_velocity_threshold: NonNegativeFloat = 0.5
+    contact_gap: NonNegativeFloat = 0.1
+    contact_speculative_scale: NonNegativeFloat = 1.0
+    contact_gap_gate: NonNegativeFloat | None = None
+    contact_friction_scale: NonNegativeFloat = 1.0
+    contact_friction_position_iterations: int = -1
+    contact_friction_gap_max: float | None = None
+    contact_shared_anchor: StrictBool = False
+    contact_friction_shared_anchor: StrictBool = False
+    contact_compliance: StrictBool = False
+    enable_sleeping: StrictBool = False
+    sleep_linear_threshold: PositiveFloat = 0.05
+    sleep_angular_threshold: PositiveFloat = 0.15
+    sleep_quiet_time: PositiveFloat = 0.5
+    sleep_skip_constraints: StrictBool = True
+    articulated_contact_response: Literal["immediate", "propagation", "propagation_fused", "propagation_colored"] = (
+        "immediate"
+    )
+    propagation_same_articulation_rows: StrictBool = False
+
+    _is_built: bool = PrivateAttr(default=False)
+
+    def __setattr__(self, name: str, value) -> None:
+        if self._is_built:
+            gs.raise_exception(
+                f"'SteelOptions.{name}' is fixed once the scene is built. The step options are changed through the "
+                "property of the same name of the solver ('scene.rigid_solver'), see 'SteelOptions'."
+            )
+        super().__setattr__(name, value)
+
+    def model_post_init(self, context):
+        super().model_post_init(context)
+        # The options of 'RigidOptions' that configure its own constraint solver, integrator and hibernation.
+        rigid_only_fields = (
+            "constraint_solver",
+            "tolerance",
+            "ls_iterations",
+            "ls_tolerance",
+            "noslip_iterations",
+            "noslip_tolerance",
+            "friction_cone",
+            "contact_resolution",
+            "enable_rolling_friction",
+            "impratio",
+            "sparse_solve",
+            "constraint_timeconst",
+            "use_hibernation",
+            "hibernation_thresh_vel",
+            "integrator",
+            "enable_mujoco_compatibility",
+            "max_dynamic_constraints",
+            "disable_constraint",
+        )
+        rigid_only_set = [name for name in rigid_only_fields if name in self.model_fields_set]
+        if rigid_only_set:
+            gs.raise_exception(f"'SteelOptions' does not support the 'RigidOptions' fields {rigid_only_set}.")
+        if not np.isfinite(
+            (
+                self.baumgarte,
+                self.cfm,
+                self.relaxation,
+                self.contact_friction_scale,
+                self.contact_gap,
+                self.contact_warmstart_decay,
+                self.restitution_velocity_threshold,
+                self.contact_speculative_scale,
+            )
+        ).all():
+            gs.raise_exception(
+                "'baumgarte', 'cfm', 'relaxation', 'contact_friction_scale', 'contact_gap', 'contact_warmstart_decay', "
+                "'restitution_velocity_threshold' and 'contact_speculative_scale' must be finite."
+            )
+        if self.contact_gap_gate is not None and not np.isfinite(self.contact_gap_gate):
+            gs.raise_exception("'contact_gap_gate' must be finite or None.")
+        if np.isnan(self.joint_limit_activation_gap) or self.joint_limit_activation_gap < 0.0:
+            gs.raise_exception("'joint_limit_activation_gap' must be non-negative.")
+        fraction = self.velocity_limit_activation_fraction
+        if not (0.0 <= fraction <= 1.0 or fraction == float("inf")):
+            gs.raise_exception("'velocity_limit_activation_fraction' must lie in [0, 1] or be inf.")
+        if self.contact_regularization > 1.0e6:
+            gs.raise_exception("'contact_regularization' must not exceed 1e6.")
+        if self.contact_friction_position_iterations < -1:
+            gs.raise_exception("'contact_friction_position_iterations' must be -1 or non-negative.")
+        if self.contact_friction_gap_max is not None and np.isnan(self.contact_friction_gap_max):
+            gs.raise_exception("'contact_friction_gap_max' must not be NaN.")
+        if self.propagation_same_articulation_rows and self.articulated_contact_response != "propagation":
+            gs.raise_exception(
+                "'propagation_same_articulation_rows' requires articulated_contact_response='propagation', got "
+                f"'{self.articulated_contact_response}'."
+            )
+
+
 class MPMOptions(GravityMixin, TimeBasedMixin):
     """
     Options configuring the MPMSolver.

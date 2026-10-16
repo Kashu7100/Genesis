@@ -9,6 +9,7 @@ import torch
 import genesis as gs
 from genesis.constants import link_ref_frame
 from genesis.engine.states.entities import RigidEntityState
+from genesis.options.solvers import SteelOptions
 from genesis.typing import UnitVec4FType, Vec3FType
 from genesis.utils import geom as gu
 from genesis.utils.misc import DeprecationError, broadcast_tensor, qd_to_torch, tensor_to_array
@@ -29,8 +30,9 @@ from .rigid_link import KinematicLink, RigidLink
 
 if TYPE_CHECKING:
     from genesis.engine.scene import Scene
-    from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
     from genesis.engine.solvers.kinematic_solver import KinematicSolver
+    from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
+    from genesis.engine.solvers.steel import SteelSolver
 
 
 # Wrapper to track the arguments of a function and save them in the target buffer
@@ -1757,7 +1759,7 @@ class RigidEntity(KinematicEntity):
         self._edge_start = solver.n_edges
         self._free_verts_state_start = solver.n_free_verts
         self._fixed_verts_state_start = solver.n_fixed_verts
-        self._equality_start = 0
+        self._equality_start = solver.n_equalities
         self._free_verts_idx_local = torch.tensor([], dtype=gs.tc_int, device=gs.device)
         self._fixed_verts_idx_local = torch.tensor([], dtype=gs.tc_int, device=gs.device)
         self._visualize_contact: bool = desc.visualize_contact
@@ -3442,6 +3444,219 @@ class RigidEntity(KinematicEntity):
         """
         links_idx = [link.idx for link in self.links if not link.is_fixed]
         return self._solver.get_links_mass(links_idx, envs_idx).sum(dim=-1)
+
+    # ------------------------------------------------------------------------------------
+    # --------------------------------- Steel materials ----------------------------------
+    # ------------------------------------------------------------------------------------
+
+    @property
+    def _steel_solver(self) -> "SteelSolver":
+        """The solver of the entity, raising unless it is the Steel solver (see 'gs.options.SteelOptions')."""
+        if not isinstance(self._solver._options, SteelOptions):
+            gs.raise_exception("This accessor requires the Steel solver (see 'gs.options.SteelOptions').")
+        return self._solver
+
+    @gs.assert_built
+    def set_geoms_restitution(self, restitution, geoms_idx_local=None, envs_idx=None):
+        """
+        Set the restitution coefficient of the given geoms of the entity (see 'gs.materials.Rigid').
+
+        The restitution of a contact is the mean of the coefficients of its two geoms. Requires the Steel solver.
+
+        Parameters
+        ----------
+        restitution : float | array_like
+            The restitution coefficient, between 0 (no rebound) and 1 (elastic), per geom and environment.
+        geoms_idx_local : None | array_like, optional
+            The indices of the geoms. If None, all the geoms of the entity are considered. Defaults to None.
+        envs_idx : None | array_like, optional
+            The indices of the environments. If None, all environments will be considered. Defaults to None.
+        """
+        geoms_idx = self._get_global_idx(geoms_idx_local, self.n_geoms, self._geom_start, unsafe=True)
+        self._steel_solver.set_geoms_restitution(restitution, geoms_idx, envs_idx)
+
+    @gs.assert_built
+    def get_geoms_restitution(self, geoms_idx_local=None, envs_idx=None):
+        """Get the restitution coefficient of the given geoms of the entity, per environment and geom."""
+        geoms_idx = self._get_global_idx(geoms_idx_local, self.n_geoms, self._geom_start, unsafe=True)
+        return self._steel_solver.get_geoms_restitution(geoms_idx, envs_idx)
+
+    @gs.assert_built
+    def set_geoms_contact_stiffness(self, stiffness, geoms_idx_local=None, envs_idx=None):
+        """
+        Set the contact stiffness [N/m] of the given geoms of the entity (see 'gs.materials.Rigid').
+
+        A zero stiffness makes the contacts of the geom rigid. Requires the Steel solver with 'contact_compliance'.
+
+        Parameters
+        ----------
+        stiffness : float | array_like
+            The contact stiffness, per geom and environment.
+        geoms_idx_local : None | array_like, optional
+            The indices of the geoms. If None, all the geoms of the entity are considered. Defaults to None.
+        envs_idx : None | array_like, optional
+            The indices of the environments. If None, all environments will be considered. Defaults to None.
+        """
+        geoms_idx = self._get_global_idx(geoms_idx_local, self.n_geoms, self._geom_start, unsafe=True)
+        self._steel_solver.set_geoms_contact_stiffness(stiffness, geoms_idx, envs_idx)
+
+    @gs.assert_built
+    def get_geoms_contact_stiffness(self, geoms_idx_local=None, envs_idx=None):
+        """Get the contact stiffness of the given geoms of the entity, per environment and geom."""
+        geoms_idx = self._get_global_idx(geoms_idx_local, self.n_geoms, self._geom_start, unsafe=True)
+        return self._steel_solver.get_geoms_contact_stiffness(geoms_idx, envs_idx)
+
+    @gs.assert_built
+    def set_geoms_contact_damping(self, damping, geoms_idx_local=None, envs_idx=None):
+        """
+        Set the contact damping [N s/m] of the given geoms of the entity (see 'gs.materials.Rigid').
+
+        It acts on the contacts of the geoms with a positive contact stiffness. Requires the Steel solver with
+        'contact_compliance'.
+
+        Parameters
+        ----------
+        damping : float | array_like
+            The contact damping, per geom and environment.
+        geoms_idx_local : None | array_like, optional
+            The indices of the geoms. If None, all the geoms of the entity are considered. Defaults to None.
+        envs_idx : None | array_like, optional
+            The indices of the environments. If None, all environments will be considered. Defaults to None.
+        """
+        geoms_idx = self._get_global_idx(geoms_idx_local, self.n_geoms, self._geom_start, unsafe=True)
+        self._steel_solver.set_geoms_contact_damping(damping, geoms_idx, envs_idx)
+
+    @gs.assert_built
+    def get_geoms_contact_damping(self, geoms_idx_local=None, envs_idx=None):
+        """Get the contact damping of the given geoms of the entity, per environment and geom."""
+        geoms_idx = self._get_global_idx(geoms_idx_local, self.n_geoms, self._geom_start, unsafe=True)
+        return self._steel_solver.get_geoms_contact_damping(geoms_idx, envs_idx)
+
+    @gs.assert_built
+    def set_links_angular_damping(self, angular_damping, links_idx_local=None, envs_idx=None):
+        """
+        Set the angular velocity damping rate [1/s] of the given links of the entity (see 'gs.materials.Rigid').
+
+        It damps the spin of the root link of a free-floating entity, read at every step. Requires the Steel solver.
+
+        Parameters
+        ----------
+        angular_damping : float | array_like
+            The damping rate, per link and environment.
+        links_idx_local : None | array_like, optional
+            The indices of the links. If None, all the links of the entity are considered. Defaults to None.
+        envs_idx : None | array_like, optional
+            The indices of the environments. If None, all environments will be considered. Defaults to None.
+        """
+        links_idx = self._get_global_idx(links_idx_local, self.n_links, self._link_start, unsafe=True)
+        self._steel_solver.set_links_angular_damping(angular_damping, links_idx, envs_idx)
+
+    @gs.assert_built
+    def get_links_angular_damping(self, links_idx_local=None, envs_idx=None):
+        """Get the angular velocity damping rate of the given links of the entity, per environment and link."""
+        links_idx = self._get_global_idx(links_idx_local, self.n_links, self._link_start, unsafe=True)
+        return self._steel_solver.get_links_angular_damping(links_idx, envs_idx)
+
+    @gs.assert_built
+    def set_links_max_linear_velocity(self, max_linear_velocity, links_idx_local=None, envs_idx=None):
+        """
+        Set the bound [m/s] of the center of mass speed of the given links of the entity (see 'gs.materials.Rigid').
+
+        It bounds each world axis of the velocity of a free-floating entity, read at every step. A non-finite bound
+        disables it. Requires the Steel solver.
+
+        Parameters
+        ----------
+        max_linear_velocity : float | array_like
+            The speed bound, per link and environment.
+        links_idx_local : None | array_like, optional
+            The indices of the links. If None, all the links of the entity are considered. Defaults to None.
+        envs_idx : None | array_like, optional
+            The indices of the environments. If None, all environments will be considered. Defaults to None.
+        """
+        links_idx = self._get_global_idx(links_idx_local, self.n_links, self._link_start, unsafe=True)
+        self._steel_solver.set_links_max_linear_velocity(max_linear_velocity, links_idx, envs_idx)
+
+    @gs.assert_built
+    def get_links_max_linear_velocity(self, links_idx_local=None, envs_idx=None):
+        """Get the bound of the center of mass speed of the given links of the entity, per environment and link."""
+        links_idx = self._get_global_idx(links_idx_local, self.n_links, self._link_start, unsafe=True)
+        return self._steel_solver.get_links_max_linear_velocity(links_idx, envs_idx)
+
+    @gs.assert_built
+    def set_links_max_angular_velocity(self, max_angular_velocity, links_idx_local=None, envs_idx=None):
+        """
+        Set the bound [rad/s] of the angular speed of the given links of the entity (see 'gs.materials.Rigid').
+
+        It bounds each world axis of the angular velocity of a free-floating entity, read at every step. A non-finite
+        bound disables it. Requires the Steel solver.
+
+        Parameters
+        ----------
+        max_angular_velocity : float | array_like
+            The angular speed bound, per link and environment.
+        links_idx_local : None | array_like, optional
+            The indices of the links. If None, all the links of the entity are considered. Defaults to None.
+        envs_idx : None | array_like, optional
+            The indices of the environments. If None, all environments will be considered. Defaults to None.
+        """
+        links_idx = self._get_global_idx(links_idx_local, self.n_links, self._link_start, unsafe=True)
+        self._steel_solver.set_links_max_angular_velocity(max_angular_velocity, links_idx, envs_idx)
+
+    @gs.assert_built
+    def get_links_max_angular_velocity(self, links_idx_local=None, envs_idx=None):
+        """Get the bound of the angular speed of the given links of the entity, per environment and link."""
+        links_idx = self._get_global_idx(links_idx_local, self.n_links, self._link_start, unsafe=True)
+        return self._steel_solver.get_links_max_angular_velocity(links_idx, envs_idx)
+
+    @gs.assert_built
+    def set_links_max_depenetration_velocity(self, max_depenetration_velocity, links_idx_local=None, envs_idx=None):
+        """
+        Set the bound [m/s] of the penetration correction velocity of the given links of the entity.
+
+        It bounds the velocity at which the contacts of a free-floating entity correct penetration (see
+        'gs.materials.Rigid'), read at every step. A non-finite bound disables it. Requires the Steel solver.
+
+        Parameters
+        ----------
+        max_depenetration_velocity : float | array_like
+            The correction velocity bound, per link and environment.
+        links_idx_local : None | array_like, optional
+            The indices of the links. If None, all the links of the entity are considered. Defaults to None.
+        envs_idx : None | array_like, optional
+            The indices of the environments. If None, all environments will be considered. Defaults to None.
+        """
+        links_idx = self._get_global_idx(links_idx_local, self.n_links, self._link_start, unsafe=True)
+        self._steel_solver.set_links_max_depenetration_velocity(max_depenetration_velocity, links_idx, envs_idx)
+
+    @gs.assert_built
+    def get_links_max_depenetration_velocity(self, links_idx_local=None, envs_idx=None):
+        """Get the bound of the penetration correction velocity of the given links, per environment and link."""
+        links_idx = self._get_global_idx(links_idx_local, self.n_links, self._link_start, unsafe=True)
+        return self._steel_solver.get_links_max_depenetration_velocity(links_idx, envs_idx)
+
+    @gs.assert_built
+    def get_links_parent_wrench(self, links_idx_local=None, envs_idx=None):
+        """
+        Get the wrench the inbound joint of each given link of the entity transmits to it, about its center of mass.
+
+        It is the net wrench of the subtree of the link from the inverse dynamics at the start of the last step, in
+        world axes. It leaves out the constraint and contact impulses of the step. Requires the Steel solver.
+
+        Parameters
+        ----------
+        links_idx_local : None | array_like, optional
+            The indices of the links. If None, all the links of the entity are considered. Defaults to None.
+        envs_idx : None | array_like, optional
+            The indices of the environments. If None, all environments will be considered. Defaults to None.
+
+        Returns
+        -------
+        wrench : torch.Tensor, shape (n_links, 6) or (n_envs, n_links, 6)
+            The force [N] in the first three components and the torque [N m] in the last three.
+        """
+        links_idx = self._get_global_idx(links_idx_local, self.n_links, self._link_start, unsafe=True)
+        return self._steel_solver.get_links_parent_wrench(links_idx, envs_idx)
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------

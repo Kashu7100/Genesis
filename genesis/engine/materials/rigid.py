@@ -86,6 +86,36 @@ class Rigid(Kinematic["RigidEntity"]):
     contact_resistance : float or None, optional
         IPC coupling contact resistance/stiffness override for this entity. ``None`` means use
         ``IPCCouplerOptions.contact_resistance``. Default is None.
+    restitution : float, optional
+        Coefficient of restitution of the contacts of the entity, between 0 (no rebound) and 1 (elastic), mixed with that
+        of the other geometry by their mean. Only used by the Steel solver (see 'gs.options.SteelOptions'), which applies
+        it to impacts faster than 'restitution_velocity_threshold'. Default is 0.0.
+    angular_damping : float or None, optional
+        Angular velocity damping rate [1/s] of a free-floating entity, applied as w *= 1 - angular_damping * dt every
+        step. It damps residual spin, at the cost of slowing down every rotation of the body. Only used by the Steel
+        solver. None resolves to 0.05. Default is None.
+    max_linear_velocity : float or None, optional
+        Bound of the center of mass speed [m/s] of a free-floating entity along each world axis, enforced by velocity
+        rows. Only used by the Steel solver. None leaves it unbounded. Default is None.
+    max_angular_velocity : float or None, optional
+        Bound of the angular speed [rad/s] of a free-floating entity about each world axis. Only used by the Steel
+        solver. None leaves it unbounded. Default is None.
+    max_depenetration_velocity : float or None, optional
+        Bound of the velocity [m/s] at which the contacts of a free-floating entity correct penetration, which avoids
+        launching bodies out of deep overlaps at the cost of slower recovery. Only used by the Steel solver. None
+        leaves it unbounded. Default is None.
+    contact_stiffness : float or None, optional
+        Stiffness [N/m] of the contacts of the entity, which the Steel solver with 'contact_compliance' solves with an
+        implicit spring-damper law (see 'gs.options.SteelOptions'). A soft material penetrates at rest by its load over
+        its stiffness: a lower stiffness models a softer material and spreads the impact over more time, at the cost
+        of a deeper penetration. Two compliant geometries act as springs in series, k = k_a k_b / (k_a + k_b), and a
+        rigid geometry leaves the stiffness of the other. None keeps the contacts rigid. Default is None.
+    contact_damping : float, optional
+        Damping [N s/m] of the compliant contacts of the entity, acting while the geometries penetrate. It dissipates
+        the energy of impacts and of contact vibrations, at the cost of a slower settling into the resting
+        penetration when large. Two compliant geometries combine their dampings as
+        (c_a k_b^2 + c_b k_a^2) / (k_a + k_b)^2, which keeps the relaxation time c / k of two equal materials. Requires
+        'contact_stiffness'. Default is 0.0.
     """
 
     use_visual_raycasting: StrictBool = False
@@ -107,6 +137,13 @@ class Rigid(Kinematic["RigidEntity"]):
     enable_coup_collision: StrictBool = True
     coup_collision_links: StrArrayType | None = None
     contact_resistance: PositiveFloat | None = None
+    restitution: Annotated[ValidFloat, Field(ge=0.0, le=1.0)] = 0.0
+    angular_damping: NonNegativeFloat | None = None
+    max_linear_velocity: PositiveFloat | None = None
+    max_angular_velocity: PositiveFloat | None = None
+    max_depenetration_velocity: PositiveFloat | None = None
+    contact_stiffness: PositiveFloat | None = None
+    contact_damping: NonNegativeFloat = 0.0
 
     @model_validator(mode="before")
     @classmethod
@@ -144,6 +181,9 @@ class Rigid(Kinematic["RigidEntity"]):
                 "`coup_collision_links` is only effective when `enable_coup_collision=True`. "
                 "Set `enable_coup_collision=False` to disable collision for all links."
             )
+
+        if self.contact_damping > 0.0 and self.contact_stiffness is None:
+            gs.raise_exception("`contact_damping` requires `contact_stiffness`.")
 
         if self.sdf_min_res > self.sdf_max_res:
             gs.raise_exception("`sdf_min_res` must be smaller than or equal to `sdf_max_res`.")

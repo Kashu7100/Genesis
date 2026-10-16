@@ -16,6 +16,8 @@ def func_capsule_capsule_contact(
     gb_quat: qd.types.vector(4),
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
+    collider_info: array_class.ColliderInfo,
+    collider_static_config: qd.template(),
 ):
     """
     Analytical capsule-capsule collision detection.
@@ -63,6 +65,9 @@ def func_capsule_capsule_contact(
     dist_sq = diff.dot(diff)
     combined_radius = radius_a + radius_b
     combined_radius_sq = combined_radius * combined_radius
+    if qd.static(collider_static_config.has_contact_gap):
+        # A pair closer than the gap is reported with the negative penetration combined_radius - dist
+        combined_radius_sq = (combined_radius + collider_info.contact_gap[None]) ** 2
 
     is_col = False
     normal_unit = qd.Vector([1.0, 0.0, 0.0], dt=gs.qd_float)
@@ -104,6 +109,8 @@ def func_sphere_sphere_contact(
     gb_pos: qd.types.vector(3),
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
+    collider_info: array_class.ColliderInfo,
+    collider_static_config: qd.template(),
 ):
     """
     Analytical sphere-sphere collision detection.
@@ -129,6 +136,9 @@ def func_sphere_sphere_contact(
     dist_sq = diff.dot(diff)
     combined_radius = radius_a + radius_b
     combined_radius_sq = combined_radius * combined_radius
+    if qd.static(collider_static_config.has_contact_gap):
+        # A pair closer than the gap is reported with the negative penetration combined_radius - dist
+        combined_radius_sq = (combined_radius + collider_info.contact_gap[None]) ** 2
 
     is_col = False
     normal_unit = qd.Vector([1.0, 0.0, 0.0], dt=gs.qd_float)
@@ -159,6 +169,8 @@ def func_sphere_capsule_contact(
     gb_quat: qd.types.vector(4),
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
+    collider_info: array_class.ColliderInfo,
+    collider_static_config: qd.template(),
 ):
     """
     Analytical sphere-capsule collision detection.
@@ -209,6 +221,9 @@ def func_sphere_capsule_contact(
     dist_sq = diff.dot(diff)
     combined_radius = sphere_radius + capsule_radius
     combined_radius_sq = combined_radius * combined_radius
+    if qd.static(collider_static_config.has_contact_gap):
+        # A pair closer than the gap is reported with the negative penetration combined_radius - dist
+        combined_radius_sq = (combined_radius + collider_info.contact_gap[None]) ** 2
 
     is_col = False
     normal_unit = qd.Vector([1.0, 0.0, 0.0], dt=gs.qd_float)
