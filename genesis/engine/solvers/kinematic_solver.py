@@ -1237,7 +1237,7 @@ class KinematicSolver(Solver):
             else:
                 mask = (0, *qs_mask) if self.n_envs == 0 else indices_to_mask(envs_idx, *qs_mask, boolean_mask=False)
                 assign_indexed_tensor(data, mask, qpos)
-                errno[envs_idx] = 0
+                errno[mask[:1]] = 0
                 if mask and isinstance(mask[0], torch.Tensor):
                     envs_idx = mask[0].reshape((-1,))
             if gs.backend == gs.metal:

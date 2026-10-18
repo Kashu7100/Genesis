@@ -177,7 +177,7 @@ def test_batched_envs_are_independent(show_viewer):
     scene.reset(state=state, envs_idx=[1])
     box.set_dofs_velocity(0.0, envs_idx=[2])
     assert_equal(solver.get_error_envs_mask(), [False, False, True, False])
-    box.set_qpos(box.get_qpos(envs_idx=[0]), envs_idx=[2])
+    box.set_qpos(box.get_qpos(envs_idx=[0])[0], envs_idx=(1, 2))
     assert_equal(solver.get_error_envs_mask(), [False, False, False, False])
     scene.step()
     assert np.isfinite(tensor_to_array(box.get_pos())).all()
