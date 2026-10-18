@@ -1010,6 +1010,10 @@ class KinematicSolver(Solver):
             self._is_forward_pos_updated = self._is_forward_vel_updated = False
             self.update_forward_pos()
 
+    def get_error_envs_mask(self):
+        """Mask of the environments that raised an error since their configuration was last set."""
+        return qd_to_torch(self.data_manager.errno) > 0
+
     # ------------------------------------------------------------------------------------
     # -------------------------------- process_input -------------------------------------
     # ------------------------------------------------------------------------------------

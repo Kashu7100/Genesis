@@ -528,28 +528,29 @@ class MochiSoftEntity(Entity):
         self._solver.set_soft_vertices_velocity(self, vel, envs_idx)
 
     def _sanitize_vertices_idx(self, verts_idx_local):
-        """One vertex set shared by every environment (a 1D array), or one per environment: a 2D tensor of shape
-        (n_envs, n) whose -1 entries are padding, kept on the device so a per-step call costs no transfer."""
-        if isinstance(verts_idx_local, torch.Tensor) and verts_idx_local.ndim == 2:
-            verts_idx = verts_idx_local.to(device=gs.device, dtype=gs.tc_int)
-            if ((verts_idx < -1) | (verts_idx >= self.n_vertices)).any():
+        """Sanitize a vertex set into a device tensor, one set shared by every environment (n,) or one set per
+        environment (n_envs, n) whose -1 entries are padding.
+
+        Host data is range-checked. A torch tensor is taken as it is, as `sanitize_index` does, so that a per-step call
+        on device-resident indices costs neither a transfer nor a synchronization.
+        """
+        if not isinstance(verts_idx_local, torch.Tensor):
+            verts_idx_local = np.asarray(verts_idx_local, dtype=gs.np_int)
+            if ((verts_idx_local < -1) | (verts_idx_local >= self.n_vertices)).any():
                 gs.raise_exception(f"Vertex index out of range [-1, {self.n_vertices}) (-1 marks padding).")
-            return verts_idx
-        verts_idx = np.atleast_1d(np.asarray(tensor_to_array(verts_idx_local), dtype=gs.np_int))
-        if verts_idx.ndim != 1:
+        verts_idx = torch.atleast_1d(torch.as_tensor(verts_idx_local, dtype=gs.tc_int, device=gs.device))
+        if verts_idx.ndim != 1 and verts_idx.ndim != 2:
             gs.raise_exception(
-                "Pass one vertex set shared by every environment as a 1D array, or one set per environment as a 2D "
-                f"torch tensor of shape (n_envs, n) padded with -1; got an array of shape {verts_idx.shape}."
+                "Pass one vertex set shared by every environment, of shape (n,), or one set per environment, of shape "
+                f"(n_envs, n) padded with -1. Got an array of shape {tuple(verts_idx.shape)}."
             )
-        if verts_idx.min(initial=0) < 0 or verts_idx.max(initial=-1) >= self.n_vertices:
-            gs.raise_exception("Vertex index out of range.")
         return verts_idx
 
     def set_vertices_fixed(self, verts_idx_local, is_fixed=True, envs_idx=None):
         """Fix the given vertices at their current position (Dirichlet condition), or release them.
 
-        `verts_idx_local` is one set for every environment, shape (n,), or one set per environment, a tensor of
-        shape (n_envs, n) whose -1 entries are skipped.
+        `verts_idx_local` is one set for every environment, shape (n,), or one set per environment, shape (n_envs, n),
+        whose -1 entries are skipped.
         """
         self._solver.set_soft_vertices_fixed(self, self._sanitize_vertices_idx(verts_idx_local), is_fixed, envs_idx)
 
@@ -557,9 +558,9 @@ class MochiSoftEntity(Entity):
         """Prescribe the positions the given vertices must reach at the end of the next step (moving Dirichlet
         condition); the vertices become fixed until released with `set_vertices_fixed(..., is_fixed=False)`.
 
-        `verts_idx_local` is one set for every environment, shape (n,), with `pos` of shape (n, 3) or (n_envs, n, 3);
-        or one set per environment, a tensor of shape (n_envs, n) whose -1 entries are skipped, with `pos` of shape
-        (n_envs, n, 3). This is how a gripper carries whichever vertices it closed on in each environment.
+        `verts_idx_local` is one set for every environment, shape (n,), with `pos` of shape (n, 3) or (n_envs, n, 3),
+        or one set per environment, shape (n_envs, n) whose -1 entries are skipped, with `pos` of shape (n_envs, n, 3).
+        This is how a gripper carries whichever vertices it closed on in each environment.
         """
         self._solver.set_soft_vertices_target(self, self._sanitize_vertices_idx(verts_idx_local), pos, envs_idx)
 

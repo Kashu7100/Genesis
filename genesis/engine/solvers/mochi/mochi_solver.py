@@ -46,6 +46,7 @@ from ..rigid.abd.misc import (
     kernel_init_geom_fields,
     kernel_init_link_dynamics,
     kernel_init_vert_fields,
+    kernel_set_zero,
 )
 from .articulated import kernel_assemble_joints, kernel_project_links_residual, kernel_update_conv_weights
 from .colliders import query_collider
@@ -159,10 +160,8 @@ from .soft import (
     kernel_soft_set_pair_enabled,
     kernel_soft_set_state,
     kernel_soft_set_vertices_fixed,
-    kernel_soft_set_vertices_fixed_per_env,
     kernel_soft_set_vertices_positions,
     kernel_soft_set_vertices_target,
-    kernel_soft_set_vertices_target_per_env,
     kernel_soft_set_vertices_velocities,
     kernel_soft_step_start,
     kernel_soft_store_ls_ref,
@@ -1567,7 +1566,24 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             )
 
     def _on_external_state_change(self, change, envs_idx):
-        self._mark_external_state_dirty(self._scene._sanitize_envs_idx(envs_idx))
+        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+        self._mark_external_state_dirty(envs_idx)
+        if change == StateChange.GEOMETRY:
+            self._clear_errno(envs_idx)
+
+    def _clear_errno(self, envs_idx):
+        """Clear the error of the given environments, from an already sanitized index.
+
+        An environment whose configuration is set from outside the solver starts over, so that resetting the
+        environments `get_error_envs_mask` names lets the others go on.
+        """
+        if gs.use_zerocopy:
+            errno = qd_to_torch(self._errno, copy=False)
+            errno[envs_idx] = 0
+            if gs.backend == gs.metal:
+                torch.mps.synchronize()
+        else:
+            kernel_set_zero(envs_idx, self._errno)
 
     def _mark_external_state_dirty(self, envs_idx):
         """Record the environments whose state was set from outside the solver, from an already sanitized index."""
@@ -2328,15 +2344,6 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             )
         self._external_state_dirty_mask[tensor_to_array(envs_idx)] = False
         self._is_contacts_recorded = False
-        # A restored environment starts over: whatever error it raised (a diverged solve) is cleared, as the rigid
-        # solver clears its own, so that resetting the environments `get_error_envs_mask` names lets the others go on.
-        _kernel_clear_errno(envs_idx, self._errno)
-
-    def get_error_envs_mask(self):
-        """Mask (n_envs,) of the environments that raised an error since their last reset (a diverged solve, a
-        contact-capacity overflow). `check_errno` raises for any of them at the start of a later step unless they
-        are reset first."""
-        return qd_to_torch(self._errno) > 0
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- contact API ------------------------------------
@@ -2940,6 +2947,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         envs_idx, pos = self._soft_values_of_entity(entity, pos, envs_idx)
         kernel_soft_set_vertices_positions(envs_idx, entity.v_start, pos, self.soft_state, self.rigid_config)
         self._mark_external_state_dirty(envs_idx)
+        self._clear_errno(envs_idx)
         self._is_contacts_recorded = False
 
     def set_soft_vertices_velocity(self, entity, vel, envs_idx=None):
@@ -2947,52 +2955,44 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         kernel_soft_set_vertices_velocities(envs_idx, entity.v_start, vel, self.soft_state, self.rigid_config)
         self._mark_external_state_dirty(envs_idx)
 
-    def _per_env_vertices(self, entity, verts_idx, envs_idx):
-        """Solver indices of a per-environment vertex set (n_envs_idx, n) of `entity`, -1 entries kept as -1."""
+    def _per_env_vertices(self, verts_idx, envs_idx):
+        """Lay out a vertex set as one row per environment of `envs_idx`, from a set shared by all of them or one per
+        environment."""
+        if verts_idx.ndim == 1:
+            return verts_idx[None].expand(len(envs_idx), -1).contiguous()
         if verts_idx.shape[0] != len(envs_idx):
             gs.raise_exception(
                 f"A per-environment vertex set must have one row per environment: got {verts_idx.shape[0]} rows "
                 f"for {len(envs_idx)} environments."
             )
-        return torch.where(verts_idx >= 0, verts_idx + entity.v_start, -1).to(dtype=gs.tc_int).contiguous()
+        return verts_idx.contiguous()
 
     def set_soft_vertices_fixed(self, entity, verts_idx, is_fixed, envs_idx=None):
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
-        if verts_idx.ndim == 2:
-            verts_idx = self._per_env_vertices(entity, verts_idx, envs_idx)
-            kernel_soft_set_vertices_fixed_per_env(
-                envs_idx, verts_idx, int(bool(is_fixed)), self.soft_state, self.rigid_config
-            )
-            # Releasing leaves the state as it is; only fixing zeroes the velocities.
-            if is_fixed:
-                self._mark_external_state_dirty(envs_idx)
-            return
-        verts_idx = np.asarray(verts_idx, dtype=gs.np_int) + entity.v_start
-        kernel_soft_set_vertices_fixed(envs_idx, verts_idx, int(bool(is_fixed)), self.soft_state, self.rigid_config)
+        verts_idx = self._per_env_vertices(verts_idx, envs_idx)
+        kernel_soft_set_vertices_fixed(
+            envs_idx, verts_idx, entity.v_start, int(bool(is_fixed)), self.soft_state, self.rigid_config
+        )
         self._mark_external_state_dirty(envs_idx)
 
     def set_soft_vertices_target(self, entity, verts_idx, pos, envs_idx=None):
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
-        if verts_idx.ndim == 2:
-            verts_idx = self._per_env_vertices(entity, verts_idx, envs_idx)
-        n_verts = verts_idx.shape[-1]
+        is_shared = verts_idx.ndim == 1
+        verts_idx = self._per_env_vertices(verts_idx, envs_idx)
+        n_verts = verts_idx.shape[1]
         # A tensor already on the device goes straight to the kernel: this is called every control step.
         pos = torch.as_tensor(pos, dtype=gs.tc_float, device=gs.device)
-        if verts_idx.ndim == 1 and pos.shape == (n_verts, 3):
+        if is_shared and pos.shape == (n_verts, 3):
             pos = pos[None].expand(len(envs_idx), -1, -1)
         if pos.shape != (len(envs_idx), n_verts, 3):
             gs.raise_exception(
                 f"Expected an array of shape ({len(envs_idx)}, {n_verts}, 3)"
-                + (f" or ({n_verts}, 3)" if verts_idx.ndim == 1 else "")
+                + (f" or ({n_verts}, 3)" if is_shared else "")
                 + f", got {tuple(pos.shape)}."
             )
-        if verts_idx.ndim == 2:
-            kernel_soft_set_vertices_target_per_env(
-                envs_idx, verts_idx, pos.contiguous(), self.soft_state, self.rigid_config
-            )
-        else:
-            verts_idx = np.asarray(verts_idx, dtype=gs.np_int) + entity.v_start
-            kernel_soft_set_vertices_target(envs_idx, verts_idx, pos.contiguous(), self.soft_state, self.rigid_config)
+        kernel_soft_set_vertices_target(
+            envs_idx, verts_idx, entity.v_start, pos.contiguous(), self.soft_state, self.rigid_config
+        )
         if self.mochi_config.use_sleeping:
             i_n = len(self._entities) + entity.idx_in_solver
             self._wake_nodes(self._nodes_idx[i_n : i_n + 1], self._nodes_idx, envs_idx)
@@ -3029,12 +3029,6 @@ def _kernel_activate_all_envs(mochi_state: MochiState, rigid_config: qd.template
     for i_b in range(mochi_state.is_active.shape[0]):
         mochi_state.is_active[i_b] = True
         mochi_state.ls_is_done[i_b] = False
-
-
-@qd.kernel
-def _kernel_clear_errno(envs_idx: qd.types.ndarray(), errno: qd.Tensor):
-    for i_b_ in range(envs_idx.shape[0]):
-        errno[envs_idx[i_b_]] = 0
 
 
 @qd.kernel

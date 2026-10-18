@@ -166,24 +166,56 @@ def test_batched_envs_are_independent(show_viewer):
 
 @pytest.mark.precision("64")
 def test_resetting_an_errored_environment_clears_its_error(show_viewer):
-    from genesis.utils.array_class import ErrorCode
-
     scene = _mochi_scene(show_viewer, 0.02)
     scene.add_entity(gs.morphs.Plane(), material=gs.materials.Mochi.Rigid())
-    scene.add_entity(gs.morphs.Box(size=(0.2, 0.2, 0.2), pos=(0.0, 0.0, 0.3)), material=gs.materials.Mochi.Rigid())
-    scene.build(n_envs=3)
-    state = scene.get_state()
+    box = scene.add_entity(
+        gs.morphs.Box(size=(0.2, 0.2, 0.2), pos=(0.0, 0.0, 0.3)), material=gs.materials.Mochi.Rigid()
+    )
+    cube = scene.add_entity(
+        gs.morphs.Box(
+            size=(0.2, 0.2, 0.2),
+            pos=(1.0, 0.0, 0.3),
+            maxvolume=0.001,
+        ),
+        material=gs.materials.Mochi.Elastic(
+            E=1e5,
+            nu=0.3,
+        ),
+    )
+    scene.build(n_envs=4)
     solver = scene.mochi_solver
-    # Environment 1 diverged: the mask names it alone, and the next error check raises.
-    solver._errno.from_numpy(np.array([0, int(ErrorCode.MOCHI_DIVERGED), 0], dtype=gs.np_int))
-    assert tensor_to_array(solver.get_error_envs_mask()).tolist() == [False, True, False]
+    state = scene.get_state()
+    box_qpos = box.get_qpos()
+    cube_pos = cube.get_vertices_position()
+
+    # A NaN velocity makes the solve of environments 1 to 3 diverge: the mask names them alone, and the error check
+    # raises.
+    box.set_dofs_velocity(np.full((2, 6), np.nan), envs_idx=[1, 2])
+    cube.set_velocity(np.full((1, cube.n_vertices, 3), np.nan), envs_idx=[3])
+    scene.step()
+    assert tensor_to_array(solver.get_error_envs_mask()).tolist() == [False, True, True, True]
     with pytest.raises(gs.GenesisException, match="diverged"):
         solver.check_errno()
-    # Resetting it clears the error, so the other environments go on.
+
+    # Restoring the state of an environment or setting its configuration clears its error. Setting its velocity
+    # leaves the error in place.
     scene.reset(state=state, envs_idx=[1])
+    assert tensor_to_array(solver.get_error_envs_mask()).tolist() == [False, False, True, True]
+    box.set_dofs_velocity(0.0, envs_idx=[2])
+    cube.set_velocity((0.0, 0.0, 0.0), envs_idx=[3])
+    assert tensor_to_array(solver.get_error_envs_mask()).tolist() == [False, False, True, True]
+    box.set_qpos(box_qpos[2:3], envs_idx=[2])
+    assert tensor_to_array(solver.get_error_envs_mask()).tolist() == [False, False, False, True]
+    cube.set_position(cube_pos[3:], envs_idx=[3])
     assert not tensor_to_array(solver.get_error_envs_mask()).any()
+
+    # Every environment goes on from there.
     solver.check_errno()
-    scene.step()
+    for _ in range(3):
+        scene.step()
+    assert not tensor_to_array(solver.get_error_envs_mask()).any()
+    assert np.isfinite(tensor_to_array(box.get_pos())).all()
+    assert np.isfinite(tensor_to_array(cube.get_vertices_position())).all()
 
 
 @pytest.mark.precision("64")

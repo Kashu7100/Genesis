@@ -2239,57 +2239,22 @@ def kernel_soft_set_vertices_velocities(
 def kernel_soft_set_vertices_fixed(
     envs_idx: qd.types.ndarray(),
     verts_idx: qd.types.ndarray(),
+    v_start: qd.i32,
     is_fixed: qd.i32,
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
 ):
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_v_, i_b_ in qd.ndrange(verts_idx.shape[0], envs_idx.shape[0]):
-        i_b = envs_idx[i_b_]
-        i_v = verts_idx[i_v_]
-        soft_state.verts_is_fixed[i_v, i_b] = is_fixed != 0
-        if is_fixed != 0:
-            soft_state.verts_target[i_v, i_b] = soft_state.verts_pos[i_v, i_b]
-            soft_state.verts_vel[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
-            for j in qd.static(range(N_HISTORY)):
-                soft_state.verts_vel_prev[j, i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
+    """Fix the given vertices at their current position (Dirichlet condition), or release them.
 
-
-@qd.kernel
-def kernel_soft_set_vertices_target(
-    envs_idx: qd.types.ndarray(),
-    verts_idx: qd.types.ndarray(),
-    pos: qd.types.ndarray(),
-    soft_state: MochiSoftState,
-    rigid_config: qd.template(),
-):
-    """Prescribe the end-of-step positions of the given vertices (moving Dirichlet condition): the vertices become
-    fixed and reach their target within the next step; their velocity history is kept."""
-    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_v_, i_b_ in qd.ndrange(verts_idx.shape[0], envs_idx.shape[0]):
-        i_b = envs_idx[i_b_]
-        i_v = verts_idx[i_v_]
-        soft_state.verts_is_fixed[i_v, i_b] = True
-        soft_state.verts_target[i_v, i_b] = qd.Vector(
-            [pos[i_b_, i_v_, 0], pos[i_b_, i_v_, 1], pos[i_b_, i_v_, 2]], dt=gs.qd_float
-        )
-
-
-@qd.kernel
-def kernel_soft_set_vertices_fixed_per_env(
-    envs_idx: qd.types.ndarray(),
-    verts_idx: qd.types.ndarray(),
-    is_fixed: qd.i32,
-    soft_state: MochiSoftState,
-    rigid_config: qd.template(),
-):
-    """`kernel_soft_set_vertices_fixed` with one vertex set per environment: `verts_idx` is (n_envs_idx, n), and
-    negative entries are skipped."""
+    `verts_idx` holds one row of entity-local vertex indices per environment of `envs_idx`, offset by `v_start` into
+    the solver, and its negative entries are padding.
+    """
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_v_, i_b_ in qd.ndrange(verts_idx.shape[1], envs_idx.shape[0]):
-        i_v = verts_idx[i_b_, i_v_]
-        if i_v >= 0:
+        i_v_local = verts_idx[i_b_, i_v_]
+        if i_v_local >= 0:
             i_b = envs_idx[i_b_]
+            i_v = i_v_local + v_start
             soft_state.verts_is_fixed[i_v, i_b] = is_fixed != 0
             if is_fixed != 0:
                 soft_state.verts_target[i_v, i_b] = soft_state.verts_pos[i_v, i_b]
@@ -2299,20 +2264,25 @@ def kernel_soft_set_vertices_fixed_per_env(
 
 
 @qd.kernel
-def kernel_soft_set_vertices_target_per_env(
+def kernel_soft_set_vertices_target(
     envs_idx: qd.types.ndarray(),
     verts_idx: qd.types.ndarray(),
+    v_start: qd.i32,
     pos: qd.types.ndarray(),
     soft_state: MochiSoftState,
     rigid_config: qd.template(),
 ):
-    """`kernel_soft_set_vertices_target` with one vertex set per environment: `verts_idx` is (n_envs_idx, n), and
-    negative entries are skipped."""
+    """Prescribe the end-of-step positions of the given vertices (moving Dirichlet condition).
+
+    The vertices become fixed and reach their target within the next step, their velocity history being kept.
+    `verts_idx` is laid out as in `kernel_soft_set_vertices_fixed`.
+    """
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_v_, i_b_ in qd.ndrange(verts_idx.shape[1], envs_idx.shape[0]):
-        i_v = verts_idx[i_b_, i_v_]
-        if i_v >= 0:
+        i_v_local = verts_idx[i_b_, i_v_]
+        if i_v_local >= 0:
             i_b = envs_idx[i_b_]
+            i_v = i_v_local + v_start
             soft_state.verts_is_fixed[i_v, i_b] = True
             soft_state.verts_target[i_v, i_b] = qd.Vector(
                 [pos[i_b_, i_v_, 0], pos[i_b_, i_v_, 1], pos[i_b_, i_v_, 2]], dt=gs.qd_float

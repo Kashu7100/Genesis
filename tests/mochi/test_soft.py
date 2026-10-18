@@ -1,7 +1,7 @@
 import numpy as np
-import torch
 import pytest
 import quadrants as qd
+import torch
 import trimesh
 
 import genesis as gs
@@ -195,7 +195,7 @@ def test_soft_per_env_vertex_targets(show_viewer):
     assert vel[0, :, 2].max() < -0.5
     assert_allclose(tensor_to_array(bar.get_vertices_position())[1, top[0]], tensor_to_array(target[1, 0]), tol=1e-9)
     with pytest.raises(gs.GenesisException, match="out of range"):
-        bar.set_vertices_target(torch.full((2, 1), bar.n_vertices, device=gs.device), target[:, :1])
+        bar.set_vertices_target([[bar.n_vertices], [0]], target[:, :1])
     with pytest.raises(gs.GenesisException, match="one row per environment"):
         bar.set_vertices_target(verts_idx[:1], target[:1])
 
