@@ -495,6 +495,20 @@ def test_export_before_build(n_envs, checkpoint_scene, tmp_path, caplog):
     threaded_scene.export(threaded)
     assert gs.Scene.load(threaded).options.viewer.run_in_thread is (None if sys.platform == "darwin" else True)
 
+    # The materials of several solvers sharing a class name each load back as the material they were written as
+    namesakes_scene = gs.Scene()
+    for material in (gs.materials.Rigid(), gs.materials.Mochi.Rigid()):
+        namesakes_scene.add_entity(
+            morph=gs.morphs.Box(
+                size=(0.1, 0.1, 0.1),
+            ),
+            material=material,
+        )
+    namesakes = tmp_path / f"namesakes{SCENE_FORMAT}"
+    namesakes_scene.export(namesakes)
+    namesakes_materials = [type(entity.material) for entity in gs.Scene.load(namesakes).entities]
+    assert namesakes_materials == [gs.materials.Rigid, gs.materials.Mochi.Rigid]
+
 
 @pytest.mark.required
 def test_load_rejects_damaged_file(checkpoint_scene, tmp_path):
