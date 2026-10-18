@@ -5,7 +5,7 @@ import torch
 import genesis as gs
 from genesis.utils.misc import tensor_to_array
 
-from ..utils.assertions import assert_allclose
+from ..utils.assertions import assert_allclose, assert_equal
 from .reference import load_reference, mochi_to_genesis
 
 
@@ -139,6 +139,7 @@ def test_batched_envs_are_independent(show_viewer):
         gs.morphs.Box(size=(0.4, 0.4, 0.4), pos=(0.0, 0.0, 0.6)), material=gs.materials.Mochi.Rigid()
     )
     scene.build(n_envs=n_envs)
+    state = scene.get_state()
     # Different drop heights per environment; the other environments must not see the change.
     heights = 0.6 + 0.1 * np.arange(n_envs)
     box.set_pos(np.stack([np.zeros(n_envs), np.zeros(n_envs), heights], axis=-1))
@@ -163,59 +164,23 @@ def test_batched_envs_are_independent(show_viewer):
     n_contacts = contacts["valid_mask"].sum(dim=1)
     assert n_contacts[1] == 0 and bool((n_contacts[[0, 2, 3]] == 6).all())
 
-
-@pytest.mark.precision("64")
-def test_resetting_an_errored_environment_clears_its_error(show_viewer):
-    scene = _mochi_scene(show_viewer, 0.02)
-    scene.add_entity(gs.morphs.Plane(), material=gs.materials.Mochi.Rigid())
-    box = scene.add_entity(
-        gs.morphs.Box(size=(0.2, 0.2, 0.2), pos=(0.0, 0.0, 0.3)), material=gs.materials.Mochi.Rigid()
-    )
-    cube = scene.add_entity(
-        gs.morphs.Box(
-            size=(0.2, 0.2, 0.2),
-            pos=(1.0, 0.0, 0.3),
-            maxvolume=0.001,
-        ),
-        material=gs.materials.Mochi.Elastic(
-            E=1e5,
-            nu=0.3,
-        ),
-    )
-    scene.build(n_envs=4)
-    solver = scene.mochi_solver
-    state = scene.get_state()
-    box_qpos = box.get_qpos()
-    cube_pos = cube.get_vertices_position()
-
-    # A NaN velocity makes the solve of environments 1 to 3 diverge: the mask names them alone, and the error check
+    # A NaN velocity makes the solve of environments 1 and 2 diverge: the mask names them alone, and the error check
     # raises.
-    box.set_dofs_velocity(np.full((2, 6), np.nan), envs_idx=[1, 2])
-    cube.set_velocity(np.full((1, cube.n_vertices, 3), np.nan), envs_idx=[3])
+    solver = scene.mochi_solver
+    box.set_dofs_velocity(np.nan, envs_idx=[1, 2])
     scene.step()
-    assert tensor_to_array(solver.get_error_envs_mask()).tolist() == [False, True, True, True]
+    assert_equal(solver.get_error_envs_mask(), [False, True, True, False])
     with pytest.raises(gs.GenesisException, match="diverged"):
         solver.check_errno()
-
-    # Restoring the state of an environment or setting its configuration clears its error. Setting its velocity
-    # leaves the error in place.
+    # Restoring the state of an environment or setting its configuration clears its error, setting its velocity leaves
+    # the error in place. Every environment goes on from there.
     scene.reset(state=state, envs_idx=[1])
-    assert tensor_to_array(solver.get_error_envs_mask()).tolist() == [False, False, True, True]
     box.set_dofs_velocity(0.0, envs_idx=[2])
-    cube.set_velocity((0.0, 0.0, 0.0), envs_idx=[3])
-    assert tensor_to_array(solver.get_error_envs_mask()).tolist() == [False, False, True, True]
-    box.set_qpos(box_qpos[2:3], envs_idx=[2])
-    assert tensor_to_array(solver.get_error_envs_mask()).tolist() == [False, False, False, True]
-    cube.set_position(cube_pos[3:], envs_idx=[3])
-    assert not tensor_to_array(solver.get_error_envs_mask()).any()
-
-    # Every environment goes on from there.
-    solver.check_errno()
-    for _ in range(3):
-        scene.step()
-    assert not tensor_to_array(solver.get_error_envs_mask()).any()
+    assert_equal(solver.get_error_envs_mask(), [False, False, True, False])
+    box.set_qpos(box.get_qpos(envs_idx=[0]), envs_idx=[2])
+    assert_equal(solver.get_error_envs_mask(), [False, False, False, False])
+    scene.step()
     assert np.isfinite(tensor_to_array(box.get_pos())).all()
-    assert np.isfinite(tensor_to_array(cube.get_vertices_position())).all()
 
 
 @pytest.mark.precision("64")

@@ -531,19 +531,18 @@ class MochiSoftEntity(Entity):
         """Sanitize a vertex set into a device tensor, one set shared by every environment (n,) or one set per
         environment (n_envs, n) whose -1 entries are padding.
 
-        Host data is range-checked. A torch tensor is taken as it is, as `sanitize_index` does, so that a per-step call
-        on device-resident indices costs neither a transfer nor a synchronization.
+        The range check of device-resident indices synchronizes the host with the device.
         """
-        if not isinstance(verts_idx_local, torch.Tensor):
-            verts_idx_local = np.asarray(verts_idx_local, dtype=gs.np_int)
-            if ((verts_idx_local < -1) | (verts_idx_local >= self.n_vertices)).any():
-                gs.raise_exception(f"Vertex index out of range [-1, {self.n_vertices}) (-1 marks padding).")
         verts_idx = torch.atleast_1d(torch.as_tensor(verts_idx_local, dtype=gs.tc_int, device=gs.device))
         if verts_idx.ndim != 1 and verts_idx.ndim != 2:
             gs.raise_exception(
                 "Pass one vertex set shared by every environment, of shape (n,), or one set per environment, of shape "
                 f"(n_envs, n) padded with -1. Got an array of shape {tuple(verts_idx.shape)}."
             )
+        # Padding only makes sense in a per-environment set, where rows hold different numbers of vertices.
+        verts_idx_min = 0 if verts_idx.ndim == 1 else -1
+        if ((verts_idx < verts_idx_min) | (verts_idx >= self.n_vertices)).any():
+            gs.raise_exception(f"Vertex index out of range [{verts_idx_min}, {self.n_vertices}).")
         return verts_idx
 
     def set_vertices_fixed(self, verts_idx_local, is_fixed=True, envs_idx=None):

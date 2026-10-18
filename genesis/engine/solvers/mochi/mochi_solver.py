@@ -1566,24 +1566,7 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             )
 
     def _on_external_state_change(self, change, envs_idx):
-        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
-        self._mark_external_state_dirty(envs_idx)
-        if change == StateChange.GEOMETRY:
-            self._clear_errno(envs_idx)
-
-    def _clear_errno(self, envs_idx):
-        """Clear the error of the given environments, from an already sanitized index.
-
-        An environment whose configuration is set from outside the solver starts over, so that resetting the
-        environments `get_error_envs_mask` names lets the others go on.
-        """
-        if gs.use_zerocopy:
-            errno = qd_to_torch(self._errno, copy=False)
-            errno[envs_idx] = 0
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
-        else:
-            kernel_set_zero(envs_idx, self._errno)
+        self._mark_external_state_dirty(self._scene._sanitize_envs_idx(envs_idx))
 
     def _mark_external_state_dirty(self, envs_idx):
         """Record the environments whose state was set from outside the solver, from an already sanitized index."""
@@ -2947,7 +2930,8 @@ class MochiSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         envs_idx, pos = self._soft_values_of_entity(entity, pos, envs_idx)
         kernel_soft_set_vertices_positions(envs_idx, entity.v_start, pos, self.soft_state, self.rigid_config)
         self._mark_external_state_dirty(envs_idx)
-        self._clear_errno(envs_idx)
+        # Setting the configuration of a deformable body clears the error of its environments, as `set_qpos` does.
+        kernel_set_zero(envs_idx, self._errno)
         self._is_contacts_recorded = False
 
     def set_soft_vertices_velocity(self, entity, vel, envs_idx=None):

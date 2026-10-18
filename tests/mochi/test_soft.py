@@ -10,7 +10,7 @@ from genesis.engine.solvers.mochi.mochi_solver import _kernel_activate_all_envs
 from genesis.engine.solvers.mochi.soft import kernel_soft_condense_dense
 from genesis.utils.misc import qd_to_numpy, tensor_to_array
 
-from ..utils.assertions import assert_allclose
+from ..utils.assertions import assert_allclose, assert_equal
 from .reference import load_reference, mochi_to_genesis
 
 
@@ -159,48 +159,6 @@ def test_soft_fixed_vertices_hang(show_viewer):
 
 
 @pytest.mark.precision("64")
-def test_soft_per_env_vertex_targets(show_viewer):
-    scene = _mochi_scene(show_viewer, 0.02, n_newton_iterations=8, linear_solver="pcg")
-    bar = scene.add_entity(
-        gs.morphs.Box(size=(0.1, 0.1, 0.2), pos=(0.0, 0.0, 1.0), maxvolume=0.0005),
-        material=gs.materials.Mochi.Elastic(E=1e5, nu=0.3, rho=1000.0, mass_damping=5.0),
-    )
-    scene.build(n_envs=2)
-    rest = tensor_to_array(bar.get_vertices_position())[0]
-    top = np.flatnonzero(rest[:, 2] > rest[:, 2].max() - 1e-6)
-    # Environment 0 carries its whole top face 5 cm up; environment 1 carries one vertex sideways, the rest of its row
-    # being padding.
-    verts_idx = torch.full((2, len(top)), -1, dtype=gs.tc_int, device=gs.device)
-    verts_idx[0] = torch.as_tensor(top, device=gs.device)
-    verts_idx[1, 0] = int(top[0])
-    target = torch.as_tensor(rest[top], dtype=gs.tc_float, device=gs.device).repeat(2, 1, 1)
-    target[0, :, 2] += 0.05
-    target[1, 0, 0] += 0.05
-    for _ in range(60):
-        bar.set_vertices_target(verts_idx, target)
-        scene.step()
-    pos = tensor_to_array(bar.get_vertices_position())
-    assert_allclose(pos[0, top], tensor_to_array(target[0]), tol=1e-9)
-    assert_allclose(pos[1, top[0]], tensor_to_array(target[1, 0]), tol=1e-9)
-    # The padded vertices of environment 1 were never pinned: its free top vertices sag below their rest height.
-    assert (pos[1, top[1:], 2] < rest[top[1:], 2] - 1e-4).all()
-    # Releasing environment 0 only lets its bar fall, while environment 1 still hangs from its one vertex.
-    release = torch.full_like(verts_idx, -1)
-    release[0] = verts_idx[0]
-    bar.set_vertices_fixed(release, is_fixed=False)
-    for _ in range(10):
-        bar.set_vertices_target(verts_idx[1:], target[1:], envs_idx=[1])
-        scene.step()
-    vel = tensor_to_array(bar.get_vertices_velocity())
-    assert vel[0, :, 2].max() < -0.5
-    assert_allclose(tensor_to_array(bar.get_vertices_position())[1, top[0]], tensor_to_array(target[1, 0]), tol=1e-9)
-    with pytest.raises(gs.GenesisException, match="out of range"):
-        bar.set_vertices_target([[bar.n_vertices], [0]], target[:, :1])
-    with pytest.raises(gs.GenesisException, match="one row per environment"):
-        bar.set_vertices_target(verts_idx[:1], target[:1])
-
-
-@pytest.mark.precision("64")
 def test_soft_rigid_stack_batched(show_viewer):
     scene = _mochi_scene(show_viewer, 1.0 / 60.0, n_newton_iterations=8)
     scene.add_entity(gs.morphs.Plane(), material=gs.materials.Mochi.Rigid())
@@ -232,6 +190,19 @@ def test_soft_rigid_stack_batched(show_viewer):
         assert_allclose(box_force[i_b], (0.0, 0.0, box_mass * 9.8), atol=1e-2, rtol=1e-5)
         assert_allclose(slab_force[i_b], (0.0, 0.0, slab.mass * 9.8), atol=1e-2, rtol=1e-5)
     assert_allclose(tensor_to_array(slab.get_vertices_velocity()), 0.0, atol=1e-4)
+
+    # A NaN velocity makes the solve of environment 1 diverge. Setting the configuration of its deformable body clears
+    # its error, setting its velocity leaves the error in place.
+    slab_pos = slab.get_vertices_position()
+    slab.set_velocity((np.nan, np.nan, np.nan), envs_idx=[1])
+    scene.step()
+    assert_equal(scene.mochi_solver.get_error_envs_mask(), [False, True])
+    slab.set_velocity((0.0, 0.0, 0.0), envs_idx=[1])
+    assert_equal(scene.mochi_solver.get_error_envs_mask(), [False, True])
+    slab.set_position(slab_pos[1:], envs_idx=[1])
+    assert_equal(scene.mochi_solver.get_error_envs_mask(), [False, False])
+    scene.step()
+    assert np.isfinite(tensor_to_array(slab.get_vertices_position())).all()
 
 
 @qd.kernel
@@ -462,28 +433,60 @@ def test_soft_moving_dirichlet(show_viewer, integrator):
         newton_rel_tol=1e-12,
     )
     bar = scene.add_entity(
-        gs.morphs.Box(size=(0.1, 0.1, 0.3), pos=(0.0, 0.0, 1.0), maxvolume=0.001),
-        material=gs.materials.Mochi.Elastic(E=1e5, nu=0.3, rho=1000.0, mass_damping=2.0),
+        gs.morphs.Box(
+            size=(0.1, 0.1, 0.3),
+            pos=(0.0, 0.0, 1.0),
+            maxvolume=0.001,
+        ),
+        material=gs.materials.Mochi.Elastic(
+            E=1e5,
+            nu=0.3,
+            rho=1000.0,
+            mass_damping=2.0,
+        ),
     )
-    scene.build()
-    rest = tensor_to_array(bar.get_vertices_position())
+    scene.build(n_envs=2)
+    rest = tensor_to_array(bar.get_vertices_position())[0]
     top = np.flatnonzero(rest[:, 2] > rest[:, 2].max() - 1e-6)
+    # One vertex set per environment: environment 0 drives its whole top face, environment 1 a single vertex, the rest
+    # of its row being padding.
+    verts_idx = torch.full((2, len(top)), -1, dtype=gs.tc_int, device=gs.device)
+    verts_idx[0] = torch.as_tensor(top, device=gs.device)
+    verts_idx[1, 0] = int(top[0])
     n_steps = 60
     for i_step in range(n_steps):
         target = rest[top] + (i_step + 1) * dt * v_drive
-        bar.set_vertices_target(top, target)
+        bar.set_vertices_target(verts_idx, np.stack([target, target]))
         scene.step()
         pos = tensor_to_array(bar.get_vertices_position())
         vel = tensor_to_array(bar.get_vertices_velocity())
         # The driven vertices reach their prescribed positions exactly, and their finite-difference velocity is the
         # drive velocity under both integrators (the BDF2 extrapolation is consistent with a constant velocity).
-        assert_allclose(pos[top], target, tol=1e-12)
-        assert_allclose(vel[top], v_drive, tol=1e-9)
+        assert_allclose(pos[0, top], target, tol=1e-12)
+        assert_allclose(vel[0, top], v_drive, tol=1e-9)
+        assert_allclose(pos[1, top[0]], target[0], tol=1e-12)
+        assert_allclose(vel[1, top[0]], v_drive, tol=1e-9)
     # The free part of the bar is dragged along with the driven face.
-    assert np.all(np.linalg.norm(vel - v_drive, axis=1) < 0.5 * np.linalg.norm(v_drive))
-    assert_allclose(pos.mean(axis=0) - rest.mean(axis=0), n_steps * dt * v_drive, rtol=0.2, atol=1e-3)
-    # Released, the vertices are free again and keep moving with the body.
-    bar.set_vertices_fixed(top, is_fixed=False)
+    assert np.all(np.linalg.norm(vel[0] - v_drive, axis=1) < 0.5 * np.linalg.norm(v_drive))
+    assert_allclose(pos[0].mean(axis=0) - rest.mean(axis=0), n_steps * dt * v_drive, rtol=0.2, atol=1e-3)
+    # The padded vertices are free: dragged by a single vertex, they trail behind the targets of the face.
+    assert np.all(np.linalg.norm(pos[1, top[1:]] - target[1:], axis=1) > 1e-3)
+    # Released in environment 0 alone, its vertices are free again and keep moving with the body, while environment 1
+    # follows the drive of its vertex, given as a set shared by every environment.
+    release = verts_idx.clone()
+    release[1] = -1
+    bar.set_vertices_fixed(release, is_fixed=False)
+    target = rest[top[:1]] + (n_steps + 1) * dt * v_drive
+    bar.set_vertices_target(top[:1], target, envs_idx=[1])
     scene.step()
     pos_next = tensor_to_array(bar.get_vertices_position())
-    assert np.linalg.norm(pos_next[top] - pos[top], axis=1).max() > 0.5 * dt * np.linalg.norm(v_drive)
+    assert np.linalg.norm(pos_next[0, top] - pos[0, top], axis=1).max() > 0.5 * dt * np.linalg.norm(v_drive)
+    assert_allclose(pos_next[1, top[0]], target[0], tol=1e-12)
+    # Out-of-range vertices are refused, wherever the indices live, and so is padding in a set shared by every
+    # environment.
+    with pytest.raises(gs.GenesisException, match="out of range"):
+        bar.set_vertices_fixed(torch.tensor([[bar.n_vertices], [0]], device=gs.device))
+    with pytest.raises(gs.GenesisException, match="out of range"):
+        bar.set_vertices_fixed([0, -1])
+    with pytest.raises(gs.GenesisException, match="one row per environment"):
+        bar.set_vertices_fixed(verts_idx[:1])
