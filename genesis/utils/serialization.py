@@ -2,8 +2,8 @@
 
 A file holds JavaScript Object Notation (JSON) and arrays, and what each value in it is comes from the type the
 loader expects: the caller says what it exported and what it is loading, and the declared types of the descriptions
-and options take it from there. So a file holds no module path, no import, and no code, and a class name appears only
-where a declared type has subclasses and the file must say which one.
+and options take it from there. So a file holds no import and no code, and a class name appears only where a declared
+type has subclasses and the file must say which one. A class extending one of the same name goes by its module path.
 """
 
 import dataclasses
@@ -17,7 +17,6 @@ import types
 import typing
 import xml.etree.ElementTree as ET
 import zipfile
-from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence, Set
 from enum import IntEnum
 from functools import lru_cache, partial
@@ -211,28 +210,15 @@ def _accepted_classes(expect) -> tuple:
     return (expect,)
 
 
-def _names_by_class(roots: tuple[type, ...]) -> dict[type, str]:
-    """Returns the name a file writes each class extending one of the roots under, unique among them.
+def _class_name(cls: type) -> str:
+    """Returns the name a file writes a class under.
 
-    A class goes by its own name, unless a class it is no base of shares that name. It then goes by its module path,
-    which tells apart the classes extending it (the rigid material of another solver) and unrelated namesakes (the
-    elastic materials of several solvers), while the base keeps the name it has always been written under.
+    A class goes by its own name, unless it extends a class of that name (the rigid material of another solver). It
+    then goes by its module path, which tells it apart from the class it extends.
     """
-    classes = set()
-    pending = list(roots)
-    while pending:
-        cls = pending.pop()
-        if cls not in classes:
-            classes.add(cls)
-            pending.extend(cls.__subclasses__())
-    namesakes = defaultdict(list)
-    for cls in classes:
-        namesakes[cls.__name__].append(cls)
-    names = {}
-    for cls in classes:
-        is_base = all(issubclass(namesake, cls) for namesake in namesakes[cls.__name__])
-        names[cls] = cls.__name__ if is_base else f"{cls.__module__}.{cls.__qualname__}"
-    return names
+    if any(base.__name__ == cls.__name__ for base in cls.__mro__[1:]):
+        return f"{cls.__module__}.{cls.__qualname__}"
+    return cls.__name__
 
 
 def _classes_by_name(expect) -> dict[str, type]:
@@ -241,12 +227,11 @@ def _classes_by_name(expect) -> dict[str, type]:
     A declaration accepting 'Morph' accepts every kind of morph, so 'Morph' and everything extending it may stand
     there. A name read back is looked up here, so a file naming a class outside the declaration is rejected.
     """
-    names = _names_by_class((Options,))
     by_name = {}
     classes = [_unwrap_annotation(arg) for arg in _accepted_classes(expect)]
     while classes:
         cls = classes.pop()
-        by_name[names.get(cls, cls.__name__)] = cls
+        by_name[_class_name(cls)] = cls
         classes.extend(cls.__subclasses__())
     return by_name
 
@@ -298,9 +283,7 @@ def schema(classes: set[type]) -> dict:
     that gained a field since keeps loading while one whose fields moved is rejected by name. Sorted by name, so what
     a file holds follows from the classes alone rather than from the order they are met in.
     """
-    names_by_class = _names_by_class((Options,))
-    names = {cls: names_by_class.get(cls, cls.__name__) for cls in classes}
-    return {names[cls]: _layout(cls) for cls in sorted(classes, key=names.get)}
+    return {_class_name(cls): _layout(cls) for cls in sorted(classes, key=_class_name)}
 
 
 def declared_schema(expect: dict) -> dict:
@@ -309,7 +292,6 @@ def declared_schema(expect: dict) -> dict:
     A load holds only the declared types until it reads a value, so it takes every class a declaration admits. The
     comparison looks up only the names the file holds, so the extra entries cost nothing.
     """
-    names = _names_by_class((Options,))
     layout = {}
     for annotation in expect.values():
         seen = set()
@@ -322,13 +304,13 @@ def declared_schema(expect: dict) -> dict:
                 continue
             seen.add(declared)
             if issubclass(declared, IntEnum):
-                layout[names.get(declared, declared.__name__)] = _layout(declared)
+                layout[_class_name(declared)] = _layout(declared)
             elif _has_declared_fields(declared):
                 for cls in _classes_by_name(declared).values():
                     if cls in seen and cls is not declared:
                         continue
                     seen.add(cls)
-                    layout[names.get(cls, cls.__name__)] = _layout(cls)
+                    layout[_class_name(cls)] = _layout(cls)
                     declarations.extend(_declared_fields(cls).values())
     return layout
 
@@ -423,8 +405,7 @@ def _export_value(value, expect, exported: "Exported"):
         # A class saying how it travels may stand where its base is declared, so the file names which one it is.
         if held is None or _accepted_classes(expect) == (type(value),):
             return held
-        name = _names_by_class((SerializationMixin, *_REGISTERED)).get(type(value), type(value).__name__)
-        return {"@class": name, "raw": held}
+        return {"@class": _class_name(type(value)), "raw": held}
     if _has_declared_fields(expect):
         exported.classes.add(type(value))
         given = vars(value)
@@ -436,9 +417,7 @@ def _export_value(value, expect, exported: "Exported"):
             # An option object carries the names of the fields the user gave, since rebuilding one needs them. They
             # are sorted, so exporting the same scene twice gives the same file.
             values = {"values": values, "given": sorted(value.model_fields_set)}
-        if _accepted_classes(expect) == (type(value),):
-            return values
-        return {"@": _names_by_class((Options,)).get(type(value), type(value).__name__), **values}
+        return values if _accepted_classes(expect) == (type(value),) else {"@": _class_name(type(value)), **values}
     expect = _deduce_union(expect, value)
     origin = typing.get_origin(expect)
     if _is_sequence(origin):
@@ -474,8 +453,7 @@ def _export_any(value, exported: "Exported"):
     # it received rather than a path to read them from.
     codec = _class_codec(type(value))
     if codec is not None:
-        name = _names_by_class((SerializationMixin, *_REGISTERED)).get(type(value), type(value).__name__)
-        return {"@class": name, "raw": codec[0](value, _exporting_into(exported))}
+        return {"@class": _class_name(type(value)), "raw": codec[0](value, _exporting_into(exported))}
     gs.raise_exception(f"A Genesis file cannot hold {type(value).__name__} where 'Any' was declared.")
 
 
@@ -488,11 +466,12 @@ def _load_any(raw, loaded: "Loaded"):
     if "@dict" in raw:
         return {_load_any(k, loaded): _load_any(v, loaded) for k, v in raw["@dict"]}
     if "@class" in raw:
-        for cls, name in _names_by_class((SerializationMixin, *_REGISTERED)).items():
-            if name == raw["@class"]:
-                codec = _class_codec(cls)
-                if codec is not None:
-                    return codec[1](raw["raw"], _loading_from(loaded))
+        classes = [SerializationMixin, *_REGISTERED]
+        while classes:
+            cls = classes.pop()
+            classes.extend(cls.__subclasses__())
+            if _class_name(cls) == raw["@class"]:
+                return _class_codec(cls)[1](raw["raw"], _loading_from(loaded))
         gs.raise_exception(f"A Genesis file holds a '{raw['@class']}', which no class says how it is loaded.")
     gs.raise_exception(f"A Genesis file holds a value this version cannot load where 'Any' stands: {sorted(raw)}.")
 
@@ -547,7 +526,7 @@ def _load_value(raw, expect, loaded: "Loaded"):
                 try:
                     values[name] = _field_check(cls, name).validate_python(value, context=_FROM_FILE)
                 except ValidationError as e:
-                    gs.raise_exception_from(f"A Genesis file states a '{name}' that {cls.__name__} rejects.", e)
+                    gs.raise_exception_from(f"A Genesis file states a '{name}' that {_class_name(cls)} rejects.", e)
             return cls.model_construct(_fields_set=set(raw["given"]), **values)
         return cls(**{name: _load_value(raw[name], declared[name], loaded) for name in declared if name in raw})
     expect = _deduce_union(expect, raw)
