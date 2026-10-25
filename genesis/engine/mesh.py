@@ -73,16 +73,6 @@ CHARTS_ROT = np.stack((np.eye(3), gu.euler_to_R(np.array((90.0, 0.0, 0.0)))))
 _TMESH_CACHE = OwnedCache()
 
 
-def _get_sorted_edges_key(faces, n_verts):
-    """Return the sorted keys of the edges of every face, with one key per face side.
-
-    The key of an edge packs its two vertex indices, smaller first, into one integer, which sorts and compares millions
-    of edges much faster than rows of vertex pairs.
-    """
-    faces_rolled = np.roll(faces, 1, axis=1)
-    return np.sort(np.minimum(faces, faces_rolled) * n_verts + np.maximum(faces, faces_rolled), axis=None)
-
-
 def cached_by_tmesh(method):
     """Wrap a method of 'Mesh' computing data from its trimesh alone, so that the meshes of one trimesh share it.
 
@@ -348,8 +338,12 @@ class Mesh(RBC, serialization.SerializationMixin):
         """
         Get the unique edges of the mesh.
         """
+        # The key of an edge packs its two vertex indices, smaller first, into one integer, which sorts and compares
+        # millions of edges much faster than rows of vertex pairs.
         n_verts = len(self.verts)
-        edges_key = _get_sorted_edges_key(self.faces, n_verts)
+        faces_rolled = np.roll(self.faces, 1, axis=1)
+        edges_key = np.minimum(self.faces, faces_rolled) * n_verts + np.maximum(self.faces, faces_rolled)
+        edges_key = np.sort(edges_key, axis=None)
         edges_key = edges_key[np.diff(edges_key, prepend=-1) != 0]
         edges = np.stack(np.divmod(edges_key, n_verts), axis=-1)
         return edges[edges[:, 0] != edges[:, 1]]
@@ -368,6 +362,8 @@ class Mesh(RBC, serialization.SerializationMixin):
         # closing a non-watertight one raises when it has fewer than 4 non-coplanar vertices.
         try:
             tmesh = trimesh.Trimesh(self.verts, self.faces, process=False)
+            # The watertightness of the mesh is cached and counted on edge keys (see 'is_watertight'), while this fresh
+            # trimesh would group the rows of all its edges again.
             if not self.is_watertight:
                 gs.logger.warning(
                     "Mesh is not watertight. Falling back to convex hull for estimating inertial properties."
@@ -418,9 +414,8 @@ class Mesh(RBC, serialization.SerializationMixin):
         vert_neighbors concatenates each vertex's neighbor indices, vert_n_neighbors holds the neighbor count of each
         vertex, and vert_neighbor_start the offset of each vertex's slice into vert_neighbors.
         """
-        # The unique edges are sorted with their smaller vertex first, so listing every edge from its larger vertex then
-        # from its smaller one and grouping them by vertex with a stable sort yields the neighbors of each vertex in
-        # ascending order.
+        # The unique edges are sorted with their smaller vertex first, so listing them from their larger vertex then
+        # their smaller one and grouping by vertex with a stable sort gives the neighbors of each vertex in order.
         edges = self.get_unique_edges()
         verts_idx = np.concatenate((edges[:, 1], edges[:, 0]))
         vert_neighbors = np.concatenate((edges[:, 0], edges[:, 1]))[np.argsort(verts_idx, kind="stable")]
@@ -704,11 +699,13 @@ class Mesh(RBC, serialization.SerializationMixin):
         """
         Whether the mesh is a closed manifold surface.
         """
-        # Every edge must be shared by exactly two faces, counted on the sorted edge keys, which scales to millions of
-        # faces where the row grouping of trimesh does not. Bracketing the keys by values out of their range makes each
-        # group of equal keys start at a change, and leaves a mesh without faces watertight, as trimesh has it.
+        # Every edge must be shared by exactly two faces, counted on the sorted edge keys (see 'get_unique_edges').
+        # Bracketing the keys by values out of their range makes each group of equal keys start at a change, and leaves
+        # a mesh without faces watertight, as trimesh has it.
         n_verts = len(self.verts)
-        edges_key = _get_sorted_edges_key(self.faces, n_verts)
+        faces_rolled = np.roll(self.faces, 1, axis=1)
+        edges_key = np.minimum(self.faces, faces_rolled) * n_verts + np.maximum(self.faces, faces_rolled)
+        edges_key = np.sort(edges_key, axis=None)
         is_edge_start = np.diff(edges_key, prepend=-1, append=n_verts * n_verts) != 0
         return (np.diff(np.flatnonzero(is_edge_start)) == 2).all()
 

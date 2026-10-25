@@ -178,7 +178,9 @@ def parse_terrain(morph: Terrain, surface):
         surface=surface,
         uv_scale=morph.uv_scale if need_uvs else None,
     )
-    vmesh = gs.Mesh.from_trimesh(mesh=tmesh, surface=surface, metadata={}) if morph.visualization else None
+    vmesh = None
+    if morph.visualization:
+        vmesh = gs.Mesh.from_trimesh(mesh=tmesh, surface=surface, metadata={})
     mesh = gs.Mesh.from_trimesh(
         mesh=tmesh,
         surface=gs.surfaces.Collision(),
@@ -318,7 +320,6 @@ def convert_heightfield_to_watertight_trimesh(
         verts_normal = trimesh.geometry.weighted_vertex_normals(
             len(vertices_top), triangles_top, faces_normal, trimesh.triangles.angles(triangles)
         )
-        del triangles
         vmesh_single = trimesh.Trimesh(
             vertices_top, triangles_top, vertex_normals=verts_normal, visual=visual, process=False
         )
