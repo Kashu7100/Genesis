@@ -1431,6 +1431,9 @@ class ColliderState:
     box_axi: qd.Tensor
     box_ppts2: qd.Tensor
     box_pu: qd.Tensor
+    # The bounds of a geom in the frame of the terrain and the prism of the terrain cell it is tested against, one slot
+    # per thread of the terrain narrowphase. Its thread count is a multiple of the number of envs, which it reads from
+    # these shapes, and each thread also holds the slot of the same index of the MPR state (see activate_terrain).
     xyz_max_min: qd.Tensor
     prism: qd.Tensor
     n_contacts: qd.Tensor = of_kind(DataKind.DERIVED)
@@ -1457,7 +1460,7 @@ class ColliderState:
 
 
 def get_collider_state(
-    solver, rigid_config, n_possible_pairs, collider_info, collider_static_config, split_narrowphase
+    solver, rigid_config, n_possible_pairs, n_terrain_threads, collider_info, collider_static_config, split_narrowphase
 ):
     _B = solver._B
     n_links = solver.n_links_
@@ -1501,8 +1504,8 @@ def get_collider_state(
         box_axi=V_VEC(3, dtype=gs.qd_float, shape=box_axi_shape),
         box_ppts2=V(dtype=gs.qd_float, shape=box_ppts2_shape),
         box_pu=V_VEC(3, dtype=gs.qd_float, shape=box_pu_shape),
-        xyz_max_min=V(dtype=gs.qd_float, shape=(6, _B)),
-        prism=V_VEC(3, dtype=gs.qd_float, shape=(6, _B)),
+        xyz_max_min=V(dtype=gs.qd_float, shape=(6, n_terrain_threads)),
+        prism=V_VEC(3, dtype=gs.qd_float, shape=(6, n_terrain_threads)),
         n_contacts=V(dtype=gs.qd_int, shape=(_B,)),
         n_contacts_hibernated=V(dtype=gs.qd_int, shape=(_B,)),
         first_time=V(dtype=gs.qd_bool, shape=(_B,)),

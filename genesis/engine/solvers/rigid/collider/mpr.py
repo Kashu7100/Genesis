@@ -39,6 +39,14 @@ class MPR:
         self.contact0_mpr_state = array_class.get_mpr_state(n_contact0_threads)
         self.multicontact_mpr_state = array_class.get_mpr_state(n_multicontact_threads)
 
+    def activate_terrain(self, n_terrain_threads):
+        """Allocate one slot of the MPR state per thread of the terrain narrowphase.
+
+        The terrain narrowphase runs n_terrain_threads threads, a multiple of the number of environments. The other
+        passes, which run before or after it, index the state by environment and use its first slots.
+        """
+        self.mpr_state = array_class.get_mpr_state(n_terrain_threads)
+
 
 @qd.kernel
 def clear(mpr_state: qd.template()):

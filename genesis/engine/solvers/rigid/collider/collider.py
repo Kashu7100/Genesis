@@ -101,6 +101,15 @@ class Collider:
             self.gjk.activate(n_contact0_threads, gpu_cores)
         elif self.collider_config.has_non_box_plane_convex_convex:
             self.gjk.activate()
+        # The terrain narrowphase splits the terrain pairs of an env over chunks, one thread each, every thread holding
+        # a slot of scratch memory. A pair walks the cells under its geom serially and pair costs span orders of
+        # magnitude, so the chunks outnumber the GPU cores twice, which keeps them busy while the longest pairs finish,
+        # capped by the terrain pairs an env can hold. The CPU backend runs one chunk per env.
+        self._n_terrain_threads = self._solver._B
+        if self.collider_config.has_terrain:
+            n_terrain_chunks = (2 * self.collider_config.gpu_cores + self._solver._B - 1) // self._solver._B
+            self._n_terrain_threads *= max(min(n_terrain_chunks, self._n_terrain_pairs), 1)
+            self.mpr.activate_terrain(self._n_terrain_threads)
         if self.collider_config.has_terrain or self.collider_config.has_non_box_plane_convex_convex:
             self._support_field.activate()
 
@@ -193,7 +202,7 @@ class Collider:
             self._n_possible_pairs,
             self._collision_pair_idx,
             self._valid_collision_pairs,
-            has_terrain,
+            self._n_terrain_pairs,
             has_non_box_plane_convex_convex,
             has_convex_specialization,
             has_nonconvex_nonterrain,
@@ -210,7 +219,7 @@ class Collider:
         self._geoms_link_idx = np.array([geom.link.idx for geom in self._solver.geoms], dtype=gs.np_int)
         self._links_n_geoms = np.bincount(self._geoms_link_idx, minlength=self._solver.n_links_)
 
-        has_prunable_contacts = gs.use_ndarray or has_nonconvex_nonterrain or has_terrain
+        has_prunable_contacts = gs.use_ndarray or has_nonconvex_nonterrain or self._n_terrain_pairs > 0
         if not has_prunable_contacts and len(self._valid_collision_pairs):
             geoms_type = np.array([geom.type for geom in self._solver.geoms])
             pairs_type = geoms_type[self._valid_collision_pairs]
@@ -228,7 +237,7 @@ class Collider:
         self.collider_config = array_class.ColliderStaticConfig(
             gpu_cores=get_gpu_core_count(),
             gpu_cores_per_unit=get_gpu_cores_per_unit(),
-            has_terrain=has_terrain,
+            has_terrain=self._n_terrain_pairs > 0,
             # Outside performance mode the convex narrowphase and the contact sort it gates are always compiled in, the
             # narrowphase finding nothing in a scene whose convex pairs all take a box specialization.
             has_non_box_plane_convex_convex=has_non_box_plane_convex_convex or gs.use_ndarray,
@@ -304,6 +313,7 @@ class Collider:
             self._solver,
             self._solver.rigid_config,
             n_possible_pairs_,
+            self._n_terrain_threads,
             self.collider_info,
             self.collider_config,
             split_narrowphase=self._use_split_narrowphase,
@@ -329,8 +339,8 @@ class Collider:
         For each pair of geoms, determine if they can collide based on their properties and the solver configuration.
         Pairs that are already colliding at the initial configuration (qpos0) are filtered out with a warning.
 
-        Returns (n_possible_pairs, collision_pair_idx, pair_flags) where pair_flags is a dict of booleans
-        for has_terrain, has_non_box_plane_convex_convex, has_convex_specialization, has_nonconvex_nonterrain.
+        Returns (n_possible_pairs, collision_pair_idx, pair_flags) where pair_flags holds the number of pairs against a
+        terrain, then the booleans has_non_box_plane_convex_convex, has_convex_specialization, has_nonconvex_nonterrain.
         """
         # Links whose contact is handled by an external solver (e.g. IPC) are excluded from GJK collision.
         # Only applies when the IPC coupler is active. Mirrors the link filtering logic in
@@ -545,8 +555,8 @@ class Collider:
         valid_convex_a = geom_is_convex[row[valid_indices]]
         valid_convex_b = geom_is_convex[col[valid_indices]]
 
-        has_any_vs_terrain = bool(
-            np.any((valid_type_a == gs.GEOM_TYPE.TERRAIN) | (valid_type_b == gs.GEOM_TYPE.TERRAIN))
+        n_terrain_pairs = np.count_nonzero(
+            (valid_type_a == gs.GEOM_TYPE.TERRAIN) | (valid_type_b == gs.GEOM_TYPE.TERRAIN)
         )
         both_convex = valid_convex_a & valid_convex_b
         if np.any(both_convex):
@@ -611,7 +621,7 @@ class Collider:
             n_possible_pairs,
             collision_pair_idx,
             valid_collision_pairs,
-            has_any_vs_terrain,
+            n_terrain_pairs,
             has_non_box_plane_convex_convex,
             has_convex_specialization,
             has_nonconvex_vs_nonterrain,
