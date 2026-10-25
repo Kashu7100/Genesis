@@ -78,6 +78,8 @@ class Simulator(RBC):
         self._grad_epoch = 0
         self._is_forward_ready = True
         self._is_backward_ready = True
+        # Whether the errors of the steps taken since the last backward pass have been checked (see 'reverse_step')
+        self._is_rollout_checked = True
 
         # solvers
         self.tool_solver = ToolSolver(self.scene, self, options.tool)
@@ -353,6 +355,13 @@ class Simulator(RBC):
         if not self._is_backward_ready or self.cur_step_global < step:
             gs.raise_exception("Multiple backward calls not allowed.")
 
+        # Stepping checks errno with a delay (see 'step'), so the errors of the last steps of the rollout are checked
+        # once here, before the reverse pass replays them.
+        if not self._is_rollout_checked:
+            if self.rigid_solver.is_active:
+                self.rigid_solver.check_errno()
+            self._is_rollout_checked = True
+
         while self.cur_step_global >= step:
             self.collect_output_grads()
             inputs_grad_pairs = self._step_grad()
@@ -409,6 +418,7 @@ class Simulator(RBC):
         # advances their clock. The backward pass winds it down again through `_step_grad`.
         if not in_backward:
             self._steps += 1
+            self._is_rollout_checked = False
 
         with self._step_timer.phase("physics"):
             if self._rigid_only and not self._requires_grad:  # "Only Advance!" --Thomas Wade :P

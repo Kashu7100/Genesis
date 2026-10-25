@@ -218,3 +218,44 @@ def test_closed_loop_policy_grad_matches_fd(grad_revolute, precision, show_viewe
     del scenes, arms, scene, scene_ana, arms_ana
     gc.collect()
     assert scene_ref() is None
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_backward_raises_on_flagged_rollout(n_envs, show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            requires_grad=True,
+        ),
+        rigid_options=gs.options.RigidOptions(
+            max_contacts=1,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(1.5, -1.5, 1.0),
+            camera_lookat=(0.25, 0.0, 0.1),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
+    spheres = [
+        scene.add_entity(
+            morph=gs.morphs.Sphere(
+                pos=(0.5 * i, 0.0, 0.0999),
+                radius=0.1,
+            ),
+        )
+        for i in range(2)
+    ]
+    scene.build(n_envs=n_envs)
+
+    # Two contacts against a budget of one overflow from the first step, while a rollout shorter than the errno polling
+    # period of stepping leaves the backward pass to report it.
+    vel = torch.zeros((max(n_envs, 1), 6), dtype=gs.tc_float, device=gs.device, requires_grad=True)
+    spheres[0].set_dofs_velocity(vel if n_envs > 0 else vel[0])
+    for _ in range(3):
+        scene.step()
+    loss = spheres[0].get_state().pos.sum()
+    with pytest.raises(gs.GenesisException, match="max number of post-pruning contact points"):
+        loss.backward()

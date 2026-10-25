@@ -1401,20 +1401,19 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
         With 'wait' set to False on CUDA, the error flags are copied to page-locked host memory without waiting for the
         device, and the copy enqueued by the previous call is checked instead. An error then raises one call later, but
-        the host only waits for the device when it lags behind by more than the interval between two calls.
+        the host only waits for the device when it lags behind by more than the interval between two calls. A flag
+        found in that copy is confirmed by a blocking read of the device flags before raising, so an environment whose
+        state has been set since then raises nothing.
         """
         if not wait and self._errno_host is not None:
             self._errno_event.synchronize()
-            errno = np.bitwise_or.reduce(tensor_to_array(self._errno_host))
-            if errno:
-                # The flags stay raised on the device until the state of the faulty environments is set, so the next
-                # call copies them again. Clearing the copy that raises spares raising it a second time after the user
-                # has set a valid state.
-                self._errno_host.zero_()
-            else:
-                self._errno_host.copy_(qd_to_torch(self._errno, copy=False), non_blocking=True)
-                self._errno_event.record()
-        elif gs.use_zerocopy:
+            is_flagged = self._errno_host.any()
+            self._errno_host.copy_(qd_to_torch(self._errno, copy=False), non_blocking=True)
+            self._errno_event.record()
+            if not is_flagged:
+                return
+
+        if gs.use_zerocopy:
             errno = np.bitwise_or.reduce(qd_to_numpy(self._errno))
         else:
             errno = kernel_bit_reduction(self._errno)
