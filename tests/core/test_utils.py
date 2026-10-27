@@ -10,16 +10,16 @@ import torch
 
 import igl
 import pytest
+import scipy.linalg
 import trimesh
 from PIL import Image
-from scipy.linalg import polar as scipy_polar
-from scipy.spatial.transform import Rotation as R, Slerp
+from scipy.spatial.transform import Rotation, Slerp
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.utils import warnings as warnings_mod
+from genesis.utils import warnings
 from genesis.utils.image_exporter import FrameImageExporter, as_grayscale_image
-from genesis.utils.misc import tensor_to_array
+from genesis.utils.misc import tensor_to_array, unique_rows
 from genesis.utils.tools import RunningMean
 from genesis.utils.urdf import compose_inertial_properties
 from genesis.utils.warnings import warn_once
@@ -34,9 +34,9 @@ TOL = 1e-7
 
 @pytest.fixture
 def clear_seen_fixture():
-    warnings_mod._seen.clear()
+    warnings._seen.clear()
     yield
-    warnings_mod._seen.clear()
+    warnings._seen.clear()
 
 
 def _qd_kernel_wrapper(qd_func, num_inputs, num_outputs, *args):
@@ -345,10 +345,10 @@ def test_slerp(batch_shape, tol):
     lerp_true = np.empty_like(q0)
     lerp_from_one_true = np.empty_like(q1)
     for i in range(numel):
-        rots = R.from_quat([q0[i], q1[i]], scalar_first=True)
+        rots = Rotation.from_quat([q0[i], q1[i]], scalar_first=True)
         slerp = Slerp([0, 1], rots)
         lerp_true[i] = slerp([INTERP_RATIO]).as_quat(scalar_first=True)
-        rots = R.from_quat([q0[0], q1[i]], scalar_first=True)
+        rots = Rotation.from_quat([q0[0], q1[i]], scalar_first=True)
         slerp = Slerp([0, 1], rots)
         lerp_from_one_true[i] = slerp([INTERP_RATIO]).as_quat(scalar_first=True)
 
@@ -425,6 +425,39 @@ def test_compose_inertial_properties():
     assert_allclose(combined_mass, expected_mass, tol=TOL)
     assert_allclose(combined_com, expected_com, tol=TOL)
     assert_allclose(combined_inertia, expected_inertia, tol=TOL)
+
+
+@pytest.mark.required
+def test_unique_rows():
+    INT64_MIN, INT64_MAX = np.iinfo(np.int64).min, np.iinfo(np.int64).max
+    UINT64_MAX = np.iinfo(np.uint64).max
+    rows_list = (
+        np.random.randint(-50, 50, (2000, 3)),
+        np.random.randint(0, 4, (500, 2)).astype(np.uint8),
+        np.array(
+            [
+                [INT64_MIN, 1],
+                [INT64_MAX, 0],
+                [INT64_MIN, 1],
+            ],
+        ),
+        np.array(
+            [
+                [UINT64_MAX, 0],
+                [0, 1],
+                [UINT64_MAX, 0],
+            ],
+            dtype=np.uint64,
+        ),
+        np.random.randint(-(2**40), 2**40, (1000, 3)),
+        np.random.randint(0, 2, (100, 40)),
+        np.zeros((0, 3), dtype=np.int64),
+    )
+    for rows in rows_list:
+        expected = np.unique(rows, axis=0, return_index=True, return_inverse=True, return_counts=True)
+        for value, expected_value in zip(unique_rows(rows), expected):
+            assert value.dtype == expected_value.dtype
+            assert_equal(value, expected_value)
 
 
 @pytest.mark.required
@@ -505,7 +538,7 @@ def test_polar_decomposition(side, tol):
     assert np.all(np_eigenvals.real >= -tol), "P should be positive semi-definite"
 
     # Validate against scipy
-    scipy_U, scipy_P = scipy_polar(np_A, side=side)
+    scipy_U, scipy_P = scipy.linalg.polar(np_A, side=side)
     np_U_scipy, np_P_scipy = gu.polar(np_A, pure_rotation=False, side=side)
     assert_allclose(scipy_U, np_U_scipy, tol=tol)
     assert_allclose(scipy_P, np_P_scipy, tol=tol)
