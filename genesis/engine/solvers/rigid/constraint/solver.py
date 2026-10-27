@@ -2,12 +2,13 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 import numpy as np
-import quadrants as qd
 import torch
+
 from frozendict import frozendict
 
-import genesis as gs
+import quadrants as qd
 
+import genesis as gs
 import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 import genesis.utils.simt as su
@@ -16,6 +17,7 @@ from genesis.engine.solvers.rigid.abd.misc import (
     func_hibernate_island_if_settled,
     func_list_item,
     func_list_range_start,
+    func_wakeup_island,
     linear_to_lower_tri,
 )
 from genesis.utils.misc import assign_indexed_tensor, indices_to_mask, qd_to_numpy, qd_to_torch
@@ -476,6 +478,7 @@ class ConstraintSolver:
             int(link2_idx),
             envs_idx,
             int(eq_type),
+            self._solver.dyn_state,
             self.constraint_state,
             self._solver.dyn_info,
             self._solver.rigid_info,
@@ -2186,6 +2189,7 @@ def kernel_delete_dynamic_constraint(
     link2_idx: int,
     envs_idx: qd.types.ndarray(),
     eq_type: int,
+    dyn_state: array_class.DynState,
     constraint_state: array_class.ConstraintState,
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
@@ -2200,6 +2204,18 @@ def kernel_delete_dynamic_constraint(
             if dyn_info.equalities.eq_type[i_e, i_b] == eq_type and (
                 (link_a == link1_idx and link_b == link2_idx) or (link_a == link2_idx and link_b == link1_idx)
             ):
+                # Nothing else wakes a link held asleep by the deleted constraint (see the hibernation pass of
+                # func_build_islands)
+                if qd.static(rigid_config.use_hibernation):
+                    for i_side in range(2):
+                        i_l = link_a
+                        if i_side == 1:
+                            i_l = link_b
+                        if dyn_state.links.is_hibernated[i_l, i_b]:
+                            i_is = constraint_state.island.links_island_idx[i_l, i_b]
+                            func_wakeup_island(
+                                i_is, i_b, dyn_state, constraint_state, dyn_info, rigid_info, rigid_config
+                            )
                 if i_e < constraint_state.qd_n_equalities[i_b] - 1:
                     # Swap-remove must move the whole constraint record, not just its type,
                     # otherwise the surviving slot keeps the deleted constraint's links/data.
