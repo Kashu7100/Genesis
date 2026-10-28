@@ -246,16 +246,17 @@ def func_steel_prepare_patches(
     friction_gap_limit = steel_info.friction_gap_limit[None]
     qd.loop_config(serialize=qd.static(steel_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_c, i_b in qd.ndrange(max_contacts, _B):
-        steel_patch_frame.indices[i_c, i_b] = i_c
-        steel_patch_frame.owner[i_c, i_b] = -1
-        steel_patch_frame.valid[i_c, i_b] = 0
-        steel_patch_frame.source[i_c, i_b] = -1
-        steel_patch_frame.eligible[i_c, i_b] = 0
-        steel_patch_frame.tangent_impulse[i_c, i_b] = qd.Vector.zero(gs.qd_float, 3)
-        steel_contacts.patch_weight[i_c, i_b] = 0.0
-        steel_contacts.patch_next[i_c, i_b] = -1
-        steel_contacts.patch_phi[i_c, i_b] = qd.Vector.zero(gs.qd_float, 2)
+        # Every reader of the patch fields indexes them by a contact of the step, so the slots past the contact count
+        # are left as they are: resetting the whole capacity would write it all at every step.
         if i_c < steel_contacts.n[i_b]:
+            steel_patch_frame.indices[i_c, i_b] = i_c
+            steel_patch_frame.owner[i_c, i_b] = -1
+            steel_patch_frame.valid[i_c, i_b] = 0
+            steel_patch_frame.source[i_c, i_b] = -1
+            steel_patch_frame.tangent_impulse[i_c, i_b] = qd.Vector.zero(gs.qd_float, 3)
+            steel_contacts.patch_weight[i_c, i_b] = 0.0
+            steel_contacts.patch_next[i_c, i_b] = -1
+            steel_contacts.patch_phi[i_c, i_b] = qd.Vector.zero(gs.qd_float, 2)
             i_ga = steel_contacts.shape0[i_c, i_b]
             i_gb = steel_contacts.shape1[i_c, i_b]
             i_la = steel_contacts.body0[i_c, i_b]
