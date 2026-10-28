@@ -24,7 +24,7 @@ from ..rigid.abd.forward_kinematics import (
     kernel_forward_kinematics_links_geoms,
     kernel_forward_velocity,
 )
-from ..rigid.rigid_solver import RigidSolver, kernel_substep_collision
+from ..rigid.rigid_solver import RigidSolver
 from .compliance import func_steel_compliance_rows
 from .contacts import (
     func_steel_gather_warmstart,
@@ -1103,32 +1103,7 @@ class SteelSolver(RigidSolver):
                 self._scene._envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, False
             )
 
-        collider = self.collider
-        collider._contact_data_cache.clear()
-        kernel_substep_collision(
-            self.geoms_init_AABB,
-            self.dyn_state,
-            collider.collider_state,
-            collider.mpr.mpr_state,
-            collider.gjk.gjk_state,
-            collider.gjk.gjk_state.diff_contact_input,
-            collider.mpr.contact0_mpr_state,
-            collider.gjk.contact0_gjk_state,
-            collider.mpr.multicontact_mpr_state,
-            collider.gjk.multicontact_gjk_state,
-            self.constraint_solver.constraint_state,
-            self.dyn_info,
-            self.rigid_info,
-            collider.collider_info,
-            self.rigid_config,
-            collider.collider_config,
-            collider.gjk.gjk_config,
-            False,
-            collider._n_possible_pairs > 0,
-            collider._use_split_narrowphase,
-            collider._use_coop_dedup,
-            self._errno,
-        )
+        self.collider.detection()
 
         if self._steel_plan.n_arts > 0:
             self._steel_advance()

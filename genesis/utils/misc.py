@@ -9,8 +9,8 @@ import numbers
 import os
 import random
 import sys
-from collections import OrderedDict
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import field
 from importlib import import_module
 from itertools import combinations
@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 import cpuinfo
+import numba as nb
 import psutil
 import pyglet
 
@@ -114,6 +115,25 @@ class redirect_libc_stderr:
         os.close(self.original_stderr_fileno)
         self.stderr_fileno = None
         self.original_stderr_fileno = None
+
+
+@contextmanager
+def set_environ(environ: Mapping[str, str]):
+    """Set environment variables for the duration of the context, then restore them to their previous state.
+
+    Only the variables in 'environ' are touched: those previously unset are removed on exit, the others get back their
+    previous value.
+    """
+    environ_prev = {name: os.environ.get(name) for name in environ}
+    os.environ.update(environ)
+    try:
+        yield
+    finally:
+        for name, value in environ_prev.items():
+            if value is None:
+                del os.environ[name]
+            else:
+                os.environ[name] = value
 
 
 def assert_initialized(cls):
@@ -360,129 +380,6 @@ def get_assets_dir():
     return os.path.join(get_src_dir(), "assets")
 
 
-def get_cache_dir():
-    cache_dir = os.environ.get("GS_CACHE_FILE_PATH")
-    if cache_dir is not None:
-        return cache_dir
-    root_cache_dir = None
-    if sys.platform == "linux":
-        root_cache_dir = os.environ.get("XDG_CACHE_HOME")
-    if root_cache_dir is None:
-        root_cache_dir = os.path.join(os.path.expanduser("~"), ".cache")
-    return os.path.join(root_cache_dir, "genesis")
-
-
-def get_gsd_cache_dir():
-    return os.path.join(get_cache_dir(), "gsd")
-
-
-def get_gnd_cache_dir():
-    return os.path.join(get_cache_dir(), "terrain")
-
-
-def get_cvx_cache_dir():
-    return os.path.join(get_cache_dir(), "cvx")
-
-
-def get_ptc_cache_dir():
-    return os.path.join(get_cache_dir(), "ptc")
-
-
-def get_fps_pc_cache_dir():
-    return os.path.join(get_cache_dir(), "fps_pc")
-
-
-def get_tet_cache_dir():
-    return os.path.join(get_cache_dir(), "tet")
-
-
-def get_gel_cache_dir():
-    return os.path.join(get_cache_dir(), "gel")
-
-
-def get_remesh_cache_dir():
-    return os.path.join(get_cache_dir(), "rm")
-
-
-def get_wt_cache_dir():
-    return os.path.join(get_cache_dir(), "wt")
-
-
-def get_wth_cache_dir():
-    return os.path.join(get_cache_dir(), "wth")
-
-
-def get_exr_cache_dir():
-    return os.path.join(get_cache_dir(), "exr")
-
-
-def get_usd_cache_dir():
-    return os.path.join(get_cache_dir(), "usd")
-
-
-_CLEARABLE_CACHES: list[Callable[[], None]] = []
-
-
-def register_cache_clear(cache_clear: Callable[[], None]) -> None:
-    """Register a callback that drops a module-level cache, invoked by clear_caches on genesis teardown.
-
-    Pass the cache's own clearing method, e.g. the cache_clear of a functools.lru_cache or the clear of a manual dict
-    cache. This lets module-level asset caches (parsed meshes, baked textures, ...) release the large arrays they hold
-    for destroyed scenes without the teardown path having to know about each one.
-    """
-    _CLEARABLE_CACHES.append(cache_clear)
-
-
-def clear_caches() -> None:
-    """Drop every cache registered through register_cache_clear."""
-    for cache_clear in _CLEARABLE_CACHES:
-        cache_clear()
-
-
-class SizeCappedCache:
-    """An LRU cache bounded by the total byte footprint of its values rather than by their count.
-
-    Each value is stored together with an explicit size in bytes; once the running total exceeds max_bytes the
-    least-recently-used entries are evicted until it fits again (the most-recent entry is always kept). This suits
-    caching a handful of large, scene-independent arrays - such as processed collision geometry - where the number of
-    distinct entries is a poor proxy for the memory actually held. An optional max_entries also caps the entry count,
-    so values whose reported size is small or zero (e.g. flat-color textures) cannot accumulate without bound. It
-    registers itself with register_cache_clear so it is dropped together with the other asset caches on genesis
-    teardown.
-    """
-
-    def __init__(self, max_bytes: int, max_entries: "int | None" = None) -> None:
-        self._max_bytes = max_bytes
-        self._max_entries = max_entries
-        self._store: "OrderedDict[Any, tuple[Any, int]]" = OrderedDict()
-        self._total_bytes = 0
-        register_cache_clear(self.clear)
-
-    def get(self, key: Any) -> Any:
-        entry = self._store.get(key)
-        if entry is None:
-            return None
-        self._store.move_to_end(key)
-        return entry[0]
-
-    def put(self, key: Any, value: Any, n_bytes: int) -> None:
-        previous = self._store.pop(key, None)
-        if previous is not None:
-            self._total_bytes -= previous[1]
-        self._store[key] = (value, n_bytes)
-        self._total_bytes += n_bytes
-        while len(self._store) > 1 and (
-            self._total_bytes > self._max_bytes
-            or (self._max_entries is not None and len(self._store) > self._max_entries)
-        ):
-            _, (_, evicted_bytes) = self._store.popitem(last=False)
-            self._total_bytes -= evicted_bytes
-
-    def clear(self) -> None:
-        self._store.clear()
-        self._total_bytes = 0
-
-
 def geometric_mean(a, b):
     """Geometric mean of two non-negative values: sqrt(a * b)."""
     if a < 0 or b < 0:
@@ -499,23 +396,16 @@ def harmonic_mean(a, b):
     return 2 * (a * b) / (a + b)
 
 
-def assert_gs_tensor(x):
-    if not isinstance(x, gs.Tensor):
-        gs.raise_exception("Only accepts genesis.Tensor.")
-
-
 def to_gs_tensor(x, dtype: torch.dtype | None = None):
-    if isinstance(x, gs.Tensor):
-        tensor = x
-    elif isinstance(x, torch.Tensor):
-        tensor = gs.Tensor(x)
-    else:
-        x = np.asarray(x)
-        # See broadcast_tensor for arrays with negative strides
-        if any(stride < 0 for stride in x.strides):
-            x = x.copy()
-        tensor = gs.from_numpy(x)
-    return tensor.to(dtype=dtype, device=gs.device)
+    if isinstance(x, torch.Tensor):
+        return x.to(dtype=dtype, device=gs.device)
+    x = np.asarray(x)
+    # See broadcast_tensor for arrays with negative strides
+    if any(stride < 0 for stride in x.strides):
+        x = x.copy()
+    if dtype is None and x.dtype != np.bool_:
+        dtype = gs.tc_float if np.issubdtype(x.dtype, np.floating) else gs.tc_int
+    return torch.tensor(x, dtype=dtype, device=gs.device)
 
 
 def tensor_to_cpu(x):
@@ -551,6 +441,80 @@ def data_to_array(data, *, to_torch: bool = False, copy: bool | None = None):
     if is_sequence(data):
         return type(data)(data_to_array(v, to_torch=to_torch, copy=copy) for v in data)
     return data
+
+
+@nb.jit(nopython=True, cache=True)
+def unique_rows(rows):
+    """Find the unique rows of a 2D integer array, in lexicographic order, as 'np.unique' along the first axis does.
+
+    The rows are sorted by a stable least-significant-digit radix sort, linear in the number of rows, which goes through
+    the digits of the last column first. Its stability makes the first row of each run of equal rows its first
+    occurrence.
+
+    Returns the unique rows, the index of the first occurrence of each unique row, the index of the unique row matching
+    each row, and the number of occurrences of each unique row.
+    """
+    n_rows, n_columns = rows.shape
+    # Unsigned arithmetic, modular, yields the exact offset of a value from the minimum of its column whatever the dtype
+    columns_value = np.empty((n_columns, n_rows), dtype=np.uint64)
+    columns_range = np.zeros(n_columns, dtype=np.uint64)
+    if n_rows:
+        for i_c in range(n_columns):
+            column_min = rows[:, i_c].min()
+            for i_r in range(n_rows):
+                columns_value[i_c, i_r] = np.uint64(rows[i_r, i_c]) - np.uint64(column_min)
+                columns_range[i_c] = max(columns_range[i_c], columns_value[i_c, i_r])
+
+    rows_order = np.arange(n_rows)
+    rows_order_next = np.empty(n_rows, dtype=np.int64)
+    # Digits of 11 bits keep the histogram of a pass small enough to stay in cache
+    digits_offset = np.empty(2049, dtype=np.int64)
+    for i_c in range(n_columns - 1, -1, -1):
+        shift = np.uint64(0)
+        while shift < np.uint64(64) and columns_range[i_c] >> shift:
+            # The digit counts are independent of the order of the rows, which spares a random access per row
+            digits_offset[:] = 0
+            for i_r in range(n_rows):
+                digits_offset[((columns_value[i_c, i_r] >> shift) & np.uint64(2047)) + 1] += 1
+            for digit in range(2048):
+                digits_offset[digit + 1] += digits_offset[digit]
+            for i in range(n_rows):
+                i_r = rows_order[i]
+                digit = (columns_value[i_c, i_r] >> shift) & np.uint64(2047)
+                rows_order_next[digits_offset[digit]] = i_r
+                digits_offset[digit] += 1
+            rows_order, rows_order_next = rows_order_next, rows_order
+            shift += np.uint64(11)
+
+    # Equal rows are compared on the rows themselves, whose values are contiguous in memory
+    is_run_start = np.empty(n_rows, dtype=np.bool_)
+    n_unique = 0
+    for i in range(n_rows):
+        i_r = rows_order[i]
+        is_run_start[i] = i == 0
+        if i > 0:
+            i_r_prev = rows_order[i - 1]
+            for i_c in range(n_columns):
+                if rows[i_r, i_c] != rows[i_r_prev, i_c]:
+                    is_run_start[i] = True
+                    break
+        n_unique += is_run_start[i]
+
+    rows_unique = np.empty((n_unique, n_columns), dtype=rows.dtype)
+    unique_index = np.empty(n_unique, dtype=np.int64)
+    unique_counts = np.zeros(n_unique, dtype=np.int64)
+    rows_inverse = np.empty(n_rows, dtype=np.int64)
+    i_u = -1
+    for i in range(n_rows):
+        i_r = rows_order[i]
+        if is_run_start[i]:
+            i_u += 1
+            unique_index[i_u] = i_r
+            for i_c in range(n_columns):
+                rows_unique[i_u, i_c] = rows[i_r, i_c]
+        unique_counts[i_u] += 1
+        rows_inverse[i_r] = i_u
+    return rows_unique, unique_index, rows_inverse, unique_counts
 
 
 def is_approx_multiple(a, b, tol=1e-7):

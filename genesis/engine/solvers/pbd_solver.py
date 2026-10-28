@@ -750,12 +750,8 @@ class PBDSolver(GravityMixin, TimeBasedMixin, Solver):
     # ------------------------------------ stepping --------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def process_input(self, in_backward=False):
-        for entity in self._entities:
-            entity.process_input(in_backward=in_backward)
-
     def process_input_grad(self):
-        pass
+        return []
 
     def substep_pre_coupling(self, f):
         if self.is_active:
@@ -1050,6 +1046,13 @@ class PBDSolver(GravityMixin, TimeBasedMixin, Solver):
         if self.is_built:
             return self._n_elems
         return sum(entity.n_elems for entity in self._entities if isinstance(entity, PBD3DEntity))
+
+    @property
+    def n_vvert_supports(self):
+        """
+        Number of particles supporting each visual vertex.
+        """
+        return self._n_vvert_supports
 
     @property
     def n_vverts(self):

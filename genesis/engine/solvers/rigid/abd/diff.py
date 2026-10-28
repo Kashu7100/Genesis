@@ -26,29 +26,33 @@ from .forward_kinematics import func_update_cartesian_space, func_forward_veloci
 def func_copy_next_to_curr(
     dyn_state: array_class.DynState, rigid_info: array_class.RigidInfo, rigid_config: qd.template(), errno: qd.Tensor
 ):
+    """Copy the integrated velocities and positions of every env to its state, unless one of them is not a number.
+
+    A NaN raises INVALID_ACC_NAN for its env, which halts the simulation, and leaves the state of that env as it was so
+    that the NaN does not propagate. Every velocity and position takes its own thread.
+    """
     n_qs = rigid_info.qpos.shape[0]
     n_dofs = dyn_state.dofs.vel.shape[0]
     _B = dyn_state.dofs.vel.shape[1]
+    n_dofs_qs = qd.max(n_dofs, n_qs)
 
-    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
-    for i_b in range(_B):
-        # Prevent nan propagation
+    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
+    for i_dq, i_b in qd.ndrange(n_dofs_qs, _B):
         is_valid = True
-        for i_d in range(n_dofs):
-            e = dyn_state.dofs.vel_next[i_d, i_b]
-            is_valid &= not qd.math.isnan(e)
-        for i_q in range(n_qs):
-            e = rigid_info.qpos_next[i_q, i_b]
-            is_valid &= not qd.math.isnan(e)
+        if i_dq < n_dofs:
+            is_valid = not qd.math.isnan(dyn_state.dofs.vel_next[i_dq, i_b])
+        if i_dq < n_qs:
+            is_valid = is_valid and not qd.math.isnan(rigid_info.qpos_next[i_dq, i_b])
+        if not is_valid:
+            qd.atomic_or(errno[i_b], array_class.ErrorCode.INVALID_ACC_NAN)
 
-        if is_valid:
-            for i_d in range(n_dofs):
-                dyn_state.dofs.vel[i_d, i_b] = dyn_state.dofs.vel_next[i_d, i_b]
-
-            for i_q in range(n_qs):
-                rigid_info.qpos[i_q, i_b] = rigid_info.qpos_next[i_q, i_b]
-        else:
-            errno[i_b] = errno[i_b] | array_class.ErrorCode.INVALID_ACC_NAN
+    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
+    for i_dq, i_b in qd.ndrange(n_dofs_qs, _B):
+        if (errno[i_b] & array_class.ErrorCode.INVALID_ACC_NAN) == 0:
+            if i_dq < n_dofs:
+                dyn_state.dofs.vel[i_dq, i_b] = dyn_state.dofs.vel_next[i_dq, i_b]
+            if i_dq < n_qs:
+                rigid_info.qpos[i_dq, i_b] = rigid_info.qpos_next[i_dq, i_b]
 
 
 @qd.func
@@ -108,6 +112,11 @@ def func_save_adjoint_cache(
     for i_q, i_b in qd.ndrange(n_qs, _B):
         rigid_adjoint_cache.qpos[f, i_q, i_b] = rigid_info.qpos[i_q, i_b]
 
+    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
+    for i_l, i_b in qd.ndrange(dyn_state.links.cfrc_coupling_ang.shape[0], _B):
+        rigid_adjoint_cache.links_cfrc_coupling_ang[f, i_l, i_b] = dyn_state.links.cfrc_coupling_ang[i_l, i_b]
+        rigid_adjoint_cache.links_cfrc_coupling_vel[f, i_l, i_b] = dyn_state.links.cfrc_coupling_vel[i_l, i_b]
+
 
 @qd.func
 def func_load_adjoint_cache(
@@ -130,6 +139,11 @@ def func_load_adjoint_cache(
     for i_q, i_b in qd.ndrange(n_qs, _B):
         rigid_info.qpos[i_q, i_b] = rigid_adjoint_cache.qpos[f, i_q, i_b]
 
+    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
+    for i_l, i_b in qd.ndrange(dyn_state.links.cfrc_coupling_ang.shape[0], _B):
+        dyn_state.links.cfrc_coupling_ang[i_l, i_b] = rigid_adjoint_cache.links_cfrc_coupling_ang[f, i_l, i_b]
+        dyn_state.links.cfrc_coupling_vel[i_l, i_b] = rigid_adjoint_cache.links_cfrc_coupling_vel[f, i_l, i_b]
+
 
 @qd.kernel(fastcache=True)
 def kernel_prepare_backward_substep(
@@ -143,6 +157,13 @@ def kernel_prepare_backward_substep(
 ):
     # Load the current state from adjoint cache
     func_load_adjoint_cache(f, dyn_state, rigid_adjoint_cache, rigid_info, rigid_config)
+
+    # The coupling wrench is cleared at the end of a substep outside the backward pass (see func_integrate), so its
+    # adjoint, which the couplers have read by now, starts from zero for this substep.
+    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
+    for i_l, i_b in qd.ndrange(dyn_state.links.cfrc_coupling_ang.shape[0], dyn_state.links.cfrc_coupling_ang.shape[1]):
+        dyn_state.links.cfrc_coupling_ang.grad[i_l, i_b] = qd.Vector.zero(gs.qd_float, 3)
+        dyn_state.links.cfrc_coupling_vel.grad[i_l, i_b] = qd.Vector.zero(gs.qd_float, 3)
 
     # If mujoco compatibility is disabled, update the cartesian space and save the results to adjoint cache. This is
     # because the cartesian space is overwritten later by other kernels if mujoco compatibility was disabled.

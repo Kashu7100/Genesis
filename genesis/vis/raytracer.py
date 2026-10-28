@@ -43,7 +43,7 @@ class EnvironmentSphere:
         self._renderer = renderer
         if self.surface is None:
             return
-        env_sphere = trimesh.load(self.file_path)
+        env_sphere = mu.load_trimesh(self.file_path)
         env_vertices = env_sphere.vertices * self.radius
         env_faces = env_sphere.faces
         env_normals = env_sphere.vertex_normals
@@ -280,9 +280,9 @@ class Raytracer:
 
                 for geom in geoms:
                     if "sdf" in rigid_entity.surface.vis_mode:
-                        mesh = geom.get_sdf_trimesh()
+                        mesh = geom.sdf_trimesh
                     else:
-                        mesh = geom.get_trimesh()
+                        mesh = geom.trimesh
                     self.add_rigid_batch(
                         name=str(geom.uid),
                         vertices=mesh.vertices,
@@ -296,7 +296,7 @@ class Raytracer:
             for kinematic_entity in self.sim.kinematic_solver.entities:
                 assert kinematic_entity.surface.vis_mode == "visual"
                 for geom in kinematic_entity.vgeoms:
-                    mesh = geom.get_trimesh()
+                    mesh = geom.trimesh
                     self.add_rigid_batch(
                         name=str(geom.uid),
                         vertices=mesh.vertices,

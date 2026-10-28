@@ -1,8 +1,9 @@
 from typing import TYPE_CHECKING
 
 import numpy as np
-import quadrants as qd
 import torch
+
+import quadrants as qd
 
 import genesis as gs
 import genesis.utils.array_class as array_class
@@ -198,6 +199,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
     def reset_grad(self):
         self.particles.grad.fill(0.0)
         self.grid.grad.fill(0.0)
+        self._queried_states.clear()
 
         for entity in self._entities:
             entity.reset_grad()
@@ -224,9 +226,6 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
                 gs.raise_exception(
                     "CPIC is not supported in differentiable mode yet. Submit a feature request if you need it."
                 )
-
-            if self._enable_CPIC and self.sim.rigid_solver.is_active and self.sim.rigid_solver.n_geoms:
-                self.sim.rigid_solver.collider._sdf.activate()
 
             self.init_particle_fields()
             self.init_grid_fields()
@@ -391,6 +390,8 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
                         )
                 self.particles[f + 1, i_p, i_b].F = F_new
                 self.particles[f + 1, i_p, i_b].Jp = Jp_new
+                # The actuation holds over every substep of the step it is set at, and until it is set again
+                self.particles[f + 1, i_p, i_b].actu = self.particles[f, i_p, i_b].actu
 
                 # B. compute stress
                 # NOTE:
@@ -547,14 +548,6 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
     # ------------------------------------ stepping --------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def process_input(self, in_backward=False):
-        for entity in self._entities:
-            entity.process_input(in_backward=in_backward)
-
-    def process_input_grad(self):
-        for entity in self._entities[::-1]:
-            entity.process_input_grad()
-
     def substep_pre_coupling(self, f):
         if self._sim.requires_grad:
             self.reset_grid_and_grad(f)
@@ -577,7 +570,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
             self.sim.coupler.rigid_solver.dyn_info.geoms,
             self.sim.coupler.rigid_solver.dyn_state.links,
             self.sim.coupler.rigid_solver.rigid_info,
-            self.sim.coupler.rigid_solver.collider._sdf._sdf_info,
+            self.sim.coupler.rigid_solver.collider.sdf.sdf_info,
             self.sim.coupler.rigid_solver.collider.collider_config,
         )
 
@@ -588,7 +581,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
             self.sim.coupler.rigid_solver.dyn_info.geoms,
             self.sim.coupler.rigid_solver.dyn_state.links,
             self.sim.coupler.rigid_solver.rigid_info,
-            self.sim.coupler.rigid_solver.collider._sdf._sdf_info,
+            self.sim.coupler.rigid_solver.collider.sdf.sdf_info,
             self.sim.coupler.rigid_solver.collider.collider_config,
         )
         self.svd_grad(f)
@@ -643,6 +636,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
             self.particles[target, i_p, i_b].F = self.particles[source, i_p, i_b].F
             self.particles[target, i_p, i_b].C = self.particles[source, i_p, i_b].C
             self.particles[target, i_p, i_b].Jp = self.particles[source, i_p, i_b].Jp
+            self.particles[target, i_p, i_b].actu = self.particles[source, i_p, i_b].actu
 
             self.particles_ng[target, i_p, i_b].active = self.particles_ng[source, i_p, i_b].active
 
@@ -654,6 +648,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
             self.particles.grad[target, i_p, i_b].F = self.particles.grad[source, i_p, i_b].F
             self.particles.grad[target, i_p, i_b].C = self.particles.grad[source, i_p, i_b].C
             self.particles.grad[target, i_p, i_b].Jp = self.particles.grad[source, i_p, i_b].Jp
+            self.particles.grad[target, i_p, i_b].actu = self.particles.grad[source, i_p, i_b].actu
             self.particles_ng[target, i_p, i_b].active = self.particles_ng[source, i_p, i_b].active
 
     @qd.kernel
@@ -699,38 +694,32 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
             self.particles.grad[i_f, i_p, i_b].U = qd.Matrix.zero(gs.qd_float, 3, 3)
             self.particles.grad[i_f, i_p, i_b].V = qd.Matrix.zero(gs.qd_float, 3, 3)
             self.particles.grad[i_f, i_p, i_b].S = qd.Matrix.zero(gs.qd_float, 3, 3)
+            self.particles.grad[i_f, i_p, i_b].actu = gs.qd_float(0.0)
 
     # ------------------------------------------------------------------------------------
     # ------------------------------------ gradient --------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def collect_output_grads(self):
-        """
-        Collect gradients from downstream queried states.
-        """
-        for entity in self._entities:
-            entity.collect_output_grads()
-
     def add_grad_from_state(self, state):
         if self.is_active:
             if state.pos.grad is not None:
-                state.pos.assert_contiguous()
+                assert state.pos.grad.is_contiguous()
                 self.add_grad_from_pos(self._sim.cur_substep_local, state.pos.grad)
 
             if state.vel.grad is not None:
-                state.vel.assert_contiguous()
+                assert state.vel.grad.is_contiguous()
                 self.add_grad_from_vel(self._sim.cur_substep_local, state.vel.grad)
 
             if state.C.grad is not None:
-                state.C.assert_contiguous()
+                assert state.C.grad.is_contiguous()
                 self.add_grad_from_C(self._sim.cur_substep_local, state.C.grad)
 
             if state.F.grad is not None:
-                state.F.assert_contiguous()
+                assert state.F.grad.is_contiguous()
                 self.add_grad_from_F(self._sim.cur_substep_local, state.F.grad)
 
             if state.Jp.grad is not None:
-                state.Jp.assert_contiguous()
+                assert state.Jp.grad.is_contiguous()
                 self.add_grad_from_Jp(self._sim.cur_substep_local, state.Jp.grad)
 
     @qd.kernel
@@ -782,6 +771,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
                     "C": torch.zeros((self._B, self._n_particles, 3, 3), dtype=gs.tc_float, device=gs.device),
                     "F": torch.zeros((self._B, self._n_particles, 3, 3), dtype=gs.tc_float, device=gs.device),
                     "Jp": torch.zeros((self._B, self._n_particles), dtype=gs.tc_float, device=gs.device),
+                    "actu": torch.zeros((self._B, self._n_particles), dtype=gs.tc_float, device=gs.device),
                     "active": torch.zeros((self._B, self._n_particles), dtype=gs.tc_bool, device=gs.device),
                 }
 
@@ -792,6 +782,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
                 self._ckpt[ckpt_name]["C"],
                 self._ckpt[ckpt_name]["F"],
                 self._ckpt[ckpt_name]["Jp"],
+                self._ckpt[ckpt_name]["actu"],
                 self._ckpt[ckpt_name]["active"],
             )
 
@@ -815,6 +806,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
                 self._ckpt[ckpt_name]["C"],
                 self._ckpt[ckpt_name]["F"],
                 self._ckpt[ckpt_name]["Jp"],
+                self._ckpt[ckpt_name]["actu"],
                 self._ckpt[ckpt_name]["active"],
             )
 
@@ -823,7 +815,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
 
     def set_state(self, f, state, envs_idx=None):
         if self.is_active:
-            self._kernel_set_state(f, state.pos, state.vel, state.C, state.F, state.Jp, state.active)
+            self._kernel_set_state(f, state.pos, state.vel, state.C, state.F, state.Jp, state.actu, state.active)
 
     @qd.kernel
     def _kernel_set_state(
@@ -834,6 +826,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
         C: qd.types.ndarray(),  # shape [B, n_particles, 3, 3]
         F: qd.types.ndarray(),  # shape [B, n_particles, 3, 3]
         Jp: qd.types.ndarray(),  # shape [B, n_particles]
+        actu: qd.types.ndarray(),  # shape [B, n_particles]
         active: qd.types.ndarray(),  # shape [B, n_particles]
     ):
         for i_p, i_b in qd.ndrange(self._n_particles, self._B):
@@ -845,8 +838,9 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
                 for k in qd.static(range(3)):
                     self.particles[f, i_p, i_b].C[j, k] = C[i_b, i_p, j, k]
                     self.particles[f, i_p, i_b].F[j, k] = F[i_b, i_p, j, k]
-            # Write Jp, active
+            # Write Jp, actu, active
             self.particles[f, i_p, i_b].Jp = Jp[i_b, i_p]
+            self.particles[f, i_p, i_b].actu = actu[i_b, i_p]
             self.particles_ng[f, i_p, i_b].active = active[i_b, i_p]
 
     def get_state(self, f):
@@ -854,7 +848,8 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
             return None
 
         state = MPMSolverState(self._scene)
-        self._kernel_get_state(f, state.pos, state.vel, state.C, state.F, state.Jp, state.active)
+        self._kernel_get_state(f, state.pos, state.vel, state.C, state.F, state.Jp, state.actu, state.active)
+        self._queried_states.append(state)
         return state
 
     @qd.kernel
@@ -866,6 +861,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
         C: qd.types.ndarray(),  # shape [B, n_particles, 3, 3]
         F: qd.types.ndarray(),  # shape [B, n_particles, 3, 3]
         Jp: qd.types.ndarray(),  # shape [B, n_particles]
+        actu: qd.types.ndarray(),  # shape [B, n_particles]
         active: qd.types.ndarray(),  # shape [B, n_particles]
     ):
         for i_p, i_b in qd.ndrange(self._n_particles, self._B):
@@ -876,6 +872,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
                     C[i_b, i_p, j, k] = self.particles[f, i_p, i_b].C[j, k]
                     F[i_b, i_p, j, k] = self.particles[f, i_p, i_b].F[j, k]
             Jp[i_b, i_p] = self.particles[f, i_p, i_b].Jp
+            actu[i_b, i_p] = self.particles[f, i_p, i_b].actu
             active[i_b, i_p] = qd.cast(self.particles_ng[f, i_p, i_b].active, gs.qd_bool)
 
     def update_render_fields(self):
@@ -1073,13 +1070,15 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
         f: qd.i32,
         particle_start: qd.i32,
         n_particles: qd.i32,
-        envs_idx: qd.types.ndarray(),
-        actus_grad: qd.types.ndarray(),  # shape [B, n_particles]
+        actus_grad: qd.types.ndarray(),  # shape [B, n_particles, n_groups]
     ):
-        for i_p_, i_g, i_b_ in qd.ndrange(n_particles, envs_idx.shape[0]):
+        for i_p_, i_b in qd.ndrange(n_particles, self._B):
             i_p = i_p_ + particle_start
-            i_b = envs_idx[i_b_]
-            actus_grad[i_b_, i_p_] = self.particles.grad[f, i_p, i_b].actu
+            # Each particle reads the column of its muscle group (see _kernel_set_particles_actu)
+            i_g = self.particles_info[i_p].muscle_group
+            actus_grad[i_b, i_p_, i_g] = self.particles.grad[f, i_p, i_b].actu
+            # The input overwrites the actuation, so the value it replaces has no effect past this substep
+            self.particles.grad[f, i_p, i_b].actu = 0.0
 
     @qd.kernel
     def _kernel_get_particles_actu(
@@ -1229,6 +1228,13 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
         if self.is_built:
             return self._n_particles
         return sum(entity.n_particles for entity in self._entities)
+
+    @property
+    def n_vvert_supports(self):
+        """
+        Number of particles supporting each visual vertex.
+        """
+        return self._n_vvert_supports
 
     @property
     def n_vverts(self):

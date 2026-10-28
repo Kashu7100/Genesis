@@ -2,18 +2,23 @@ import functools
 from pathlib import Path
 
 import numpy as np
-import quadrants as qd
 import torch
+
 import trimesh
+
+import quadrants as qd
 
 import genesis as gs
 import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
 import genesis.utils.particle as pu
-from genesis.engine.states.cache import QueriedStates
-from genesis.utils.misc import to_gs_tensor, broadcast_tensor
+from genesis.utils.misc import broadcast_tensor, to_gs_tensor
 
 from .base_entity import Entity
+
+# Number of vvert-particle distances computed at once when searching the supports of the vverts. Their difference
+# vectors take 24 MiB in double precision, while chunks of this size still amortize the per-chunk overhead of numpy.
+VVERTS_DIST2_MAX_SIZE = 2**20
 
 
 def assert_active(method):
@@ -105,7 +110,6 @@ class ParticleEntity(Entity):
 
         self.init_tgt_vars()
         self.init_ckpt()
-        self._queried_states = QueriedStates()
 
         # Note that this attribute must only be used in forward pass
         self.active = False
@@ -189,14 +193,23 @@ class ParticleEntity(Entity):
         raise NotImplementedError
 
     def _add_vverts_to_solver(self):
-        # Compute supports for rendering vverts using neighboring particles
-        dist2 = np.sum(np.square(self._vverts[:, None, :] - self._particles[None, :, :]), axis=2)
-        support_idxs = np.argpartition(dist2, self.solver._n_vvert_supports - 1, axis=1)[
-            :, : self.solver._n_vvert_supports
-        ]
-        row_indices = np.arange(dist2.shape[0])[:, None]
-        sorted_order = np.lexsort((support_idxs, dist2[row_indices, support_idxs]))
-        support_idxs = support_idxs[row_indices, sorted_order].astype(gs.np_int)
+        """Compute the supports of the vverts among their neighboring particles, for rendering.
+
+        The vverts are processed by chunks whose distances to all the particles take a bounded memory. A chunk holds one
+        vvert at least, whose distances take as much memory as the positions of the particles.
+        """
+        n_supports = self.solver.n_vvert_supports
+        chunk_size = max(VVERTS_DIST2_MAX_SIZE // len(self._particles), 1)
+        support_idxs = np.empty((len(self._vverts), n_supports), dtype=gs.np_int)
+        for i_vv_start in range(0, len(self._vverts), chunk_size):
+            vverts_chunk = self._vverts[i_vv_start : i_vv_start + chunk_size]
+            dist2 = np.sum(np.square(vverts_chunk[:, None, :] - self._particles), axis=-1)
+            chunk_support_idxs = np.argpartition(dist2, n_supports - 1, axis=1)[:, :n_supports]
+            chunk_support_dist2 = np.take_along_axis(dist2, chunk_support_idxs, axis=1)
+            sorted_order = np.lexsort((chunk_support_idxs, chunk_support_dist2))
+            support_idxs[i_vv_start : i_vv_start + chunk_size] = np.take_along_axis(
+                chunk_support_idxs, sorted_order, axis=1
+            )
         support_idxs = np.clip(support_idxs, 0, len(self._particles) - 1)
 
         all_ps = self._particles[support_idxs]
@@ -222,11 +235,11 @@ class ParticleEntity(Entity):
             i_vv = i_vv_ + self._vvert_start
             v = vverts[i_vv_]
             P_inv = P_invs[i_vv_]
-            b = P_inv @ (v - particles[support_idxs_local[i_vv_, self.solver._n_vvert_supports - 1]])
-            for j in range(self.solver._n_vvert_supports - 1):
+            b = P_inv @ (v - particles[support_idxs_local[i_vv_, self.solver.n_vvert_supports - 1]])
+            for j in range(self.solver.n_vvert_supports - 1):
                 self.solver.vverts_info.support_weights[i_vv][j] = b[j]
-            self.solver.vverts_info.support_weights[i_vv][self.solver._n_vvert_supports - 1] = 1.0 - b.sum()
-            for j in range(self.solver._n_vvert_supports):
+            self.solver.vverts_info.support_weights[i_vv][self.solver.n_vvert_supports - 1] = 1.0 - b.sum()
+            for j in range(self.solver.n_vvert_supports):
                 self.solver.vverts_info.support_idxs[i_vv][j] = support_idxs_local[i_vv_, j] + self._particle_start
 
     def sample(self):
@@ -324,7 +337,7 @@ class ParticleEntity(Entity):
             origin = pos
 
         self._particles = np.asarray(particles, dtype=gs.np_float, order="C")
-        self._init_particles_offset = gs.tensor(self._particles) - gs.tensor(origin)
+        self._init_particles_offset = torch.tensor(self._particles - origin, dtype=gs.tc_float, device=gs.device)
         self._n_particles = len(self._particles)
 
         gs.logger.info(f"Sampled ~<{self._n_particles:,}>~ particles.")
@@ -403,6 +416,11 @@ class ParticleEntity(Entity):
         ----------
         in_backward : bool, default=False
             Whether the simulation is in the backward gradient pass.
+
+        Returns
+        -------
+        inputs : tuple
+            The inputs applied at this step, of any type, for the simulator to tape.
         """
         if in_backward:
             # use negative index because buffer length might not be full
@@ -412,59 +430,65 @@ class ParticleEntity(Entity):
         else:
             for key in self._tgt_keys:
                 self._tgt_buffer[key].append(self._tgt[key])
+        inputs = tuple(self._tgt.values())
 
         if any(self._tgt[key] is not None for key in self._tgt_keys):
             particles_idx_local = self._sanitize_particles_idx_local(envs_idx=self._scene._envs_idx)
 
-        # Note that setting positions resets velocities to zero, so it must be done BEFORE setting velocities
+        # Note that setting positions resets velocities to zero, so it must be done BEFORE setting velocities.
+        # The setter kernels of every deformable entity take detached inputs: they only read the values, the gradient
+        # reaches each input through `process_input_grad`, and a gradient-tracking kernel argument makes Quadrants
+        # allocate a `.grad` buffer for it.
         if self._tgt["pos"] is not None:
-            self._tgt["pos"].assert_contiguous()
-            self._tgt["pos"].assert_sceneless()
-            self.set_particles_pos(self._tgt["pos"], particles_idx_local)
+            assert self._tgt["pos"].is_contiguous()
+            self.set_particles_pos(self._tgt["pos"].detach(), particles_idx_local)
 
         if self._tgt["vel"] is not None:
-            self._tgt["vel"].assert_contiguous()
-            self._tgt["vel"].assert_sceneless()
-            self.set_particles_vel(self._tgt["vel"], particles_idx_local)
+            assert self._tgt["vel"].is_contiguous()
+            self.set_particles_vel(self._tgt["vel"].detach(), particles_idx_local)
 
         if self._tgt["act"] is not None:
-            self._tgt["act"].assert_contiguous()
-            self._tgt["act"].assert_sceneless()
+            assert self._tgt["act"].is_contiguous()
             act_values = torch.tensor((gs.ACTIVE, gs.INACTIVE), dtype=gs.tc_int, device=gs.device)
             assert torch.isin(self._tgt["act"], act_values).all()
             self.set_particles_active(self._tgt["act"], particles_idx_local)
 
+        # Only the entities of a muscle material tape an actuation (see init_tgt_keys)
+        if "actu" in self._tgt_keys and self._tgt["actu"] is not None:
+            assert self._tgt["actu"].is_contiguous()
+            self.set_particles_actu(self._tgt["actu"].detach(), particles_idx_local)
+
         for key in self._tgt_keys:
             self._tgt[key] = None
+        return inputs
 
     def process_input_grad(self):
         """
         Process gradients of input states and propagate them backward.
 
+        Returns
+        -------
+        inputs_grad : list of tuple
+            The pairs (input, gradient) of the inputs applied at this step that track gradients.
+
         Notes
         -----
-        Automatically applies the backward hooks for position, velocity, and actuation tensors.
         Clears the gradients in the solver to avoid double accumulation.
         """
         _tgt_pos = self._tgt_buffer["pos"].pop()
-        if _tgt_pos is not None and _tgt_pos.requires_grad:
-            _tgt_pos._backward_from_qd(self._set_particles_pos_grad)
-
         _tgt_vel = self._tgt_buffer["vel"].pop()
-        if _tgt_vel is not None and _tgt_vel.requires_grad:
-            _tgt_vel._backward_from_qd(self._set_particles_vel_grad)
+
+        inputs_grad = []
+        for tgt, set_grad in ((_tgt_pos, self._set_particles_pos_grad), (_tgt_vel, self._set_particles_vel_grad)):
+            if tgt is not None and tgt.requires_grad:
+                grad = torch.zeros_like(tgt)
+                set_grad(grad)
+                inputs_grad.append((tgt, grad))
 
         # Manually zero the grad since manually setting state breaks gradient flow
         if _tgt_vel is not None or _tgt_pos is not None:
             self._reset_grad()
-
-    def collect_output_grads(self):
-        """
-        Collect gradients from external queried states.
-        """
-        if self._sim.cur_step_global in self._queried_states:
-            for state in self._queried_states[self._sim.cur_step_global]:
-                self.add_grad_from_state(state)
+        return inputs_grad
 
     # ------------------------------------------------------------------------------------
     # ---------------------------------- io & control ------------------------------------
@@ -472,7 +496,8 @@ class ParticleEntity(Entity):
 
     @assert_active
     def _set_particles_target_state(self, key, name, element_shape, dtype, tensor, envs_idx=None):
-        if self.sim.requires_grad and self.sim.cur_t > 0.0:
+        # Overwriting the position or velocity of the particles cuts the gradient of everything that led to them
+        if key in ("pos", "vel") and self.sim.requires_grad and self.sim.cur_t > 0.0:
             gs.logger.warning(
                 f"Manually setting particle '{name}'. This is not recommended because it breaks gradient flow."
             )

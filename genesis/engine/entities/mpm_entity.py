@@ -1,13 +1,14 @@
 import functools
 
-import quadrants as qd
 import torch
+
+import quadrants as qd
 
 import genesis as gs
 from genesis.engine.states.entities import MPMEntityState
 from genesis.utils.misc import to_gs_tensor
 
-from .particle_entity import assert_active, ParticleEntity
+from .particle_entity import ParticleEntity, assert_active
 
 
 def assert_muscle(method):
@@ -149,23 +150,23 @@ class MPMEntity(ParticleEntity):
             The state object containing gradients for physical quantities.
         """
         if state.pos.grad is not None:
-            state.pos.assert_contiguous()
+            assert state.pos.grad.is_contiguous()
             self._kernel_add_frame_particles_pos_grad(self._sim.cur_substep_local, state.pos.grad)
 
         if state.vel.grad is not None:
-            state.vel.assert_contiguous()
+            assert state.vel.grad.is_contiguous()
             self._kernel_add_frame_particles_vel_grad(self._sim.cur_substep_local, state.vel.grad)
 
         if state.C.grad is not None:
-            state.C.assert_contiguous()
+            assert state.C.grad.is_contiguous()
             self._kernel_add_frame_particles_C_grad(self._sim.cur_substep_local, state.C.grad)
 
         if state.F.grad is not None:
-            state.F.assert_contiguous()
+            assert state.F.grad.is_contiguous()
             self._kernel_add_frame_particles_F_grad(self._sim.cur_substep_local, state.F.grad)
 
         if state.Jp.grad is not None:
-            state.Jp.assert_contiguous()
+            assert state.Jp.grad.is_contiguous()
             self._kernel_add_frame_particles_Jp_grad(self._sim.cur_substep_local, state.Jp.grad)
 
     @qd.kernel
@@ -254,25 +255,21 @@ class MPMEntity(ParticleEntity):
             i_global = i_p + self._particle_start
             self._solver.particles.grad[f, i_global, i_b].Jp += Jp_grad[i_b, i_p]
 
-    def process_input(self, in_backward=False):
-        if isinstance(self.material, gs.materials.MPM.Muscle) and self._tgt["actu"] is not None:
-            self._tgt["actu"].assert_contiguous()
-            self._tgt["actu"].assert_sceneless()
-            particles_idx_local = self._sanitize_particles_idx_local(envs_idx=self._scene._envs_idx)
-            self.set_particles_actu(self._tgt["actu"], particles_idx_local)
-
-        super().process_input(in_backward)
-
     def process_input_grad(self):
         """
         Process gradients for buffered inputs and backpropagate using custom kernels.
+
+        Returns the pairs (input, gradient) of the inputs applied at this step that track gradients.
         """
+        inputs_grad = []
         if isinstance(self.material, gs.materials.MPM.Muscle):
             _tgt_actu = self._tgt_buffer["actu"].pop()
             if _tgt_actu is not None and _tgt_actu.requires_grad:
-                _tgt_actu._backward_from_qd(self._set_particles_actu_grad)
+                actu_grad = torch.zeros_like(_tgt_actu)
+                self._set_particles_actu_grad(actu_grad)
+                inputs_grad.append((_tgt_actu, actu_grad))
 
-        super().process_input_grad()
+        return inputs_grad + super().process_input_grad()
 
     @gs.assert_built
     def get_state(self):
@@ -477,7 +474,7 @@ class MPMEntity(ParticleEntity):
 
     def get_particles_actu(self, envs_idx=None):
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
-        actus = self._sanitize_particles_tensor(None, gs.tc_float, None, envs_idx, (self.material.n_groups,))
+        actus = self._sanitize_particles_tensor(None, gs.tc_float, None, envs_idx)
         self.solver._kernel_get_particles_actu(
             self._sim.cur_substep_local, self._particle_start, self.n_particles, envs_idx, actus
         )
@@ -516,7 +513,7 @@ class MPMEntity(ParticleEntity):
         muscle_group : torch.Tensor, shape (n_particles,)
             A tensor containing the muscle group ID of each particle.
         """
-        muscle_group = gs.zeros((self._n_particles,), dtype=gs.tc_int, requires_grad=False, scene=self._scene)
+        muscle_group = torch.zeros((self._n_particles,), dtype=gs.tc_int, device=gs.device)
         self.solver._kernel_get_particles_muscle_group(self._particle_start, self._n_particles, muscle_group)
         return muscle_group
 

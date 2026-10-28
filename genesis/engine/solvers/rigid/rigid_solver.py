@@ -15,6 +15,7 @@ from genesis.engine.materials import Rigid
 from genesis.engine.states import RigidSolverState, SolverCheckpoint
 from genesis.options.morphs import Drone, Morph, Terrain
 from genesis.options.solvers import RigidOptions
+from genesis.typing import Vec2FType, Vec3FType
 from genesis.utils.misc import (
     DeprecationError,
     assign_indexed_tensor,
@@ -78,6 +79,7 @@ from .abd.accessor import (
     kernel_wake_up_entities_by_dofs,
     kernel_wake_up_entities_by_links,
     kernel_wake_up_entities_by_qs,
+    kernel_wake_up_entities_held_by_links,
 )
 from .abd.diff import (
     func_copy_next_to_curr,
@@ -139,7 +141,6 @@ from .abd.misc import (
     kernel_wakeup_coupled_links,
 )
 from .collider import Collider
-from .collider.collider import func_detection
 from .constraint import ConstraintSolver
 from .constraint.backward import (
     kernel_accumulate_constraint_solver_grads,
@@ -310,7 +311,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
     def build(self):
         self._n_geoms = self.n_geoms
-        self._n_cells = self.n_cells
         self._n_verts = self.n_verts
         self._n_free_verts = self.n_free_verts
         self._n_fixed_verts = self.n_fixed_verts
@@ -322,7 +322,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self._equalities = self.equalities
 
         self.n_geoms_ = max(1, self.n_geoms)
-        self.n_cells_ = max(1, self.n_cells)
         self.n_verts_ = max(1, self.n_verts)
         self.n_faces_ = max(1, self.n_faces)
         self.n_edges_ = max(1, self.n_edges)
@@ -459,10 +458,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     def _resolve_broadphase_traversal(self):
         if self._options.broadphase_traversal is not None:
             return self._options.broadphase_traversal
-        # The valid pairs are shared by every environment, while a heterogeneous environment carries one variant of each
-        # entity. ALL_VS_ALL tests the pairs of every variant in every environment, those of the variants it does not
-        # carry failing on their empty axis-aligned bounding box (see func_update_geom_aabbs), whereas sweep-and-prune
-        # (SAP) only sweeps the geoms each environment carries.
+        # The valid link pairs are shared by every environment, while a heterogeneous environment carries one variant of
+        # each entity. ALL_VS_ALL tests the link pairs of every variant in every environment, those of the variants it
+        # does not carry failing on their empty axis-aligned bounding box (see func_collision_clear), whereas
+        # sweep-and-prune (SAP) sorts those empty boxes out of the sweep.
         if gs.backend == gs.cpu or self._enable_heterogeneous:
             return gs.broadphase_traversal.SAP
         return gs.broadphase_traversal.ALL_VS_ALL
@@ -662,6 +661,12 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 while island_tile_cap_first < min(min_tree_dofs, island_tile_cap_last):
                     island_tile_cap_first *= 2
                 island_tile_cap_first = min(island_tile_cap_first, island_tile_cap_last)
+                # An island holds at most every dof of the scene, so the first doubling that reaches the dof count is
+                # the last class holding islands: a larger cap would launch an empty class every iteration.
+                island_tile_cap_doubling = island_tile_cap_first
+                while island_tile_cap_doubling < min(self.n_dofs, island_tile_cap_last):
+                    island_tile_cap_doubling *= 2
+                island_tile_cap_last = min(island_tile_cap_last, island_tile_cap_doubling)
 
                 # The cooperative in-place LDL^T has no cap; the shared-memory tile is faster but capped. Same env logic
                 # as the Hessian: tile from the largest block >= 8 DOFs, drop the env guard above the cap where the
@@ -1008,6 +1013,21 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self.rigid_info.dofs_mass_block_start.from_numpy(dofs_mass_block_start)
         self.rigid_info.dofs_mass_block_end.from_numpy(dofs_mass_block_end)
 
+        dofs_mass_parent = np.full(self.n_dofs_, -1, dtype=gs.np_int)
+        for link in self.links:
+            for i_d in range(link.dof_start, link.dof_end):
+                j_d = i_d - 1
+                if i_d == link.dof_start:
+                    j_d = -1
+                    j_l = link.parent_idx
+                    while j_l != -1 and self.links[j_l].n_dofs == 0:
+                        j_l = self.links[j_l].parent_idx
+                    if j_l != -1:
+                        j_d = self.links[j_l].dof_end - 1
+                if j_d >= dofs_mass_block_start[i_d]:
+                    dofs_mass_parent[i_d] = j_d
+        self.rigid_info.dofs_mass_parent.from_numpy(dofs_mass_parent)
+
     def _dispatch_heterogeneous_vgeoms(self):
         """
         Dispatch per-environment geom/vgeom ranges and inertial properties for heterogeneous links.
@@ -1048,6 +1068,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 links_inertial_quat,
                 links_inertial_i,
                 self.dyn_info,
+                self.rigid_config,
             )
 
             # Set active_envs on geoms — indicates which environments each geom is active in
@@ -1138,12 +1159,12 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             # estimate the exact contact information.
             geoms_center = []
             for geom in geoms:
-                tmesh = geom.mesh.trimesh
-                if tmesh.is_watertight:
-                    geoms_center.append(tmesh.center_mass)
+                # A geom enclosing no volume has no center of mass, and its inertial reports no mass
+                if geom.mesh.is_watertight and geom.mesh.inertial.mass > 0.0:
+                    geoms_center.append(geom.mesh.inertial.com)
                 else:
                     # Still fallback to mean vertex position if no better option...
-                    geoms_center.append(np.mean(tmesh.vertices, axis=0))
+                    geoms_center.append(np.mean(geom.mesh.verts, axis=0))
 
             # A geom is hollow when its own center lies in a cavity rather than inside its material (bowl, mug,
             # nut), i.e. its own SDF is positive at its center. This is a static property of the collision
@@ -1157,10 +1178,13 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                     geom.type not in (gs.GEOM_TYPE.SPHERE, gs.GEOM_TYPE.PLANE, gs.GEOM_TYPE.TERRAIN)
                     and not geom.is_convex
                 ):
-                    grid_pos = geom.T_mesh_to_sdf[:3, :3] @ center + geom.T_mesh_to_sdf[:3, 3]
-                    cell = np.minimum(np.maximum(np.floor(grid_pos).astype(gs.np_int), 0), geom.sdf_res - 2)
+                    sdf_grid = geom.desc.mesh.get_sdf_grid(geom.desc.sdf)
+                    grid_pos = sdf_grid.T_mesh_to_sdf[:3, :3] @ center + sdf_grid.T_mesh_to_sdf[:3, 3]
+                    cell = np.minimum(
+                        np.maximum(np.floor(grid_pos).astype(gs.np_int), 0), np.subtract(geom.desc.sdf.n_nodes, 2)
+                    )
                     frac = grid_pos - cell
-                    corners = geom.sdf_val[cell[0] : cell[0] + 2, cell[1] : cell[1] + 2, cell[2] : cell[2] + 2]
+                    corners = sdf_grid.value[cell[0] : cell[0] + 2, cell[1] : cell[1] + 2, cell[2] : cell[2] + 2]
                     weights_x, weights_y, weights_z = ([1.0 - frac[i], frac[i]] for i in range(3))
                     sd_center = np.einsum("i,j,k,ijk->", weights_x, weights_y, weights_z, corners)
                     is_hollow = sd_center > gs.EPS
@@ -1299,13 +1323,15 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                     self.dyn_info,
                     self.rigid_info,
                     self.rigid_config,
-                    self._is_backward,
-                    self._errno,
+                    is_reversed=False,
+                    is_backward=self._is_backward,
+                    errno=self._errno,
                 )
         else:
-            # The work before the constraint solve is captured as two graphs cut ahead of the collision detection, since
-            # the compile time of a kernel grows faster than its size while one more graph replay costs next to nothing.
-            # The work after the solve is captured as one graph.
+            # The work before the constraint solve is captured as three graphs, since the compile time of a kernel grows
+            # faster than its size while one more graph replay costs next to nothing. The collision detection takes a
+            # graph of its own, the one Collider.detection launches, so that a scene compiles it once whether it steps
+            # or detects collisions alone. The work after the solve is captured as one graph.
             collider = self.collider
             constraint_solver = self.constraint_solver
             collider._contact_data_cache.clear()
@@ -1322,31 +1348,18 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 self._is_backward,
                 not self._disable_constraint,
             )
-            kernel_substep_collision(
-                self.geoms_init_AABB,
-                self.dyn_state,
-                collider.collider_state,
-                collider.mpr.mpr_state,
-                collider.gjk.gjk_state,
-                collider.gjk.gjk_state.diff_contact_input,
-                collider.mpr.contact0_mpr_state,
-                collider.gjk.contact0_gjk_state,
-                collider.mpr.multicontact_mpr_state,
-                collider.gjk.multicontact_gjk_state,
-                constraint_solver.constraint_state,
-                self.dyn_info,
-                self.rigid_info,
-                collider.collider_info,
-                self.rigid_config,
-                collider.collider_config,
-                collider.gjk.gjk_config,
-                not self._disable_constraint,
-                collider._n_possible_pairs > 0,
-                collider._use_split_narrowphase,
-                collider._use_coop_dedup,
-                self._errno,
-            )
+            if self._enable_collision:
+                collider.detection()
             if not self._disable_constraint:
+                kernel_substep_inequality(
+                    self.dyn_state,
+                    collider.collider_state,
+                    constraint_solver.constraint_state,
+                    self.dyn_info,
+                    self.rigid_info,
+                    self.rigid_config,
+                    collider.collider_config,
+                )
                 func_solve_body(
                     self.dyn_state,
                     constraint_solver.constraint_state,
@@ -1371,10 +1384,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if not isinstance(self.sim.coupler, SAPCoupler):
             self._is_forward_pos_updated = not self._enable_mujoco_compatibility
             self._is_forward_vel_updated = not self._enable_mujoco_compatibility
-            if self._requires_grad:
-                kernel_save_adjoint_cache(
-                    f + 1, self.dyn_state, self._rigid_adjoint_cache, self.rigid_info, self.rigid_config
-                )
 
     def get_error_envs_mask(self):
         return qd_to_torch(self._errno) > 0
@@ -1403,6 +1412,11 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             gs.raise_exception(
                 f"Exceeding max number of post-pruning contact points ({max_contacts}) supported by the constraint "
                 "solver. Please increase the value of RigidSolver's option 'max_contacts'."
+            )
+        if errno & array_class.ErrorCode.UNSUPPORTED_COLLISION_PAIR:
+            gs.raise_exception(
+                "Collision between a non-convex geom and a terrain is not supported. Set 'convexify=True' or filter this "
+                "pair out via 'contype'/'conaffinity'."
             )
         if errno & array_class.ErrorCode.INVALID_CONTACT_NAN:
             gs.raise_exception(
@@ -1541,7 +1555,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         )
 
     def _func_update_acc(self):
-        kernel_update_acc(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config)
+        kernel_update_acc(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=False)
 
     def _func_integrate_dq_entity(self, dq, i_e, i_b, respect_joint_limit):
         func_integrate_dq_entity(i_e, i_b, dq, self.dyn_info, self.rigid_info, self.rigid_config, respect_joint_limit)
@@ -1727,9 +1741,11 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             self.dyn_info,
             self.rigid_info,
             self.rigid_config,
+            is_reversed=True,
             is_backward=True,
             errno=self._errno,
         )
+        kernel_update_acc.grad(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=True)
 
         # Mirror the forward branch in _func_constraint_force:
         #   (A) _disable_constraint=True: the forward never calls the constraint solver; acc is the smooth-dynamics
@@ -1751,8 +1767,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             is_backward=True,
         )
 
-        # If it was the very first substep, we need to backpropagate through the initial update of the cartesian space
-        if self._enable_mujoco_compatibility or self._sim.cur_substep_global == 0:
+        # The first substep of a step starts from the cartesian space the inputs of the step refreshed from the state
+        # they set (the initial one for the very first step). Its adjoint belongs to that state, so it is folded in
+        # before the reverse pass of the inputs reads it, which leaves none to the post-integrate update.
+        if self._enable_mujoco_compatibility or self._sim.cur_substep_global % self._sim.substeps == 0:
             self._update_cartesian_grad(envs_idx)
 
         # Change back to forward mode
@@ -1772,8 +1790,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 self.dyn_info,
                 self.rigid_info,
                 self.rigid_config,
-                self._is_backward,
-                self._errno,
+                is_reversed=False,
+                is_backward=self._is_backward,
+                errno=self._errno,
             )
         elif isinstance(self.sim.coupler, IPCCoupler):
             # If any rigid entity is coupled to IPC, perform rigid simulation in post-coupling phase.
@@ -1781,17 +1800,19 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             if self.sim.coupler.has_any_rigid_coupling:
                 self.substep(f)
 
+        if self._requires_grad and not isinstance(self.sim.coupler, SAPCoupler):
+            # After the couplers, which accumulate the coupling wrench the next substep consumes
+            kernel_save_adjoint_cache(
+                f + 1, self.dyn_state, self._rigid_adjoint_cache, self.rigid_info, self.rigid_config
+            )
+
     # ------------------------------------------------------------------------------------
     # -------------------------------- state get/set -------------------------------------
     # ------------------------------------------------------------------------------------
 
     def get_state(self, f=None):
-        s_global = self.sim.cur_step_global
         if self.is_active:
-            if s_global in self._queried_states:
-                return self._queried_states[s_global][0]
-
-            state = RigidSolverState(self._scene, s_global)
+            state = RigidSolverState(self._scene, self.sim.cur_step_global)
 
             # A captured state must be self-consistent: links_pos / links_quat have to be the Cartesian pose implied by
             # the qpos captured alongside them, otherwise restoring it does not reproduce the configuration it was taken
@@ -1842,6 +1863,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             quat_dst = qd_to_torch(self.dyn_state.links.quat, transpose=True, copy=False)
             cfrc_vel_dst = qd_to_torch(self.dyn_state.links.cfrc_applied_vel, transpose=True, copy=False)
             cfrc_ang_dst = qd_to_torch(self.dyn_state.links.cfrc_applied_ang, transpose=True, copy=False)
+            cfrc_coupling_vel_dst = qd_to_torch(self.dyn_state.links.cfrc_coupling_vel, transpose=True, copy=False)
+            cfrc_coupling_ang_dst = qd_to_torch(self.dyn_state.links.cfrc_coupling_ang, transpose=True, copy=False)
             fric_dst = qd_to_torch(self.dyn_state.geoms.friction_ratio, transpose=True, copy=False)
             # Setting the state is a discontinuity: wake every body in the affected envs (a body left hibernated would
             # stay frozen), restoring the flags and the awake-dof count alongside the other state buffers.
@@ -1879,6 +1902,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 torch.where(envs_mask[:, None, None], state.links_quat, quat_dst, out=quat_dst)
                 cfrc_vel_dst.masked_fill_(envs_mask[:, None, None], 0.0)
                 cfrc_ang_dst.masked_fill_(envs_mask[:, None, None], 0.0)
+                cfrc_coupling_vel_dst.masked_fill_(envs_mask[:, None, None], 0.0)
+                cfrc_coupling_ang_dst.masked_fill_(envs_mask[:, None, None], 0.0)
                 if self.n_geoms:
                     torch.where(envs_mask[:, None], state.friction_ratio, fric_dst, out=fric_dst)
                 if self._use_hibernation:
@@ -1902,6 +1927,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 quat_dst[envs_idx] = state.links_quat[envs_idx]
                 cfrc_vel_dst[envs_idx] = 0.0
                 cfrc_ang_dst[envs_idx] = 0.0
+                cfrc_coupling_vel_dst[envs_idx] = 0.0
+                cfrc_coupling_ang_dst[envs_idx] = 0.0
                 if self.n_geoms:
                     fric_dst[envs_idx] = state.friction_ratio[envs_idx]
                 if self._use_hibernation:
@@ -1977,14 +2004,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         super().__setstate__(state)
         self._restart()
 
-    def process_input(self, in_backward=False):
-        for entity in self._entities:
-            entity.process_input(in_backward=in_backward)
-
-    def process_input_grad(self):
-        for entity in self._entities:
-            entity.process_input_grad()
-
     def save_ckpt(self, ckpt_name):
         # Save ckpt only if we need gradients, because this operation is costly
         if self._requires_grad:
@@ -1996,6 +2015,12 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             self._ckpt[ckpt_name]["qpos"] = qd_to_numpy(self._rigid_adjoint_cache.qpos, copy=True)
             self._ckpt[ckpt_name]["dofs_vel"] = qd_to_numpy(self._rigid_adjoint_cache.dofs_vel, copy=True)
             self._ckpt[ckpt_name]["dofs_acc"] = qd_to_numpy(self._rigid_adjoint_cache.dofs_acc, copy=True)
+            self._ckpt[ckpt_name]["links_cfrc_coupling_ang"] = qd_to_numpy(
+                self._rigid_adjoint_cache.links_cfrc_coupling_ang, copy=True
+            )
+            self._ckpt[ckpt_name]["links_cfrc_coupling_vel"] = qd_to_numpy(
+                self._rigid_adjoint_cache.links_cfrc_coupling_vel, copy=True
+            )
 
             for entity in self._entities:
                 entity.save_ckpt(ckpt_name)
@@ -2005,6 +2030,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self.rigid_info.qpos.from_numpy(self._ckpt[ckpt_name]["qpos"][0])
         self.dyn_state.dofs.vel.from_numpy(self._ckpt[ckpt_name]["dofs_vel"][0])
         self.dyn_state.dofs.acc.from_numpy(self._ckpt[ckpt_name]["dofs_acc"][0])
+        self.dyn_state.links.cfrc_coupling_ang.from_numpy(self._ckpt[ckpt_name]["links_cfrc_coupling_ang"][0])
+        self.dyn_state.links.cfrc_coupling_vel.from_numpy(self._ckpt[ckpt_name]["links_cfrc_coupling_vel"][0])
 
         if not self._enable_mujoco_compatibility:
             # Mirror the post-integrate refresh of kernel_step_2: the replayed substeps skip their own cartesian /
@@ -2040,6 +2067,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
     @mutates(StateChange.GEOMETRY, links="links_idx")
     def set_base_links_pos(self, pos, links_idx=None, envs_idx=None, *, relative=False, skip_forward=False):
+        if self.constraint_solver is not None:
+            self.constraint_solver.reset(envs_idx)
+
         if links_idx is None:
             links_idx = self._base_links_idx
 
@@ -2129,17 +2159,30 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                     "option 'batch_fixed_verts=True'."
                 )
 
-            # Wake up hibernated entities before setting position (fixed links don't need wake-up)
-            if self._use_hibernation and not all(self.links[i_l].is_fixed for i_l in links_idx):
-                kernel_wake_up_entities_by_links(
-                    links_idx,
-                    envs_idx,
-                    self.dyn_state,
-                    self.constraint_solver.constraint_state,
-                    self.dyn_info,
-                    self.rigid_info,
-                    self.rigid_config,
-                )
+            # Wake up the entities of the links before moving them, and for a fixed link, which never sleeps, the links
+            # resting on or constrained to it, which would stay asleep where it was otherwise
+            if self._use_hibernation:
+                if not all(self.links[i_l].is_fixed for i_l in links_idx):
+                    kernel_wake_up_entities_by_links(
+                        links_idx,
+                        envs_idx,
+                        self.dyn_state,
+                        self.constraint_solver.constraint_state,
+                        self.dyn_info,
+                        self.rigid_info,
+                        self.rigid_config,
+                    )
+                if any(self.links[i_l].is_fixed for i_l in links_idx):
+                    kernel_wake_up_entities_held_by_links(
+                        links_idx,
+                        envs_idx,
+                        self.dyn_state,
+                        self.collider.collider_state,
+                        self.constraint_solver.constraint_state,
+                        self.dyn_info,
+                        self.rigid_info,
+                        self.rigid_config,
+                    )
 
             kernel_set_links_pos(
                 links_idx, envs_idx, pos, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
@@ -2159,11 +2202,18 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             self._is_forward_pos_updated = False
             self._is_forward_vel_updated = False
 
+        # See 'set_qpos'
+        if self.collider is not None:
+            self.collider.clear(envs_idx)
+
     def set_links_quat(self, quat, links_idx=None, envs_idx=None):
         raise DeprecationError("This method has been removed. Please use 'set_base_links_quat' instead.")
 
     @mutates(StateChange.GEOMETRY, links="links_idx")
     def set_base_links_quat(self, quat, links_idx=None, envs_idx=None, *, relative=False, skip_forward=False):
+        if self.constraint_solver is not None:
+            self.constraint_solver.reset(envs_idx)
+
         if links_idx is None:
             links_idx = self._base_links_idx
 
@@ -2263,17 +2313,29 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             if has_fixed_verts and not (set_all_envs and (torch.diff(quat, dim=0).abs() < gs.EPS).all()):
                 gs.raise_exception("Impossible to set env-specific quat for fixed links with at least one geometry.")
 
-            # Wake up hibernated entities before setting quaternion (fixed links don't need wake-up)
-            if self._use_hibernation and not all(self.links[i_l].is_fixed for i_l in links_idx):
-                kernel_wake_up_entities_by_links(
-                    links_idx,
-                    envs_idx,
-                    self.dyn_state,
-                    self.constraint_solver.constraint_state,
-                    self.dyn_info,
-                    self.rigid_info,
-                    self.rigid_config,
-                )
+            # Wake up the entities of the links before rotating them (see 'set_base_links_pos')
+            if self._use_hibernation:
+                if not all(self.links[i_l].is_fixed for i_l in links_idx):
+                    kernel_wake_up_entities_by_links(
+                        links_idx,
+                        envs_idx,
+                        self.dyn_state,
+                        self.constraint_solver.constraint_state,
+                        self.dyn_info,
+                        self.rigid_info,
+                        self.rigid_config,
+                    )
+                if any(self.links[i_l].is_fixed for i_l in links_idx):
+                    kernel_wake_up_entities_held_by_links(
+                        links_idx,
+                        envs_idx,
+                        self.dyn_state,
+                        self.collider.collider_state,
+                        self.constraint_solver.constraint_state,
+                        self.dyn_info,
+                        self.rigid_info,
+                        self.rigid_config,
+                    )
 
             kernel_set_links_quat(
                 links_idx, envs_idx, quat, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
@@ -2292,6 +2354,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         else:
             self._is_forward_pos_updated = False
             self._is_forward_vel_updated = False
+
+        # See 'set_qpos'
+        if self.collider is not None:
+            self.collider.clear(envs_idx)
 
     @mutates(StateChange.INERTIA)
     def _set_links_info(self, values, links_idx, name, envs_idx=None, *, scale_inertia=False):
@@ -2477,8 +2543,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
     @mutates(StateChange.GEOMETRY, links=MutatedLinks.ARTICULATED)
     def set_qpos(self, qpos, qs_idx=None, envs_idx=None, *, skip_forward=False):
-        if self.collider is not None:
-            self.collider.reset(envs_idx)
         if self.constraint_solver is not None:
             self.constraint_solver.reset(envs_idx)
 
@@ -2547,6 +2611,11 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         else:
             self._is_forward_pos_updated = False
             self._is_forward_vel_updated = False
+
+        # The contacts and their forces were found at the previous pose, so they are cleared, the sleepers alone keeping
+        # theirs (see 'Collider.clear')
+        if self.collider is not None:
+            self.collider.clear(envs_idx)
 
     @mutates(StateChange.MODEL)
     def set_global_sol_params(self, sol_params):
@@ -2738,7 +2807,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
     @mutates(StateChange.GEOMETRY, links=MutatedLinks.ARTICULATED)
     def set_dofs_position(self, position, dofs_idx=None, envs_idx=None):
-        self.collider.reset(envs_idx)
         self.constraint_solver.reset(envs_idx)
 
         position, dofs_idx, envs_idx = self._sanitize_io_variables(
@@ -2766,6 +2834,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         )
         self._is_forward_pos_updated = True
         self._is_forward_vel_updated = True
+
+        # See 'set_qpos'
+        if self.collider is not None:
+            self.collider.clear(envs_idx)
 
     def _wake_dofs(self, dofs_idx, envs_idx):
         # Revive any hibernated entity owning these (already sanitized) dofs before a state is written to them;
@@ -3103,12 +3175,13 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             frictionloss = qd_to_torch(self.dyn_info.dofs.frictionloss, transpose=True)
 
         # Frictionloss constraint forces mapped back to DOF space. Frictionloss constraints occupy the contiguous block
-        # [n_constraints_equality, n_constraints_equality + n_constraints_frictionloss) of the constraint list and have
-        # an identity Jacobian, so `efc_force` at a frictionloss row is exactly the DOF-space frictionloss effort. The
-        # assembly loop appends them in ascending DOF order (it iterates links -> joints -> DOFs serially within each
-        # env, matching the global DOF numbering), so the k-th frictionloss row is the k-th DOF with nonzero
-        # frictionloss. Its row index is therefore `n_constraints_equality + rank`, with `rank` the running count of
-        # frictionloss-enabled DOFs (-1 for DOFs without frictionloss, which contribute zero).
+        # [n_constraints_equality, n_constraints_equality + n_constraints_frictionloss) of the constraint list, the DOF
+        # rows first (the rows of screw constraints follow them). A DOF row has an identity Jacobian, so `efc_force` at
+        # that row is exactly the DOF-space frictionloss effort. The assembly loop appends the DOF rows in ascending DOF
+        # order (it iterates links -> joints -> DOFs serially within each env, matching the global DOF numbering), so
+        # the k-th frictionloss row is the k-th DOF with nonzero frictionloss. Its row index is therefore
+        # `n_constraints_equality + rank`, with `rank` the running count of frictionloss-enabled DOFs (-1 for DOFs
+        # without frictionloss, which contribute zero).
         efc_force = qd_to_torch(self.constraint_solver.efc_force, envs_idx, transpose=True)
         n_constraints_equality = qd_to_torch(self.constraint_solver.n_constraints_equality, envs_idx)
         has_frictionloss = frictionloss > gs.EPS
@@ -3418,11 +3491,107 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
     @mutates(StateChange.MODEL)
     def add_weld_constraint(self, link1_idx, link2_idx, envs_idx=None):
-        return self.constraint_solver.add_weld_constraint(link1_idx, link2_idx, envs_idx)
+        # The only type-specific entry is the torque scale of the rotation rows.
+        self.constraint_solver.add_dynamic_constraint(
+            gs.EQUALITY_TYPE.WELD,
+            link1_idx,
+            link2_idx,
+            anchor_link_idx=link1_idx,
+            anchor_pos=np.zeros(3, dtype=gs.np_float),
+            eq_data_tail=(1.0,),
+            envs_idx=envs_idx,
+        )
 
     @mutates(StateChange.MODEL)
     def delete_weld_constraint(self, link1_idx, link2_idx, envs_idx=None):
-        return self.constraint_solver.delete_weld_constraint(link1_idx, link2_idx, envs_idx)
+        self.constraint_solver.delete_dynamic_constraint(gs.EQUALITY_TYPE.WELD, link1_idx, link2_idx, envs_idx)
+
+    @mutates(StateChange.MODEL)
+    def add_screw_constraint(
+        self,
+        link1_idx: int,
+        link2_idx: int,
+        axis: Vec3FType,
+        pitch: float,
+        pos: Vec3FType | None = None,
+        limit: Vec2FType | None = None,
+        frictionloss: float = 0.0,
+        envs_idx=None,
+    ):
+        """
+        Constrain a link to screw along an axis attached to another link, starting from their current relative pose.
+
+        The two links stop colliding with each other while the constraint holds.
+
+        Parameters
+        ----------
+        link1_idx : int
+            The global index of the link carrying the screw axis, such as a bolt.
+        link2_idx : int
+            The global index of the link screwing along the axis, such as a nut.
+        axis : array_like
+            The direction of the screw axis, in the frame of link1.
+        pitch : float
+            The travel of link2 along the axis per full turn about it [m], positive for a right-handed screw, as
+            thread pitches are given (3 mm for an M24 x 3 thread). Zero gives a revolute motion, and infinity a
+            prismatic one.
+        pos : None | array_like, optional
+            A point of the screw axis, in the frame of link1. If None, the axis passes through the origin of link2.
+            Defaults to None.
+        limit : None | array_like, optional
+            The lower and upper travel of link2 along the axis [m], counted from the current pose, such as the seat of
+            a nut. If None, the travel is unbounded. Defaults to None.
+        frictionloss : float, optional
+            The dry friction torque about the axis [N*m], or the dry friction force along it [N] for an infinite pitch.
+            Defaults to 0.0.
+        envs_idx : None | array_like, optional
+            The indices of the environments. If None, all environments will be considered. Defaults to None.
+        """
+        if self._requires_grad:
+            gs.raise_exception("Screw constraints are not supported yet when requires_grad is True.")
+        axis = np.asarray(axis, dtype=gs.np_float)
+        axis_norm = np.linalg.norm(axis)
+        anchor_pos = np.zeros(3, dtype=gs.np_float) if pos is None else np.asarray(pos, dtype=gs.np_float)
+        limit = np.array((-np.inf, np.inf) if limit is None else limit, dtype=gs.np_float)
+        if (
+            axis.shape != (3,)
+            or not gs.EPS <= axis_norm < np.inf
+            or np.isnan(pitch)
+            or anchor_pos.shape != (3,)
+            or not np.isfinite(anchor_pos).all()
+            or limit.shape != (2,)
+            or not limit[0] <= 0.0 <= limit[1]
+            or not 0.0 <= frictionloss < np.inf
+        ):
+            gs.raise_exception(
+                "Invalid screw parameters: 'axis' must be a finite non-zero 3D vector, 'pitch' a number, 'pos' a "
+                "finite 3D point, 'limit' a (lower, upper) pair enclosing the current pose and 'frictionloss' finite "
+                f"and non-negative. Got axis={axis}, pitch={pitch}, pos={pos}, limit={limit} and "
+                f"frictionloss={frictionloss}."
+            )
+
+        # The pitch enters the constraint per radian, as the direction (cos, sin) of (1, pitch / 2pi), which stays
+        # finite for a zero pitch and an infinite one (see func_screw_frame).
+        if np.isinf(pitch):
+            pitch_cos, pitch_sin = 0.0, 1.0
+        else:
+            pitch_norm = np.hypot(1.0, pitch / (2.0 * np.pi))
+            pitch_cos, pitch_sin = 1.0 / pitch_norm, pitch / (2.0 * np.pi) / pitch_norm
+
+        anchor_link_idx = link2_idx if pos is None else link1_idx
+        self.constraint_solver.add_dynamic_constraint(
+            gs.EQUALITY_TYPE.SCREW,
+            link1_idx,
+            link2_idx,
+            anchor_link_idx,
+            anchor_pos,
+            eq_data_tail=(*(axis / axis_norm), pitch_cos, pitch_sin, *limit, frictionloss),
+            envs_idx=envs_idx,
+        )
+
+    @mutates(StateChange.MODEL)
+    def delete_screw_constraint(self, link1_idx: int, link2_idx: int, envs_idx=None):
+        self.constraint_solver.delete_dynamic_constraint(gs.EQUALITY_TYPE.SCREW, link1_idx, link2_idx, envs_idx)
 
     def get_weld_constraints(self, as_tensor: bool = True, to_torch: bool = True):
         return self.constraint_solver.get_weld_constraints(as_tensor, to_torch)
@@ -3466,12 +3635,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if self.is_built:
             return self._n_geoms
         return len(self.geoms)
-
-    @property
-    def n_cells(self):
-        if self.is_built:
-            return self._n_cells
-        return sum(entity.n_cells for entity in self._entities)
 
     @property
     def n_verts(self):
@@ -3573,6 +3736,7 @@ def func_step_2(
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
+    is_reversed: qd.template(),
     is_backward: qd.template(),
     errno: qd.Tensor,
 ):
@@ -3581,12 +3745,15 @@ def func_step_2(
     # because the acceleration at the end of the step is unknown for now as it may change discontinuous between
     # before and after integration under the effect of external forces and constraints. This means that
     # acceleration data will be shifted one timestep in the past, but there isn't really any way around.
-    func_update_acc(dyn_state, dyn_info, rigid_info, rigid_config, update_cacc=True, is_backward=is_backward)
+    # The midpoint integration overwrites the acceleration the link accelerations read, which a launch that autodiff
+    # reverses cannot do, so the backward pass reverses them as a launch of their own (see substep_pre_coupling_grad).
+    if qd.static(not is_reversed):
+        func_update_acc(dyn_state, dyn_info, rigid_info, rigid_config, update_cacc=True, is_backward=is_backward)
 
     if qd.static(rigid_config.integrator != gs.integrator.approximate_implicitfast):
         func_implicit_damping(dyn_state, dyn_info, rigid_info, rigid_config)
 
-    func_integrate(dyn_state, dyn_info, rigid_info, rigid_config, is_backward)
+    func_integrate(dyn_state, dyn_info, rigid_info, rigid_config, is_reversed, is_backward)
 
     if qd.static(not is_backward):
         func_copy_next_to_curr(dyn_state, rigid_info, rigid_config, errno)
@@ -3605,11 +3772,12 @@ def kernel_step_2(
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
+    is_reversed: qd.template(),
     is_backward: qd.template(),
     errno: qd.Tensor,
 ):
     """Run the second half of a substep on its own (see func_step_2)."""
-    func_step_2(dyn_state, constraint_state, dyn_info, rigid_info, rigid_config, is_backward, errno)
+    func_step_2(dyn_state, constraint_state, dyn_info, rigid_info, rigid_config, is_reversed, is_backward, errno)
 
 
 @qd.kernel(graph=True, fastcache=True)
@@ -3644,63 +3812,19 @@ def kernel_substep_dynamics(
 
 
 @qd.kernel(graph=True, fastcache=True)
-def kernel_substep_collision(
-    geoms_init_AABB: array_class.GeomsInitAABB,
+def kernel_substep_inequality(
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
-    mpr_state: array_class.MPRState,
-    gjk_state: array_class.GJKState,
-    diff_contact_input: array_class.DiffContactInput,
-    contact0_mpr_state: array_class.MPRState,
-    contact0_gjk_state: array_class.GJKState,
-    multicontact_mpr_state: array_class.MPRState,
-    multicontact_gjk_state: array_class.GJKState,
     constraint_state: array_class.ConstraintState,
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
-    collider_info: array_class.ColliderInfo,
     rigid_config: qd.template(),
     collider_static_config: qd.template(),
-    gjk_static_config: qd.template(),
-    enable_constraint: qd.template(),
-    has_possible_pairs: qd.template(),
-    split_narrowphase: qd.template(),
-    coop_dedup: qd.template(),
-    errno: qd.Tensor,
 ):
-    """Detect the collisions of a substep, then assemble its inequality constraints, captured as one graph.
-
-    enable_constraint selects the assembly of the inequality constraints. has_possible_pairs, split_narrowphase and
-    coop_dedup configure the detection (see func_detection).
-    """
-    if qd.static(rigid_config.enable_collision):
-        func_detection(
-            geoms_init_AABB=geoms_init_AABB,
-            dyn_state=dyn_state,
-            collider_state=collider_state,
-            mpr_state=mpr_state,
-            gjk_state=gjk_state,
-            diff_contact_input=diff_contact_input,
-            contact0_mpr_state=contact0_mpr_state,
-            contact0_gjk_state=contact0_gjk_state,
-            multicontact_mpr_state=multicontact_mpr_state,
-            multicontact_gjk_state=multicontact_gjk_state,
-            constraint_state=constraint_state,
-            dyn_info=dyn_info,
-            rigid_info=rigid_info,
-            collider_info=collider_info,
-            rigid_config=rigid_config,
-            collider_static_config=collider_static_config,
-            gjk_static_config=gjk_static_config,
-            has_possible_pairs=has_possible_pairs,
-            split_narrowphase=split_narrowphase,
-            coop_dedup=coop_dedup,
-            errno=errno,
-        )
-    if qd.static(enable_constraint):
-        func_add_inequality_constraints(
-            dyn_state, collider_state, constraint_state, dyn_info, rigid_info, rigid_config, collider_static_config
-        )
+    """Assemble the inequality constraints of a substep, captured as one graph."""
+    func_add_inequality_constraints(
+        dyn_state, collider_state, constraint_state, dyn_info, rigid_info, rigid_config, collider_static_config
+    )
 
 
 @qd.kernel(graph=True, fastcache=True)
@@ -3725,4 +3849,13 @@ def kernel_substep_post(
         func_resolve_post(
             dyn_state, collider_state, constraint_state, dyn_info, rigid_info, rigid_config, noslip, errno
         )
-    func_step_2(dyn_state, constraint_state, dyn_info, rigid_info, rigid_config, is_backward, errno)
+    func_step_2(
+        dyn_state,
+        constraint_state,
+        dyn_info,
+        rigid_info,
+        rigid_config,
+        is_reversed=False,
+        is_backward=is_backward,
+        errno=errno,
+    )

@@ -1,5 +1,6 @@
 import collections.abc
 import dataclasses
+import gc
 import hashlib
 import io
 import json
@@ -267,9 +268,6 @@ class Scene(RBC):
         # emitters
         self._emitters = gs.List()
 
-        self._backward_ready = False
-        self._forward_ready = False
-
         self._uid = gs.UID()
         self._is_built = False
         self._pre_step_callbacks: list = []
@@ -301,6 +299,11 @@ class Scene(RBC):
             if getattr(self, "_sim", None) is not None:
                 self._sim.destroy()
                 self._sim = None
+
+                # Reference cycles leave the Quadrants arrays of the simulator to a later garbage collection, which
+                # aborts the process if it runs on a thread without their CUDA context, e.g. the viewer render thread.
+                # FIXME: quadrants#981 - Quadrants frees device memory without making its CUDA context current.
+                gc.collect()
 
             # The viewer plugins stopped by the visualizer still require a built scene
             self._is_built = False
@@ -889,9 +892,12 @@ class Scene(RBC):
             if self._sim.rigid_solver.is_active:
                 try:
                     self._sim.rigid_solver.check_errno()
-                except gs.GenesisException:
-                    self.destroy()
-                    raise
+                except gs.GenesisException as e:
+                    gs.logger.warning(
+                        "The initial state is invalid. Register a valid one with 'scene.reset(state)', or overwrite it "
+                        "manually following 'scene.build' and every call to 'scene.reset()', otherwise stepping will fail "
+                        f"with: {e}"
+                    )
             self._reset()
 
         # visualizer
@@ -990,22 +996,19 @@ class Scene(RBC):
             self._init_state = self._get_state()
         self._restart()
 
-    def _restart(self):
-        """Restart what surrounds the state: the gradient tape, the cache of the visualizer and the emitters."""
-        self._forward_ready = True
-        self._reset_grad()
+    def _restart(self, refresh_viewer=True):
+        """Restart what surrounds the state: the cache of the visualizer and the emitters.
 
+        'refresh_viewer' repaints the interactive viewer right away (see 'Visualizer.reset').
+        """
         # Clear the entire cache of the visualizer.
         # TODO: Could be optimized to only clear cache associated the the environments being reset.
         if self._visualizer.is_built:
-            self._visualizer.reset()
+            self._visualizer.reset(refresh_viewer)
 
         # TODO: sets _next_particle = 0; not sure this is env isolation safe
         for emitter in self._emitters:
             emitter.reset()
-
-    def _reset_grad(self):
-        self._backward_ready = True
 
     @gs.assert_built
     def backward(self, loss: torch.Tensor, *args, **kwargs):
@@ -1032,14 +1035,8 @@ class Scene(RBC):
         # it: the unroll winds them down step by step, and the restore below puts the physics back where they were.
         snapshot = self.get_state()
         steps = self._sim._steps.clone()
-        # The sim unroll (self._backward) re-enters the torch graph from each step's queried states, so the graph
-        # must survive the initial autograd pass.
-        if kwargs.setdefault("retain_graph", True) is not True:
-            gs.raise_exception("'retain_graph' must be left unset: scene.backward requires the graph to survive.")
-        # The functional torch.autograd.backward fills torch and queried-state grads while leaving the sim unroll to
-        # the explicit self._backward call below, keeping gs.Tensor.backward's automatic scene._backward out of it.
+        # The autograd nodes of the steps unroll the rollout within this backward pass (see genesis.grad.bridge).
         torch.autograd.backward(loss, *args, **kwargs)
-        self._backward()
         # keep_init semantics: see _reset. Restoring the snapshot puts the physics back where the forward pass left
         # it, so the clocks snapshotted above are put back with it rather than left at zero.
         self._reset(snapshot, keep_init=True)
@@ -1081,7 +1078,7 @@ class Scene(RBC):
         advance = not any([callback() for callback in tuple(self._pre_step_callbacks)])
 
         if advance:
-            if not self._forward_ready:
+            if not self._sim.is_forward_ready:
                 gs.raise_exception("Forward simulation not allowed after backward pass. Please reset scene state.")
             # The recorders read the state a step starts from, with the inputs the step consumes: 'Simulator.step'
             # zeroes the applied forces at its end. The pre-step callbacks ran, so their inputs are read as well.
@@ -1090,10 +1087,8 @@ class Scene(RBC):
             self._sim.step()
 
         if update_visualizer:
-            # Force the refresh when the sim did not advance (e.g. paused) so edits made off the step loop -
-            # like a GUI joint slider calling set_qpos - are still drawn and the viewer does not appear frozen.
             with step_timer.phase("rendering"):
-                self._visualizer.update(force=not advance, auto=refresh_visualizer)
+                self._visualizer.update_on_sim_step(advanced=advance, auto=refresh_visualizer)
 
         # A vetoed step never happened for the timings: the next 'start' discards the one it opened
         if not advance:
@@ -1129,10 +1124,6 @@ class Scene(RBC):
         finally:
             self._recorder_manager.stop()
 
-    def _step_grad(self):
-        self._sim.collect_output_grads()
-        self._sim._step_grad()
-
     @gs.assert_built
     def draw_debug_line(self, start, end, radius=0.002, color=(1.0, 0.0, 0.0, 0.5)):
         """
@@ -1155,7 +1146,9 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_line(start, end, radius, color)
+            return self._visualizer.context.add_debug_node(
+                self._visualizer.context.make_debug_line(start, end, radius, color)
+            )
 
     @gs.assert_built
     def draw_debug_arrow(self, pos, vec=(0, 0, 1), radius=0.01, color=(1.0, 0.0, 0.0, 0.5)):
@@ -1179,7 +1172,10 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_arrow(pos, vec, radius, color)
+            node = self._visualizer.context.make_debug_arrow(pos, vec, radius, color)
+            if node is not None:
+                self._visualizer.context.add_debug_node(node)
+            return node
 
     @gs.assert_built
     def draw_debug_frame(self, T, axis_length=1.0, origin_size=0.015, axis_radius=0.01, color=None):
@@ -1205,7 +1201,9 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_frame(T, axis_length, origin_size, axis_radius, color)
+            return self._visualizer.context.add_debug_node(
+                self._visualizer.context.make_debug_frame(T, axis_length, origin_size, axis_radius, color)
+            )
 
     @gs.assert_built
     def draw_debug_frames(self, Ts, axis_length=1.0, origin_size=0.015, axis_radius=0.01, color=None):
@@ -1231,7 +1229,9 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_frames(Ts, axis_length, origin_size, axis_radius, color)
+            return self._visualizer.context.add_debug_node(
+                self._visualizer.context.make_debug_frames(Ts, axis_length, origin_size, axis_radius, color)
+            )
 
     @gs.assert_built
     def draw_debug_mesh(self, mesh, pos=np.zeros(3), T=None):
@@ -1253,7 +1253,7 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_mesh(mesh, pos, T)
+            return self._visualizer.context.add_debug_node(self._visualizer.context.make_debug_mesh(mesh, pos, T))
 
     @gs.assert_built
     def draw_debug_sphere(self, pos, radius=0.01, color=(1.0, 0.0, 0.0, 0.5)):
@@ -1275,7 +1275,9 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_sphere(pos, radius, color)
+            return self._visualizer.context.add_debug_node(
+                self._visualizer.context.make_debug_sphere(pos, radius, color)
+            )
 
     @gs.assert_built
     def draw_debug_spheres(self, poss, radius=0.01, color=(1.0, 0.0, 0.0, 0.5)):
@@ -1297,7 +1299,9 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_spheres(poss, radius, color)
+            return self._visualizer.context.add_debug_node(
+                self._visualizer.context.make_debug_spheres(poss, radius, color)
+            )
 
     @gs.assert_built
     def draw_debug_box(
@@ -1327,8 +1331,10 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_box(
-                bounds, color, wireframe=wireframe, wireframe_radius=wireframe_radius
+            return self._visualizer.context.add_debug_node(
+                self._visualizer.context.make_debug_box(
+                    bounds, color, wireframe=wireframe, wireframe_radius=wireframe_radius
+                )
             )
 
     @gs.assert_built
@@ -1349,7 +1355,7 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_points(poss, colors)
+            return self._visualizer.context.add_debug_node(self._visualizer.context.make_debug_points(poss, colors))
 
     @gs.assert_built
     def draw_debug_frustum(self, camera, color=(1.0, 1.0, 1.0, 0.3)):
@@ -1371,7 +1377,9 @@ class Scene(RBC):
         """
         with self._visualizer.viewer_lock:
             mesh = mu.create_camera_frustum(camera, color)
-            return self._visualizer.context.draw_debug_mesh(mesh, T=camera.transform)
+            return self._visualizer.context.add_debug_node(
+                self._visualizer.context.make_debug_mesh(mesh, T=camera.transform)
+            )
 
     @gs.assert_built
     def draw_debug_trajectory(self, poss, radius=0.002, color=(1.0, 0.5, 0.0, 0.8)):
@@ -1400,7 +1408,7 @@ class Scene(RBC):
         segments = [mu.create_line(poss[i], poss[i + 1], radius, color) for i in range(len(poss) - 1)]
         merged = trimesh.util.concatenate(segments)
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_mesh(merged)
+            return self._visualizer.context.add_debug_node(self._visualizer.context.make_debug_mesh(merged))
 
     @gs.assert_built
     def draw_debug_path(self, qposs, entity, link_idx=-1, density=0.3, frame_scaling=1.0):
@@ -1445,8 +1453,10 @@ class Scene(RBC):
                 pos, quat = self.rigid_solver.forward_kinematics_query(entity, qposs[indices[i]])
                 Ts[i] = tensor_to_array(gu.trans_quat_to_T(pos[link_idx], quat[link_idx]))
 
-            return self._visualizer.context.draw_debug_frames(
-                Ts, axis_length=frame_scaling * 0.1, origin_size=0.001, axis_radius=frame_scaling * 0.005
+            return self._visualizer.context.add_debug_node(
+                self._visualizer.context.make_debug_frames(
+                    Ts, axis_length=frame_scaling * 0.1, origin_size=0.001, axis_radius=frame_scaling * 0.005
+                )
             )
 
     @gs.assert_built
@@ -1525,22 +1535,6 @@ class Scene(RBC):
         """
         with self._visualizer.viewer_lock:
             self._visualizer.context.clear_debug_objects()
-
-    def _backward(self):
-        """
-        At this point, all the scene states the simulation run should have been filled with gradients.
-        Next, we run backward from scene state back to scene's internal# Quadrants variables, then back through time.
-        """
-
-        if not self._backward_ready:
-            gs.raise_exception("Multiple backward calls not allowed.")
-
-        # backward pass through time
-        while self._sim.cur_step_global > 0:
-            self._step_grad()
-
-        self._backward_ready = False
-        self._forward_ready = False
 
     @gs.assert_built
     def get_time(self, envs_idx=None):
@@ -1823,7 +1817,7 @@ class Scene(RBC):
         the arrays written back are the ones that build allocates. A state from another layout is rejected, and a state
         from another build by the names of the arrays that differ. Everything around the state restarts as under
         'reset': the gradient tape, the sensors and the recorders forget the run that led here, and the visualizer
-        redraws.
+        redraws, the interactive viewer when a refresh is due.
 
         Parameters
         ----------
@@ -1852,7 +1846,8 @@ class Scene(RBC):
         self._recorder_manager.record(self._sim.cur_step_global)
         self._recorder_manager.reset()
         self._sim.__setstate__(state.sim)
-        self._restart()
+        # The restored state is rendered at the scheduled framerate without forcing immediate refresh, as after a step
+        self._restart(refresh_viewer=False)
 
     def _sanitize_envs_idx(
         self, envs_idx: int | range | slice | tuple[int, ...] | list[int] | torch.Tensor | np.ndarray | None

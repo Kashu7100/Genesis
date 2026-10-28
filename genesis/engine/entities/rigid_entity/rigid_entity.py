@@ -474,6 +474,7 @@ class KinematicEntity(Entity):
             self._tgt = self._tgt_buffer[index].copy()
         else:
             self._tgt_buffer.append(self._tgt.copy())
+        inputs = tuple(value for data_kwargs in self._tgt.values() for value in data_kwargs.values())
 
         update_tgt_while_set = self._update_tgt_while_set
         # Apply targets in the order of insertion
@@ -495,40 +496,38 @@ class KinematicEntity(Entity):
 
         self._tgt = dict()
         self._update_tgt_while_set = update_tgt_while_set
+        return inputs
 
     def process_input_grad(self):
+        """Return the pairs (input, gradient) of the inputs applied at this step that track gradients."""
+        inputs_grad = []
         index = self._sim.cur_step_local - self._sim._steps_local
         for key in reversed(self._tgt_buffer[index].keys()):
             data_kwargs = self._tgt_buffer[index][key]
 
+            # Inputs are stored on the tape as passed by the user, so scalars and array-likes (valid setter inputs that
+            # cannot carry a gradient) are filtered out with the tensor check below.
             match key[0]:
-                # We need to unpack the data_kwargs because [_backward_from_qd] only supports positional arguments.
-                # Inputs are stored on the tape as passed by the user, so scalars and array-likes (valid setter
-                # inputs that cannot carry a gradient) are filtered out with the tensor check.
                 case "set_pos":
-                    pos = data_kwargs.pop("pos")
-                    if isinstance(pos, torch.Tensor) and pos.requires_grad:
-                        pos._backward_from_qd(self.set_pos_grad, data_kwargs["envs_idx"], data_kwargs["relative"])
+                    tgt = data_kwargs.pop("pos")
+                    set_grad, grad_args = self.set_pos_grad, (data_kwargs["envs_idx"], data_kwargs["relative"])
 
                 case "set_quat":
-                    quat = data_kwargs.pop("quat")
-                    if isinstance(quat, torch.Tensor) and quat.requires_grad:
-                        quat._backward_from_qd(self.set_quat_grad, data_kwargs["envs_idx"], data_kwargs["relative"])
+                    tgt = data_kwargs.pop("quat")
+                    set_grad, grad_args = self.set_quat_grad, (data_kwargs["envs_idx"], data_kwargs["relative"])
 
                 case "set_dofs_velocity":
-                    velocity = data_kwargs.pop("velocity")
                     # [velocity] could be None when we want to zero the velocity (see set_dofs_velocity of RigidSolver)
-                    if isinstance(velocity, torch.Tensor) and velocity.requires_grad:
-                        velocity._backward_from_qd(
-                            self.set_dofs_velocity_grad, data_kwargs["dofs_idx_local"], data_kwargs["envs_idx"]
-                        )
+                    tgt = data_kwargs.pop("velocity")
+                    set_grad = self.set_dofs_velocity_grad
+                    grad_args = (data_kwargs["dofs_idx_local"], data_kwargs["envs_idx"])
 
                 case "control_dofs_force":
-                    force = data_kwargs.pop("force")
-                    if isinstance(force, torch.Tensor) and force.requires_grad:
-                        force._backward_from_qd(
-                            self.set_dofs_force_grad, data_kwargs["dofs_idx_local"], data_kwargs["envs_idx"]
-                        )
+                    tgt = data_kwargs.pop("force")
+                    set_grad, grad_args = (
+                        self.set_dofs_force_grad,
+                        (data_kwargs["dofs_idx_local"], data_kwargs["envs_idx"]),
+                    )
 
                 case "control_dofs_velocity" | "control_dofs_position" | "control_dofs_position_velocity":
                     # PD control targets are replayed for primal correctness but have no input-gradient path.
@@ -538,9 +537,16 @@ class KinematicEntity(Entity):
                                 "Gradients with respect to PD control targets are not supported yet. Use "
                                 "'control_dofs_force' for differentiable control inputs."
                             )
+                    tgt = None
 
                 case _:
                     gs.raise_exception(f"Invalid target key: {key[0]} not in {self._tgt_keys}")
+
+            if isinstance(tgt, torch.Tensor) and tgt.requires_grad:
+                grad = torch.zeros_like(tgt)
+                set_grad(*grad_args, grad)
+                inputs_grad.append((tgt, grad))
+        return inputs_grad
 
     def save_ckpt(self, ckpt_name):
         if ckpt_name not in self._ckpt:
@@ -556,16 +562,13 @@ class KinematicEntity(Entity):
 
     @gs.assert_built
     def get_state(self):
-        state = RigidEntityState(self, self._sim.cur_step_global)
-
         solver_state = self._solver.get_state()
-        pos = solver_state.links_pos[:, self.base_link_idx]
-        quat = solver_state.links_quat[:, self.base_link_idx]
-
-        state._pos = pos
-        state._quat = quat
-
-        return state
+        return RigidEntityState(
+            self,
+            self._sim.cur_step_global,
+            solver_state.links_pos[:, self.base_link_idx],
+            solver_state.links_quat[:, self.base_link_idx],
+        )
 
     def _get_global_idx(self, idx_local, idx_local_max, idx_global_start=0, *, unsafe=False):
         if idx_local is None:
@@ -1753,7 +1756,6 @@ class RigidEntity(KinematicEntity):
 
     def __init__(self, scene: "Scene", solver: "RigidSolver", idx: int, desc: RigidEntityDescription):
         self._geom_start = solver.n_geoms
-        self._cell_start = solver.n_cells
         self._vert_start = solver.n_verts
         self._face_start = solver.n_faces
         self._edge_start = solver.n_edges
@@ -1785,7 +1787,6 @@ class RigidEntity(KinematicEntity):
         """Reassign collision and visual geom indices for multi-link heterogeneous entities."""
         # Reassign collision geom indices sequentially
         running_idx = self._geom_start
-        running_cell = self._cell_start
         running_vert = self._vert_start
         running_face = self._face_start
         running_edge = self._edge_start
@@ -1795,7 +1796,6 @@ class RigidEntity(KinematicEntity):
         for link in self._links:
             for geom in link.geoms:
                 geom._idx = running_idx
-                geom._cell_start = running_cell
                 geom._vert_start = running_vert
                 geom._face_start = running_face
                 geom._edge_start = running_edge
@@ -1806,7 +1806,6 @@ class RigidEntity(KinematicEntity):
                     geom._verts_state_start = running_free_vs
                     running_free_vs += geom.n_verts
                 running_idx += 1
-                running_cell += geom.n_cells
                 running_vert += geom.n_verts
                 running_face += geom.n_faces
                 running_edge += geom.n_edges
@@ -1908,7 +1907,6 @@ class RigidEntity(KinematicEntity):
             joint_start=joint_start,
             n_joints=len(l_desc.joints),
             geom_start=self.n_geoms + self._geom_start,
-            cell_start=self.n_cells + self._cell_start,
             vert_start=self.n_verts + self._vert_start,
             face_start=self.n_faces + self._face_start,
             edge_start=self.n_edges + self._edge_start,
@@ -2122,19 +2120,6 @@ class RigidEntity(KinematicEntity):
     # ------------------------------------------------------------------------------------
     # ---------------------------------- control & io ------------------------------------
     # ------------------------------------------------------------------------------------
-
-    @gs.assert_built
-    def get_state(self):
-        state = RigidEntityState(self, self._sim.cur_step_global)
-
-        solver_state = self._solver.get_state()
-        pos = solver_state.links_pos[:, self.base_link_idx]
-        quat = solver_state.links_quat[:, self.base_link_idx]
-
-        state._pos = pos
-        state._quat = quat
-
-        return state
 
     # ------------------------------------------------------------------------------------
     # -------------------------------- vertices / AABB -----------------------------------
@@ -3675,11 +3660,6 @@ class RigidEntity(KinematicEntity):
         return sum(link.n_geoms for link in self._links)
 
     @property
-    def n_cells(self):
-        """The number of sdf cells in the entity."""
-        return sum(link.n_cells for link in self._links)
-
-    @property
     def n_verts(self):
         """The number of vertices (from collision geom `RigidGeom`) in the entity."""
         return sum(link.n_verts for link in self._links)
@@ -3703,16 +3683,6 @@ class RigidEntity(KinematicEntity):
     def geom_end(self):
         """The index of the entity's last RigidGeom in the scene *plus one*."""
         return self._geom_start + self.n_geoms
-
-    @property
-    def cell_start(self):
-        """The start index the entity's sdf cells in the scene."""
-        return self._cell_start
-
-    @property
-    def cell_end(self):
-        """The end index the entity's sdf cells in the scene *plus one*."""
-        return self._cell_start + self.n_cells
 
     @property
     def gravity_compensation(self):

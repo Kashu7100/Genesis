@@ -18,7 +18,7 @@ import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 
 from .forward_dynamics import func_refresh_links_invweight_and_meaninertia
-from .misc import func_apply_link_external_wrench, func_wakeup_island
+from .misc import func_apply_link_external_wrench, func_equality_links, func_wakeup_island
 
 
 class ConstraintType(IntEnum):
@@ -165,8 +165,10 @@ def kernel_set_state(
     for i_l, i_b_ in qd.ndrange(n_links, _B):
         for j in qd.static(range(3)):
             dyn_state.links.pos[i_l, envs_idx[i_b_]][j] = links_pos[envs_idx[i_b_], i_l, j]
-            dyn_state.links.cfrc_applied_vel[i_l, envs_idx[i_b_]][j] = gs.qd_float(0.0)
-            dyn_state.links.cfrc_applied_ang[i_l, envs_idx[i_b_]][j] = gs.qd_float(0.0)
+            dyn_state.links.cfrc_applied_vel[i_l, envs_idx[i_b_]][j] = 0.0
+            dyn_state.links.cfrc_applied_ang[i_l, envs_idx[i_b_]][j] = 0.0
+            dyn_state.links.cfrc_coupling_vel[i_l, envs_idx[i_b_]][j] = 0.0
+            dyn_state.links.cfrc_coupling_ang[i_l, envs_idx[i_b_]][j] = 0.0
         for j in qd.static(range(4)):
             dyn_state.links.quat[i_l, envs_idx[i_b_]][j] = links_quat[envs_idx[i_b_], i_l, j]
 
@@ -259,6 +261,50 @@ def kernel_wake_up_entities_by_links(
                 rigid_info,
                 rigid_config,
             )
+
+
+@qd.kernel(fastcache=True)
+def kernel_wake_up_entities_held_by_links(
+    links_idx: qd.types.ndarray(),
+    envs_idx: qd.types.ndarray(),
+    dyn_state: array_class.DynState,
+    collider_state: array_class.ColliderState,
+    constraint_state: array_class.ConstraintState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    rigid_config: qd.template(),
+):
+    """Wake up the hibernated islands resting on or constrained to the specified links.
+
+    A fixed link never sleeps, so moving it wakes nothing by itself, while the links it holds would stay asleep where
+    it was. They are found through the contacts a sleeper keeps (see n_contacts_hibernated in array_class.py) and the
+    equality constraints.
+    """
+    n_links = rigid_info.links_tree_idx.shape[0]
+    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
+    for i_b_ in range(envs_idx.shape[0]):
+        i_b = envs_idx[i_b_]
+        n_contacts_hibernated = collider_state.n_contacts_hibernated[i_b]
+        for i_e in range(n_contacts_hibernated + constraint_state.qd_n_equalities[i_b]):
+            i_la = -1
+            i_lb = -1
+            if i_e < n_contacts_hibernated:
+                i_c = collider_state.contact_sort_idx[i_e, i_b]
+                i_la = collider_state.contact_data.link_a[i_c, i_b]
+                i_lb = collider_state.contact_data.link_b[i_c, i_b]
+            else:
+                i_la, i_lb = func_equality_links(i_e - n_contacts_hibernated, i_b, n_links, dyn_info, rigid_config)
+            for i_l_ in range(links_idx.shape[0]):
+                i_l = links_idx[i_l_]
+                i_sleeper = -1
+                if i_la == i_l:
+                    i_sleeper = i_lb
+                elif i_lb == i_l:
+                    i_sleeper = i_la
+                if i_sleeper >= 0:
+                    if dyn_state.links.is_hibernated[i_sleeper, i_b]:
+                        i_is = constraint_state.island.links_island_idx[i_sleeper, i_b]
+                        func_wakeup_island(i_is, i_b, dyn_state, constraint_state, dyn_info, rigid_info, rigid_config)
 
 
 @qd.kernel(fastcache=True)

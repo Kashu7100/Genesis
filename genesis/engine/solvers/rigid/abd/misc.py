@@ -32,6 +32,35 @@ def linear_to_lower_tri(i_pair: qd.i32, strict: qd.template() = False):
 
 
 @qd.func
+def func_equality_links(i_eq: int, i_b: int, n_links: int, dyn_info: array_class.DynInfo, rigid_config: qd.template()):
+    """Return the pair of links coupled by equality constraint i_eq of env i_b, -1 standing for a missing link.
+
+    CONNECT, WELD and SCREW equalities reference links. JOINT equalities reference joints, each mapped to the link whose
+    dof range owns its first dof. The linear scan this takes stays cheap, since joint equalities are rare and link
+    counts are small.
+    """
+    i_l_a = dyn_info.equalities.eq_obj1id[i_eq, i_b]
+    i_l_b = dyn_info.equalities.eq_obj2id[i_eq, i_b]
+    if dyn_info.equalities.eq_type[i_eq, i_b] == gs.EQUALITY_TYPE.JOINT:
+        for i_side in qd.static(range(2)):
+            i_j = i_l_a if qd.static(i_side == 0) else i_l_b
+            i_l_joint = -1
+            if i_j >= 0:
+                I_j = [i_j, i_b] if qd.static(rigid_config.batch_joints_info) else i_j
+                i_d = dyn_info.joints.dof_start[I_j]
+                for i_l in range(n_links):
+                    I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
+                    if dyn_info.links.dof_start[I_l] <= i_d < dyn_info.links.dof_end[I_l]:
+                        i_l_joint = i_l
+                        break
+            if qd.static(i_side == 0):
+                i_l_a = i_l_joint
+            else:
+                i_l_b = i_l_joint
+    return i_l_a, i_l_b
+
+
+@qd.func
 def func_wakeup_island(
     i_island: int,
     i_b: int,
@@ -411,10 +440,12 @@ def kernel_update_heterogeneous_links_vgeom(
     links_vgeom_end: qd.types.ndarray(),
     # Quadrants variables
     dyn_info: array_class.DynInfo,
+    rigid_config: qd.template(),
 ):
     """Update per-environment links vgeom for heterogeneous entities."""
     _B = links_vgeom_start.shape[0]
 
+    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
         dyn_info.links.vgeom_start[i_l, i_b] = links_vgeom_start[i_b]
         dyn_info.links.vgeom_end[i_l, i_b] = links_vgeom_end[i_b]
@@ -433,10 +464,12 @@ def kernel_update_heterogeneous_link_info(
     links_inertial_i: qd.types.ndarray(),
     # Quadrants variables
     dyn_info: array_class.DynInfo,
+    rigid_config: qd.template(),
 ):
     """Update per-environment link info for heterogeneous entities."""
     _B = links_geom_start.shape[0]
 
+    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
         dyn_info.links.geom_start[i_l, i_b] = links_geom_start[i_b]
         dyn_info.links.geom_end[i_l, i_b] = links_geom_end[i_b]
