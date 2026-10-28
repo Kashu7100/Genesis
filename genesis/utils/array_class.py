@@ -3857,6 +3857,11 @@ class SteelInfo:
     unbounded_depenetration: qd.Tensor
     drive_unbounded_impulse: qd.Tensor
     support_gap: qd.Tensor
+    preelim_reg_rel: qd.Tensor
+    preelim_reg_floor: qd.Tensor
+    sleep_linear_threshold: qd.Tensor
+    sleep_angular_threshold: qd.Tensor
+    sleep_quiet_time: qd.Tensor
 
 
 def get_steel_info(solver):
@@ -3980,6 +3985,12 @@ def get_steel_info(solver):
         drive_unbounded_impulse=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e20),
         # A contact with static geometry supports an island while its gap [m] does not exceed this distance.
         support_gap=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-5),
+        # Diagonal regularization of the pre-eliminated bilateral block, relative to each row's diagonal, and its floor.
+        preelim_reg_rel=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0e-3),
+        preelim_reg_floor=V_SCALAR_FROM(dtype=gs.qd_float, value=max(options.cfm, 1.0e-7)),
+        sleep_linear_threshold=V_SCALAR_FROM(dtype=gs.qd_float, value=options.sleep_linear_threshold),
+        sleep_angular_threshold=V_SCALAR_FROM(dtype=gs.qd_float, value=options.sleep_angular_threshold),
+        sleep_quiet_time=V_SCALAR_FROM(dtype=gs.qd_float, value=options.sleep_quiet_time),
     )
 
 

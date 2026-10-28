@@ -97,9 +97,6 @@ PLANE_BOUNDING_RADIUS = 1.0e6
 DEFAULT_ANGULAR_DAMPING = 0.05
 # Position-correction gain of friction patches when 'friction_anchor_beta' is None with the matrix-free solve.
 DEFAULT_FRICTION_ANCHOR_BETA = 0.2
-# Diagonal regularization of the pre-eliminated bilateral block, relative to each row's diagonal, and its floor.
-PREELIM_REG_REL = 1.0e-3
-PREELIM_REG_FLOOR_MIN = 1.0e-7
 
 SOLVE_MODES = ("matrix_free", "split")
 DRIVE_MODES = ("augmented", "rows")
@@ -290,7 +287,6 @@ class SteelSolver(RigidSolver):
 
         self._steel_plan = None
         self._steel_step = 0
-        self._steel_last_dt = None
         # The Steel material inputs at build, one value per environment, which get_steel_info copies into SteelInfo.
         # The material setters write SteelInfo afterwards.
         self._steel_links_angular_damping = None
@@ -1135,7 +1131,7 @@ class SteelSolver(RigidSolver):
         )
 
         if self._steel_plan.n_arts > 0:
-            self._steel_advance(self._substep_dt)
+            self._steel_advance()
 
         self._is_forward_pos_updated = True
         self._is_forward_vel_updated = True
@@ -1200,18 +1196,15 @@ class SteelSolver(RigidSolver):
                     f"'{option}' (see SteelSolver.check_constraint_capacity)."
                 )
 
-    def _steel_advance(self, dt: float) -> None:
-        """Advance the Steel state by one step of duration dt and write it back to the Genesis state.
+    def _steel_advance(self) -> None:
+        """Advance the Steel state by one substep and write it back to the Genesis state.
 
         The contacts of the step are gathered first (see _steel_gather_contacts), then kernel_steel_step runs the step.
         With velocity iterations, it stops after the row setup and the position solve, the velocity pass and the end of
         the step follow in kernels of their own.
         """
         options = self._options
-        # The augmented mass matrix depends on dt through the implicit drive terms.
-        is_dt_changed = self._steel_last_dt is not None and abs(self._steel_last_dt - dt) > 1.0e-8
-        self._steel_last_dt = dt
-        global_refresh = self._steel_step % options.update_mass_matrix_interval == 0 or is_dt_changed
+        global_refresh = self._steel_step % options.update_mass_matrix_interval == 0
         n_friction_iterations = options.contact_friction_position_iterations
         friction_start = (
             0 if n_friction_iterations < 0 else options.iterations - min(n_friction_iterations, options.iterations)
@@ -1221,7 +1214,6 @@ class SteelSolver(RigidSolver):
         self._steel_gather_contacts()
         regularize = self._steel_contact_w < 1.0
         kernel_steel_step(
-            dt,
             options.iterations,
             friction_start,
             self.dyn_state,
@@ -1246,11 +1238,6 @@ class SteelSolver(RigidSolver):
             self.steel_model,
             self.rigid_config,
             self.steel_config,
-            PREELIM_REG_REL,
-            max(options.cfm, PREELIM_REG_FLOOR_MIN),
-            options.sleep_linear_threshold,
-            options.sleep_angular_threshold,
-            options.sleep_quiet_time,
             global_refresh,
             regularize,
             self._errno,
@@ -1275,11 +1262,11 @@ class SteelSolver(RigidSolver):
                 freeze_drive_rows=False,
             )
             kernel_steel_velocity_pass(
-                dt,
                 self.steel_rows,
                 self.steel_free_rows,
                 self.steel_prop,
                 self.steel_dyn,
+                self.rigid_info,
                 self.steel_info,
                 self.steel_model,
                 self.steel_config,
@@ -1302,7 +1289,6 @@ class SteelSolver(RigidSolver):
                 freeze_drive_rows=self._steel_velocity_drive_mode == "freeze",
             )
             kernel_steel_step_end(
-                dt,
                 self.dyn_state,
                 self.collider.collider_state,
                 self.steel_state,
@@ -1322,9 +1308,6 @@ class SteelSolver(RigidSolver):
                 self.steel_model,
                 self.rigid_config,
                 self.steel_config,
-                options.sleep_linear_threshold,
-                options.sleep_angular_threshold,
-                options.sleep_quiet_time,
             )
         if options.enable_sleeping:
             self._steel_sleep_is_history_valid = True
@@ -1632,7 +1615,6 @@ def func_steel_step_end(
 
 @qd.kernel(graph=True, fastcache=True)
 def kernel_steel_step(
-    dt: float,
     n_iterations: int,
     friction_start_iteration: int,
     dyn_state: array_class.DynState,
@@ -1657,16 +1639,11 @@ def kernel_steel_step(
     steel_model: array_class.SteelModelInfo,
     rigid_config: qd.template(),
     steel_config: qd.template(),
-    preelim_reg_rel: float,
-    preelim_reg_floor: float,
-    sleep_linear_threshold: float,
-    sleep_angular_threshold: float,
-    sleep_quiet_time: float,
     global_refresh: bool,
     regularize: bool,
     errno: qd.Tensor,
 ):
-    """Advance the Steel state by one step of duration dt from the gathered contacts and publish it, as one graph.
+    """Advance the Steel state by one substep from the gathered contacts and publish it, as one graph.
 
     Stage 1 evaluates the forward kinematics, the inverse dynamics with implicit drives and the mass matrix (refreshed
     when global_refresh), stage 2 factors it and stage 3 predicts the unconstrained velocity. Stage 4 builds the
@@ -1675,9 +1652,10 @@ def kernel_steel_step(
     the friction rows from friction_start_iteration on, starting from the unconstrained prediction plus the velocity of
     the warm-start impulses, regularize applying the contact regularization weight. Stage 7 integrates and the new
     state is published (see func_steel_step_end). With velocity iterations, the step stops before stages 5 and 6.
-    preelim_reg_rel and preelim_reg_floor regularize the bilateral pre-elimination (see func_steel_preelim) and the
-    sleep thresholds configure the sleeping islands (see func_steel_sleep_finish).
     """
+    # The constants of the step come from the info structs: a float argument makes the launch arguments uncacheable,
+    # so that every launch would rebuild the arguments of every struct.
+    dt = rigid_info.substep_dt[None]
     # Drive rows come first in the row order and must exist before the velocity scaling of stage 1. The sleeping
     # islands of the step are built from its contacts.
     func_steel_allocate_drive_rows(dyn_state, steel_rows, dyn_info, rigid_info, steel_model, steel_config)
@@ -1790,7 +1768,14 @@ def kernel_steel_step(
         )
     func_steel_responses(steel_contacts, steel_rows, steel_dyn, steel_model, steel_config)
     if qd.static(steel_config.has_preelim):
-        func_steel_preelim(preelim_reg_rel, preelim_reg_floor, steel_contacts, steel_rows, steel_model, steel_config)
+        func_steel_preelim(
+            steel_info.preelim_reg_rel[None],
+            steel_info.preelim_reg_floor[None],
+            steel_contacts,
+            steel_rows,
+            steel_model,
+            steel_config,
+        )
     func_steel_row_setup(
         dt,
         steel_state,
@@ -1996,9 +1981,9 @@ def kernel_steel_step(
             steel_model,
             rigid_config,
             steel_config,
-            sleep_linear_threshold,
-            sleep_angular_threshold,
-            sleep_quiet_time,
+            steel_info.sleep_linear_threshold[None],
+            steel_info.sleep_angular_threshold[None],
+            steel_info.sleep_quiet_time[None],
         )
 
 
@@ -2042,11 +2027,11 @@ def kernel_steel_solve(
 
 @qd.kernel(graph=True, fastcache=True)
 def kernel_steel_velocity_pass(
-    dt: float,
     steel_rows: array_class.SteelRows,
     steel_free_rows: array_class.SteelFreeRows,
     steel_prop: array_class.SteelPropagation,
     steel_dyn: array_class.SteelDynamics,
+    rigid_info: array_class.RigidInfo,
     steel_info: array_class.SteelInfo,
     steel_model: array_class.SteelModelInfo,
     steel_config: qd.template(),
@@ -2056,6 +2041,8 @@ def kernel_steel_velocity_pass(
     The right-hand sides of the rows drop their position bias (see func_steel_velocity_pass_rhs) and the link twists of
     a propagation response are recomputed from the solved velocity.
     """
+    # See kernel_steel_step for why the substep is read from RigidInfo.
+    dt = rigid_info.substep_dt[None]
     _B = steel_dyn.v_out.shape[1]
     n_dofs = steel_dyn.v_out.shape[0]
     qd.loop_config(serialize=qd.static(steel_config.para_level < gs.PARA_LEVEL.PARTIAL))
@@ -2071,7 +2058,6 @@ def kernel_steel_velocity_pass(
 
 @qd.kernel(graph=True, fastcache=True)
 def kernel_steel_step_end(
-    dt: float,
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
     steel_state: array_class.SteelState,
@@ -2091,11 +2077,10 @@ def kernel_steel_step_end(
     steel_model: array_class.SteelModelInfo,
     rigid_config: qd.template(),
     steel_config: qd.template(),
-    sleep_linear_threshold: float,
-    sleep_angular_threshold: float,
-    sleep_quiet_time: float,
 ):
     """Finish a step with velocity iterations once its velocity is refined (see func_steel_step_end), as one graph."""
+    # See kernel_steel_step for why the substep is read from RigidInfo.
+    dt = rigid_info.substep_dt[None]
     func_steel_step_end(
         dt,
         dyn_state,
@@ -2117,9 +2102,9 @@ def kernel_steel_step_end(
         steel_model,
         rigid_config,
         steel_config,
-        sleep_linear_threshold,
-        sleep_angular_threshold,
-        sleep_quiet_time,
+        steel_info.sleep_linear_threshold[None],
+        steel_info.sleep_angular_threshold[None],
+        steel_info.sleep_quiet_time[None],
     )
 
 
