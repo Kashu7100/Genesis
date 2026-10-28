@@ -112,10 +112,13 @@ def func_contact_row_points(
 
 @qd.func
 def func_contact_mu(i_c: int, i_b: int, steel_contacts: array_class.SteelContacts, steel_info: array_class.SteelInfo):
-    """Return the friction coefficient of contact i_c: the mean of the coefficients of its two geoms."""
+    """Return the friction coefficient of contact i_c: the larger of the coefficients of its two geoms.
+
+    It is the rule of the rigid solver, so a material behaves the same with both solvers.
+    """
     i_g0 = steel_contacts.shape0[i_c, i_b]
     i_g1 = steel_contacts.shape1[i_c, i_b]
-    return 0.5 * (steel_info.geoms_mu[i_g0, i_b] + steel_info.geoms_mu[i_g1, i_b])
+    return qd.max(steel_info.geoms_mu[i_g0, i_b], steel_info.geoms_mu[i_g1, i_b])
 
 
 @qd.func
@@ -705,9 +708,7 @@ def func_steel_build_rows(
                 if qd.static(steel_config.drive_mode == 1):
                     steel_rows.drive_stiffness[i_r, i_b] = ke
                     steel_rows.drive_damping[i_r, i_b] = kd
-                    steel_rows.drive_geom_error[i_r, i_b] = (
-                        q_target - rigid_info.qpos0[i_q, i_b] - steel_state.q[i_q, i_b]
-                    )
+                    steel_rows.drive_geom_error[i_r, i_b] = q_target - steel_state.q[i_q, i_b]
                     steel_rows.drive_impulse_range[i_r, i_b] = dyn_info.dofs.force_range[I_d]
                     vel_limit = steel_info.dofs_velocity_limit[i_d]
                     if vel_limit <= 0.0 or qd.math.isinf(vel_limit) or qd.math.isnan(vel_limit):

@@ -289,6 +289,22 @@ def mimic_hinges():
 
 
 @pytest.fixture(scope="session")
+def vertical_hinges():
+    mjcf = ET.Element("mujoco", model="vertical_hinges")
+    ET.SubElement(mjcf, "compiler", angle="radian")
+    worldbody = ET.SubElement(mjcf, "worldbody")
+    for name, y, joint_attrib in (
+        ("offset", 0.0, {"ref": "0.5"}),
+        ("damped", 0.5, {"damping": "30.0", "armature": "0.01"}),
+    ):
+        body = ET.SubElement(worldbody, "body", name=name, pos=f"0 {y} 1")
+        ET.SubElement(body, "inertial", pos="0 0 0", mass="1", diaginertia="1e-3 1e-3 1e-3")
+        ET.SubElement(body, "joint", name=f"{name}_joint", type="hinge", axis="0 0 1", **joint_attrib)
+        ET.SubElement(body, "geom", type="box", size="0.1 0.02 0.02", contype="0", conaffinity="0")
+    return mjcf
+
+
+@pytest.fixture(scope="session")
 def yaw_puck():
     mjcf = ET.Element("mujoco", model="yaw_puck")
     worldbody = ET.SubElement(mjcf, "worldbody")

@@ -23,10 +23,12 @@ from ..utils.assertions import assert_allclose, assert_equal
 @pytest.mark.parametrize("n_envs", [0, 2])
 def test_contact_dynamics(steel_kwargs, n_envs, show_viewer):
     # A box sliding at V0 decelerates at MU * g, a resting box is held by a contact force equal to its weight, and a
-    # sphere far above the ground falls freely under semi-implicit Euler: z_n = z_0 - g dt^2 n (n + 1) / 2.
+    # sphere far above the ground falls freely under semi-implicit Euler: z_n = z_0 - g dt^2 n (n + 1) / 2. The friction
+    # of a contact is the larger coefficient of its two geoms, so a slippery box on the ground decelerates at MU * g too.
     GRAVITY = 9.81
     DT = 0.005
     MU = 0.5
+    MU_SLIPPERY = 0.1
     V0 = 2.0
     HALF_SIZE = 0.05
     Z0 = 3.0
@@ -60,6 +62,15 @@ def test_contact_dynamics(steel_kwargs, n_envs, show_viewer):
         ),
         material=material,
     )
+    box_slippery = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, -1.0, HALF_SIZE),
+            size=(2 * HALF_SIZE, 2 * HALF_SIZE, 2 * HALF_SIZE),
+        ),
+        material=gs.materials.Rigid(
+            friction=MU_SLIPPERY,
+        ),
+    )
     box_rest = scene.add_entity(
         morph=gs.morphs.Box(
             pos=(1.0, 0.0, HALF_SIZE),
@@ -77,6 +88,7 @@ def test_contact_dynamics(steel_kwargs, n_envs, show_viewer):
     scene.build(n_envs=n_envs)
 
     box_slide.set_dofs_velocity([V0, 0.0, 0.0], dofs_idx_local=slice(0, 3))
+    box_slippery.set_dofs_velocity([V0, 0.0, 0.0], dofs_idx_local=slice(0, 3))
     support_forces = []
     for _ in range(N_STEPS):
         scene.step()
@@ -84,6 +96,7 @@ def test_contact_dynamics(steel_kwargs, n_envs, show_viewer):
 
     t = N_STEPS * DT
     assert_allclose(box_slide.get_dofs_velocity()[..., 0], V0 - MU * GRAVITY * t, atol=2e-3)
+    assert_allclose(box_slippery.get_dofs_velocity()[..., 0], V0 - MU * GRAVITY * t, atol=2e-3)
     assert_allclose(box_slide.get_dofs_velocity()[..., 1:3], 0.0, atol=2e-3)
     assert_allclose(box_rest.get_dofs_velocity(), 0.0, atol=2e-3)
     # The contact force of a resting body fluctuates around its weight from one step to the next.
@@ -248,19 +261,25 @@ def test_step_options(n_envs, show_viewer):
 
 @pytest.mark.required
 @pytest.mark.parametrize("n_envs", [0, 2])
-def test_joint_constraints(mimic_hinges, four_bar_linkage, pendulum, n_envs, show_viewer):
+def test_joint_constraints(mimic_hinges, four_bar_linkage, pendulum, vertical_hinges, n_envs, show_viewer):
     # A position drive carries joint2 of the mimic hinges toward a target beyond its limit: the limit holds it at 45
     # degrees and the mimic equality keeps joint1 equal to it. A velocity limit bounds the speed of a pendulum falling
     # from upright. The loop closure of the four-bar linkage keeps the rocker tip on its anchor of the base, (0.2, 0, 0)
     # in the base frame, while the crank spins. At rest, the inbound joint of every link of the linkage carries the
-    # weight of the subtree of the link, whose moment about the center of mass of the link it balances.
+    # weight of the subtree of the link, whose moment about the center of mass of the link it balances. A position
+    # drive reaches its target, relative to the reference position of its hinge like every DOF position. The joint
+    # damping is implicit: a stiffly damped hinge spinning freely keeps its sign and loses the factor
+    # I / (I + damping * DT) of its speed per step, I being its inertia about the axis plus its armature.
     GRAVITY = 9.81
+    DT = 0.005
     LIMIT = np.deg2rad(45.0)
     VELOCITY_LIMIT = 1.0
+    TARGET = 0.2
+    SPIN = 1.0
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
-            dt=0.005,
+            dt=DT,
             gravity=(0.0, 0.0, -GRAVITY),
         ),
         rigid_options=gs.options.SteelOptions(
@@ -291,8 +310,18 @@ def test_joint_constraints(mimic_hinges, four_bar_linkage, pendulum, n_envs, sho
             fixed=True,
         ),
     )
+    hinges = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=ET.tostring(vertical_hinges, encoding="unicode"),
+            pos=(0.0, -2.0, 0.0),
+        ),
+    )
     scene.build(n_envs=n_envs)
 
+    i_l_damped = hinges.get_link("damped").idx_local
+    inertia = hinges.get_links_inertia()[..., i_l_damped, 2, 2] + hinges.get_dofs_armature()[..., 1]
+    spin_ratio = inertia / (inertia + hinges.get_dofs_damping()[..., 1] * DT)
+    hinges.set_dofs_velocity([SPIN], dofs_idx_local=[1])
     links_pos = linkage.get_links_pos()
     links_com = links_pos + gu.transform_by_quat(linkage.get_links_COM().expand_as(links_pos), linkage.get_links_quat())
     links_weight = linkage.get_links_mass() * GRAVITY
@@ -306,7 +335,11 @@ def test_joint_constraints(mimic_hinges, four_bar_linkage, pendulum, n_envs, sho
         assert_allclose(links_parent_wrench[..., i_l, 2], subtree_weight.sum(), tol=1e-4)
         assert_allclose(links_parent_wrench[..., i_l, 3:5], torque.sum(dim=-2), tol=1e-4)
         assert_allclose(links_parent_wrench[..., i_l, 5], 0.0, tol=1e-4)
+    assert_allclose(hinges.get_dofs_velocity()[..., 1], SPIN * spin_ratio, rtol=1e-4)
 
+    hinges.set_dofs_kp([200.0, 0.0])
+    hinges.set_dofs_kv([5.0, 0.0])
+    hinges.control_dofs_position([TARGET], dofs_idx_local=[0])
     mimic.set_dofs_kp([0.0, 200.0])
     mimic.set_dofs_kv([0.0, 20.0])
     scene.sim.rigid_solver.set_dofs_velocity_limit(
@@ -327,6 +360,7 @@ def test_joint_constraints(mimic_hinges, four_bar_linkage, pendulum, n_envs, sho
         torch.tensor([0.0, 0.0, 0.2], dtype=gs.tc_float, device=gs.device), rocker.get_quat()
     )
     assert_allclose(rocker_tip, (2.2, 0.0, 1.0), atol=2e-3)
+    assert_allclose(hinges.get_dofs_position()[..., 0], TARGET, tol=1e-4)
 
 
 @pytest.mark.required

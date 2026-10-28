@@ -493,9 +493,10 @@ def func_steel_tau(
 
     The backward pass of the inverse dynamics yields tau = applied + passive - bias, the right-hand side of
     H qdd = tau. With augmented drives, each driven DOF adds the explicit force u0 = -(ke (q - q* + dt qd) + kd (qd -
-    v*)), clamped to the force range, and records K = ke dt^2 + kd dt, which joins the mass matrix diagonal: this is the
-    backward-Euler drive f = u0 - K qdd. The subtree wrench transmitted through the inbound joint of every link is
-    published as the parent force observable, about the link center of mass.
+    v*)), clamped to the force range. Every DOF of a joint other than a free joint records K = ke dt^2 + (kd + damping)
+    dt, which joins the mass matrix diagonal: this is the backward-Euler drive and joint damping f = u0 - damping qd -
+    K qdd. The subtree wrench transmitted through the inbound joint of every link is published as the parent force
+    observable, about the link center of mass.
     """
     n_arts = steel_model.arts_dof_start.shape[0]
     _B = steel_state.q.shape[1]
@@ -536,35 +537,45 @@ def func_steel_tau(
                 steel_state.links_parent_f_ang[i_l, i_b] = f_ang - com_rel.cross(f_lin)
 
             n_aug = 0
-            if qd.static(steel_config.drive_mode == 0):
-                for i_j in range(i_j_start, i_j_end):
-                    joint_type = steel_model.joints_type[i_j]
-                    if (
-                        joint_type == STEEL_JOINT_TYPE.PRISMATIC
-                        or joint_type == STEEL_JOINT_TYPE.REVOLUTE
-                        or joint_type == STEEL_JOINT_TYPE.D6
-                    ):
-                        i_q_start = steel_model.joints_q_start[i_j]
-                        i_d_start = steel_model.joints_dof_start[i_j]
-                        for k in range(steel_model.joints_n_lin[i_j] + steel_model.joints_n_ang[i_j]):
-                            i_d = i_d_start + k
+            for i_j in range(i_j_start, i_j_end):
+                joint_type = steel_model.joints_type[i_j]
+                if joint_type != STEEL_JOINT_TYPE.FREE:
+                    is_driven = False
+                    if qd.static(steel_config.drive_mode == 0):
+                        is_driven = (
+                            joint_type == STEEL_JOINT_TYPE.PRISMATIC
+                            or joint_type == STEEL_JOINT_TYPE.REVOLUTE
+                            or joint_type == STEEL_JOINT_TYPE.D6
+                        )
+                    i_q_start = steel_model.joints_q_start[i_j]
+                    i_d_start = steel_model.joints_dof_start[i_j]
+                    for k in range(steel_model.joints_n_lin[i_j] + steel_model.joints_n_ang[i_j]):
+                        i_d = i_d_start + k
+                        I_d = [i_d, i_b] if qd.static(steel_config.batch_dofs_info) else i_d
+                        ke = gs.qd_float(0.0)
+                        kd = gs.qd_float(0.0)
+                        q_target = gs.qd_float(0.0)
+                        v_target = gs.qd_float(0.0)
+                        if is_driven:
                             ke, kd, q_target, v_target = func_drive_params(
                                 i_d, i_b, dyn_state, dyn_info, rigid_info, steel_config
                             )
-                            K = ke * dt * dt + kd * dt
-                            if (ke > 0.0 or kd > 0.0) and K > 0.0 and n_aug < max_art_dofs:
-                                I_d = [i_d, i_b] if qd.static(steel_config.batch_dofs_info) else i_d
+                        # The joint damping, applied explicitly with the passive forces above, joins the implicit term
+                        # so that a stiff damping decays instead of overshooting: (H + damping dt) qdd = tau.
+                        K = ke * dt * dt + (kd + dyn_info.dofs.damping[I_d]) * dt
+                        if K > 0.0 and n_aug < max_art_dofs:
+                            if ke > 0.0 or kd > 0.0:
+                                # The Steel coordinates and the Genesis position targets are both relative to qpos0.
                                 q = steel_state.q[i_q_start + k, i_b]
                                 qd_ = steel_state.qd[i_d, i_b]
-                                q_target = q_target - rigid_info.qpos0[i_q_start + k, i_b]
                                 u0 = -(ke * (q - q_target + dt * qd_) + kd * (qd_ - v_target))
                                 force_range = dyn_info.dofs.force_range[I_d]
                                 u0 = qd.math.clamp(u0, force_range[0], force_range[1])
-                                i_r = i_a * max_art_dofs + n_aug
-                                steel_dyn.aug_dof[i_r, i_b] = i_d
-                                steel_dyn.aug_K[i_r, i_b] = K
                                 steel_dyn.dofs_tau[i_d, i_b] = steel_dyn.dofs_tau[i_d, i_b] + u0
-                                n_aug = n_aug + 1
+                            i_r = i_a * max_art_dofs + n_aug
+                            steel_dyn.aug_dof[i_r, i_b] = i_d
+                            steel_dyn.aug_K[i_r, i_b] = K
+                            n_aug = n_aug + 1
             steel_dyn.arts_aug_count[i_a, i_b] = n_aug
 
 
@@ -580,8 +591,8 @@ def func_steel_mass_matrix(
 
     The composite rigid body algorithm gives H[i, j] = S_i . (I_c S_j) for the DOFs i of the ancestors of the joint of
     DOF j, I_c being the composite inertia of the subtree of that joint, and 0 between unrelated DOFs. The implicit
-    drive terms K join the diagonal and the factorization adds the armature: L L^T = H + diag(K) + diag(armature).
-    Articulations whose refresh is not due keep their previous factor.
+    drive and damping terms K join the diagonal and the factorization adds the armature: L L^T = H + diag(K) +
+    diag(armature). Articulations whose refresh is not due keep their previous factor.
     """
     n_arts = steel_model.arts_dof_start.shape[0]
     _B = steel_state.q.shape[1]
