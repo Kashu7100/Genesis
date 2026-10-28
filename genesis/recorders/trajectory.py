@@ -30,7 +30,7 @@ import zstandard
 import quadrants as qd
 
 import genesis as gs
-from genesis.engine.solvers.base_solver import StateChange, Subscriber
+from genesis.engine.solvers.base_solver import MODEL_CHANGES, Subscriber
 from genesis.engine.states.solvers import SimulatorCheckpoint, SolverCheckpoint
 from genesis.options.recorders import TrajectoryFile
 from genesis.utils import serialization
@@ -540,7 +540,7 @@ class TrajectoryFileWriter(BaseFileWriter):
         self._info_scalars = [item for item in info_items if isinstance(item, ScalarItem)]
         self._info_size = sum(field.nbytes for field in self._info_fields)
         self._has_info = self._info_size > 0
-        self._info_subscriber = Subscriber(frozenset((StateChange.MODEL,)))
+        self._info_subscriber = Subscriber(MODEL_CHANGES)
         for solver in sim.active_solvers:
             solver.subscribe(self._info_subscriber)
         self._i_frame = 0

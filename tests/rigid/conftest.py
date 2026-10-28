@@ -311,6 +311,55 @@ def mimic_hinges():
 
 
 @pytest.fixture(scope="session")
+def vertical_hinges():
+    mjcf = ET.Element("mujoco", model="vertical_hinges")
+    ET.SubElement(mjcf, "compiler", angle="radian")
+    worldbody = ET.SubElement(mjcf, "worldbody")
+    for name, y, joint_attrib in (
+        ("offset", 0.0, {"ref": "0.5"}),
+        ("damped", 0.5, {"damping": "30.0", "armature": "0.01"}),
+    ):
+        body = ET.SubElement(worldbody, "body", name=name, pos=f"0 {y} 1")
+        ET.SubElement(body, "inertial", pos="0 0 0", mass="1", diaginertia="1e-3 1e-3 1e-3")
+        ET.SubElement(body, "joint", name=f"{name}_joint", type="hinge", axis="0 0 1", **joint_attrib)
+        ET.SubElement(body, "geom", type="box", size="0.1 0.02 0.02", contype="0", conaffinity="0")
+    return mjcf
+
+
+@pytest.fixture(scope="session")
+def yaw_puck():
+    mjcf = ET.Element("mujoco", model="yaw_puck")
+    worldbody = ET.SubElement(mjcf, "worldbody")
+    puck = ET.SubElement(worldbody, "body", name="puck", pos="0 0 0.02")
+    ET.SubElement(puck, "inertial", pos="0 0 0", mass="0.3", diaginertia="3e-4 3e-4 3e-4")
+    for name, axis in (("x", "1 0 0"), ("y", "0 1 0"), ("z", "0 0 1")):
+        ET.SubElement(puck, "joint", name=name, type="slide", axis=axis)
+    ET.SubElement(puck, "joint", name="yaw", type="hinge", axis="0 0 1")
+    ET.SubElement(puck, "geom", type="box", size="0.005 0.005 0.02")
+    return mjcf
+
+
+@pytest.fixture(scope="session")
+def four_bar_linkage():
+    mjcf = ET.Element("mujoco", model="four_bar_linkage")
+    worldbody = ET.SubElement(mjcf, "worldbody")
+    base = ET.SubElement(worldbody, "body", name="base", pos="0 0 1")
+    ET.SubElement(base, "geom", type="box", size="0.25 0.05 0.02", mass="2")
+    crank = ET.SubElement(base, "body", name="crank", pos="-0.2 0 0")
+    ET.SubElement(crank, "joint", name="crank_joint", type="hinge", axis="0 1 0")
+    ET.SubElement(crank, "geom", type="capsule", fromto="0 0 0 0 0 -0.2", size="0.02", mass="0.3")
+    coupler = ET.SubElement(crank, "body", name="coupler", pos="0 0 -0.2")
+    ET.SubElement(coupler, "joint", name="coupler_joint", type="hinge", axis="0 1 0")
+    ET.SubElement(coupler, "geom", type="capsule", fromto="0 0 0 0.4 0 0", size="0.02", mass="0.5")
+    rocker = ET.SubElement(coupler, "body", name="rocker", pos="0.4 0 0")
+    ET.SubElement(rocker, "joint", name="rocker_joint", type="hinge", axis="0 1 0")
+    ET.SubElement(rocker, "geom", type="capsule", fromto="0 0 0 0 0 0.2", size="0.02", mass="0.3")
+    equality = ET.SubElement(mjcf, "equality")
+    ET.SubElement(equality, "connect", body1="rocker", body2="base", anchor="0 0 0.2")
+    return mjcf
+
+
+@pytest.fixture(scope="session")
 def connected_boxes():
     # The hung box starts lifted away from the fixed box by a rotation about its pivot, the top edge of the 5 mm gap
     # between their facing sides

@@ -6,7 +6,7 @@ import torch
 import genesis as gs
 from genesis.grad.bridge import ReadNode, StepNode
 from genesis.options.morphs import Morph
-from genesis.options.solvers import IPCCouplerOptions, LegacyCouplerOptions, SAPCouplerOptions
+from genesis.options.solvers import IPCCouplerOptions, LegacyCouplerOptions, SAPCouplerOptions, SteelOptions
 from genesis.repr_base import RBC
 from genesis.utils.array_class import DataItem, DataKind, iter_data
 from genesis.utils.misc import indices_to_mask
@@ -23,6 +23,7 @@ from .solvers import (
     RigidSolver,
     SFSolver,
     SPHSolver,
+    SteelSolver,
     ToolSolver,
 )
 from .solvers.base_solver import GravityMixin, TimeBasedMixin
@@ -81,7 +82,10 @@ class Simulator(RBC):
 
         # solvers
         self.tool_solver = ToolSolver(self.scene, self, options.tool)
-        self.rigid_solver = RigidSolver(self.scene, self, options.rigid)
+        if isinstance(options.rigid, SteelOptions):
+            self.rigid_solver = SteelSolver(self.scene, self, options.rigid)
+        else:
+            self.rigid_solver = RigidSolver(self.scene, self, options.rigid)
         self.kinematic_solver = KinematicSolver(self.scene, self, options.kinematic)
         self.mpm_solver = MPMSolver(self.scene, self, options.mpm)
         self.sph_solver = SPHSolver(self.scene, self, options.sph)
