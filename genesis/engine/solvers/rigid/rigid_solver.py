@@ -1380,6 +1380,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         return qd_to_torch(self._errno) > 0
 
     def check_errno(self):
+        """Raise on the error bits set by any environment, and return the bits of every environment combined."""
         if gs.use_zerocopy:
             errno = np.bitwise_or.reduce(qd_to_numpy(self._errno))
         else:
@@ -1433,6 +1434,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 "A Steel compliant contact has a compliance or a bias beyond the float32 range, or no response. Please "
                 "increase the 'contact_stiffness' of the rigid materials or the simulation timestep."
             )
+        return errno
 
     def _kernel_detect_collision(self):
         self.collider.clear()

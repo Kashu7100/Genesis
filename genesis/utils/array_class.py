@@ -307,6 +307,9 @@ class ErrorCode(IntEnum):
     STEEL_TORSION_ROWS_OVERFLOW = 0b00000000000000000000000100000000
     STEEL_TORSION_PATCH_RING = 0b00000000000000000000001000000000
     STEEL_COMPLIANCE_INVALID = 0b00000000000000000000010000000000
+    # Non-fatal: Steel dropped rows for lack of capacity. SteelSolver.check_errno warns, and the environment counts as
+    # erroneous in 'get_error_envs_mask' until its reset, its output being untrustworthy.
+    STEEL_ROWS_OVERFLOW = 0b00000000000000000000100000000000
 
 
 # =========================================== RigidInfo ===========================================

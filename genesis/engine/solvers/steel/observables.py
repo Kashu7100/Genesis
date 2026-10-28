@@ -119,6 +119,11 @@ def func_steel_update_status(
         | array_class.ErrorCode.OVERFLOW_CANDIDATE_CONTACTS
         | array_class.ErrorCode.OVERFLOW_CONTACTS
     )
+    rows_overflow = (
+        array_class.SteelOverflow.DENSE_ROWS
+        | array_class.SteelOverflow.FREE_ROWS
+        | array_class.SteelOverflow.PROPAGATION_ROWS
+    )
     qd.loop_config(serialize=qd.static(steel_config.para_level < gs.PARA_LEVEL.ALL))
     for i_b in range(_B):
         overflow = steel_status.envs_overflow[i_b]
@@ -136,6 +141,9 @@ def func_steel_update_status(
         if (errno[i_b] & contact_overflow_errno) != 0:
             overflow = overflow | array_class.SteelOverflow.CONTACTS_INCOMPLETE
         steel_status.envs_overflow[i_b] = overflow
+        # The error code carries the dropped rows too, so that the warning rides the transfer of the error check.
+        if (overflow & rows_overflow) != 0:
+            errno[i_b] = errno[i_b] | array_class.ErrorCode.STEEL_ROWS_OVERFLOW
 
         if qd.static(steel_config.has_row_watermark):
             stride = array_class.SteelRowWatermark.FAMILY_STRIDE

@@ -1179,10 +1179,11 @@ class SteelSolver(RigidSolver):
             )
 
     def check_errno(self):
-        super().check_errno()
-        if not self._steel_warn_constraint_overflow:
-            return
-        # The warnings ride the host synchronization of the error check instead of adding one per step.
+        errno = super().check_errno()
+        # The capacity status is read only once an environment dropped rows (see func_steel_update_status), so a run
+        # within capacity adds no transfer to the error check.
+        if not self._steel_warn_constraint_overflow or not errno & array_class.ErrorCode.STEEL_ROWS_OVERFLOW:
+            return errno
         overflow = int(np.bitwise_or.reduce(qd_to_numpy(self.steel_status.envs_overflow)))
         for bit, option in (
             (array_class.SteelOverflow.DENSE_ROWS, "articulation_constraint_max"),
@@ -1195,6 +1196,7 @@ class SteelSolver(RigidSolver):
                     f"Steel dropped constraint rows for lack of capacity, whose constraints are not enforced. Increase "
                     f"'{option}' (see SteelSolver.check_constraint_capacity)."
                 )
+        return errno
 
     def _steel_advance(self) -> None:
         """Advance the Steel state by one substep and write it back to the Genesis state.
