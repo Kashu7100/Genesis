@@ -250,6 +250,7 @@ class Collider:
             n_contacts_per_convex_pair=n_contacts_per_convex_pair,
             n_contacts_per_nonconvex_pair=n_contacts_per_nonconvex_pair,
             ccd_algorithm=ccd_algorithm,
+            has_contact_gap=self._solver.contact_gap > 0.0,
         )
 
     def _init_collision_fields(self) -> None:
@@ -284,6 +285,7 @@ class Collider:
             diff_normal_tolerance=self._diff_normal_tolerance,
             contact_pruning_tolerance=self._solver._options.contact_pruning_tolerance or 0.0,
             prune_deep_penetration_ratio=self._prune_deep_penetration_ratio,
+            contact_gap=self._solver.contact_gap,
         )
         self._init_collision_pair_idx(self._collision_pair_idx)
         self.collider_info.link_pair_idx.from_numpy(link_pair_idx)
