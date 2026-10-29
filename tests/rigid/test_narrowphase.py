@@ -1417,22 +1417,22 @@ def test_contact_gap_reports_separated_pairs(detection, n_envs, monkeypatch, sho
     scene.build(n_envs=n_envs)
     scene.step()
 
-    # Minkowski portal refinement (MPR), which measures the separation of the mesh of the cylinder, converges to 1e-6
-    tol = max(tol, 1e-6)
     contacts = scene.rigid_solver.collider.get_contacts(to_torch=False, keep_batch_dim=True)
     contacts_geoms_idx = np.sort(np.stack((contacts["geom_a"], contacts["geom_b"]), axis=-1), axis=-1)
-    for entity_lower, entity_upper, top, separation in (
-        (ground, box_on_ground, 0.0, 0.01),
-        (ground, sphere_on_ground, 0.0, 0.02),
-        (sphere_lower, sphere_upper, 1.1, 0.03),
-        (capsule_lower, capsule_upper, 1.1, 0.04),
-        (box_lower, box_upper, 1.1, 0.02),
-        (cylinder, box_on_cylinder, 1.1, 0.03),
-        (sphere_under_box, box_on_sphere, 1.1, 0.01),
+    # Minkowski portal refinement (MPR), which measures the separation of the mesh of the cylinder, converges to 1e-6.
+    # Every other pair is measured exactly.
+    for entity_lower, entity_upper, top, separation, pair_tol in (
+        (ground, box_on_ground, 0.0, 0.01, tol),
+        (ground, sphere_on_ground, 0.0, 0.02, tol),
+        (sphere_lower, sphere_upper, 1.1, 0.03, tol),
+        (capsule_lower, capsule_upper, 1.1, 0.04, tol),
+        (box_lower, box_upper, 1.1, 0.02, tol),
+        (cylinder, box_on_cylinder, 1.1, 0.03, max(tol, 1e-6)),
+        (sphere_under_box, box_on_sphere, 1.1, 0.01, tol),
     ):
         geoms_idx = sorted((entity_lower.geoms[0].idx, entity_upper.geoms[0].idx))
         is_pair = (contacts_geoms_idx == geoms_idx).all(axis=-1)
         assert is_pair.any(axis=-1).all()
-        assert_allclose(contacts["penetration"][is_pair], -separation, tol=tol)
-        assert_allclose(contacts["position"][is_pair][:, 2], top + 0.5 * separation, tol=tol)
+        assert_allclose(contacts["penetration"][is_pair], -separation, tol=pair_tol)
+        assert_allclose(contacts["position"][is_pair][:, 2], top + 0.5 * separation, tol=pair_tol)
     assert (contacts_geoms_idx != sphere_beyond_gap.geoms[0].idx).all()
