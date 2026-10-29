@@ -1,5 +1,3 @@
-import math
-
 import numpy as np
 import pytest
 import torch
@@ -235,10 +233,10 @@ def test_fk_multistep_force_grad_matches_fd(model_name, request, precision, show
 
 
 @pytest.mark.required
-@pytest.mark.parametrize("control_mode", ["position", "velocity"])
+@pytest.mark.parametrize("control_mode", ["position", "velocity", "position_velocity"])
 def test_per_step_pd_target_grad_matches_fd(control_mode, grad_revolute, precision, show_viewer):
-    # Per-step-varying PD targets are scenario commands, replayed by the backward unroll; the gradient of a tracked
-    # initial velocity through the controlled rollout must match finite differences.
+    # A target is given every other step and holds over the step in between, so its gradient sums over both steps it
+    # drives. A plain target overwrites the last one, which cuts its gradient from the steps after.
     pair = make_diff_scene_pair(
         grad_revolute,
         substeps=4,
@@ -247,18 +245,25 @@ def test_per_step_pd_target_grad_matches_fd(control_mode, grad_revolute, precisi
     for entity in (pair.entity_ana, pair.entity_fd):
         entity.set_dofs_kp(4.0)
         entity.set_dofs_kv(0.8)
-    targets = [0.3 * math.sin(0.7 * t) for t in range(10)]
+    n_targets = 2 if control_mode == "position_velocity" else 1
+    inputs = [0.3 * np.sin(0.7 * t + np.arange(n_targets)) if t % 2 == 0 else None for t in range(8)]
+
+    def apply_target(entity, target):
+        if control_mode == "position":
+            entity.control_dofs_position(target)
+        elif control_mode == "velocity":
+            entity.control_dofs_velocity(target)
+        else:
+            entity.control_dofs_position_velocity(target[:1], target[1:])
 
     def step_fn(entity, i_step):
-        if control_mode == "position":
-            entity.control_dofs_position(targets[i_step])
-        else:
-            entity.control_dofs_velocity(targets[i_step])
+        if i_step == 8:
+            apply_target(entity, np.full(n_targets, 0.1))
 
     assert_grad_matches_fd(
         pair,
-        [np.array([1.5])],
-        lambda e, x: e.set_dofs_velocity(x),
+        inputs,
+        apply_target,
         lambda scene, entity: entity.get_qpos()[0] ** 2,
         n_steps=10,
         step_fn=step_fn,

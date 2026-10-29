@@ -2644,7 +2644,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
         kernel_control_dofs_force(dofs_idx, envs_idx, force, self.dyn_state, self.rigid_config)
 
-    @mutates(differentiable=False)
+    @mutates()
     def control_dofs_velocity(self, velocity, dofs_idx=None, envs_idx=None):
         if gs.use_zerocopy:
             mask = (0, *indices_to_mask(dofs_idx)) if self.n_envs == 0 else indices_to_mask(envs_idx, dofs_idx)
@@ -2664,10 +2664,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if self.n_envs == 0:
             velocity = velocity[None]
 
-        # The backward pass of a step stops at the PD targets, which are inputs without gradient
         kernel_control_dofs_velocity(dofs_idx, envs_idx, velocity, self.dyn_state, self.rigid_config)
 
-    @mutates(differentiable=False)
+    @mutates()
     def control_dofs_position(self, position, dofs_idx=None, envs_idx=None):
         if gs.use_zerocopy:
             mask = (0, *indices_to_mask(dofs_idx)) if self.n_envs == 0 else indices_to_mask(envs_idx, dofs_idx)
@@ -2687,10 +2686,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if self.n_envs == 0:
             position = position[None]
 
-        # See 'control_dofs_velocity'
         kernel_control_dofs_position(dofs_idx, envs_idx, position, self.dyn_state, self.rigid_config)
 
-    @mutates(differentiable=False)
+    @mutates()
     def control_dofs_position_velocity(self, position, velocity, dofs_idx=None, envs_idx=None):
         if gs.use_zerocopy:
             mask = (0, *indices_to_mask(dofs_idx)) if self.n_envs == 0 else indices_to_mask(envs_idx, dofs_idx)
@@ -2714,7 +2712,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             position = position[None]
             velocity = velocity[None]
 
-        # See 'control_dofs_velocity'
         kernel_control_dofs_position_velocity(dofs_idx, envs_idx, position, velocity, self.dyn_state, self.rigid_config)
 
     def get_sol_params(self, geoms_idx=None, envs_idx=None, *, joints_idx=None, eqs_idx=None):
