@@ -1,3 +1,6 @@
+import math
+import xml.etree.ElementTree as ET
+
 import numpy as np
 import pytest
 import torch
@@ -6,7 +9,7 @@ import genesis as gs
 import genesis.utils.geom as gu
 from genesis.utils.misc import tensor_to_array
 
-from ..utils.assertions import assert_allclose
+from ..utils.assertions import assert_allclose, assert_equal
 from ..utils.assets import get_hf_dataset
 
 
@@ -534,3 +537,90 @@ def test_articulated_structure_mismatch(fixed_base_dual_arm, fixed_base_dual_arm
                 gs.morphs.URDF(file=fixed_base_dual_arm_chained, fixed=True),
             ]
         )
+
+
+@pytest.mark.required
+def test_variants_of_different_structure(mimic_hinges, show_viewer, tol):
+    DT = 0.01
+    G = 9.81
+    N_STEPS = 50
+    KP, KV = 40.0, 5.0
+    BOX_SIZE = 0.1
+    RADIUS = 0.05
+    RHO = 600.0
+
+    scene = gs.HeterogeneousScene(
+        sim_options=gs.options.SimOptions(
+            dt=DT,
+            gravity=(0.0, 0.0, -G),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(3.0, -3.0, 2.5),
+            camera_lookat=(0.5, 0.0, 1.0),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
+    # A free box, or two hinges tied by a joint equality and hanging from a fixed base
+    robot = scene.add_entity(
+        morph=[
+            gs.morphs.Box(
+                size=(BOX_SIZE, BOX_SIZE, BOX_SIZE),
+                pos=(0.0, 0.0, 2.0),
+            ),
+            gs.morphs.MJCF(
+                file=ET.tostring(mimic_hinges, encoding="unicode"),
+            ),
+        ],
+    )
+    obj = scene.add_entity(
+        morph=[
+            gs.morphs.Sphere(
+                radius=RADIUS,
+                pos=(2.0, 0.0, RADIUS),
+            ),
+            gs.morphs.Box(
+                size=(BOX_SIZE, BOX_SIZE, BOX_SIZE),
+                pos=(2.0, 0.0, 0.5 * BOX_SIZE),
+            ),
+            gs.morphs.Cylinder(
+                radius=RADIUS,
+                height=BOX_SIZE,
+                pos=(2.0, 0.0, 0.5 * BOX_SIZE),
+            ),
+        ],
+        material=gs.materials.Rigid(
+            rho=RHO,
+        ),
+    )
+    scene.build(n_envs=4)
+
+    # The robot is the box in the first block of environments, and the object one variant per block [0, 0, 1, 2]
+    assert_equal(robot.active_dofs_mask, [[True] * 6] * 2 + [[True] * 2 + [False] * 4] * 2)
+    volumes = (4.0 / 3.0 * math.pi * RADIUS**3, BOX_SIZE**3, math.pi * RADIUS**2 * BOX_SIZE)
+    assert_allclose(obj.get_mass(), RHO * np.array(volumes)[[0, 0, 1, 2]], tol=tol)
+
+    # The box falls from another height in the second environment, the hinges start at another angle in the third and
+    # are driven to a target in the fourth.
+    robot.set_dofs_kp(KP)
+    robot.set_dofs_kv(KV)
+    robot.set_pos([[0.0, 0.0, 1.5]], envs_idx=[1])
+    robot.set_dofs_position([[0.2, 0.2, 0.0, 0.0, 0.0, 0.0]], envs_idx=[2])
+    robot.control_dofs_position([[0.3, 0.3, 0.0, 0.0, 0.0, 0.0]], envs_idx=[3])
+    for _ in range(N_STEPS):
+        scene.step()
+    free_fall_drop = 0.5 * G * DT**2 * N_STEPS * (N_STEPS + 1)
+    assert_allclose(robot.get_pos()[:2, 2], np.array((2.0, 1.5)) - free_fall_drop, tol=tol)
+    assert_allclose(
+        robot.get_dofs_position()[2:], [[0.2, 0.2, 0.0, 0.0, 0.0, 0.0], [0.3, 0.3, 0.0, 0.0, 0.0, 0.0]], atol=1e-3
+    )
+    assert_equal(robot.get_links_pos()[:2, 1:], 0.0)
+
+    # The dofs of the free box are the translation and the rotation of its base
+    dofs_position = robot.get_dofs_position()
+    scene.reset(envs_idx=[1, 3])
+    dofs_position[1] = dofs_position.new_tensor((0.0, 0.0, 2.0, 0.0, 0.0, 0.0))
+    dofs_position[3] = 0.0
+    assert_allclose(robot.get_dofs_position(), dofs_position, tol=tol)
