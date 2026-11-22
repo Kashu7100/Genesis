@@ -1,6 +1,7 @@
 import dataclasses
+import functools
 from collections.abc import Callable, Iterable, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
@@ -9,7 +10,8 @@ import genesis as gs
 from genesis.engine.entities.rigid_entity import KinematicEntity
 from genesis.engine.entities.rigid_entity.description import _balanced_variant_mapping
 from genesis.engine.materials.base import Material
-from genesis.engine.scene import Scene
+from genesis.engine.scene import Scene, resolve_scene_options
+from genesis.engine.states.solvers import SimState
 from genesis.options import (
     BaseCouplerOptions,
     FEMOptions,
@@ -27,12 +29,15 @@ from genesis.options import (
 from genesis.options.entities import Spec, get_entity_spec
 from genesis.options.morphs import Morph
 from genesis.options.renderers import RendererOptions
+from genesis.options.sensors import SensorOptions
 from genesis.options.surfaces import Surface
 from genesis.repr_base import RBC
 from genesis.utils.misc import BuildableMixin, indices_to_mask
+from genesis.vis.camera import Camera
 
 if TYPE_CHECKING:
     from genesis.engine.entities.rigid_entity import RigidEntity
+    from genesis.engine.sensors.base_sensor import Sensor
 
 
 @dataclasses.dataclass(frozen=True)
@@ -339,6 +344,147 @@ class HeterogeneousEntity(BuildableMixin, RBC):
         return torch.arange(self.n_dofs, device=gs.device) < self.envs_n_dofs[:, None]
 
 
+class HeterogeneousSensor(BuildableMixin, RBC):
+    """A sensor of a heterogeneous scene, made of one sensor per group scene created from the options of its variant.
+
+    Its readings cover every environment, or those 'envs_idx' selects by index in the heterogeneous scene, one row per
+    selected environment in the order of the selection, and take the type the sensor of a scene returns. Anything else,
+    such as the setters of a sensor, is reached through the sensor of each group, 'sensors'.
+    """
+
+    def __init__(self, variants_options: tuple[SensorOptions, ...]):
+        self._variants_options = variants_options
+        self._sensors: tuple["Sensor", ...] = ()
+        self._partition: EnvironmentPartition | None = None
+
+    @gs.assert_unbuilt
+    def build(self, sensors: Sequence["Sensor"], partition: EnvironmentPartition) -> None:
+        """Record the sensor of each group scene, raising if its readings differ in shape from one group to another.
+
+        'sensors' follows the order of the groups in 'partition'.
+        """
+        # The entries of the readings of different variants share no meaning, which padding them to a common shape
+        # would pretend, so a reading takes one shape in every group
+        readings_shape = set()
+        for sensor in sensors:
+            reading = sensor.read()
+            fields = reading if isinstance(reading, tuple) else (reading,)
+            readings_shape.add(tuple(field.shape[1:] for field in fields))
+        if len(readings_shape) > 1:
+            gs.raise_exception(
+                f"The readings of {type(self._variants_options[0]).__name__} differ in shape from one group of "
+                f"environments to another, {sorted(readings_shape)}. Give it options reading as many entries in every "
+                "variant."
+            )
+        self._sensors = tuple(sensors)
+        self._partition = partition
+        self._is_built = True
+
+    def _gather(self, readers: Sequence[Callable], envs_idx):
+        selection = self._partition.select(envs_idx)
+        groups_rows, groups_fields = [], []
+        for i_group, rows, envs_idx_local in selection:
+            reading = readers[i_group](envs_idx=envs_idx_local)
+            groups_rows.append(rows)
+            groups_fields.append(reading if isinstance(reading, tuple) else (reading,))
+        n_envs = sum(rows.shape[0] for rows in groups_rows)
+        fields = []
+        for field_groups in zip(*groups_fields):
+            # Every selected environment is the row of exactly one group, so each entry is written
+            field = field_groups[0].new_empty((n_envs, *field_groups[0].shape[1:]))
+            for rows, field_group in zip(groups_rows, field_groups):
+                field[rows] = field_group
+            fields.append(field)
+        if isinstance(reading, tuple):
+            return type(reading)(*fields)
+        return fields[0]
+
+    @gs.assert_built
+    def read(self, envs_idx=None):
+        """Read the sensor in the selected environments, with the imperfections of its options (see 'Sensor.read')."""
+        return self._gather([sensor.read for sensor in self._sensors], envs_idx)
+
+    @gs.assert_built
+    def read_ground_truth(self, envs_idx=None):
+        """Read the sensor in the selected environments, without imperfections (see 'Sensor.read_ground_truth')."""
+        return self._gather([sensor.read_ground_truth for sensor in self._sensors], envs_idx)
+
+    @property
+    def variants_options(self) -> tuple[SensorOptions, ...]:
+        """The options of the sensor, a single one or one per variant of the entity it is attached to."""
+        return self._variants_options
+
+    @gs.assert_built
+    @property
+    def sensors(self) -> tuple["Sensor", ...]:
+        """The sensor of each group scene, in the order of the groups of the partition of the scene."""
+        return self._sensors
+
+
+class HeterogeneousRender(NamedTuple):
+    """The images a camera of a heterogeneous scene renders, in the order of the result of 'Camera.render'.
+
+    Each one holds the image of every group scene, in the order of the groups of the partition of the scene, as the
+    camera of that group scene renders it (see 'Camera.render'), or None if it was not asked for.
+    """
+
+    rgb: tuple | None
+    """The RGB image of each group scene."""
+    depth: tuple | None
+    """The depth image of each group scene."""
+    segmentation: tuple | None
+    """The segmentation mask of each group scene."""
+    normal: tuple | None
+    """The surface normal image of each group scene."""
+
+
+class HeterogeneousCamera(BuildableMixin, RBC):
+    """A camera of a heterogeneous scene, created at the same pose in every group scene.
+
+    Each group scene renders its own environments alone, so a render holds the images of each group scene apart.
+    Anything beyond rendering is reached through the camera of each group scene, 'cameras'.
+    """
+
+    def __init__(self):
+        self._cameras: tuple[Camera, ...] = ()
+
+    @gs.assert_unbuilt
+    def build(self, cameras: Sequence[Camera]) -> None:
+        """Record the camera of each group scene, in the order of the groups of the partition of the scene."""
+        self._cameras = tuple(cameras)
+        self._is_built = True
+
+    @gs.assert_built
+    def render(
+        self,
+        rgb=True,
+        depth=False,
+        segmentation=False,
+        colorize_seg=False,
+        normal=False,
+        antialiasing=False,
+        force_render=False,
+    ) -> HeterogeneousRender:
+        """Render the camera of every group scene, with the arguments of 'Camera.render'.
+
+        Returns
+        -------
+        render : HeterogeneousRender
+            The images of each group scene, as 'Camera.render' returns them for a scene.
+        """
+        groups_images = [
+            camera.render(rgb, depth, segmentation, colorize_seg, normal, antialiasing, force_render)
+            for camera in self._cameras
+        ]
+        return HeterogeneousRender(*(None if images[0] is None else images for images in zip(*groups_images)))
+
+    @gs.assert_built
+    @property
+    def cameras(self) -> tuple[Camera, ...]:
+        """The camera of each group scene, in the order of the groups of the partition of the scene."""
+        return self._cameras
+
+
 @gs.assert_initialized
 class HeterogeneousScene(BuildableMixin, RBC):
     """A batch of parallel environments whose entities may differ in structure from one environment to another.
@@ -352,11 +498,12 @@ class HeterogeneousScene(BuildableMixin, RBC):
     variants it carries. Each group scene launches its own kernels at every step, so the time of a step also grows with
     the number of groups, at most one plus the sum over the entities of their number of variants minus one.
 
-    The options are those of 'gs.Scene', and each group scene receives a copy of them. The interactive viewer shows the
-    environments of the first group alone. Cameras, sensors, recorders, emitters and force fields are added to a scene
-    before it is built, so a heterogeneous scene, whose group scenes come to exist as it builds, offers none of them.
-    After build, the scene of each group ('scenes') and the entity of each group ('HeterogeneousEntity.entities') give
-    access to everything a built scene offers.
+    The options are those of 'gs.Scene', and each group scene receives a copy of them. Each group scene lays out and
+    renders its own environments, so the interactive viewer shows a single group scene, chosen at build, and a camera
+    renders each group scene apart. Sensors, cameras and lights are added before the build, as for a scene, and each
+    group scene receives them as it is created. Recorders, emitters, force fields and USD stages are unavailable. After
+    build, the scene of each group ('scenes') and the entity of each group ('HeterogeneousEntity.entities') give access
+    to everything a built scene offers.
     """
 
     def __init__(
@@ -376,7 +523,8 @@ class HeterogeneousScene(BuildableMixin, RBC):
         show_viewer: bool | None = None,
         options: SceneOptions | None = None,
     ):
-        individual_options = (
+        self._options = resolve_scene_options(
+            options,
             sim_options,
             rigid_options,
             kinematic_options,
@@ -390,38 +538,28 @@ class HeterogeneousScene(BuildableMixin, RBC):
             profiling_options,
             renderer,
         )
-        if options is not None:
-            if any(option is not None for option in individual_options):
-                gs.raise_exception("`options` holds every option a scene is created with, so it is given alone.")
-            self._options = options
-        else:
-            self._options = SceneOptions(
-                sim=sim_options,
-                rigid=rigid_options,
-                kinematic=kinematic_options,
-                mpm=mpm_options,
-                sph=sph_options,
-                fem=fem_options,
-                pbd=pbd_options,
-                coupler=coupler_options,
-                vis=vis_options,
-                viewer=viewer_options,
-                profiling=profiling_options,
-                renderer=renderer,
-            )
+        # Each group scene numbers its own environments, where an index of the heterogeneous scene selects another one
+        if self._options.vis.rendered_envs_idx is not None:
+            gs.raise_exception("A heterogeneous scene renders all its environments. Leave 'rendered_envs_idx' None.")
         self._show_viewer = show_viewer
-        self._entities: list[HeterogeneousEntity] = []
         self._scenes: tuple[Scene, ...] = ()
+        self._entities: list[HeterogeneousEntity] = []
+        self._sensors: list[HeterogeneousSensor] = []
+        # The request adding each camera and each light to a group scene, called on every group scene as it is created
+        self._cameras: list[tuple[functools.partial, HeterogeneousCamera]] = []
+        self._lights: list[functools.partial] = []
         self._partition: EnvironmentPartition | None = None
 
     @gs.assert_unbuilt
     def add_entity(
         self,
-        morph: Morph | Iterable[Morph],
+        morph: Morph | Iterable[Morph] | None = None,
         material: Material | None = None,
         surface: Surface | None = None,
         visualize_contact: bool | None = None,
         name: str | None = None,
+        *,
+        spec: Spec | None = None,
     ) -> HeterogeneousEntity:
         """Add an entity to every group scene, as 'gs.Scene.add_entity' does.
 
@@ -439,76 +577,276 @@ class HeterogeneousScene(BuildableMixin, RBC):
             False.
         name : str | None, optional
             The name of the entity in every group scene. If None, each group scene generates one.
+        spec : gs.entities.Spec | None, optional
+            The spec to construct the entity from, in place of the individual arguments. Its morph may be one morph per
+            variant, as 'morph' may.
 
         Returns
         -------
         entity : HeterogeneousEntity
             The entity, whose accessors are available once the scene is built.
         """
-        morphs = (morph,) if isinstance(morph, Morph) else tuple(morph)
-        spec = get_entity_spec(morphs[0], material, surface, visualize_contact, name=name)
+        if spec is None:
+            if morph is None:
+                gs.raise_exception("Entity construction requires a morph.")
+            morphs = (morph,) if isinstance(morph, Morph) else tuple(morph)
+            # The spec takes the first variant alone, since every kind of entity takes the one morph of a group scene
+            spec = get_entity_spec(morphs[0], material, surface, visualize_contact, name=name)
+        elif any(value is not None for value in (morph, material, surface, visualize_contact, name)):
+            gs.raise_exception("Pass either an entity spec or individual entity arguments, never both.")
+        else:
+            morphs = spec.morphs
+            if not morphs:
+                gs.raise_exception("Entity construction requires a morph.")
         entity = HeterogeneousEntity(spec, morphs)
         self._entities.append(entity)
         return entity
 
     @gs.assert_unbuilt
-    def build(self, n_envs: int, env_spacing=(0.0, 0.0), n_envs_per_row: int | None = None, center_envs_at_origin=True):
+    def add_sensor(self, sensor_options: SensorOptions | Sequence[SensorOptions]) -> HeterogeneousSensor:
+        """Add a sensor to every group scene, as 'gs.Scene.add_sensor' does.
+
+        The entities are added to every group scene in the same order, so 'entity_idx' names the same entity in all of
+        them, while a local index (of a link, of a degree of freedom) may name another part in each variant of that
+        entity. One options object applies to every group scene, and the build raises if it is invalid for a variant.
+        One options object per variant of the entity that 'entity_idx' names, all of the same type and naming that
+        entity, gives each group scene the options of the variant it carries, as 'add_entity' takes one morph per
+        variant. Indices of links in the solver, such as 'filter_link_idx', index the links of each group scene.
+
+        Parameters
+        ----------
+        sensor_options : SensorOptions | list[SensorOptions]
+            The options of the sensor, or one options object per variant of the entity it is attached to.
+
+        Returns
+        -------
+        sensor : HeterogeneousSensor
+            The sensor, which reads every environment once the scene is built. The build raises if its readings differ
+            in shape from one group scene to another.
+        """
+        variants_options = (sensor_options,) if isinstance(sensor_options, SensorOptions) else tuple(sensor_options)
+        if len(variants_options) > 1:
+            entity_idx = variants_options[0].entity_idx
+            if not 0 <= entity_idx < len(self._entities):
+                gs.raise_exception(f"Options per variant name an entity of the scene, got 'entity_idx={entity_idx}'.")
+            if any(
+                type(options) is not type(variants_options[0]) or options.entity_idx != entity_idx
+                for options in variants_options
+            ):
+                gs.raise_exception("The options of the variants of a sensor share their type and their 'entity_idx'.")
+            n_variants = len(self._entities[entity_idx].morphs)
+            if len(variants_options) != n_variants:
+                gs.raise_exception(
+                    f"Expected one options object per variant of entity {entity_idx} ({n_variants}), got "
+                    f"{len(variants_options)}."
+                )
+        sensor = HeterogeneousSensor(variants_options)
+        self._sensors.append(sensor)
+        return sensor
+
+    @gs.assert_unbuilt
+    def add_camera(
+        self,
+        model="pinhole",
+        res=(320, 320),
+        pos=(0.5, 2.5, 3.5),
+        lookat=(0.5, 0.5, 0.5),
+        up=(0.0, 0.0, 1.0),
+        fov=30,
+        GUI=False,
+        spp=256,
+        denoise=None,
+        near=0.1,
+        far=20.0,
+        debug=False,
+        lens=None,
+    ) -> HeterogeneousCamera:
+        """Add a camera at the same pose to every group scene, with the arguments of 'gs.Scene.add_camera'.
+
+        The camera of each group scene takes the environment its scene binds a camera to by default, since an index of
+        an environment of the heterogeneous scene names an environment of one group scene alone.
+
+        Returns
+        -------
+        camera : HeterogeneousCamera
+            The camera, which renders every group scene once the scene is built.
+        """
+        add_camera = functools.partial(
+            Scene.add_camera,
+            model=model,
+            res=res,
+            pos=pos,
+            lookat=lookat,
+            up=up,
+            fov=fov,
+            GUI=GUI,
+            spp=spp,
+            denoise=denoise,
+            near=near,
+            far=far,
+            debug=debug,
+            lens=lens,
+        )
+        camera = HeterogeneousCamera()
+        self._cameras.append((add_camera, camera))
+        return camera
+
+    @gs.assert_unbuilt
+    def add_light(
+        self,
+        pos,
+        dir,
+        color=(1.0, 1.0, 1.0),
+        intensity=1.0,
+        directional=False,
+        castshadow=True,
+        cutoff=45.0,
+        attenuation=0.0,
+    ) -> None:
+        """Add a light of the batch renderer to every group scene, with the arguments of 'gs.Scene.add_light'."""
+        self._lights.append(
+            functools.partial(
+                Scene.add_light,
+                pos=pos,
+                dir=dir,
+                color=color,
+                intensity=intensity,
+                directional=directional,
+                castshadow=castshadow,
+                cutoff=cutoff,
+                attenuation=attenuation,
+            )
+        )
+
+    @gs.assert_unbuilt
+    def add_mesh_light(
+        self,
+        morph=None,
+        color=(1.0, 1.0, 1.0, 1.0),
+        intensity=20.0,
+        revert_dir=False,
+        double_sided=False,
+        cutoff=180.0,
+    ) -> None:
+        """Add a mesh light of the ray tracer to every group scene, with the arguments of 'gs.Scene.add_mesh_light'."""
+        self._lights.append(
+            functools.partial(
+                Scene.add_mesh_light,
+                morph=morph,
+                color=color,
+                intensity=intensity,
+                revert_dir=revert_dir,
+                double_sided=double_sided,
+                cutoff=cutoff,
+            )
+        )
+
+    @gs.assert_unbuilt
+    def build(
+        self,
+        n_envs: int,
+        env_spacing=(0.0, 0.0),
+        n_envs_per_row: int | None = None,
+        center_envs_at_origin=True,
+        viewer_env_idx: int = 0,
+    ):
         """Partition the environments into groups, then create and build the scene of each group.
+
+        If the build of a group scene raises, the group scenes created so far are destroyed and the scene stays unbuilt.
 
         Parameters
         ----------
         n_envs : int
             The number of parallel environments, at least one.
         env_spacing : tuple of float, shape (2,)
-            The spacing between adjacent environments of each group scene, for visualization only. The environments of
-            different groups overlap.
+            The spacing between adjacent environments of each group scene, for visualization only. Each group scene
+            lays out its own environments.
         n_envs_per_row : int | None
             The number of environments per row of each group scene, for visualization only. If None, it is set to the
             square root of the number of environments of the group.
         center_envs_at_origin : bool
             Whether to put the center of the environments of each group scene at the origin, for visualization only.
+        viewer_env_idx : int
+            The environment whose group scene the interactive viewer shows, if 'show_viewer' asks for it. The viewer
+            shows the environments of that group scene alone. Defaults to the first environment.
         """
         if n_envs < 1:
             gs.raise_exception(f"A heterogeneous scene has at least one environment, got 'n_envs={n_envs}'.")
+        if not 0 <= viewer_env_idx < n_envs:
+            gs.raise_exception(f"'viewer_env_idx' names one of the {n_envs} environments, got {viewer_env_idx}.")
 
         envs_variants_idx = np.empty((n_envs, len(self._entities)), dtype=gs.np_int)
         for i_entity, entity in enumerate(self._entities):
             envs_variants_idx[:, i_entity] = _balanced_variant_mapping(len(entity.morphs), n_envs)
         groups_variants_idx, envs_group_idx = np.unique(envs_variants_idx, axis=0, return_inverse=True)
+        i_viewer_group = envs_group_idx[viewer_env_idx]
 
         envs_local_idx = np.empty((n_envs,), dtype=gs.np_int)
-        groups_envs_idx, scenes, groups_entities = [], [], []
-        for i_group, variants_idx in enumerate(groups_variants_idx):
-            envs_idx = np.flatnonzero(envs_group_idx == i_group)
-            envs_local_idx[envs_idx] = np.arange(len(envs_idx))
-            groups_envs_idx.append(torch.as_tensor(envs_idx, device=gs.device))
+        groups_envs_idx, scenes, groups_entities, groups_sensors, groups_cameras = [], [], [], [], []
+        # A failed build destroys every group scene created so far, so that none outlives the unbuilt scene
+        is_done = False
+        try:
+            for i_group, variants_idx in enumerate(groups_variants_idx):
+                envs_idx = np.flatnonzero(envs_group_idx == i_group)
+                envs_local_idx[envs_idx] = np.arange(len(envs_idx))
+                groups_envs_idx.append(torch.as_tensor(envs_idx, device=gs.device))
 
-            scene = Scene(
-                options=self._options.model_copy(deep=True), show_viewer=self._show_viewer if i_group == 0 else False
+                show_viewer = self._show_viewer if i_group == i_viewer_group else False
+                scene = Scene(options=self._options.model_copy(deep=True), show_viewer=show_viewer)
+                scenes.append(scene)
+                groups_entities.append(
+                    [
+                        scene.add_entity(spec=entity.spec.model_copy(update={"morph": entity.morphs[i_variant]}))
+                        for entity, i_variant in zip(self._entities, variants_idx)
+                    ]
+                )
+                sensors = []
+                for i_sensor, sensor in enumerate(self._sensors):
+                    variants_options = sensor.variants_options
+                    i_variant = variants_idx[variants_options[0].entity_idx] if len(variants_options) > 1 else 0
+                    # Each group scene receives its own copy of the options, which a sensor may resolve in place
+                    try:
+                        sensors.append(scene.add_sensor(variants_options[i_variant].model_copy(deep=True)))
+                    except gs.GenesisException as e:
+                        gs.raise_exception_from(
+                            f"The options of sensor {i_sensor} are invalid for the variants "
+                            f"{tuple(variants_idx.tolist())} of the entities, in the order they were added. Give one "
+                            "options object per variant of the entity it is attached to (see "
+                            "'HeterogeneousScene.add_sensor').",
+                            e,
+                        )
+                groups_sensors.append(sensors)
+                groups_cameras.append([add_camera(scene) for add_camera, _ in self._cameras])
+                for add_light in self._lights:
+                    add_light(scene)
+                scene.build(
+                    n_envs=len(envs_idx),
+                    env_spacing=env_spacing,
+                    n_envs_per_row=n_envs_per_row,
+                    center_envs_at_origin=center_envs_at_origin,
+                )
+
+            partition = EnvironmentPartition(
+                groups_variants_idx=tuple(map(tuple, groups_variants_idx.tolist())),
+                groups_envs_idx=tuple(groups_envs_idx),
+                envs_group_idx=torch.as_tensor(envs_group_idx, device=gs.device),
+                envs_local_idx=torch.as_tensor(envs_local_idx, device=gs.device),
             )
-            groups_entities.append(
-                [
-                    scene.add_entity(spec=entity.spec.model_copy(update={"morph": entity.morphs[i_variant]}))
-                    for entity, i_variant in zip(self._entities, variants_idx)
-                ]
-            )
-            scene.build(
-                n_envs=len(envs_idx),
-                env_spacing=env_spacing,
-                n_envs_per_row=n_envs_per_row,
-                center_envs_at_origin=center_envs_at_origin,
-            )
-            scenes.append(scene)
+            # The sensors build first, since their build alone may raise, which would leave the entities built before it
+            for sensor, sensors in zip(self._sensors, zip(*groups_sensors)):
+                sensor.build(sensors, partition)
+            for entity, entities in zip(self._entities, zip(*groups_entities)):
+                entity.build(entities, partition)
+            for (_, camera), cameras in zip(self._cameras, zip(*groups_cameras)):
+                camera.build(cameras)
+            is_done = True
+        finally:
+            if not is_done:
+                for scene in scenes:
+                    scene.destroy()
 
         self._scenes = tuple(scenes)
-        self._partition = EnvironmentPartition(
-            groups_variants_idx=tuple(map(tuple, groups_variants_idx.tolist())),
-            groups_envs_idx=tuple(groups_envs_idx),
-            envs_group_idx=torch.as_tensor(envs_group_idx, device=gs.device),
-            envs_local_idx=torch.as_tensor(envs_local_idx, device=gs.device),
-        )
-        for entity, entities in zip(self._entities, zip(*groups_entities)):
-            entity.build(entities, self._partition)
+        self._partition = partition
         self._is_built = True
 
     @gs.assert_built
@@ -518,10 +856,31 @@ class HeterogeneousScene(BuildableMixin, RBC):
             scene.step()
 
     @gs.assert_built
-    def reset(self, envs_idx=None) -> None:
-        """Reset the environments 'envs_idx' selects by index to their initial state, all of them if None."""
+    def get_state(self) -> tuple[SimState, ...]:
+        """Return the current state of every group scene, which 'reset' restores.
+
+        The state of each group scene ('gs.Scene.get_state') comes in the order of the groups of 'partition'.
+        """
+        return tuple(scene.get_state() for scene in self._scenes)
+
+    @gs.assert_built
+    def reset(self, state: tuple[SimState, ...] | None = None, envs_idx=None) -> None:
+        """Reset the selected environments to the initial state of the scene.
+
+        'state', as 'get_state' returns it, becomes the initial state of the scene before the reset, as for
+        'gs.Scene.reset', so a later reset restores it in every environment. 'envs_idx' selects environments by index,
+        all of them if None.
+        """
+        if state is not None and (not isinstance(state, tuple) or len(state) != len(self._scenes)):
+            gs.raise_exception(f"Expected the state of each of the {len(self._scenes)} group scenes ('get_state').")
+        # Every group scene takes the state, with an empty selection where no environment of the group is selected, so
+        # that the state becomes the initial state of all of them
+        groups_envs_idx_local = [self._partition.envs_local_idx[:0]] * len(self._scenes)
         for i_group, _, envs_idx_local in self._partition.select(envs_idx):
-            self._scenes[i_group].reset(envs_idx=envs_idx_local)
+            groups_envs_idx_local[i_group] = envs_idx_local
+        groups_state = (None,) * len(self._scenes) if state is None else state
+        for scene, scene_state, envs_idx_local in zip(self._scenes, groups_state, groups_envs_idx_local):
+            scene.reset(scene_state, envs_idx=envs_idx_local)
 
     def destroy(self) -> None:
         """Destroy every group scene, releasing its memory."""
@@ -539,6 +898,11 @@ class HeterogeneousScene(BuildableMixin, RBC):
     def entities(self) -> tuple[HeterogeneousEntity, ...]:
         """The entities, in the order they were added."""
         return tuple(self._entities)
+
+    @property
+    def sensors(self) -> tuple[HeterogeneousSensor, ...]:
+        """The sensors, in the order they were added."""
+        return tuple(self._sensors)
 
     @property
     def is_built(self) -> bool:
