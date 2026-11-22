@@ -545,6 +545,7 @@ def test_variants_of_different_structure(mimic_hinges, show_viewer, tol):
     G = 9.81
     N_STEPS = 50
     KP, KV = 40.0, 5.0
+    V0 = 1.0
     BOX_SIZE = 0.1
     RADIUS = 0.05
     RHO = 600.0
@@ -553,6 +554,9 @@ def test_variants_of_different_structure(mimic_hinges, show_viewer, tol):
         sim_options=gs.options.SimOptions(
             dt=DT,
             gravity=(0.0, 0.0, -G),
+        ),
+        rigid_options=gs.options.RigidOptions(
+            batch_dofs_info=True,
         ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(3.0, -3.0, 2.5),
@@ -595,26 +599,42 @@ def test_variants_of_different_structure(mimic_hinges, show_viewer, tol):
             rho=RHO,
         ),
     )
+    with pytest.raises(gs.GenesisException, match="not built"):
+        _ = robot.n_dofs
     scene.build(n_envs=4)
 
     # The robot is the box in the first block of environments, and the object one variant per block [0, 0, 1, 2]
     assert_equal(robot.active_dofs_mask, [[True] * 6] * 2 + [[True] * 2 + [False] * 4] * 2)
     volumes = (4.0 / 3.0 * math.pi * RADIUS**3, BOX_SIZE**3, math.pi * RADIUS**2 * BOX_SIZE)
     assert_allclose(obj.get_mass(), RHO * np.array(volumes)[[0, 0, 1, 2]], tol=tol)
+    assert [link is None for link in robot.get_link("child1")] == [True, False, False]
+    assert robot.get_links_pos(envs_idx=[]).shape == (0, robot.n_links, 3)
+    with pytest.raises(gs.GenesisException, match="out of range"):
+        robot.get_pos(envs_idx=4)
 
-    # The box falls from another height in the second environment, the hinges start at another angle in the third and
-    # are driven to a target in the fourth.
-    robot.set_dofs_kp(KP)
+    # The box is thrown upward in the first environment and falls from another height in the second. The hinges start
+    # at another angle in the third and are driven to a target in the fourth alone, the only one with a positional gain.
+    # The vertical velocity of the box is its dof 2, beyond the dofs of the hinges, which ignore it.
+    robot.set_dofs_kp([[0.0, 0.0], [KP, KP]], dofs_idx_local=[0, 1], envs_idx=[2, 3])
     robot.set_dofs_kv(KV)
-    robot.set_pos([[0.0, 0.0, 1.5]], envs_idx=[1])
+    robot.set_dofs_velocity([V0], dofs_idx_local=[2], envs_idx=[0, 2])
+    robot.set_pos([[0.0, 0.0, 2.0], [0.0, 0.0, 1.5]], envs_idx=[0, 1], zero_velocity=False)
     robot.set_dofs_position([[0.2, 0.2, 0.0, 0.0, 0.0, 0.0]], envs_idx=[2])
-    robot.control_dofs_position([[0.3, 0.3, 0.0, 0.0, 0.0, 0.0]], envs_idx=[3])
+    robot.control_dofs_position([0.3, 0.3], dofs_idx_local=[0, 1], envs_idx=[2, 3])
+    robot.set_dofs_position(1.0, envs_idx=[])
     for _ in range(N_STEPS):
         scene.step()
     free_fall_drop = 0.5 * G * DT**2 * N_STEPS * (N_STEPS + 1)
-    assert_allclose(robot.get_pos()[:2, 2], np.array((2.0, 1.5)) - free_fall_drop, tol=tol)
+    box_velocity = -G * DT * N_STEPS
+    dofs_position_selected = robot.get_dofs_position(dofs_idx_local=[2, 0])
     assert_allclose(
-        robot.get_dofs_position()[2:], [[0.2, 0.2, 0.0, 0.0, 0.0, 0.0], [0.3, 0.3, 0.0, 0.0, 0.0, 0.0]], atol=1e-3
+        dofs_position_selected[:2],
+        [[2.0 + V0 * N_STEPS * DT - free_fall_drop, 0.0], [1.5 - free_fall_drop, 0.0]],
+        tol=tol,
+    )
+    assert_allclose(dofs_position_selected[2:], [[0.0, 0.2], [0.0, 0.3]], atol=1e-3)
+    assert_allclose(
+        robot.get_dofs_velocity(dofs_idx_local=[2]), [[V0 + box_velocity], [box_velocity], [0.0], [0.0]], tol=tol
     )
     assert_equal(robot.get_links_pos()[:2, 1:], 0.0)
 
@@ -624,3 +644,33 @@ def test_variants_of_different_structure(mimic_hinges, show_viewer, tol):
     dofs_position[1] = dofs_position.new_tensor((0.0, 0.0, 2.0, 0.0, 0.0, 0.0))
     dofs_position[3] = 0.0
     assert_allclose(robot.get_dofs_position(), dofs_position, tol=tol)
+
+
+@pytest.mark.required
+def test_variants_sharing_dofs_info(tol):
+    scene = gs.HeterogeneousScene()
+    # A single hinge, or two
+    robot = scene.add_entity(
+        morph=[
+            gs.morphs.URDF(
+                file="urdf/simple/two_cube_revolute.urdf",
+                fixed=True,
+            ),
+            gs.morphs.URDF(
+                file="urdf/simple/two_link_arm.urdf",
+                fixed=True,
+            ),
+        ],
+    )
+    scene.build(n_envs=2)
+
+    # Each environment reads the parameters its group shares, over the dofs of its variant
+    robot.set_dofs_kp([10.0, 20.0])
+    robot.set_dofs_force_range([-1.0, -2.0], [1.0, 2.0])
+    assert_allclose(robot.get_dofs_kp(), [[10.0, 0.0], [10.0, 20.0]], tol=tol)
+    assert_allclose(robot.get_dofs_kp(dofs_idx_local=[1, 0]), [[0.0, 10.0], [20.0, 10.0]], tol=tol)
+    assert_allclose(robot.get_dofs_force_range(), [[[-1.0, 0.0], [-1.0, -2.0]], [[1.0, 0.0], [1.0, 2.0]]], tol=tol)
+    with pytest.raises(gs.GenesisException, match="non-batched dofs info"):
+        robot.set_dofs_kp(10.0, envs_idx=[1])
+    with pytest.raises(gs.GenesisException, match="non-batched dofs info"):
+        robot.get_dofs_kp(envs_idx=[1])
