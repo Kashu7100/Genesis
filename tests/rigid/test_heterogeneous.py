@@ -1,3 +1,6 @@
+import math
+import xml.etree.ElementTree as ET
+
 import numpy as np
 import pytest
 import torch
@@ -6,7 +9,7 @@ import genesis as gs
 import genesis.utils.geom as gu
 from genesis.utils.misc import tensor_to_array
 
-from ..utils.assertions import assert_allclose
+from ..utils.assertions import assert_allclose, assert_equal
 from ..utils.assets import get_hf_dataset
 
 
@@ -534,3 +537,249 @@ def test_articulated_structure_mismatch(fixed_base_dual_arm, fixed_base_dual_arm
                 gs.morphs.URDF(file=fixed_base_dual_arm_chained, fixed=True),
             ]
         )
+
+
+@pytest.mark.required
+def test_variants_of_different_structure(mimic_hinges, show_viewer, tol):
+    DT = 0.01
+    G = 9.81
+    N_STEPS = 50
+    KP, KV = 40.0, 5.0
+    V0 = 1.0
+    BOX_SIZE = 0.1
+    RADIUS = 0.05
+    RHO = 600.0
+
+    scene = gs.HeterogeneousScene(
+        sim_options=gs.options.SimOptions(
+            dt=DT,
+            gravity=(0.0, 0.0, -G),
+        ),
+        rigid_options=gs.options.RigidOptions(
+            batch_dofs_info=True,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(3.0, -3.0, 2.5),
+            camera_lookat=(0.5, 0.0, 1.0),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
+    # A free box, or two hinges tied by a joint equality and hanging from a fixed base
+    robot = scene.add_entity(
+        morph=[
+            gs.morphs.Box(
+                size=(BOX_SIZE, BOX_SIZE, BOX_SIZE),
+                pos=(0.0, 0.0, 2.0),
+            ),
+            gs.morphs.MJCF(
+                file=ET.tostring(mimic_hinges, encoding="unicode"),
+            ),
+        ],
+    )
+    obj = scene.add_entity(
+        morph=[
+            gs.morphs.Sphere(
+                radius=RADIUS,
+                pos=(2.0, 0.0, RADIUS),
+            ),
+            gs.morphs.Box(
+                size=(BOX_SIZE, BOX_SIZE, BOX_SIZE),
+                pos=(2.0, 0.0, 0.5 * BOX_SIZE),
+            ),
+            gs.morphs.Cylinder(
+                radius=RADIUS,
+                height=BOX_SIZE,
+                pos=(2.0, 0.0, 0.5 * BOX_SIZE),
+            ),
+        ],
+        material=gs.materials.Rigid(
+            rho=RHO,
+        ),
+    )
+    with pytest.raises(gs.GenesisException, match="not built"):
+        _ = robot.n_dofs
+    scene.build(n_envs=4)
+
+    # The robot is the box in the first block of environments, and the object one variant per block [0, 0, 1, 2]
+    assert_equal(robot.active_dofs_mask, [[True] * 6] * 2 + [[True] * 2 + [False] * 4] * 2)
+    volumes = (4.0 / 3.0 * math.pi * RADIUS**3, BOX_SIZE**3, math.pi * RADIUS**2 * BOX_SIZE)
+    assert_allclose(obj.get_mass(), RHO * np.array(volumes)[[0, 0, 1, 2]], tol=tol)
+    assert [link is None for link in robot.get_link("child1")] == [True, False, False]
+    assert robot.get_links_pos(envs_idx=[]).shape == (0, robot.n_links, 3)
+    with pytest.raises(gs.GenesisException, match="out of range"):
+        robot.get_pos(envs_idx=4)
+
+    # The box is thrown upward in the first environment and falls from another height in the second. The hinges start
+    # at another angle in the third and are driven to a target in the fourth alone, the only one with a positional gain.
+    # The vertical velocity of the box is its dof 2, beyond the dofs of the hinges, which ignore it.
+    robot.set_dofs_kp([[0.0, 0.0], [KP, KP]], dofs_idx_local=[0, 1], envs_idx=[2, 3])
+    robot.set_dofs_kv(KV)
+    robot.set_dofs_velocity([V0], dofs_idx_local=[2], envs_idx=[0, 2])
+    robot.set_pos([[0.0, 0.0, 2.0], [0.0, 0.0, 1.5]], envs_idx=[0, 1], zero_velocity=False)
+    robot.set_dofs_position([[0.2, 0.2, 0.0, 0.0, 0.0, 0.0]], envs_idx=[2])
+    robot.control_dofs_position([0.3, 0.3], dofs_idx_local=[0, 1], envs_idx=[2, 3])
+    robot.set_dofs_position(1.0, envs_idx=[])
+    for _ in range(N_STEPS):
+        scene.step()
+    free_fall_drop = 0.5 * G * DT**2 * N_STEPS * (N_STEPS + 1)
+    box_velocity = -G * DT * N_STEPS
+    dofs_position_selected = robot.get_dofs_position(dofs_idx_local=[2, 0])
+    assert_allclose(
+        dofs_position_selected[:2],
+        [[2.0 + V0 * N_STEPS * DT - free_fall_drop, 0.0], [1.5 - free_fall_drop, 0.0]],
+        tol=tol,
+    )
+    assert_allclose(dofs_position_selected[2:], [[0.0, 0.2], [0.0, 0.3]], atol=1e-3)
+    assert_allclose(
+        robot.get_dofs_velocity(dofs_idx_local=[2]), [[V0 + box_velocity], [box_velocity], [0.0], [0.0]], tol=tol
+    )
+    assert_equal(robot.get_links_pos()[:2, 1:], 0.0)
+
+    # The dofs of the free box are the translation and the rotation of its base
+    dofs_position = robot.get_dofs_position()
+    scene.reset(envs_idx=[1, 3])
+    dofs_position[1] = dofs_position.new_tensor((0.0, 0.0, 2.0, 0.0, 0.0, 0.0))
+    dofs_position[3] = 0.0
+    assert_allclose(robot.get_dofs_position(), dofs_position, tol=tol)
+
+
+@pytest.mark.required
+def test_variants_sharing_dofs_info(tol):
+    scene = gs.HeterogeneousScene()
+    # A single hinge, or two
+    robot = scene.add_entity(
+        morph=[
+            gs.morphs.URDF(
+                file="urdf/simple/two_cube_revolute.urdf",
+                fixed=True,
+            ),
+            gs.morphs.URDF(
+                file="urdf/simple/two_link_arm.urdf",
+                fixed=True,
+            ),
+        ],
+    )
+    scene.build(n_envs=2)
+
+    # Each environment reads the parameters its group shares, over the dofs of its variant
+    robot.set_dofs_kp([10.0, 20.0])
+    robot.set_dofs_force_range([-1.0, -2.0], [1.0, 2.0])
+    assert_allclose(robot.get_dofs_kp(), [[10.0, 0.0], [10.0, 20.0]], tol=tol)
+    assert_allclose(robot.get_dofs_kp(dofs_idx_local=[1, 0]), [[0.0, 10.0], [20.0, 10.0]], tol=tol)
+    assert_allclose(robot.get_dofs_force_range(), [[[-1.0, 0.0], [-1.0, -2.0]], [[1.0, 0.0], [1.0, 2.0]]], tol=tol)
+    with pytest.raises(gs.GenesisException, match="non-batched dofs info"):
+        robot.set_dofs_kp(10.0, envs_idx=[1])
+    with pytest.raises(gs.GenesisException, match="non-batched dofs info"):
+        robot.get_dofs_kp(envs_idx=[1])
+
+
+@pytest.mark.required
+def test_sensors_cameras_and_state_across_groups(mimic_hinges, show_viewer, tol):
+    DT = 0.01
+    G = 9.81
+    N_STEPS = 10
+    BOX_SIZE = 0.1
+    CAMERA_HEIGHT = 3.0
+    RES = 64
+
+    scene = gs.HeterogeneousScene(
+        sim_options=gs.options.SimOptions(
+            dt=DT,
+            gravity=(0.0, 0.0, -G),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(3.0, -3.0, 2.5),
+            camera_lookat=(0.0, 0.0, 1.0),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
+    # A free box, or two hinges whose links hang from a fixed base with their center of mass on their axis
+    robot = scene.add_entity(
+        spec=gs.entities.Rigid(
+            morph=(
+                gs.morphs.Box(
+                    size=(BOX_SIZE, BOX_SIZE, BOX_SIZE),
+                    pos=(0.0, 0.0, 2.0),
+                ),
+                gs.morphs.MJCF(
+                    file=ET.tostring(mimic_hinges, encoding="unicode"),
+                ),
+            ),
+        ),
+    )
+    imu_base = scene.add_sensor(
+        gs.sensors.IMU(
+            entity_idx=1,
+        ),
+    )
+    # The second hinge carries an IMU turned by a quarter turn about its axis
+    imu_variants = scene.add_sensor(
+        [
+            gs.sensors.IMU(
+                entity_idx=1,
+            ),
+            gs.sensors.IMU(
+                entity_idx=1,
+                link_idx_local=2,
+                euler_offset=(0.0, 90.0, 0.0),
+            ),
+        ]
+    )
+    with pytest.raises(gs.GenesisException, match="one options object per variant"):
+        scene.add_sensor([gs.sensors.IMU(entity_idx=1)] * 3)
+    camera = scene.add_camera(
+        res=(RES, RES),
+        pos=(0.0, 0.0, CAMERA_HEIGHT),
+        lookat=(0.0, 0.0, 0.0),
+        up=(0.0, 1.0, 0.0),
+    )
+    scene.build(n_envs=4)
+
+    # The accelerometer reads zero on the box in free fall and the opposite of gravity on the links at rest, rows
+    # following the selection of environments
+    for _ in range(N_STEPS):
+        scene.step()
+    assert_allclose(imu_base.read().lin_acc, [[0.0, 0.0, 0.0]] * 2 + [[0.0, 0.0, G]] * 2, tol=tol)
+    assert_allclose(imu_variants.read(envs_idx=[3, 0]).lin_acc, [[-G, 0.0, 0.0], [0.0, 0.0, 0.0]], tol=tol)
+
+    # The camera looking down sees the top of the falling box in its group scene and the ground in the other one
+    _, depth, _, _ = camera.render(rgb=False, depth=True)
+    box_top = robot.get_pos()[0, 2] + 0.5 * BOX_SIZE
+    assert_allclose(
+        [depth[0][RES // 2, RES // 2], depth[1][RES // 2, RES // 2]], [CAMERA_HEIGHT - box_top, CAMERA_HEIGHT], tol=1e-5
+    )
+
+    # A state restores the environments a reset selects, and becomes the initial state of every group scene
+    robot.set_dofs_position([[0.2, 0.2, 0.0, 0.0, 0.0, 0.0]], envs_idx=[2])
+    state = scene.get_state()
+    dofs_position = robot.get_dofs_position()
+    for _ in range(N_STEPS):
+        scene.step()
+    robot.set_dofs_position([[0.3, 0.3, 0.0, 0.0, 0.0, 0.0]] * 2, envs_idx=[2, 3])
+    dofs_position_moved = robot.get_dofs_position()
+    scene.reset(state, envs_idx=[1])
+    dofs_position_moved[1] = dofs_position[1]
+    assert_allclose(robot.get_dofs_position(), dofs_position_moved, tol=tol)
+    scene.reset()
+    assert_allclose(robot.get_dofs_position(), dofs_position, tol=tol)
+
+    # A sensor invalid for the variant of a later group leaves no group scene alive
+    scene_invalid = gs.HeterogeneousScene()
+    scene_invalid.add_entity(
+        morph=[
+            gs.morphs.MJCF(file=ET.tostring(mimic_hinges, encoding="unicode")),
+            gs.morphs.Box(size=(BOX_SIZE, BOX_SIZE, BOX_SIZE)),
+        ]
+    )
+    scene_invalid.add_sensor(gs.sensors.IMU(entity_idx=0, link_idx_local=2))
+    n_scenes = len(gs._scene_registry)
+    with pytest.raises(gs.GenesisException, match="invalid for the variants"):
+        scene_invalid.build(n_envs=2)
+    assert len(gs._scene_registry) == n_scenes
+    assert not scene_invalid.is_built
