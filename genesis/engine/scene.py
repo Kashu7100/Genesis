@@ -151,60 +151,6 @@ def description_digest(desc: SceneDescription) -> str:
     return digest.hexdigest()
 
 
-def resolve_scene_options(
-    options: SceneOptions | None,
-    sim_options: SimOptions | None,
-    rigid_options: RigidOptions | None,
-    kinematic_options: KinematicOptions | None,
-    mpm_options: MPMOptions | None,
-    sph_options: SPHOptions | None,
-    fem_options: FEMOptions | None,
-    pbd_options: PBDOptions | None,
-    coupler_options: BaseCouplerOptions | None,
-    vis_options: VisOptions | None,
-    viewer_options: ViewerOptions | None,
-    profiling_options: ProfilingOptions | None,
-    renderer: RendererOptions | None,
-) -> SceneOptions:
-    """Return the options a scene is created with, from the arguments of the constructor of 'Scene'.
-
-    A given 'options' is returned as it is, and giving the options of a solver or component beside it raises. Otherwise
-    the options of each solver and component are gathered into one 'SceneOptions', None standing for the defaults.
-    """
-    individual_options = (
-        sim_options,
-        rigid_options,
-        kinematic_options,
-        mpm_options,
-        sph_options,
-        fem_options,
-        pbd_options,
-        coupler_options,
-        vis_options,
-        viewer_options,
-        profiling_options,
-        renderer,
-    )
-    if options is not None:
-        if any(option is not None for option in individual_options):
-            gs.raise_exception("`options` holds every option a scene is created with, so it is given alone.")
-        return options
-    return SceneOptions(
-        sim=sim_options,
-        rigid=rigid_options,
-        kinematic=kinematic_options,
-        mpm=mpm_options,
-        sph=sph_options,
-        fem=fem_options,
-        pbd=pbd_options,
-        coupler=coupler_options,
-        vis=vis_options,
-        viewer=viewer_options,
-        profiling=profiling_options,
-        renderer=renderer,
-    )
-
-
 @gs.assert_initialized
 class Scene(BuildableMixin, RBC):
     """
@@ -263,8 +209,7 @@ class Scene(BuildableMixin, RBC):
         # Delay simulator import to allow specifying Quadrants array type at init
         from genesis.engine.simulator import Simulator
 
-        self.options = resolve_scene_options(
-            options,
+        individual_options = (
             sim_options,
             rigid_options,
             kinematic_options,
@@ -278,6 +223,25 @@ class Scene(BuildableMixin, RBC):
             profiling_options,
             renderer,
         )
+        if options is not None:
+            if any(option is not None for option in individual_options):
+                gs.raise_exception("`options` holds every option a scene is created with, so it is given alone.")
+            self.options = options
+        else:
+            self.options = SceneOptions(
+                sim=sim_options,
+                rigid=rigid_options,
+                kinematic=kinematic_options,
+                mpm=mpm_options,
+                sph=sph_options,
+                fem=fem_options,
+                pbd=pbd_options,
+                coupler=coupler_options,
+                vis=vis_options,
+                viewer=viewer_options,
+                profiling=profiling_options,
+                renderer=renderer,
+            )
         if show_FPS is not None:
             warn_once(self, "Scene.show_FPS is deprecated. Please use Scene.options.profiling.show_FPS")
             self.options.profiling.show_FPS = show_FPS
@@ -423,10 +387,16 @@ class Scene(BuildableMixin, RBC):
         morph : gs.morphs.Morph | list[gs.morphs.Morph]
             The morph of the entity. If a list of morphs is provided, the entity is heterogeneous (rigid and kinematic
             entities only): each parallel environment simulates one of them, the environments being split into
-            contiguous blocks of nearly equal size. The morphs must share their kinematic topology (the same links,
-            connected by joints of the same names, types and numbers of degrees of freedom), while their geometry,
-            inertia, link frames (e.g. a different 'scale', or a different pose for a fixed base) and joint parameters
-            may differ.
+            contiguous blocks of nearly equal size. Morphs sharing their kinematic topology (the same links, connected
+            by joints of the same names, types and numbers of degrees of freedom) are simulated in one batch, their
+            geometry, inertia, link frames (e.g. a different 'scale', or a different pose for a fixed base) and joint
+            parameters differing. The morphs of a rigid entity may differ in topology too (other links and joints, a
+            fixed or a free base, their own equality constraints): the rigid simulation is then split into groups of
+            environments, one per combination of the variants of the rigid entities, each group simulated at its own
+            size and launching its own kernels at every step. Such an entity is added before every other rigid entity,
+            and the scene holds parallel environments, rigid entities alone, the Rasterizer as renderer and IMU sensors
+            as its only sensors. Every rigid entity of such a scene gathers its accessors over the groups, its
+            quantities whose size depends on the variant padded to the largest one (see 'HeterogeneousEntity').
         material : gs.materials.Material | None, optional
             The material of the entity. If None, use ``gs.materials.Rigid()``.
         surface : gs.surfaces.Surface | None, optional
@@ -1015,6 +985,12 @@ class Scene(BuildableMixin, RBC):
 
                 with namespace(self._namespace):
                     self._sim.build(n_envs)
+                # The rasterizer alone draws the groups of a grouped rigid simulation, each in its own environments
+                if self._sim.has_rigid_groups and not isinstance(self.options.renderer, gs.renderers.Rasterizer):
+                    gs.raise_exception(
+                        f"{type(self.options.renderer).__name__} does not support rigid entities that differ in "
+                        "structure from one environment to another. Use the Rasterizer."
+                    )
                 self._render_context = self._sim.render_context.register(
                     self, rendered_envs_idx=self.options.vis.rendered_envs_idx, n_envs=self._sim.n_envs
                 )

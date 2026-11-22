@@ -25,6 +25,7 @@ from genesis.utils.warnings import warn_once
 from .couplers import IPCCoupler, LegacyCoupler, SAPCoupler
 from .couplers.rigid_mpm_hybrid import RigidMPMHybrid
 from .entities import HybridEntity
+from .entities.rigid_entity.description import VariantStructureError
 from .render_context import RenderContext
 from .sensors import SensorManager
 from .solvers import FEMSolver, KinematicSolver, MPMSolver, PBDSolver, RigidSolver, SPHSolver
@@ -38,6 +39,7 @@ from .solvers.base_solver import (
     kernel_set_time,
     merge_errno,
 )
+from .solvers.rigid.grouped_solver import GroupedRigidSolver
 from .state_change import StateChange, Subscriber
 from .states.solvers import SimState, SimulatorCheckpoint, SolverCheckpoint
 
@@ -115,6 +117,9 @@ class Simulator(BatchedMixin, BuildableMixin, RBC):
 
         # solvers
         self.rigid_solver = RigidSolver(self, options.rigid)
+        # The rigid solver the steps advance: the rigid solver, or the grouped rigid solver of a scene whose rigid
+        # entities differ in structure, the rigid solver of the whole scene then staying inactive (see 'add_entity').
+        self._stepped_rigid_solver: RigidSolver | GroupedRigidSolver = self.rigid_solver
         self.kinematic_solver = KinematicSolver(self, options.kinematic)
         self.mpm_solver = MPMSolver(self, options.mpm)
         self.sph_solver = SPHSolver(self, options.sph)
@@ -186,7 +191,27 @@ class Simulator(BatchedMixin, BuildableMixin, RBC):
                 None,
             )
             assert solver is not None
-            entity = solver.add_entity(self.n_entities, surface, spec, desc)
+            try:
+                entity = solver.add_entity(self.n_entities, surface, spec, desc)
+            except VariantStructureError as e:
+                # A rigid entity whose variants differ in structure splits the rigid simulation into groups of
+                # environments, each simulated by a rigid solver of its own holding every rigid entity of the scene. The
+                # entities already added hold the solver of the whole scene, so the split must come before them. That
+                # solver stays inactive, read as such by the other solvers and the coupler as they build.
+                if not isinstance(solver, RigidSolver):
+                    raise
+                if solver.entities:
+                    gs.raise_exception_from(
+                        "A rigid entity whose variants differ in structure splits the rigid simulation into groups of "
+                        "environments, and must be added before every other rigid entity of the scene.",
+                        e,
+                    )
+                # The options are copied before the rigid solver of the whole scene resolves its own in place as it
+                # builds, from the entities it holds
+                self._stepped_rigid_solver = GroupedRigidSolver(self, solver.options.model_copy(deep=True))
+                self._solvers.append(self._stepped_rigid_solver)
+                self._solvers_by_spec_cls[solver.entity_spec_cls] = self._stepped_rigid_solver
+                entity = self._stepped_rigid_solver.add_entity(self.n_entities, surface, spec, desc)
         self._entities.append(entity)
         if entity.desc is not None:
             self.scene._desc.entities.append(entity.desc)
@@ -250,13 +275,43 @@ class Simulator(BatchedMixin, BuildableMixin, RBC):
             solver._substeps = self._substeps
             solver._substep_dt = self._substep_dt
 
+        # The groups of a grouped rigid solver simulate the rigid entities alone, each one in its own environments
+        if self.has_rigid_groups:
+            other_solvers_name = [
+                type(solver).__name__
+                for solver in self._solvers
+                if solver.is_active and solver is not self._stepped_rigid_solver
+            ]
+            if other_solvers_name:
+                gs.raise_exception(
+                    "A scene whose rigid entities differ in structure from one environment to another simulates rigid "
+                    f"entities alone, got entities of {other_solvers_name}."
+                )
+            if isinstance(self._coupler, (SAPCoupler, IPCCoupler)):
+                gs.raise_exception(
+                    f"{type(self._coupler).__name__} does not support rigid entities that differ in structure from one "
+                    "environment to another."
+                )
+            if self._requires_grad:
+                gs.raise_exception(
+                    "Differentiable simulation ('requires_grad=True') does not support rigid entities that differ in "
+                    "structure from one environment to another."
+                )
+            if self._stepped_rigid_solver.force_fields.fields:
+                gs.raise_exception(
+                    "Force fields do not support rigid entities that differ in structure from one environment to "
+                    "another."
+                )
+
         # Counted per environment to support per-env reset, as steps rather than seconds to avoid drifting over time.
         self._steps = torch.zeros((self.n_envs_,), dtype=gs.tc_int, device=gs.device)
         self.sim_state = SimulatorState(sizes=dict(envs=self.n_envs_))
 
         # solvers
         # IPCCoupler needs full substep flow for pre/post coupling phases
-        self._rigid_only = self.rigid_solver.is_active and not isinstance(self._coupler, (SAPCoupler, IPCCoupler))
+        self._rigid_only = self._stepped_rigid_solver.is_active and not isinstance(
+            self._coupler, (SAPCoupler, IPCCoupler)
+        )
         # The SAP coupler solves every FEM vertex from its momentum residual, which the quadratic energy of the models
         # of the implicit solver makes exact (see func_init_fem_reference_gradient in sap_coupler.py).
         self.fem_solver._is_free_solve_skipped = isinstance(self._coupler, SAPCoupler)
@@ -265,7 +320,7 @@ class Simulator(BatchedMixin, BuildableMixin, RBC):
             if solver.is_active:
                 self._active_solvers.append(solver)
                 self._active_systems.append(solver)
-                if not isinstance(solver, RigidSolver):
+                if not isinstance(solver, (RigidSolver, GroupedRigidSolver)):
                     self._rigid_only = False
 
         # A coupler exchanges state once per substep, so it is built once the rate that loop runs at is known.
@@ -315,6 +370,13 @@ class Simulator(BatchedMixin, BuildableMixin, RBC):
             if solver.requires_grad:
                 solver.subscribe(Subscriber(frozenset((StateChange.MODEL,)), callback=self._rollout_graph.invalidate))
 
+        # The solvers of the groups of a grouped rigid solver hold the error flags and the visual data in its place
+        leaf_systems = [
+            leaf_system
+            for system in self._active_systems
+            for leaf_system in (system.solvers if isinstance(system, GroupedRigidSolver) else (system,))
+        ]
+
         # On CPU, the flags of the solvers are merged straight from their numpy views (see 'merge_errno'), and whether
         # any env is flagged spares the calls of 'check_errno' at every step but those that raise
         self._errno_views = None
@@ -322,13 +384,14 @@ class Simulator(BatchedMixin, BuildableMixin, RBC):
         if gs.backend == gs.cpu and gs.use_zerocopy.is_supported:
             self._errno_views = [
                 (component._errno_latched.numpy(), qd_to_numpy(component._errno, copy=False))
-                for component in self._active_systems
+                for component in leaf_systems
             ]
 
         self._step_timer.add_phases("physics", "sensors")
 
         # The sensors build after the render context, since some of them read it as they build
-        self._render_context.build(n_envs, self._active_solvers, self.sanitize_envs_idx)
+        leaf_solvers = [system for system in leaf_systems if isinstance(system, Solver)]
+        self._render_context.build(n_envs, leaf_solvers, self.sanitize_envs_idx)
         self._sensor_manager.build(n_envs)
 
         self._is_built = True
@@ -488,9 +551,9 @@ class Simulator(BatchedMixin, BuildableMixin, RBC):
             if self._rigid_only and not self._requires_grad:  # "Only Advance!" --Thomas Wade :P
                 self._steps += 1
                 for _ in range(self._substeps):
-                    self.rigid_solver.substep()
+                    self._stepped_rigid_solver.substep()
                     self._cur_substep_global += 1
-                self.rigid_solver.clear_external_force()
+                self._stepped_rigid_solver.clear_external_force()
             elif self._rollout_graph.is_recording:
                 self._rollout_graph.record_step(StepOperation(self))
             else:
@@ -520,8 +583,8 @@ class Simulator(BatchedMixin, BuildableMixin, RBC):
         for _ in range(self._substeps):
             self.substep()
             self._cur_substep_global += 1
-        if self.rigid_solver.is_active:
-            self.rigid_solver.clear_external_force()
+        if self._stepped_rigid_solver.is_active:
+            self._stepped_rigid_solver.clear_external_force()
 
     def _reverse(self, substep_start: int, steps_start: torch.Tensor, checkpoints: list[SolverCheckpoint]) -> None:
         """
@@ -630,6 +693,12 @@ class Simulator(BatchedMixin, BuildableMixin, RBC):
     def _B(self) -> int:
         warn_once(self, "'Simulator._B' is deprecated. Please use 'Simulator.n_envs_' instead.")
         return self.n_envs_
+
+    @property
+    def has_rigid_groups(self) -> bool:
+        """Whether the rigid simulation is split into groups of environments, its rigid entities differing in structure
+        from one environment to another (see GroupedRigidSolver)."""
+        return isinstance(self._stepped_rigid_solver, GroupedRigidSolver)
 
     @property
     def rigid_only(self) -> bool:

@@ -433,13 +433,6 @@ def test_pick_heterogenous_objects(show_viewer):
 
 @pytest.mark.required
 def test_invalid_variant_specification_raises():
-    # Restricting variants to a single family is what keeps the inertial parsed per variant aligned with the variant
-    # index: only URDF and MJCF variants record one, so admitting a basic object among them would shift every
-    # subsequent lookup onto the wrong variant.
-    MJCF_SPHERE = (
-        '<mujoco><worldbody><body><joint type="free"/><geom type="sphere" size="0.1"/></body></worldbody></mujoco>'
-    )
-
     scene = gs.Scene(show_viewer=False)
 
     morphs_heterogeneous = (
@@ -458,12 +451,6 @@ def test_invalid_variant_specification_raises():
     with pytest.raises(gs.GenesisException, match="only support Primitive, Mesh, URDF and MJCF"):
         scene.add_entity(
             morph=(gs.morphs.Box(size=(1.0, 1.0, 1.0)), gs.morphs.Terrain()),
-        )
-
-    # A basic object and an articulated robot in the same entity
-    with pytest.raises(gs.GenesisException, match="must be consistent"):
-        scene.add_entity(
-            morph=(gs.morphs.Box(size=(1.0, 1.0, 1.0)), gs.morphs.MJCF(file=MJCF_SPHERE)),
         )
 
 
@@ -517,29 +504,6 @@ def test_morph_property_raises():
 
 
 @pytest.mark.required
-def test_articulated_structure_mismatch(fixed_base_dual_arm, fixed_base_dual_arm_chained):
-    scene = gs.Scene(show_viewer=False)
-
-    # two_cube_revolute has 1 revolute joint; two_link_arm has 2 continuous joints
-    with pytest.raises(gs.GenesisException):
-        scene.add_entity(
-            morph=[
-                gs.morphs.URDF(file="urdf/simple/two_cube_revolute.urdf", pos=(0, 0, 0.1)),
-                gs.morphs.URDF(file="urdf/simple/two_link_arm.urdf", pos=(0, 0, 0.1)),
-            ]
-        )
-
-    # Every variant shares the kinematic topology of the first one
-    with pytest.raises(gs.GenesisException, match="Link parent mismatch"):
-        scene.add_entity(
-            morph=[
-                gs.morphs.URDF(file=fixed_base_dual_arm, fixed=True),
-                gs.morphs.URDF(file=fixed_base_dual_arm_chained, fixed=True),
-            ]
-        )
-
-
-@pytest.mark.required
 def test_variants_of_different_structure(mimic_hinges, show_viewer, tol):
     DT = 0.01
     G = 9.81
@@ -550,7 +514,7 @@ def test_variants_of_different_structure(mimic_hinges, show_viewer, tol):
     RADIUS = 0.05
     RHO = 600.0
 
-    scene = gs.HeterogeneousScene(
+    scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=DT,
             gravity=(0.0, 0.0, -G),
@@ -564,9 +528,6 @@ def test_variants_of_different_structure(mimic_hinges, show_viewer, tol):
         ),
         show_viewer=show_viewer,
     )
-    scene.add_entity(
-        morph=gs.morphs.Plane(),
-    )
     # A free box, or two hinges tied by a joint equality and hanging from a fixed base
     robot = scene.add_entity(
         morph=[
@@ -578,6 +539,9 @@ def test_variants_of_different_structure(mimic_hinges, show_viewer, tol):
                 file=ET.tostring(mimic_hinges, encoding="unicode"),
             ),
         ],
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
     )
     obj = scene.add_entity(
         morph=[
@@ -648,7 +612,7 @@ def test_variants_of_different_structure(mimic_hinges, show_viewer, tol):
 
 @pytest.mark.required
 def test_variants_sharing_dofs_info(tol):
-    scene = gs.HeterogeneousScene()
+    scene = gs.Scene()
     # A single hinge, or two
     robot = scene.add_entity(
         morph=[
@@ -682,10 +646,12 @@ def test_sensors_cameras_and_state_across_groups(mimic_hinges, show_viewer, tol)
     G = 9.81
     N_STEPS = 10
     BOX_SIZE = 0.1
-    CAMERA_HEIGHT = 3.0
-    RES = 64
+    ENV_SPACING = 2.0
+    CAMERA_HEIGHT = 6.0
+    FOV = 40.0
+    RES = 128
 
-    scene = gs.HeterogeneousScene(
+    scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=DT,
             gravity=(0.0, 0.0, -G),
@@ -695,9 +661,6 @@ def test_sensors_cameras_and_state_across_groups(mimic_hinges, show_viewer, tol)
             camera_lookat=(0.0, 0.0, 1.0),
         ),
         show_viewer=show_viewer,
-    )
-    scene.add_entity(
-        morph=gs.morphs.Plane(),
     )
     # A free box, or two hinges whose links hang from a fixed base with their center of mass on their axis
     robot = scene.add_entity(
@@ -713,49 +676,49 @@ def test_sensors_cameras_and_state_across_groups(mimic_hinges, show_viewer, tol)
             ),
         ),
     )
-    imu_base = scene.add_sensor(
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
+    imu = scene.add_sensor(
         gs.sensors.IMU(
-            entity_idx=1,
+            entity_idx=robot.idx,
         ),
     )
-    # The second hinge carries an IMU turned by a quarter turn about its axis
-    imu_variants = scene.add_sensor(
-        [
-            gs.sensors.IMU(
-                entity_idx=1,
-            ),
-            gs.sensors.IMU(
-                entity_idx=1,
-                link_idx_local=2,
-                euler_offset=(0.0, 90.0, 0.0),
-            ),
-        ]
-    )
-    with pytest.raises(gs.GenesisException, match="one options object per variant"):
-        scene.add_sensor([gs.sensors.IMU(entity_idx=1)] * 3)
+    # The camera bound to the first environment looks down at the middle of the grid of environments
     camera = scene.add_camera(
         res=(RES, RES),
-        pos=(0.0, 0.0, CAMERA_HEIGHT),
-        lookat=(0.0, 0.0, 0.0),
+        pos=(0.5 * ENV_SPACING, 0.5 * ENV_SPACING, CAMERA_HEIGHT),
+        lookat=(0.5 * ENV_SPACING, 0.5 * ENV_SPACING, 0.0),
         up=(0.0, 1.0, 0.0),
+        fov=FOV,
     )
-    scene.build(n_envs=4)
+    scene.build(n_envs=4, env_spacing=(ENV_SPACING, ENV_SPACING))
 
-    # The accelerometer reads zero on the box in free fall and the opposite of gravity on the links at rest, rows
+    # The accelerometer reads zero on the box in free fall and the opposite of gravity on the base at rest, rows
     # following the selection of environments
     for _ in range(N_STEPS):
         scene.step()
-    assert_allclose(imu_base.read().lin_acc, [[0.0, 0.0, 0.0]] * 2 + [[0.0, 0.0, G]] * 2, tol=tol)
-    assert_allclose(imu_variants.read(envs_idx=[3, 0]).lin_acc, [[-G, 0.0, 0.0], [0.0, 0.0, 0.0]], tol=tol)
+    assert_allclose(imu.read().lin_acc, [[0.0, 0.0, 0.0]] * 2 + [[0.0, 0.0, G]] * 2, tol=tol)
+    assert_allclose(imu.read(envs_idx=[3, 0]).lin_acc, [[0.0, 0.0, G], [0.0, 0.0, 0.0]], tol=tol)
 
-    # The camera looking down sees the top of the falling box in its group scene and the ground in the other one
+    # The camera sees the top of the falling box straight above the origin of the environments carrying it, and the top
+    # of the vertical capsule of the first hinge in those carrying the hinges, the ground lying at the place of either
+    # in the environments carrying the other variant. The pixel samples the rounded top of the capsule up to half a
+    # pixel off its apex, which deepens it by 4 mm at most.
     _, depth, _, _ = camera.render(rgb=False, depth=True)
-    box_top = robot.get_pos()[0, 2] + 0.5 * BOX_SIZE
-    assert_allclose(
-        [depth[0][RES // 2, RES // 2], depth[1][RES // 2, RES // 2]], [CAMERA_HEIGHT - box_top, CAMERA_HEIGHT], tol=1e-5
-    )
+    box_top = tensor_to_array(robot.get_pos()[0, 2]) + 0.5 * BOX_SIZE
+    capsule_xy, capsule_top = (0.5, 0.0), 1.0 + 0.2 + 0.05
+    camera_xy = 0.5 * ENV_SPACING + scene.envs_offset[0, :2]
+    focal = 0.5 * RES / math.tan(math.radians(0.5 * FOV))
+    for point_xy, point_z, envs_depth, depth_tol in (
+        ((0.0, 0.0), box_top, [CAMERA_HEIGHT - box_top] * 2 + [CAMERA_HEIGHT] * 2, 1e-5),
+        (capsule_xy, capsule_top, [CAMERA_HEIGHT] * 2 + [CAMERA_HEIGHT - capsule_top] * 2, 1e-3),
+    ):
+        envs_xy = scene.envs_offset[:, :2] + point_xy - camera_xy
+        envs_col, envs_row = (0.5 * RES + envs_xy * (1.0, -1.0) * focal / (CAMERA_HEIGHT - point_z)).astype(np.int64).T
+        assert_allclose(depth[envs_row, envs_col], envs_depth, tol=depth_tol)
 
-    # A state restores the environments a reset selects, and becomes the initial state of every group scene
+    # A state restores the environments a reset selects, and becomes the initial state of the scene
     robot.set_dofs_position([[0.2, 0.2, 0.0, 0.0, 0.0, 0.0]], envs_idx=[2])
     state = scene.get_state()
     dofs_position = robot.get_dofs_position()
@@ -769,8 +732,8 @@ def test_sensors_cameras_and_state_across_groups(mimic_hinges, show_viewer, tol)
     scene.reset()
     assert_allclose(robot.get_dofs_position(), dofs_position, tol=tol)
 
-    # A sensor invalid for the variant of a later group leaves no group scene alive
-    scene_invalid = gs.HeterogeneousScene()
+    # A sensor on a link that a variant lacks leaves the scene unbuilt
+    scene_invalid = gs.Scene()
     scene_invalid.add_entity(
         morph=[
             gs.morphs.MJCF(file=ET.tostring(mimic_hinges, encoding="unicode")),
@@ -779,7 +742,7 @@ def test_sensors_cameras_and_state_across_groups(mimic_hinges, show_viewer, tol)
     )
     scene_invalid.add_sensor(gs.sensors.IMU(entity_idx=0, link_idx_local=2))
     n_scenes = len(gs._scene_registry)
-    with pytest.raises(gs.GenesisException, match="invalid for the variants"):
+    with pytest.raises(gs.GenesisException, match="Invalid link index 2"):
         scene_invalid.build(n_envs=2)
     assert len(gs._scene_registry) == n_scenes
     assert not scene_invalid.is_built

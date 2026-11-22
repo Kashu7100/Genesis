@@ -139,13 +139,17 @@ class KinematicSensorOptionsMixin[SensorT: "Sensor"](SensorOptions[SensorT]):
     euler_offset: Vec3FType = (0.0, 0.0, 0.0)
 
     def _validate(self, sim: "Simulator"):
-        from genesis.engine.entities import KinematicEntity
+        from genesis.engine.entities import HeterogeneousEntity, KinematicEntity
 
         super()._validate(sim)
         if self.entity_idx >= 0:
             if self.entity_idx >= len(sim.entities):
                 gs.raise_exception(f"Invalid entity index {self.entity_idx}.")
             entity = sim.entities[self.entity_idx]
+            # The links of a rigid entity simulated by groups of environments are known once the groups are, as the
+            # scene builds, which checks the link of the sensor in each group (see 'RigidSensorMixin')
+            if isinstance(entity, HeterogeneousEntity):
+                return
             if not isinstance(entity, KinematicEntity):
                 gs.raise_exception(f"Entity at index {self.entity_idx} is not a KinematicEntity.")
             if self.link_idx_local >= entity.n_links:
@@ -161,12 +165,12 @@ class RigidSensorOptionsMixin[SensorT: "Sensor"](KinematicSensorOptionsMixin[Sen
     """
 
     def _validate(self, sim: "Simulator"):
-        from genesis.engine.entities import RigidEntity
+        from genesis.engine.entities import HeterogeneousEntity, RigidEntity
 
         super()._validate(sim)
         if self.entity_idx >= 0:
             entity = sim.entities[self.entity_idx]
-            if not isinstance(entity, RigidEntity):
+            if not isinstance(entity, (RigidEntity, HeterogeneousEntity)):
                 gs.raise_exception(f"Entity at index {self.entity_idx} is not a RigidEntity.")
 
 

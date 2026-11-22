@@ -58,6 +58,15 @@ POSE_EPS = 1e-9
 PRIMITIVE_SDF_MAX_RES = 32
 
 
+class VariantStructureError(gs.GenesisException):
+    """Raised when the variants of a heterogeneous entity cannot share the kinematic structure of the primary morph.
+
+    The variants of a rigid entity simulated in one batch share the links, joints and degrees of freedom of the primary
+    morph. A rigid entity whose variants differ in any of them is simulated by groups of environments instead (see
+    GroupedRigidSolver), which the scene decides on catching this error.
+    """
+
+
 @dataclass(kw_only=True)
 class BaseRigidGeomDescription:
     """Pose of one geom in its link frame. Collision and visual geom descriptions both hold these fields."""
@@ -438,7 +447,7 @@ class KinematicEntityDescription(EntityDescription):
             ):
                 gs.raise_exception("Heterogeneous morphs only support Primitive, Mesh, URDF and MJCF types.")
             if len(set(isinstance(morph, (gs.morphs.URDF, gs.morphs.MJCF)) for morph in morphs)) > 1:
-                gs.raise_exception(
+                raise VariantStructureError(
                     "Heterogeneous morphs must be consistent: either all articulated robots (ie URDF, MJCF) or all "
                     "basic objects (ie Primitive, Mesh)."
                 )
@@ -503,7 +512,7 @@ class KinematicEntityDescription(EntityDescription):
         # The per-variant offset and inertial alignment are tracked for a single root only; a multi-root entity (one
         # MJCF/URDF with several free root bodies) would cross-contaminate the roots' offsets and init poses.
         if sum(l_desc.parent_idx == -1 for l_desc in self.links) > 1:
-            gs.raise_exception("Heterogeneous morphs are not supported on multi-root entities.")
+            raise VariantStructureError("Heterogeneous morphs are not supported on multi-root entities.")
 
         # Track per-variant init_qpos and base-link offset for per-environment dispatch (primary first). Each variant
         # accumulates its own below so an asymmetric variant is aligned exactly like its homogeneous equivalent.
@@ -528,36 +537,36 @@ class KinematicEntityDescription(EntityDescription):
 
                 # Validate that the variant has the same joint structure as the primary
                 if len(v_l_infos) != n_links:
-                    gs.raise_exception(
+                    raise VariantStructureError(
                         f"Heterogeneous variant has {len(v_l_infos)} links, "
                         f"but primary has {n_links}. All variants must have the same link count."
                     )
                 for i_l, (l_desc, v_l_info, v_j_infos) in enumerate(zip(self.links, v_l_infos, v_links_j_infos)):
                     if v_l_info["parent_idx"] != l_desc.parent_idx:
-                        gs.raise_exception(
+                        raise VariantStructureError(
                             f"Link parent mismatch at link {i_l} ('{l_desc.name}'): primary hangs it from link "
                             f"{l_desc.parent_idx}, variant from link {v_l_info['parent_idx']}. All variants must share "
                             "the kinematic topology of the primary."
                         )
                     primary_joints = l_desc.joints
                     if len(v_j_infos) != len(primary_joints):
-                        gs.raise_exception(
+                        raise VariantStructureError(
                             f"Heterogeneous variant link {i_l} has {len(v_j_infos)} joints, "
                             f"but primary has {len(primary_joints)}."
                         )
                     for p_joint, v_j_info in zip(primary_joints, v_j_infos):
                         if p_joint.name != v_j_info["name"]:
-                            gs.raise_exception(
+                            raise VariantStructureError(
                                 f"Joint name mismatch at link {i_l}: primary has '{p_joint.name}', "
                                 f"variant has '{v_j_info['name']}'. All variants must have the same joint names."
                             )
                         if p_joint.type != v_j_info["type"]:
-                            gs.raise_exception(
+                            raise VariantStructureError(
                                 f"Joint type mismatch for '{p_joint.name}': primary has {p_joint.type}, "
                                 f"variant has {v_j_info['type']}."
                             )
                         if p_joint.n_dofs != v_j_info["n_dofs"]:
-                            gs.raise_exception(
+                            raise VariantStructureError(
                                 f"DoF count mismatch for joint '{p_joint.name}': primary has {p_joint.n_dofs}, "
                                 f"variant has {v_j_info['n_dofs']}."
                             )
@@ -652,7 +661,9 @@ class KinematicEntityDescription(EntityDescription):
                 else:
                     g_infos = self._load_primitive(morph, resolution, load_geom_only_for_heterogeneous=True)
                 if morph.fixed != self.spec.morphs[0].fixed:
-                    gs.raise_exception("Mixing fixed and non-fixed morphs in heterogeneous entities is not supported.")
+                    raise VariantStructureError(
+                        "Mixing fixed and non-fixed morphs in heterogeneous entities is not supported."
+                    )
                 self._resolve_geoms_values(morph, [(self.links[0].name,)], [g_infos], resolution)
                 cg_infos, vg_infos = self._resolve_geoms(morph, g_infos, is_robot=False)
 

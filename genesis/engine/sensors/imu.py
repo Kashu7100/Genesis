@@ -123,6 +123,8 @@ class IMUReturnType(NamedTuple):
 
 
 class IMUSensor(RigidSensorMixin[IMUSharedMetadata], SimpleSensor[IMUOptions, None, IMUSharedMetadata, IMUReturnType]):
+    has_rigid_groups_support = True
+
     def __init__(
         self,
         options: IMUOptions,
@@ -197,15 +199,31 @@ class IMUSensor(RigidSensorMixin[IMUSharedMetadata], SimpleSensor[IMUOptions, No
 
     @classmethod
     def _update_raw_data(cls, shared_context: None, shared_metadata: IMUSharedMetadata, raw_data_T: torch.Tensor):
-        _kernel_update_imu_raw_data(
-            shared_metadata.links_idx,
-            shared_metadata.offsets_pos,
-            shared_metadata.offsets_quat,
-            shared_metadata.magnetic_field_vector,
-            raw_data_T,
-            shared_metadata.solver.dyn_state,
-            shared_metadata.solver.rigid_info,
-        )
+        if not shared_metadata.solver_groups:
+            _kernel_update_imu_raw_data(
+                shared_metadata.links_idx,
+                shared_metadata.offsets_pos,
+                shared_metadata.offsets_quat,
+                shared_metadata.magnetic_field_vector,
+                raw_data_T,
+                shared_metadata.solver.dyn_state,
+                shared_metadata.solver.rigid_info,
+            )
+            return
+        # The solver of each group computes the readings of its own environments, written into their columns
+        for group in shared_metadata.solver_groups:
+            envs_idx = group.solver.scene_envs_idx
+            group_raw_data_T = raw_data_T.new_empty((raw_data_T.shape[0], len(envs_idx)))
+            _kernel_update_imu_raw_data(
+                group.links_idx,
+                shared_metadata.offsets_pos[envs_idx],
+                shared_metadata.offsets_quat[envs_idx],
+                shared_metadata.magnetic_field_vector[envs_idx],
+                group_raw_data_T,
+                group.solver.dyn_state,
+                group.solver.rigid_info,
+            )
+            raw_data_T[:, envs_idx] = group_raw_data_T
 
     @classmethod
     def _apply_transform(cls, shared_metadata: IMUSharedMetadata, data: torch.Tensor, timeline, *, is_measured: bool):

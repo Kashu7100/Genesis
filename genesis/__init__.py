@@ -573,7 +573,6 @@ from .datatypes import List
 from .engine import states, materials, force_fields
 from .engine.mesh import Mesh
 from .engine.scene import Scene
-from .engine.heterogeneous_scene import HeterogeneousScene
 
 from . import recorders
 

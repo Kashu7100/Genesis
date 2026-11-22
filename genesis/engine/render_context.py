@@ -592,6 +592,16 @@ class ScopedRenderContext(Generic[OwnerT]):
         """The solvers whose changes of state make the scoped context stale (see 'stale_on'), the owner by default."""
         return (self.owner,)
 
+    @property
+    def envs_idx(self) -> torch.Tensor | None:
+        """The environments of the scene the scoped context draws, in the order its arrays hold them, None for all.
+
+        A shape stating no environments of its own appears in these (see 'Shape.envs_idx'). The render context passes
+        the environments it refreshes to 'update_shapes', 'update_markers' and 'reset' as rows of the arrays of the
+        scoped context, those of the environments it draws.
+        """
+        return None
+
     def get_shapes(
         self,
         envs_idx: "IndexType | None" = None,
@@ -652,7 +662,7 @@ class ScopedRenderContext(Generic[OwnerT]):
         return ()
 
     def update_markers(self, envs_idx: torch.Tensor) -> tuple[Shape, ...]:
-        """Return every marker the scoped context shows, with their arrays written in some environments.
+        """Return every marker the scoped context shows, with their arrays written in some environments (see 'envs_idx').
 
         It runs for a read of the markers alone, so that a view without markers never pays for them. The lifetime of a
         marker follows the rules of the shapes (see 'update_shapes'). A scoped context toggles a marker by returning it
@@ -729,6 +739,9 @@ class _Refresh(NamedTuple):
 @dataclass(eq=False)
 class _ScopedRecord:
     scoped_context: ScopedRenderContext
+    # The row of each environment of the scene in the arrays of a scoped context drawing some environments alone, -1 for
+    # those it leaves out, None for a scoped context drawing them all (see 'ScopedRenderContext.envs_idx').
+    envs_row: torch.Tensor | None = None
     # The markers the scoped context shows since its latest refresh of the markers
     markers: tuple[Shape, ...] = ()
     # The number of times the scoped context was made stale, and the latest refresh of its shapes and of its markers
@@ -818,6 +831,11 @@ class RenderContext:
         # The scoped contexts registered once the context is built build at the first read, once their owner is built
         for scoped_context in self._pending:
             record = _ScopedRecord(scoped_context)
+            if scoped_context.envs_idx is not None:
+                record.envs_row = torch.full((len(self._envs_idx),), -1, dtype=gs.tc_int, device=gs.device)
+                record.envs_row[scoped_context.envs_idx] = torch.arange(
+                    len(scoped_context.envs_idx), dtype=gs.tc_int, device=gs.device
+                )
             for source in scoped_context.sources:
                 self._sources_records.setdefault(source, []).append(record)
             scoped_context.build()
@@ -833,7 +851,8 @@ class RenderContext:
         self._shapes_record[shape] = record
         self._set_reads(record, shape)
         if shape.envs_idx is None:
-            object.__setattr__(shape, "envs_idx", self._envs_idx)
+            envs_idx = record.scoped_context.envs_idx
+            object.__setattr__(shape, "envs_idx", self._envs_idx if envs_idx is None else envs_idx)
         is_recorded_before = bool(shape.refs)
         for shape_field in dataclasses.fields(shape):
             name = shape_field.name
@@ -887,6 +906,9 @@ class RenderContext:
         # The context subscribes to every solver as it builds, ahead of every consumer, so that a change of state
         # reaches the scoped contexts, including those made later, before the consumers reading the context.
         def on_change(solver: "Solver", change: StateChange, envs_idx: "IndexType | None") -> None:
+            # A solver simulating some environments of the scene notifies the changes of its own environments
+            if solver.scene_envs_idx is not None:
+                envs_idx = solver.scene_envs_idx[solver.sanitize_envs_idx(envs_idx)]
             for record in self._sources_records.get(solver, ()):
                 if change in record.scoped_context.stale_on:
                     record.epoch += 1
@@ -961,7 +983,7 @@ class RenderContext:
     def reset(self, envs_idx: torch.Tensor) -> None:
         """Reset the appearance the scoped contexts hold in some environments, as a reset of the scene asks."""
         for record in self._records:
-            record.scoped_context.reset(envs_idx)
+            record.scoped_context.reset(self._get_rows(record, envs_idx))
         self.invalidate()
 
     def subscribe(self, subscriber: Subscriber, shapes: "tuple[Shape, ...] | None" = None) -> None:
@@ -1018,12 +1040,13 @@ class RenderContext:
             scoped_context = record.scoped_context
             if is_markers and record.is_markers_hidden and all(map(scoped_context.is_hidden, record.markers)):
                 continue
+            rows = self._get_rows(record, envs_idx)
             if is_markers:
-                self._update_markers(record, envs_idx)
+                self._update_markers(record, rows)
                 copies = record.markers_copies
                 record.markers_refresh = _Refresh(record.epoch, envs_key, n_changes)
             else:
-                shapes = scoped_context.update_shapes(envs_idx=None if is_current else envs_idx, view=view)
+                shapes = scoped_context.update_shapes(envs_idx=None if is_current else rows, view=view)
                 for shape in shapes:
                     self._record_shape(record, shape, is_marker=False)
                 shapes_before = record.views_shapes.get(view, ())
@@ -1045,9 +1068,16 @@ class RenderContext:
             for subscriber in record.subscribers:
                 subscriber.notify(StateChange.GEOMETRY)
 
-    def _update_markers(self, record: _ScopedRecord, envs_idx: torch.Tensor) -> None:
+    def _get_rows(self, record: _ScopedRecord, envs_idx: torch.Tensor) -> torch.Tensor:
+        # The rows of the given environments of the scene in the arrays of a scoped context, those it draws alone
+        if record.envs_row is None:
+            return envs_idx
+        rows = record.envs_row[envs_idx]
+        return rows[rows >= 0]
+
+    def _update_markers(self, record: _ScopedRecord, rows: torch.Tensor) -> None:
         scoped_context = record.scoped_context
-        markers = scoped_context.update_markers(envs_idx)
+        markers = scoped_context.update_markers(rows)
         for marker in markers:
             self._record_shape(record, marker, is_marker=True)
         for marker in set(record.markers).difference(markers):

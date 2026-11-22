@@ -35,14 +35,11 @@ def _add_free_body(mjcf, name, geom_type, geom_size, pos, rgba=None):
     ET.SubElement(body, "joint", name=f"{name}_root", type="free")
 
 
-def _build_fixed_base_dual_arm(shoulder_damping, right_arm_parent):
+def _build_fixed_base_dual_arm(shoulder_damping):
     """Generate a URDF of a torso the world carries and two one-link arms hanging from it by damped shoulders.
 
     The arms are mounted close enough that they overlap once they hang at rest, so that they touch when they fall under
     gravity.
-
-    'right_arm_parent' names the link the right shoulder hangs from. Both shoulders sit at the same offset from the
-    frame of their parent, so hanging the right arm from the left one changes the kinematic tree alone.
     """
     robot = ET.Element("robot", name="dual_arm")
     torso = ET.SubElement(robot, "link", name="torso")
@@ -62,7 +59,7 @@ def _build_fixed_base_dual_arm(shoulder_damping, right_arm_parent):
             ET.SubElement(geom_prop, "origin", xyz=f"{sign * 0.15} 0 0")
             ET.SubElement(ET.SubElement(geom_prop, "geometry"), "box", size="0.3 0.12 0.12")
         joint = ET.SubElement(robot, "joint", name=f"{side}_shoulder", type="revolute")
-        ET.SubElement(joint, "parent", link="torso" if side == "left" else right_arm_parent)
+        ET.SubElement(joint, "parent", link="torso")
         ET.SubElement(joint, "child", link=f"{side}_arm")
         ET.SubElement(joint, "origin", xyz=f"{sign * 0.05} 0 0")
         ET.SubElement(joint, "axis", xyz="0 1 0")
@@ -73,17 +70,12 @@ def _build_fixed_base_dual_arm(shoulder_damping, right_arm_parent):
 
 @pytest.fixture(scope="session")
 def fixed_base_dual_arm():
-    return _build_fixed_base_dual_arm(shoulder_damping=0.5, right_arm_parent="torso")
+    return _build_fixed_base_dual_arm(shoulder_damping=0.5)
 
 
 @pytest.fixture(scope="session")
 def fixed_base_dual_arm_high_damping():
-    return _build_fixed_base_dual_arm(shoulder_damping=1.0, right_arm_parent="torso")
-
-
-@pytest.fixture(scope="session")
-def fixed_base_dual_arm_chained():
-    return _build_fixed_base_dual_arm(shoulder_damping=0.5, right_arm_parent="left_arm")
+    return _build_fixed_base_dual_arm(shoulder_damping=1.0)
 
 
 @pytest.fixture(scope="session")

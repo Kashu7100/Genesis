@@ -11,6 +11,7 @@ from typing_extensions import TypeVar as TypeVarWithDefault
 import quadrants as qd
 
 import genesis as gs
+from genesis.engine.entities.rigid_entity import HeterogeneousEntity
 from genesis.engine.render_context import RenderContext, ScopedRenderContext, Shape
 from genesis.engine.solvers.rigid.data import LinksState
 from genesis.engine.state_change import StateChange
@@ -200,6 +201,9 @@ class Sensor(BuildableMixin, RBC, Generic[OptionsT, SharedSensorContextT, Shared
     # Subclasses whose `_update_shared_cache` bypasses the rings (e.g. cameras handling rendering lazily) explicitly set
     # this to ``False``.
     uses_ring_pipeline: ClassVar[bool] = True
+    # Whether the class reads a rigid entity whose rigid simulation is split into groups of environments, the solver of
+    # each group holding its own copy of the entity (see 'RigidSensorMixin' and GroupedRigidSolver).
+    has_rigid_groups_support: ClassVar[bool] = False
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -314,6 +318,15 @@ class Sensor(BuildableMixin, RBC, Generic[OptionsT, SharedSensorContextT, Shared
         This method is called by SensorManager during the scene build phase. This is where any shared metadata should be
         initialized.
         """
+        # A rigid simulation split into groups of environments is read through the entity a sensor is attached to, and
+        # the markers of a sensor through its link in the solver of the whole scene, which simulates nothing then
+        if self._manager.sim.has_rigid_groups and (
+            not self.has_rigid_groups_support or self._options.entity_idx < 0 or self._options.draw_debug
+        ):
+            gs.raise_exception(
+                f"{type(self).__name__} does not support rigid entities that differ in structure from one environment "
+                "to another. Attach an IMU to a rigid entity, without 'draw_debug'."
+            )
         # Set first, since the builds of the derived sensors call their own guarded accessors
         self._is_built = True
         self._shared_metadata.delays_ts = concat_with_tensor(
@@ -643,6 +656,9 @@ class RigidSensorMetadataMixin:
     links_idx: torch.Tensor = make_tensor_field((0,), dtype_factory=lambda: gs.tc_int)
     offsets_pos: torch.Tensor = make_tensor_field((0, 0, 3))
     offsets_quat: torch.Tensor = make_tensor_field((0, 0, 4))
+    # The solver of each group of environments of a rigid simulation split into groups, with the link of every sensor
+    # in it, which replace 'solver' and 'links_idx' when present (see GroupedRigidSolver)
+    solver_groups: list[_SolverLinkGroup] = field(default_factory=list)
 
 
 @qd.func
@@ -697,9 +713,13 @@ class _LinkAttachedSensorMixin(BuildableMixin):
         batch_size = self._manager.n_envs_
         if self._options.entity_idx >= 0:
             entity = self._manager.sim.entities[self._options.entity_idx]
-            self._link = entity.links[self._options.link_idx_local]
-            link_idx = self._options.link_idx_local + entity.link_start
-            self._register_link(entity, link_idx)
+            # The entity of each group of a rigid simulation split into groups holds the link in its own solver
+            if isinstance(entity, HeterogeneousEntity):
+                self._register_link(entity, self._options.link_idx_local)
+            else:
+                self._link = entity.links[self._options.link_idx_local]
+                link_idx = self._options.link_idx_local + entity.link_start
+                self._register_link(entity, link_idx)
 
         self._shared_metadata.offsets_pos = concat_with_tensor(
             self._shared_metadata.offsets_pos, self._options.pos_offset, expand=(batch_size, 1, 3), dim=1
@@ -737,7 +757,29 @@ class RigidSensorMixin[RigidSensorMetadataMixinT: RigidSensorMetadataMixin](_Lin
             self._register_link(entity=None, link_idx=-1)
 
     def _register_link(self, entity, link_idx: int):
-        self._shared_metadata.links_idx = concat_with_tensor(self._shared_metadata.links_idx, link_idx)
+        """Record the link of the sensor, 'link_idx' being local to the entity for a HeterogeneousEntity."""
+        if not isinstance(entity, HeterogeneousEntity):
+            self._shared_metadata.links_idx = concat_with_tensor(self._shared_metadata.links_idx, link_idx)
+            return
+        # Every sensor of a rigid simulation split into groups is attached to an entity, which every group holds, so
+        # the sensors take the same columns in every group
+        solver_groups = self._shared_metadata.solver_groups
+        for i_group, group_entity in enumerate(entity.entities):
+            if link_idx >= group_entity.n_links:
+                gs.raise_exception(
+                    f"Invalid link index {link_idx} for entity {entity.idx}, a variant of which has "
+                    f"{group_entity.n_links} links."
+                )
+            group_link_idx = link_idx + group_entity.link_start
+            if i_group == len(solver_groups):
+                links_idx = torch.empty(0, dtype=gs.tc_int, device=gs.device)
+                solver_groups.append(_SolverLinkGroup(group_entity.solver, links_idx, links_idx.clone()))
+            group = solver_groups[i_group]
+            solver_groups[i_group] = _SolverLinkGroup(
+                solver=group.solver,
+                links_idx=concat_with_tensor(group.links_idx, group_link_idx),
+                sensor_cols=concat_with_tensor(group.sensor_cols, self._idx),
+            )
 
 
 class KinematicSensorMixin[KinematicSensorMetadataMixinT: KinematicSensorMetadataMixin](_LinkAttachedSensorMixin):

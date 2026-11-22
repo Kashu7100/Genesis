@@ -1724,6 +1724,11 @@ class KinematicScopedRenderContext(ScopedRenderContext[KinematicSolver]):
             )
         self._shapes = tuple(shapes)
 
+    @property
+    def envs_idx(self) -> torch.Tensor | None:
+        """The environments of the scene the solver simulates (see 'Solver.scene_envs_idx')."""
+        return self.owner.scene_envs_idx
+
     def reset(self, envs_idx: torch.Tensor) -> None:
         """Show the first variant of the DynamicVertices of every visual geom again, and stop the propellers."""
         if self._n_posed_vgeoms < len(self._slots_vgeom):

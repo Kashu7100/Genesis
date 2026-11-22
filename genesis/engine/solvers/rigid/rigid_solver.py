@@ -3740,8 +3740,17 @@ class RigidScopedRenderContext(KinematicScopedRenderContext, ScopedRenderContext
         arrows_radius = torch.cat((radius, radius), dim=1)
         # The contacts the latest step computed no longer hold once the state, the dynamics or the model changes
         stale_on = frozenset((StateChange.GEOMETRY, StateChange.DYNAMICS, StateChange.MODEL))
+        # The arrows appear in the environments of the scene of the rows they were read from (see 'envs_idx')
+        scene_envs_idx = envs_idx if self.envs_idx is None else self.envs_idx[envs_idx]
         contacts_markers = tuple(
-            Arrows(arrows_pos, torch.cat(arrows_vec, dim=1), arrows_radius, color, envs_idx=envs_idx, stale_on=stale_on)
+            Arrows(
+                arrows_pos,
+                torch.cat(arrows_vec, dim=1),
+                arrows_radius,
+                color,
+                envs_idx=scene_envs_idx,
+                stale_on=stale_on,
+            )
             for arrows_vec, color in ((arrows_force, CONTACT_FORCE_COLOR), (arrows_normal, CONTACT_NORMAL_COLOR))
         )
         return (*markers, *contacts_markers)
