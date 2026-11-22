@@ -872,7 +872,7 @@ class Collider:
                 torch.mps.synchronize()
             return
 
-        envs_idx = self._solver.sim.sanitize_envs_idx(envs_idx)
+        envs_idx = self._solver.sanitize_envs_idx(envs_idx)
         collider_kernel_reset(
             envs_idx, self.collider_state, self._solver.rigid_config, self.collider_config, cache_only
         )
@@ -890,7 +890,7 @@ class Collider:
         self._contact_data_cache.clear()
         # A kernel wipes the live contacts alone, while views over the contact buffers would wipe every slot of them
         if not isinstance(envs_idx, torch.Tensor):
-            envs_idx = self._solver.sim.sanitize_envs_idx(envs_idx)
+            envs_idx = self._solver.sanitize_envs_idx(envs_idx)
         if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
             fn = kernel_masked_collider_clear
         else:

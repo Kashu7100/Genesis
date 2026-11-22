@@ -776,7 +776,7 @@ class KinematicEntity(Entity):
 
         # For heterogeneous entities, compute AABB per-environment respecting active_envs_idx
         if self._enable_heterogeneous:
-            envs_idx = self._solver.sim.sanitize_envs_idx(envs_idx)
+            envs_idx = self._solver.sanitize_envs_idx(envs_idx)
             n_envs = len(envs_idx)
             aabb_min = torch.full((n_envs, 3), float("inf"), dtype=gs.tc_float, device=gs.device)
             aabb_max = torch.full((n_envs, 3), float("-inf"), dtype=gs.tc_float, device=gs.device)
@@ -1501,7 +1501,7 @@ class KinematicEntity(Entity):
             Pose error for each target. The 6-vector is [err_pos_x, err_pos_y, err_pos_z, err_rot_x, err_rot_y,
             err_rot_z]. Only returned if `return_error` is True.
         """
-        envs_idx = self._solver.sim.sanitize_envs_idx(envs_idx)
+        envs_idx = self._solver.sanitize_envs_idx(envs_idx)
 
         if self.n_dofs == 0:
             gs.raise_exception("Entity has zero dofs.")
@@ -1951,7 +1951,7 @@ class RigidEntity(KinematicEntity):
             A tensor of boolean mask indicating the batch indices with failed plan.
         """
         if self._solver.n_envs > 0:
-            n_envs = len(self._solver.sim.sanitize_envs_idx(envs_idx))
+            n_envs = len(self._solver.sanitize_envs_idx(envs_idx))
         else:
             n_envs = 1
 
@@ -2044,7 +2044,7 @@ class RigidEntity(KinematicEntity):
         # For heterogeneous entities, compute AABB per-environment respecting active_envs_idx.
         # FIXME: Remove this branch after implementing 'get_verts'.
         if self._enable_heterogeneous and self._solver.n_envs > 0:
-            envs_idx = self._solver.sim.sanitize_envs_idx(envs_idx)
+            envs_idx = self._solver.sanitize_envs_idx(envs_idx)
             n_envs = len(envs_idx)
             aabb_min = torch.full((n_envs, 3), float("inf"), dtype=gs.tc_float, device=gs.device)
             aabb_max = torch.full((n_envs, 3), float("-inf"), dtype=gs.tc_float, device=gs.device)

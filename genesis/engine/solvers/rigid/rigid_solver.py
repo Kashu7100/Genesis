@@ -230,8 +230,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     # --------------------------------- Initialization -----------------------------------
     # ------------------------------------------------------------------------------------
 
-    def __init__(self, sim: "Simulator", options: RigidOptions) -> None:
-        super().__init__(sim, options)
+    def __init__(self, sim: "Simulator", options: RigidOptions, scene_envs_idx: torch.Tensor | None = None) -> None:
+        super().__init__(sim, options, scene_envs_idx)
 
         self._enable_collision = options.enable_collision
         self._enable_multi_contact = options.enable_multi_contact
@@ -996,7 +996,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             gs.raise_exception(
                 "Links and dofs must be batched to selectively update invweight and meaninertia for some environment."
             )
-        envs_idx = self._sim.sanitize_envs_idx(envs_idx)
+        envs_idx = self.sanitize_envs_idx(envs_idx)
 
         kernel_refresh_invweight_and_meaninertia(
             envs_idx,
@@ -1317,7 +1317,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     def _update_forward_kinematics(self, envs_idx):
         """Update the cartesian space and the velocities of the links of the given environments from their state."""
         if not isinstance(envs_idx, torch.Tensor):
-            envs_idx = self._sim.sanitize_envs_idx(envs_idx)
+            envs_idx = self.sanitize_envs_idx(envs_idx)
         if envs_idx.dtype == torch.bool:
             fn = kernel_masked_forward_kinematics_links_geoms
         else:
@@ -1356,7 +1356,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
         # A differentiable scene has no SAP coupler, which a scene with 'requires_grad' refuses at build
         if is_recording:
-            envs_idx = self._sim.sanitize_envs_idx(None)
+            envs_idx = self.sanitize_envs_idx(None)
             self._update_forward_kinematics(envs_idx)
             kernel_forward_dynamics_without_qacc(
                 self.dyn_state,
@@ -1720,7 +1720,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 torch.mps.synchronize()
         if (self._use_hibernation and not gs.use_zerocopy) or not partial:
             # The kernels that follow take the selection sanitized once for all of them
-            envs_idx = self._sim.sanitize_envs_idx(envs_idx)
+            envs_idx = self.sanitize_envs_idx(envs_idx)
             if self._use_hibernation and not gs.use_zerocopy:
                 kernel_reset_hibernation(
                     envs_idx,
@@ -1810,7 +1810,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 pos = torch.as_tensor(pos, dtype=gs.tc_float, device=gs.device)
                 same_pos = pos.ndim < 2 or len(pos) == 1 or (torch.diff(pos, dim=0).abs() < gs.EPS).all()
                 set_all_envs = envs_idx is None or torch.equal(
-                    torch.sort(self._sim.sanitize_envs_idx(envs_idx)).values, self._envs_idx
+                    torch.sort(self.sanitize_envs_idx(envs_idx)).values, self._envs_idx
                 )
                 if not (set_all_envs and same_pos):
                     gs.raise_exception(
@@ -1940,7 +1940,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 quat = torch.as_tensor(quat, dtype=gs.tc_float, device=gs.device)
                 same_quat = quat.ndim < 2 or len(quat) == 1 or (torch.diff(quat, dim=0).abs() < gs.EPS).all()
                 set_all_envs = envs_idx is None or torch.equal(
-                    torch.sort(self._sim.sanitize_envs_idx(envs_idx)).values, self._envs_idx
+                    torch.sort(self.sanitize_envs_idx(envs_idx)).values, self._envs_idx
                 )
                 if not (set_all_envs and same_quat):
                     gs.raise_exception(
@@ -3211,7 +3211,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         # The axis and its point are given in the authored link frames, which the morph offset and the inertial
         # alignment move away from the internal ones the constraint is solved in (see '_offset_world_shift'). The
         # offsets follow the sorted unique envs that 'add_dynamic_constraint' fills.
-        envs_idx_unique = torch.unique(self._sim.sanitize_envs_idx(envs_idx))
+        envs_idx_unique = torch.unique(self.sanitize_envs_idx(envs_idx))
         anchor_link_idx = link2_idx if pos is None else link1_idx
         anchor_offset_pos = _select_links_offset(self._links_offset_pos, anchor_link_idx, envs_idx_unique)[..., 0, :]
         anchor_offset_quat = _select_links_offset(self._links_offset_quat, anchor_link_idx, envs_idx_unique)[..., 0, :]

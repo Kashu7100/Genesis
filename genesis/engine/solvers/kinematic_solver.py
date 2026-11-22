@@ -187,8 +187,10 @@ class KinematicSolver(Solver):
     # The kinds of entity this solver builds, each with the morph class it is built from, the most specific first
     _entity_classes = ((Morph, KinematicEntity),)
 
-    def __init__(self, sim: "Simulator", options: "KinematicOptions") -> None:
-        super().__init__(sim, options)
+    def __init__(
+        self, sim: "Simulator", options: "KinematicOptions", scene_envs_idx: torch.Tensor | None = None
+    ) -> None:
+        super().__init__(sim, options, scene_envs_idx)
 
         self._enable_collision = False
         self._enable_mujoco_compatibility = False
@@ -828,7 +830,7 @@ class KinematicSolver(Solver):
             # FIXME: quadrants#1086 - fast math reassociates sums by code layout, so the kinematics recomputed here can
             # differ in the last bits from those the step left, and a replay from a saved state matches up to rounding.
             kernel_forward_kinematics(
-                self._sim.sanitize_envs_idx(envs_idx),
+                self.sanitize_envs_idx(envs_idx),
                 self.dyn_state,
                 self.dyn_info,
                 self.rigid_info,
@@ -969,7 +971,7 @@ class KinematicSolver(Solver):
 
         if not skip_forward:
             if not isinstance(envs_idx, torch.Tensor):
-                envs_idx = self._sim.sanitize_envs_idx(envs_idx)
+                envs_idx = self.sanitize_envs_idx(envs_idx)
             if envs_idx.dtype == torch.bool:
                 fn = kernel_masked_forward_kinematics
             else:
@@ -992,7 +994,7 @@ class KinematicSolver(Solver):
             if gs.backend == gs.metal:
                 torch.mps.synchronize()
             if not skip_forward and not isinstance(envs_idx, torch.Tensor):
-                envs_idx = self._sim.sanitize_envs_idx(envs_idx)
+                envs_idx = self.sanitize_envs_idx(envs_idx)
         else:
             velocity, dofs_idx, envs_idx = self._sanitize_io_variables(
                 velocity, dofs_idx, self.n_dofs, "dofs_idx", envs_idx, skip_allocation=True
@@ -1040,7 +1042,7 @@ class KinematicSolver(Solver):
         if positions.ndim == 0 or positions.ndim > 3 or positions.shape[-1] != 2:
             gs.raise_exception("`positions` must have shape (2,), (n_points, 2), or (n_envs, n_points, 2).")
 
-        envs_idx = self._sim.sanitize_envs_idx(envs_idx)
+        envs_idx = self.sanitize_envs_idx(envs_idx)
         n_envs = len(envs_idx)
         is_single_position = positions.ndim == 1
         n_points = 1 if is_single_position else positions.shape[-2]
@@ -1222,7 +1224,7 @@ class KinematicSolver(Solver):
         hold, and restores the one it does. Returns positions (n_envs, n_links, 3) and orientations
         (n_envs, n_links, 4), without the batch dimension when the scene is not batched.
         """
-        envs_idx = self._sim.sanitize_envs_idx(envs_idx)
+        envs_idx = self.sanitize_envs_idx(envs_idx)
         qpos = broadcast_tensor(qpos, gs.tc_float, (len(envs_idx), entity.n_qs), ("envs_idx", "qs_idx")).contiguous()
 
         qs_idx = torch.arange(entity._q_start, entity._q_start + entity.n_qs, dtype=gs.tc_int, device=gs.device)
@@ -1844,7 +1846,7 @@ class KinematicScopedRenderContext(ScopedRenderContext[KinematicSolver]):
                 mask = (0, i_dg) if solver.n_envs == 0 else indices_to_mask(envs_idx, i_dg)
                 assign_indexed_tensor(variant_view, mask, variants_idx)
             else:
-                envs_idx = solver.sim.sanitize_envs_idx(envs_idx)
+                envs_idx = solver.sanitize_envs_idx(envs_idx)
                 variants_idx = broadcast_tensor(variants_idx, gs.tc_int, envs_idx.shape).contiguous()
                 kernel_set_vverts_variant(envs_idx, i_dg, variants_idx, dynamic_vverts)
         else:
@@ -1865,7 +1867,7 @@ class KinematicScopedRenderContext(ScopedRenderContext[KinematicSolver]):
                 assign_indexed_tensor(pos_view, pos_mask, vverts)
                 assign_indexed_tensor(variant_view, variant_mask, -1)
             else:
-                envs_idx = solver.sim.sanitize_envs_idx(envs_idx)
+                envs_idx = solver.sanitize_envs_idx(envs_idx)
                 target_shape = (envs_idx.shape[0], vgeom.n_vverts, 3)
                 vverts = broadcast_tensor(vverts, gs.tc_float, target_shape, ("envs", "vverts", "xyz")).contiguous()
                 kernel_set_batched_vverts(envs_idx, i_dg, vvert_start, vverts, dynamic_vverts)

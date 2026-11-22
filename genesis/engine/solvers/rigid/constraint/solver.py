@@ -319,7 +319,7 @@ class ConstraintSolver:
                 torch.mps.synchronize()
             return
 
-        envs_idx = self._solver.sim.sanitize_envs_idx(envs_idx)
+        envs_idx = self._solver.sanitize_envs_idx(envs_idx)
         constraint_solver_kernel_reset(envs_idx, self.constraint_state, self._solver.rigid_config)
 
     def clear(self, envs_idx=None):
@@ -357,7 +357,7 @@ class ConstraintSolver:
             return
 
         if not isinstance(envs_idx, torch.Tensor):
-            envs_idx = self._solver.sim.sanitize_envs_idx(envs_idx)
+            envs_idx = self._solver.sanitize_envs_idx(envs_idx)
         if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
             fn = constraint_solver_kernel_masked_clear
         else:
@@ -499,7 +499,7 @@ class ConstraintSolver:
     ):
         """Register a dynamic constraint between two links in the selected envs (see kernel_add_dynamic_constraint)."""
         # An env selected twice would pass the checks below twice against the same count, then be written twice.
-        envs_idx = torch.unique(self._solver.sim.sanitize_envs_idx(envs_idx))
+        envs_idx = torch.unique(self._solver.sanitize_envs_idx(envs_idx))
         link1_idx, link2_idx = int(link1_idx), int(link2_idx)
         if link1_idx < 0 or link2_idx < 0 or link1_idx == link2_idx:
             gs.raise_exception("Dynamic constraints require two distinct links, the world is not a valid link.")
@@ -542,7 +542,7 @@ class ConstraintSolver:
         )
 
     def delete_dynamic_constraint(self, eq_type, link1_idx, link2_idx, envs_idx=None):
-        envs_idx = torch.unique(self._solver.sim.sanitize_envs_idx(envs_idx))
+        envs_idx = torch.unique(self._solver.sanitize_envs_idx(envs_idx))
         self._eq_const_info_cache.clear()
         kernel_delete_dynamic_constraint(
             int(link1_idx),

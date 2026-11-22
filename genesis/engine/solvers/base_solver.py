@@ -103,14 +103,15 @@ class TimeBasedMixin:
     _substeps: int
     _substep_dt: float
 
-    def __init__(self, sim, options):
+    def __init__(self, sim, options, scene_envs_idx=None):
         """Compute how many substeps this solver runs per scene step, from the interval it integrates over.
 
         The count is `SimOptions.dt` divided by the interval the options of this solver ask for. A solver whose `dt`
         was left unset takes `SimOptions.substeps` instead. Since the substep loop advances every solver together,
-        `Simulator.build` then checks that the active solvers all end up on the same count.
+        `Simulator.build` then checks that the active solvers all end up on the same count. 'scene_envs_idx' is passed
+        on to 'Solver'.
         """
-        super().__init__(sim, options)
+        super().__init__(sim, options, scene_envs_idx)
         self._substeps = max(1, round(sim.dt / options.dt)) if "dt" in options.model_fields_set else sim.substeps
         self._substep_dt = sim.dt / self._substeps
 
@@ -141,6 +142,8 @@ class ErrnoMixin:
     _errno_event: "torch.cuda.Event | None" = None
     # The context of the check that enqueued the copy 'check_errno' reads next
     _errno_host_context: str | None = None
+    # The index in the scene of each env of the flags, which the messages name, None for the identity
+    _errno_envs_idx: np.ndarray | None = None
 
     def build_errno(self, n_envs: int) -> None:
         """Allocate the flags accumulated for each env, which the build of the component calls."""
@@ -246,6 +249,8 @@ class ErrnoMixin:
                 message = report()
                 if self.n_envs > 0:
                     envs_idx = np.flatnonzero(errno_envs & code)
+                    if self._errno_envs_idx is not None:
+                        envs_idx = self._errno_envs_idx[envs_idx]
                     envs_idx_str = np.array2string(envs_idx, separator=", ", threshold=6, edgeitems=3)
                     if envs_idx.size > 6:
                         envs_idx_str = f"({envs_idx.size}): {envs_idx_str}"
@@ -528,7 +533,7 @@ class GravityMixin(BuildableMixin):
                 torch.mps.synchronize()
             return
 
-        envs_idx = self._sim.sanitize_envs_idx(envs_idx)
+        envs_idx = self.sanitize_envs_idx(envs_idx)
         gravity = broadcast_tensor(gravity, gs.tc_float, (len(envs_idx), 3), ("envs_idx", ""))
         kernel_set_gravity(gravity.contiguous(), envs_idx, self._gravity)
 
@@ -558,10 +563,16 @@ class Solver(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, RBC):
     # The entity spec class whose entities the solver simulates, which the simulator dispatches on
     entity_spec_cls: ClassVar[type[gs.entities.Spec]]
 
-    def __init__(self, sim: "Simulator", options):
+    def __init__(self, sim: "Simulator", options, scene_envs_idx: torch.Tensor | None = None):
+        """Create a solver of the given options, simulating the environments of the scene 'scene_envs_idx' names.
+
+        'scene_envs_idx' holds the index in the scene of each environment the solver simulates, in the order of its own,
+        and None stands for every environment of the scene. The build of the solver then takes the number of entries.
+        """
         self._uid = gs.UID()
         self._sim = sim
         self._options = options
+        self._scene_envs_idx = scene_envs_idx
         self._entities: list[Entity] = gs.List()
 
         # Whether the state of the solver tracks gradients, and the autograd graph of the simulator recording them
@@ -653,7 +664,7 @@ class Solver(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, RBC):
             dtype = gs.tc_float
         n_envs = self.n_envs
         is_overwrite = tensor is not None and not accumulate
-        envs_idx_ = self._sim.sanitize_envs_idx(envs_idx) if batched else self._envs_idx[:0]
+        envs_idx_ = self.sanitize_envs_idx(envs_idx) if batched else self._envs_idx[:0]
 
         if batched and batched_idx and np.ndim(inputs_idx) == 2:
             dim_names = ("envs_idx", idx_name, *["" for _ in element_shape])
@@ -712,8 +723,11 @@ class Solver(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, RBC):
         calls it first, then sets `_is_built` once its own data is valid.
         """
         super().build(n_envs)
+        assert self._scene_envs_idx is None or len(self._scene_envs_idx) == self.n_envs_
 
         self.build_errno(self.n_envs_)
+        if self._scene_envs_idx is not None:
+            self._errno_envs_idx = tensor_to_array(self._scene_envs_idx)
         if self._requires_grad:
             self._error_reports = {
                 **self._error_reports,
@@ -903,6 +917,11 @@ class Solver(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, RBC):
     @property
     def sim(self):
         return self._sim
+
+    @property
+    def scene_envs_idx(self) -> torch.Tensor | None:
+        """The index in the scene of each environment the solver simulates, None when it simulates them all in order."""
+        return self._scene_envs_idx
 
     @property
     def options(self) -> "Options":

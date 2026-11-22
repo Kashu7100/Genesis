@@ -3,7 +3,6 @@ import weakref
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING
 
-import numpy as np
 import torch
 
 import genesis as gs
@@ -11,7 +10,6 @@ from genesis.engine.solvers.base_solver import BackwardErrorCode
 from genesis.grad.bridge import LaunchRecorder, Operation, RolloutGraph
 from genesis.options.solvers import IPCCouplerOptions, LegacyCouplerOptions, SAPCouplerOptions
 from genesis.repr_base import RBC
-from genesis.typing import IndexType
 from genesis.utils.data import ArrayItem, DataItem, DataKind, check_data, iter_data
 from genesis.utils.misc import (
     BatchedMixin,
@@ -20,7 +18,6 @@ from genesis.utils.misc import (
     qd_destroy_data,
     qd_to_numpy,
     qd_to_torch,
-    sanitize_index,
 )
 from genesis.utils.tools import StepTimer
 from genesis.utils.warnings import warn_once
@@ -638,46 +635,6 @@ class Simulator(BatchedMixin, BuildableMixin, RBC):
     def rigid_only(self) -> bool:
         """Whether the rigid solver alone advances the physics, which lets a step skip the coupling."""
         return self._rigid_only
-
-    def sanitize_envs_idx(self, envs_idx: IndexType | None) -> torch.Tensor:
-        """Return the indices of the given parallel environments as a tensor, all of them if None.
-
-        A selection by a slice, a range, an integer or a list of contiguous indices returns a view of the indices of all
-        the environments. A scene without parallel environments takes no selection.
-        """
-        if envs_idx is None:
-            return self._envs_idx
-
-        if self.n_envs == 0:
-            gs.raise_exception("`envs_idx` is not supported for non-parallelized scene.")
-
-        if isinstance(envs_idx, slice):
-            if envs_idx.step is not None and envs_idx.step < 0:
-                return sanitize_index(envs_idx, -1, self.n_envs, 0, "envs_idx")
-            return self._envs_idx[envs_idx]
-        if isinstance(envs_idx, range):
-            if envs_idx.step < 0:
-                return sanitize_index(envs_idx, -1, self.n_envs, 0, "envs_idx")
-            return self._envs_idx[envs_idx]
-        if isinstance(envs_idx, (int, np.integer)):
-            if not -self.n_envs <= envs_idx < self.n_envs:
-                gs.raise_exception(f"`envs_idx` out of range: {envs_idx} not in [{-self.n_envs}, {self.n_envs}).")
-            if envs_idx < 0:
-                envs_idx = envs_idx + self.n_envs
-            return self._envs_idx[envs_idx : envs_idx + 1]
-        if isinstance(envs_idx, (list, tuple)) and envs_idx and not isinstance(envs_idx[0], bool):
-            # A contiguous run of indices given on the host, such as the environments a renderer draws, takes the view
-            # of a slice rather than a copy of the indices on the device. A list of booleans is a mask.
-            start, n_envs = envs_idx[0], len(envs_idx)
-            if (
-                isinstance(start, (int, np.integer))
-                and 0 <= start
-                and start + n_envs <= self.n_envs
-                and list(envs_idx) == list(range(start, start + n_envs))
-            ):
-                return self._envs_idx if n_envs == self.n_envs else self._envs_idx[start : start + n_envs]
-
-        return sanitize_index(envs_idx, -1, self.n_envs, 0, "envs_idx")
 
     @property
     def render_context(self) -> RenderContext:
