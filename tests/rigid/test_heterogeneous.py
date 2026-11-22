@@ -674,3 +674,112 @@ def test_variants_sharing_dofs_info(tol):
         robot.set_dofs_kp(10.0, envs_idx=[1])
     with pytest.raises(gs.GenesisException, match="non-batched dofs info"):
         robot.get_dofs_kp(envs_idx=[1])
+
+
+@pytest.mark.required
+def test_sensors_cameras_and_state_across_groups(mimic_hinges, show_viewer, tol):
+    DT = 0.01
+    G = 9.81
+    N_STEPS = 10
+    BOX_SIZE = 0.1
+    CAMERA_HEIGHT = 3.0
+    RES = 64
+
+    scene = gs.HeterogeneousScene(
+        sim_options=gs.options.SimOptions(
+            dt=DT,
+            gravity=(0.0, 0.0, -G),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(3.0, -3.0, 2.5),
+            camera_lookat=(0.0, 0.0, 1.0),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
+    # A free box, or two hinges whose links hang from a fixed base with their center of mass on their axis
+    robot = scene.add_entity(
+        spec=gs.entities.Rigid(
+            morph=(
+                gs.morphs.Box(
+                    size=(BOX_SIZE, BOX_SIZE, BOX_SIZE),
+                    pos=(0.0, 0.0, 2.0),
+                ),
+                gs.morphs.MJCF(
+                    file=ET.tostring(mimic_hinges, encoding="unicode"),
+                ),
+            ),
+        ),
+    )
+    imu_base = scene.add_sensor(
+        gs.sensors.IMU(
+            entity_idx=1,
+        ),
+    )
+    # The second hinge carries an IMU turned by a quarter turn about its axis
+    imu_variants = scene.add_sensor(
+        [
+            gs.sensors.IMU(
+                entity_idx=1,
+            ),
+            gs.sensors.IMU(
+                entity_idx=1,
+                link_idx_local=2,
+                euler_offset=(0.0, 90.0, 0.0),
+            ),
+        ]
+    )
+    with pytest.raises(gs.GenesisException, match="one options object per variant"):
+        scene.add_sensor([gs.sensors.IMU(entity_idx=1)] * 3)
+    camera = scene.add_camera(
+        res=(RES, RES),
+        pos=(0.0, 0.0, CAMERA_HEIGHT),
+        lookat=(0.0, 0.0, 0.0),
+        up=(0.0, 1.0, 0.0),
+    )
+    scene.build(n_envs=4)
+
+    # The accelerometer reads zero on the box in free fall and the opposite of gravity on the links at rest, rows
+    # following the selection of environments
+    for _ in range(N_STEPS):
+        scene.step()
+    assert_allclose(imu_base.read().lin_acc, [[0.0, 0.0, 0.0]] * 2 + [[0.0, 0.0, G]] * 2, tol=tol)
+    assert_allclose(imu_variants.read(envs_idx=[3, 0]).lin_acc, [[-G, 0.0, 0.0], [0.0, 0.0, 0.0]], tol=tol)
+
+    # The camera looking down sees the top of the falling box in its group scene and the ground in the other one
+    _, depth, _, _ = camera.render(rgb=False, depth=True)
+    box_top = robot.get_pos()[0, 2] + 0.5 * BOX_SIZE
+    assert_allclose(
+        [depth[0][RES // 2, RES // 2], depth[1][RES // 2, RES // 2]], [CAMERA_HEIGHT - box_top, CAMERA_HEIGHT], tol=1e-5
+    )
+
+    # A state restores the environments a reset selects, and becomes the initial state of every group scene
+    robot.set_dofs_position([[0.2, 0.2, 0.0, 0.0, 0.0, 0.0]], envs_idx=[2])
+    state = scene.get_state()
+    dofs_position = robot.get_dofs_position()
+    for _ in range(N_STEPS):
+        scene.step()
+    robot.set_dofs_position([[0.3, 0.3, 0.0, 0.0, 0.0, 0.0]] * 2, envs_idx=[2, 3])
+    dofs_position_moved = robot.get_dofs_position()
+    scene.reset(state, envs_idx=[1])
+    dofs_position_moved[1] = dofs_position[1]
+    assert_allclose(robot.get_dofs_position(), dofs_position_moved, tol=tol)
+    scene.reset()
+    assert_allclose(robot.get_dofs_position(), dofs_position, tol=tol)
+
+    # A sensor invalid for the variant of a later group leaves no group scene alive
+    scene_invalid = gs.HeterogeneousScene()
+    scene_invalid.add_entity(
+        morph=[
+            gs.morphs.MJCF(file=ET.tostring(mimic_hinges, encoding="unicode")),
+            gs.morphs.Box(size=(BOX_SIZE, BOX_SIZE, BOX_SIZE)),
+        ]
+    )
+    scene_invalid.add_sensor(gs.sensors.IMU(entity_idx=0, link_idx_local=2))
+    n_scenes = len(gs._scene_registry)
+    with pytest.raises(gs.GenesisException, match="invalid for the variants"):
+        scene_invalid.build(n_envs=2)
+    assert len(gs._scene_registry) == n_scenes
+    assert not scene_invalid.is_built

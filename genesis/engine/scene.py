@@ -151,6 +151,60 @@ def description_digest(desc: SceneDescription) -> str:
     return digest.hexdigest()
 
 
+def resolve_scene_options(
+    options: SceneOptions | None,
+    sim_options: SimOptions | None,
+    rigid_options: RigidOptions | None,
+    kinematic_options: KinematicOptions | None,
+    mpm_options: MPMOptions | None,
+    sph_options: SPHOptions | None,
+    fem_options: FEMOptions | None,
+    pbd_options: PBDOptions | None,
+    coupler_options: BaseCouplerOptions | None,
+    vis_options: VisOptions | None,
+    viewer_options: ViewerOptions | None,
+    profiling_options: ProfilingOptions | None,
+    renderer: RendererOptions | None,
+) -> SceneOptions:
+    """Return the options a scene is created with, from the arguments of the constructor of 'Scene'.
+
+    A given 'options' is returned as it is, and giving the options of a solver or component beside it raises. Otherwise
+    the options of each solver and component are gathered into one 'SceneOptions', None standing for the defaults.
+    """
+    individual_options = (
+        sim_options,
+        rigid_options,
+        kinematic_options,
+        mpm_options,
+        sph_options,
+        fem_options,
+        pbd_options,
+        coupler_options,
+        vis_options,
+        viewer_options,
+        profiling_options,
+        renderer,
+    )
+    if options is not None:
+        if any(option is not None for option in individual_options):
+            gs.raise_exception("`options` holds every option a scene is created with, so it is given alone.")
+        return options
+    return SceneOptions(
+        sim=sim_options,
+        rigid=rigid_options,
+        kinematic=kinematic_options,
+        mpm=mpm_options,
+        sph=sph_options,
+        fem=fem_options,
+        pbd=pbd_options,
+        coupler=coupler_options,
+        vis=vis_options,
+        viewer=viewer_options,
+        profiling=profiling_options,
+        renderer=renderer,
+    )
+
+
 @gs.assert_initialized
 class Scene(BuildableMixin, RBC):
     """
@@ -209,7 +263,8 @@ class Scene(BuildableMixin, RBC):
         # Delay simulator import to allow specifying Quadrants array type at init
         from genesis.engine.simulator import Simulator
 
-        individual_options = (
+        self.options = resolve_scene_options(
+            options,
             sim_options,
             rigid_options,
             kinematic_options,
@@ -223,25 +278,6 @@ class Scene(BuildableMixin, RBC):
             profiling_options,
             renderer,
         )
-        if options is not None:
-            if any(option is not None for option in individual_options):
-                gs.raise_exception("`options` holds every option a scene is created with, so it is given alone.")
-            self.options = options
-        else:
-            self.options = SceneOptions(
-                sim=sim_options,
-                rigid=rigid_options,
-                kinematic=kinematic_options,
-                mpm=mpm_options,
-                sph=sph_options,
-                fem=fem_options,
-                pbd=pbd_options,
-                coupler=coupler_options,
-                vis=vis_options,
-                viewer=viewer_options,
-                profiling=profiling_options,
-                renderer=renderer,
-            )
         if show_FPS is not None:
             warn_once(self, "Scene.show_FPS is deprecated. Please use Scene.options.profiling.show_FPS")
             self.options.profiling.show_FPS = show_FPS
