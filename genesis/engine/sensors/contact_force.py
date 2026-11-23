@@ -1,3 +1,4 @@
+import functools
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -6,13 +7,22 @@ import torch
 import quadrants as qd
 
 import genesis as gs
+from genesis.engine.entities.rigid_entity import HeterogeneousEntity
 from genesis.engine.render_context import Arrows, Points, Shape
+from genesis.engine.solvers.rigid.grouped_solver import GroupedRigidSolver
 from genesis.options.sensors import Contact as ContactSensorOptions
 from genesis.options.sensors import ContactForce as ContactForceSensorOptions
 from genesis.utils.geom import inv_transform_by_quat, qd_inv_transform_by_quat, transform_by_quat
 from genesis.utils.misc import concat_with_tensor, make_tensor_field
 
-from .base_sensor import RigidSensorMetadataMixin, RigidSensorMixin, SimpleSensor, SimpleSensorMetadata
+from .base_sensor import (
+    RigidSensorMetadataMixin,
+    RigidSensorMixin,
+    SimpleSensor,
+    SimpleSensorMetadata,
+    _SolverLinkGroup,
+    update_groups_raw_data,
+)
 
 if TYPE_CHECKING:
     from genesis.engine.entities.rigid_entity.rigid_link import RigidLink
@@ -147,6 +157,9 @@ class ContactSensor(SimpleSensor[ContactSensorOptions, None, ContactSensorMetada
     Sensor that returns bool based on whether associated RigidLink is in contact.
     """
 
+    # The link of a RigidEntity stands at the same index in the solver of every group (see GroupedRigidSolver)
+    has_rigid_groups_support = True
+
     def __init__(
         self, options: ContactSensorOptions, idx: int, shared_context, shared_metadata, manager: "SensorManager"
     ):
@@ -161,7 +174,9 @@ class ContactSensor(SimpleSensor[ContactSensorOptions, None, ContactSensorMetada
         if self._shared_metadata.solver is None:
             self._shared_metadata.solver = self._manager.sim.rigid_solver
 
-        entity = self._shared_metadata.solver.entities[self._options.entity_idx]
+        entity = self._manager.sim.entities[self._options.entity_idx]
+        if isinstance(entity, HeterogeneousEntity):
+            gs.raise_exception("Contact does not support a rigid entity whose variants differ in structure.")
         link_idx = self._options.link_idx_local + entity.link_start
         self._link = entity.links[self._options.link_idx_local]
 
@@ -190,12 +205,29 @@ class ContactSensor(SimpleSensor[ContactSensorOptions, None, ContactSensorMetada
     @classmethod
     def _update_raw_data(cls, shared_context: None, shared_metadata: ContactSensorMetadata, raw_data_T: torch.Tensor):
         assert shared_metadata.solver is not None
-        all_contacts = shared_metadata.solver.collider.get_contacts(as_tensor=True, to_torch=True)
+        links_idx = shared_metadata.expanded_links_idx
+        if not isinstance(shared_metadata.solver, GroupedRigidSolver):
+            cls._update_group_raw_data(
+                shared_metadata, _SolverLinkGroup(shared_metadata.solver, links_idx, links_idx), raw_data_T
+            )
+            return
+        # The solver of each group detects the contacts of its own environments
+        solver_groups = [_SolverLinkGroup(solver, links_idx, links_idx) for solver in shared_metadata.solver.solvers]
+        update_groups_raw_data(
+            solver_groups, raw_data_T, functools.partial(cls._update_group_raw_data, shared_metadata)
+        )
+
+    @staticmethod
+    def _update_group_raw_data(
+        shared_metadata: ContactSensorMetadata, group: _SolverLinkGroup, raw_data_T: torch.Tensor
+    ) -> None:
+        solver = group.solver
+        all_contacts = solver.collider.get_contacts(as_tensor=True, to_torch=True)
         link_a, link_b = all_contacts["link_a"], all_contacts["link_b"]
         if link_a.shape[-1] == 0:
             raw_data_T.zero_()
             return
-        if shared_metadata.solver.n_envs == 0:
+        if solver.n_envs == 0:
             link_a, link_b = link_a[None], link_b[None]
 
         is_contact_a = link_a[..., None, :] == shared_metadata.expanded_links_idx[..., None]
@@ -244,6 +276,9 @@ class ContactForceSensor(
     Sensor that returns the total contact force being applied to the associated RigidLink in its local frame.
     """
 
+    # The solver of each group detects the contacts of its own environments (see 'RigidSensorMixin._register_link')
+    has_rigid_groups_support = True
+
     @gs.assert_unbuilt
     def build(self):
         super().build()
@@ -278,11 +313,25 @@ class ContactForceSensor(
         cls, shared_context: None, shared_metadata: ContactForceSensorMetadata, raw_data_T: torch.Tensor
     ):
         assert shared_metadata.solver is not None
+        if not shared_metadata.solver_groups:
+            links_idx = shared_metadata.links_idx
+            cls._update_group_raw_data(
+                shared_metadata, _SolverLinkGroup(shared_metadata.solver, links_idx, links_idx), raw_data_T
+            )
+            return
+        update_groups_raw_data(
+            shared_metadata.solver_groups, raw_data_T, functools.partial(cls._update_group_raw_data, shared_metadata)
+        )
 
+    @staticmethod
+    def _update_group_raw_data(
+        shared_metadata: ContactForceSensorMetadata, group: _SolverLinkGroup, raw_data_T: torch.Tensor
+    ) -> None:
+        solver, links_idx = group.solver, group.links_idx
         # Note that forcing GPU sync to operate on `slice(0, max(n_contacts))` is usually faster overall.
-        all_contacts = shared_metadata.solver.collider.get_contacts(as_tensor=True, to_torch=True)
+        all_contacts = solver.collider.get_contacts(as_tensor=True, to_torch=True)
         force, link_a, link_b = all_contacts["force"], all_contacts["link_a"], all_contacts["link_b"]
-        if shared_metadata.solver.n_envs == 0:
+        if solver.n_envs == 0:
             force, link_a, link_b = force[None], link_a[None], link_b[None]
 
         # Short-circuit if no contacts
@@ -290,25 +339,25 @@ class ContactForceSensor(
             raw_data_T.zero_()
             return
 
-        links_quat = shared_metadata.solver.get_links_quat()
-        if shared_metadata.solver.n_envs == 0:
+        links_quat = solver.get_links_quat()
+        if solver.n_envs == 0:
             links_quat = links_quat[None]
 
         if gs.use_zerocopy:
             # Forces are aggregated BEFORE moving them in local frame for efficiency.
-            force_mask_a = link_a[:, None] == shared_metadata.links_idx[None, :, None]
-            force_mask_b = link_b[:, None] == shared_metadata.links_idx[None, :, None]
+            force_mask_a = link_a[:, None] == links_idx[None, :, None]
+            force_mask_b = link_b[:, None] == links_idx[None, :, None]
             _drop_filtered_counterpart_contacts(force_mask_a, force_mask_b, link_a, link_b, shared_metadata)
             force_mask = force_mask_b.to(dtype=gs.tc_float) - force_mask_a.to(dtype=gs.tc_float)
             sensors_force = (force_mask[..., None] * force[:, None]).sum(dim=2)
-            sensors_quat = links_quat[:, shared_metadata.links_idx]
-            n_envs = max(shared_metadata.solver.n_envs, 1)
+            sensors_quat = links_quat[:, links_idx]
+            n_envs = max(solver.n_envs, 1)
             result = inv_transform_by_quat(sensors_force, sensors_quat)  # (B, n_sensors, 3)
             raw_data_T[:] = result.permute(1, 2, 0).reshape(-1, n_envs)
         else:
             raw_data_T.zero_()
             _kernel_get_contacts_forces(
-                shared_metadata.links_idx,
+                links_idx,
                 shared_metadata.filter_links_idx,
                 force.contiguous(),
                 link_a.contiguous(),

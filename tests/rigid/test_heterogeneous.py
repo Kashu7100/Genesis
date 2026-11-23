@@ -694,7 +694,7 @@ def test_variants_sharing_dofs_info(n_envs, tol):
 def test_sensors_cameras_and_state_across_groups(mimic_hinges, show_viewer, tol):
     DT = 0.01
     G = 9.81
-    N_STEPS = 10
+    N_STEPS = 20
     BOX_SIZE = 0.1
     ENV_SPACING = 2.0
     CAMERA_HEIGHT = 6.0
@@ -711,6 +711,13 @@ def test_sensors_cameras_and_state_across_groups(mimic_hinges, show_viewer, tol)
             camera_lookat=(0.0, 0.0, 1.0),
         ),
         show_viewer=show_viewer,
+    )
+    # A box resting on the ground, added before the entity whose variants differ in structure
+    box = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(BOX_SIZE, BOX_SIZE, BOX_SIZE),
+            pos=(0.0, -0.6, 0.5 * BOX_SIZE),
+        ),
     )
     # A free box, or two hinges whose links hang from a fixed base with their center of mass on their axis
     robot = scene.add_entity(
@@ -734,6 +741,25 @@ def test_sensors_cameras_and_state_across_groups(mimic_hinges, show_viewer, tol)
             entity_idx=robot.idx,
         ),
     )
+    imu_static = scene.add_sensor(
+        gs.sensors.IMU(),
+    )
+    contact_force = scene.add_sensor(
+        gs.sensors.ContactForce(
+            entity_idx=box.idx,
+        ),
+    )
+    contact = scene.add_sensor(
+        gs.sensors.Contact(
+            entity_idx=box.idx,
+        ),
+    )
+    lift_torque = scene.add_sensor(
+        gs.sensors.JointTorque(
+            entity_idx=box.idx,
+            dofs_idx_local=[2],
+        ),
+    )
     # The camera bound to the first environment looks down at the middle of the grid of environments
     camera = scene.add_camera(
         res=(RES, RES),
@@ -744,12 +770,25 @@ def test_sensors_cameras_and_state_across_groups(mimic_hinges, show_viewer, tol)
     )
     scene.build(n_envs=4, env_spacing=(ENV_SPACING, ENV_SPACING))
 
-    # The accelerometer reads zero on the box in free fall and the opposite of gravity on the base at rest, rows
-    # following the selection of environments
+    # The resting box is lifted by a vertical force of its own in each environment, short of its weight
+    weight = tensor_to_array(box.get_mass()) * G
+    lifts = np.array([0.0, 0.25, 0.5, 0.75]) * weight
+    lifts_dofs_force = np.zeros((4, 6))
+    lifts_dofs_force[:, 2] = lifts
     for _ in range(N_STEPS):
+        box.control_dofs_force(lifts_dofs_force)
         scene.step()
+
+    # The accelerometer reads zero on the box in free fall and the opposite of gravity on the base at rest and on the
+    # world, rows following the selection of environments
     assert_allclose(imu.read().lin_acc, [[0.0, 0.0, 0.0]] * 2 + [[0.0, 0.0, G]] * 2, tol=tol)
     assert_allclose(imu.read(envs_idx=[3, 0]).lin_acc, [[0.0, 0.0, G], [0.0, 0.0, 0.0]], tol=tol)
+    assert_allclose(imu_static.read().lin_acc, [[0.0, 0.0, G]] * 4, tol=tol)
+
+    # The ground holds the box with its weight less the lift, which the joint of the box transmits
+    assert_allclose(contact_force.read(), np.stack([np.zeros(4), np.zeros(4), weight - lifts], axis=-1), tol=1e-3)
+    assert_equal(contact.read(), True)
+    assert_allclose(lift_torque.read(), lifts[:, None], tol=tol)
 
     # The camera sees the top of the falling box straight above the origin of the environments carrying it, and the top
     # of the vertical capsule of the first hinge in those carrying the hinges, the ground lying at the place of either

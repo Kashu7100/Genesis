@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 import torch
 
 import genesis as gs
+from genesis.engine.entities.rigid_entity import HeterogeneousEntity
 from genesis.options.sensors import JointTorque as JointTorqueOptions
 from genesis.utils.misc import concat_with_tensor, make_tensor_field
 
@@ -44,12 +45,19 @@ class JointTorqueSensor(SimpleSensor[JointTorqueOptions, None, JointTorqueSensor
         shared_metadata: JointTorqueSensorMetadata,
         manager: "SensorManager",
     ):
+        # A rigid simulation split into groups reads the degrees of freedom of a RigidEntity at the same indices in every
+        # group (see GroupedRigidSolver), while those of a HeterogeneousEntity differ from one group to another
+        entity = manager.sim.entities[options.entity_idx]
+        if isinstance(entity, HeterogeneousEntity):
+            gs.raise_exception("JointTorque does not support a rigid entity whose variants differ in structure.")
         # Resolve dofs_idx_local=None to the full DOF range before super().__init__(), because _get_return_format() is
         # called inside the base constructor and needs the final DOF count.
         if options.dofs_idx_local is None:
-            entity = manager.sim.entities[options.entity_idx]
             options.dofs_idx_local = tuple(range(entity.n_dofs))
         super().__init__(options, idx, shared_context, shared_metadata, manager)
+
+    # The solver of a rigid simulation split into groups gathers the efforts of every group (see GroupedRigidSolver)
+    has_rigid_groups_support = True
 
     def _get_return_format(self) -> tuple[int, ...]:
         return (len(self._options.dofs_idx_local),)
