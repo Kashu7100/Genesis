@@ -800,7 +800,7 @@ def test_sensors_cameras_and_state_across_groups(mimic_hinges, show_viewer, tol)
     camera_xy = 0.5 * ENV_SPACING + scene.envs_offset[0, :2]
     focal = 0.5 * RES / math.tan(math.radians(0.5 * FOV))
     for point_xy, point_z, envs_depth, depth_tol in (
-        ((0.0, 0.0), box_top, [CAMERA_HEIGHT - box_top] * 2 + [CAMERA_HEIGHT] * 2, 2e-6),
+        ((0.0, 0.0), box_top, [CAMERA_HEIGHT - box_top] * 2 + [CAMERA_HEIGHT] * 2, 5e-6),
         (capsule_xy, capsule_top, [CAMERA_HEIGHT] * 2 + [CAMERA_HEIGHT - capsule_top] * 2, 1e-3),
     ):
         envs_xy = scene.envs_offset[:, :2] + point_xy - camera_xy

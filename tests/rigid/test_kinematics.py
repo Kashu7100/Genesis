@@ -1150,7 +1150,7 @@ def test_host_forward_kinematics(
         joints_mask = [joint.type != gs.JOINT_TYPE.FIXED for joint in joints]
         joints_idx = [joint.idx for joint in joints if joint.type != gs.JOINT_TYPE.FIXED]
         links_pos, links_quat, geoms_pos, geoms_quat, joints_xanchor, joints_xaxis = compute_forward_kinematics(
-            entities, n_envs=2, qpos=qpos_host
+            entities, solver.envs_layout, qpos=qpos_host
         )
         assert_allclose(links_pos, solver.get_links_pos(links_idx), tol=tol)
         assert_allclose(links_quat, solver.get_links_quat(links_idx), tol=tol)
