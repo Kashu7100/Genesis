@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 import genesis as gs
-from genesis.engine.entities.rigid_entity.description import _balanced_variant_mapping
+from genesis.engine.entities.rigid_entity.description import RigidEntityDescription, _balanced_variant_mapping
 from genesis.engine.entities.rigid_entity.heterogeneous_entity import HeterogeneousEntity
 from genesis.engine.state_change import Subscriber
 from genesis.engine.states import SolverCheckpoint
@@ -17,7 +17,6 @@ from ..base_solver import GravityMixin, Solver, TimeBasedMixin
 from .rigid_solver import RigidSolver
 
 if TYPE_CHECKING:
-    from genesis.engine.entities.rigid_entity.description import RigidEntityDescription
     from genesis.engine.simulator import Simulator
     from genesis.options.solvers import RigidOptions
     from genesis.options.surfaces import Surface
@@ -132,7 +131,7 @@ class GroupedRigidSolver(GravityMixin, TimeBasedMixin, Solver):
         idx: int,
         surface: "Surface | None",
         spec: "gs.entities.Rigid | None",
-        desc: "RigidEntityDescription | None" = None,
+        desc: RigidEntityDescription | None = None,
     ) -> HeterogeneousEntity:
         """Record a rigid entity of index 'idx' in the scene, which the solver of each group creates as the solver builds.
 
@@ -164,7 +163,7 @@ class GroupedRigidSolver(GravityMixin, TimeBasedMixin, Solver):
         groups_variants_idx, envs_group_idx = np.unique(envs_variants_idx, axis=0, return_inverse=True)
 
         envs_local_idx = np.empty((n_envs,), dtype=gs.np_int)
-        variants_desc: dict[tuple[int, int], "RigidEntityDescription"] = {}
+        variants_desc: dict[tuple[int, int], RigidEntityDescription] = {}
         groups_envs_idx, solvers, groups_entities = [], [], []
         for i_group, variants_idx in enumerate(groups_variants_idx):
             envs_idx = np.flatnonzero(envs_group_idx == i_group)
