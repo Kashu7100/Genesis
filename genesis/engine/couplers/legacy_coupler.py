@@ -75,6 +75,8 @@ from genesis.utils.simt import (
 if TYPE_CHECKING:
     from genesis.engine.entities.rigid_entity.rigid_geom import RigidGeom
     from genesis.engine.simulator import Simulator
+    from genesis.engine.solvers import RigidSolver
+    from genesis.engine.solvers.rigid.grouped_solver import GroupedRigidSolver
 
 
 PBD_PARTICLES = Size("pbd_particles")
@@ -350,7 +352,6 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
         self.sim = simulator
         self.options = options
 
-        self.rigid_solver = self.sim.rigid_solver
         self.mpm_solver = self.sim.mpm_solver
         self.sph_solver = self.sim.sph_solver
         self.pbd_solver = self.sim.pbd_solver
@@ -379,6 +380,11 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
             return
         yield from iter_data(self, "legacy_coupler_state")
         yield from iter_data(self, "sph_boundaries")
+
+    @property
+    def rigid_solver(self) -> "RigidSolver | GroupedRigidSolver":
+        """The rigid solver of the scene, a grouped one once its rigid entities differ in structure (see 'Simulator')."""
+        return self.sim.rigid_solver
 
     @property
     def has_fem_sph(self) -> bool:
@@ -448,7 +454,7 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
             has_mpm_pbd=has_mpm_pbd,
             has_fem_mpm=self.fem_solver.is_active and self.mpm_solver.is_active and self.options.fem_mpm,
             has_fem_sph=self.has_fem_sph,
-            is_links_info_batched=self.rigid_solver.rigid_config.batch_links_info,
+            is_links_info_batched=self.rigid_solver.options.batch_links_info,
             is_external_wrench_exact=has_rigid_sph and is_opted_in(RigidData.dyn_state.links.cfrc_external_sums),
             enable_cooperative_particles=0 < self.sph_solver.n_particles * self.n_envs_ <= get_gpu_core_count(),
             enable_cooperative_segments=0 < n_segments * self.n_envs_ <= get_gpu_core_count(),

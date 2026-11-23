@@ -1,3 +1,4 @@
+import functools
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -19,6 +20,7 @@ from .base_sensor import (
     SimpleSensorMetadata,
     func_sensor_link_motion,
     func_sensor_link_pose,
+    update_groups_raw_data,
 )
 
 if TYPE_CHECKING:
@@ -210,20 +212,23 @@ class IMUSensor(RigidSensorMixin[IMUSharedMetadata], SimpleSensor[IMUOptions, No
                 shared_metadata.solver.rigid_info,
             )
             return
-        # The solver of each group computes the readings of its own environments, written into their columns
-        for group in shared_metadata.solver_groups:
-            envs_idx = group.solver.scene_envs_idx
-            group_raw_data_T = raw_data_T.new_empty((raw_data_T.shape[0], len(envs_idx)))
-            _kernel_update_imu_raw_data(
-                group.links_idx,
-                shared_metadata.offsets_pos[envs_idx],
-                shared_metadata.offsets_quat[envs_idx],
-                shared_metadata.magnetic_field_vector[envs_idx],
-                group_raw_data_T,
-                group.solver.dyn_state,
-                group.solver.rigid_info,
-            )
-            raw_data_T[:, envs_idx] = group_raw_data_T
+        # The solver of each group computes the readings of its own environments
+        update_groups_raw_data(
+            shared_metadata.solver_groups, raw_data_T, functools.partial(cls._update_group_raw_data, shared_metadata)
+        )
+
+    @staticmethod
+    def _update_group_raw_data(shared_metadata: IMUSharedMetadata, group, group_raw_data_T: torch.Tensor) -> None:
+        envs_idx = group.solver.scene_envs_idx
+        _kernel_update_imu_raw_data(
+            group.links_idx,
+            shared_metadata.offsets_pos[envs_idx],
+            shared_metadata.offsets_quat[envs_idx],
+            shared_metadata.magnetic_field_vector[envs_idx],
+            group_raw_data_T,
+            group.solver.dyn_state,
+            group.solver.rigid_info,
+        )
 
     @classmethod
     def _apply_transform(cls, shared_metadata: IMUSharedMetadata, data: torch.Tensor, timeline, *, is_measured: bool):

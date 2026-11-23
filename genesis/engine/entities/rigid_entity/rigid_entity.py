@@ -13,6 +13,7 @@ from genesis.utils.misc import DeprecationError, broadcast_tensor, qd_to_torch
 
 from ..base_entity import Entity
 from .description import (
+    EnvironmentsLayout,
     KinematicAttachmentDescription,
     KinematicEntityDescription,
     KinematicLinkDescription,
@@ -20,7 +21,6 @@ from .description import (
     RigidEqualityDescription,
     RigidJointDescription,
     RigidLinkDescription,
-    _balanced_variant_mapping,
 )
 from .inertial import RHO_MUJOCO, RHO_OBJECT, RHO_ROBOT, compose_inertial_from_g_infos, finalize_inertial
 from .rigid_equality import RigidEquality
@@ -35,13 +35,13 @@ if TYPE_CHECKING:
     from genesis.typing import IndexType
 
 
-def get_variants_kinematics(entity, n_envs: int):
+def get_variants_kinematics(entity, envs_layout: EnvironmentsLayout):
     """Get the links, joints and qpos0 of every variant of an entity, and the variant each environment carries.
 
     The first variant holds the live links and joints, which an attach reshapes, and a homogeneous entity holds this
     one alone. The other variants of a heterogeneous entity, which an attach refuses, hold those their descriptions
     state. Returns, for every variant, the descriptions of its links and of its joints and its neutral configuration
-    (qpos0), then the variant carried by each of the 'n_envs' environment rows.
+    (qpos0), then the variant carried by each environment of 'envs_layout'.
     """
     variants = entity.desc.variants[1:]
     variants_links = [[link.desc for link in entity.links], *[variant.links for variant in variants]]
@@ -50,14 +50,14 @@ def get_variants_kinematics(entity, n_envs: int):
         *[[j_desc for l_desc in variant.links for j_desc in l_desc.joints] for variant in variants],
     ]
     variants_qpos0 = [variant.init_qpos for variant in entity.desc.variants] or [entity.init_qpos]
-    envs_variant_idx = _balanced_variant_mapping(len(variants_links), n_envs)
+    envs_variant_idx = envs_layout.get_variant_idx(len(variants_links))
     return variants_links, variants_joints, variants_qpos0, envs_variant_idx
 
 
-def compute_forward_kinematics(entities, n_envs: int, qpos=None):
+def compute_forward_kinematics(entities, envs_layout: EnvironmentsLayout, qpos=None):
     """Compute the world poses of the links and the geoms of rigid entities on the host, from their descriptions alone.
 
-    It reads no solver data, so it runs before the rigid solver allocates any. 'n_envs' is the number of environment
+    It reads no solver data, so it runs before the rigid solver allocates any. 'envs_layout' gives the environment
     rows returned, each taking the variant of a heterogeneous entity that the solver dispatches to it (see
     'get_variants_kinematics'). 'qpos' gathers the generalized coordinates of the entities in order, one row per
     environment, and defaults to the neutral configuration (qpos0). The parent of every attached entity must be part of
@@ -79,15 +79,16 @@ def compute_forward_kinematics(entities, n_envs: int, qpos=None):
     geoms_pos = np.array([geom.init_pos for entity in entities for geom in entity.geoms]).reshape((-1, 3))
     geoms_quat = np.array([geom.init_quat for entity in entities for geom in entity.geoms]).reshape((-1, 4))
     # Homogeneous entities at their neutral configuration stand at the same poses in every environment
-    n_envs_computed = 1 if qpos is None and not any([entity.desc.variants for entity in entities]) else n_envs
+    n_envs = len(envs_layout.envs_idx)
+    if qpos is None and not any([entity.desc.variants for entity in entities]):
+        envs_layout = EnvironmentsLayout(1, np.zeros(1, dtype=gs.np_int))
+    n_envs_computed = len(envs_layout.envs_idx)
 
     # The parameters of every variant of every entity, then the row each environment reads from
     links_pos_table, links_quat_table, joints_pos_table, joints_axis_table, qpos0_table = [], [], [], [], []
     links_row, joints_row, qs_row = [], [], []
     for entity in entities:
-        variants_links, variants_joints, variants_qpos0, envs_variant_idx = get_variants_kinematics(
-            entity, n_envs=n_envs_computed
-        )
+        variants_links, variants_joints, variants_qpos0, envs_variant_idx = get_variants_kinematics(entity, envs_layout)
         envs_variant_idx = envs_variant_idx[:, None]
         links_row.append(len(links_pos_table) + envs_variant_idx * entity.n_links + np.arange(entity.n_links))
         joints_row.append(len(joints_pos_table) + envs_variant_idx * entity.n_joints + np.arange(entity.n_joints))
@@ -301,6 +302,20 @@ class KinematicEntity(Entity):
         for joint in self.joints:
             joint._destroy()
         super()._destroy()
+
+    def _bind_solver(self, solver) -> None:
+        """Make the entity and its parts reach their data through 'solver', which simulates them at the same indices.
+
+        A scene whose rigid entities differ in structure simulates its other rigid entities in the solver of each of its
+        groups, which a GroupedRigidSolver reaches for them (see 'GroupedRigidSolver.build').
+        """
+        self._solver = solver
+        for link in self._links:
+            link._solver = solver
+            for vgeom in link.vgeoms:
+                vgeom._solver = solver
+        for joint in self.joints:
+            joint._solver = solver
 
     def _create_joints(
         self, j_descs: Sequence[RigidJointDescription], link_idx: int, joint_start: int
@@ -1858,6 +1873,13 @@ class RigidEntity(KinematicEntity):
         for equality in self._equalities:
             equality._destroy()
         super()._destroy()
+
+    def _bind_solver(self, solver) -> None:
+        super()._bind_solver(solver)
+        for geom in self.geoms:
+            geom._solver = solver
+        for equality in self._equalities:
+            equality._solver = solver
 
     def _add_equality(self, desc: RigidEqualityDescription):
         match desc.type:

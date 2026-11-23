@@ -528,6 +528,17 @@ def test_variants_of_different_structure(mimic_hinges, show_viewer, tol):
         ),
         show_viewer=show_viewer,
     )
+    # The plane and a free ball are added before the first entity whose variants differ in structure, and keep the
+    # handles the scene returned for them
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
+    ball = scene.add_entity(
+        morph=gs.morphs.Sphere(
+            radius=RADIUS,
+            pos=(-2.0, 0.0, 2.0),
+        ),
+    )
     # A free box, or two hinges tied by a joint equality and hanging from a fixed base
     robot = scene.add_entity(
         morph=[
@@ -540,9 +551,7 @@ def test_variants_of_different_structure(mimic_hinges, show_viewer, tol):
             ),
         ],
     )
-    scene.add_entity(
-        morph=gs.morphs.Plane(),
-    )
+    # An object whose variants share their structure, between two entities whose variants differ in structure
     obj = scene.add_entity(
         morph=[
             gs.morphs.Sphere(
@@ -563,12 +572,31 @@ def test_variants_of_different_structure(mimic_hinges, show_viewer, tol):
             rho=RHO,
         ),
     )
+    # The hinges, a free box or a free sphere, the environments carrying the first variant of the robot taking the hinges
+    robot_last = scene.add_entity(
+        morph=[
+            gs.morphs.MJCF(
+                file=ET.tostring(mimic_hinges, encoding="unicode"),
+                pos=(0.0, 2.0, 0.0),
+            ),
+            gs.morphs.Box(
+                size=(BOX_SIZE, BOX_SIZE, BOX_SIZE),
+                pos=(0.0, 2.0, 2.0),
+            ),
+            gs.morphs.Sphere(
+                radius=RADIUS,
+                pos=(0.0, 2.0, 2.0),
+            ),
+        ],
+    )
     with pytest.raises(gs.GenesisException, match="not built"):
         _ = robot.n_dofs
     scene.build(n_envs=4)
 
-    # The robot is the box in the first block of environments, and the object one variant per block [0, 0, 1, 2]
+    # The robot is the box in the first block of environments, the last robot and the object one variant per block
+    # [0, 0, 1, 2]
     assert_equal(robot.active_dofs_mask, [[True] * 6] * 2 + [[True] * 2 + [False] * 4] * 2)
+    assert_equal(robot_last.active_dofs_mask, [[True] * 2 + [False] * 4] * 2 + [[True] * 6] * 2)
     volumes = (4.0 / 3.0 * math.pi * RADIUS**3, BOX_SIZE**3, math.pi * RADIUS**2 * BOX_SIZE)
     assert_allclose(obj.get_mass(), RHO * np.array(volumes)[[0, 0, 1, 2]], tol=tol)
     assert [link is None for link in robot.get_link("child1")] == [True, False, False]
@@ -586,10 +614,16 @@ def test_variants_of_different_structure(mimic_hinges, show_viewer, tol):
     robot.set_dofs_position([[0.2, 0.2, 0.0, 0.0, 0.0, 0.0]], envs_idx=[2])
     robot.control_dofs_position([0.3, 0.3], dofs_idx_local=[0, 1], envs_idx=[2, 3])
     robot.set_dofs_position(1.0, envs_idx=[])
+    # The ball falls from its own height in each environment but the last, which the rigid solver of the scene leaves
+    # without gravity
+    balls_height = 2.0 + 0.1 * np.arange(4)
+    ball.set_pos(np.stack([np.full(4, -2.0), np.zeros(4), balls_height], axis=-1))
+    scene.rigid_solver.set_gravity((0.0, 0.0, 0.0), envs_idx=[3])
     for _ in range(N_STEPS):
         scene.step()
     free_fall_drop = 0.5 * G * DT**2 * N_STEPS * (N_STEPS + 1)
     box_velocity = -G * DT * N_STEPS
+    assert_allclose(ball.get_pos()[:, 2], balls_height - free_fall_drop * np.array([1.0, 1.0, 1.0, 0.0]), tol=tol)
     dofs_position_selected = robot.get_dofs_position(dofs_idx_local=[2, 0])
     assert_allclose(
         dofs_position_selected[:2],
@@ -611,8 +645,17 @@ def test_variants_of_different_structure(mimic_hinges, show_viewer, tol):
 
 
 @pytest.mark.required
-def test_variants_sharing_dofs_info(tol):
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_variants_sharing_dofs_info(n_envs, tol):
+    BOX_POS = (1.0, 0.0, 0.5)
+
     scene = gs.Scene()
+    box = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.1, 0.1, 0.1),
+            pos=BOX_POS,
+        ),
+    )
     # A single hinge, or two
     robot = scene.add_entity(
         morph=[
@@ -626,7 +669,14 @@ def test_variants_sharing_dofs_info(tol):
             ),
         ],
     )
-    scene.build(n_envs=2)
+    scene.build(n_envs=n_envs)
+    assert_allclose(box.get_pos(), BOX_POS, tol=tol)
+
+    # A scene without parallel environments simulates the first variant alone
+    if n_envs == 0:
+        robot.set_dofs_kp([10.0])
+        assert_allclose(robot.get_dofs_kp(), [10.0], tol=tol)
+        return
 
     # Each environment reads the parameters its group shares, over the dofs of its variant
     robot.set_dofs_kp([10.0, 20.0])

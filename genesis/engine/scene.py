@@ -393,10 +393,10 @@ class Scene(BuildableMixin, RBC):
             parameters differing. The morphs of a rigid entity may differ in topology too (other links and joints, a
             fixed or a free base, their own equality constraints): the rigid simulation is then split into groups of
             environments, one per combination of the variants of the rigid entities, each group simulated at its own
-            size and launching its own kernels at every step. Such an entity is added before every other rigid entity,
-            and the scene holds parallel environments, rigid entities alone, the Rasterizer as renderer and IMU sensors
-            as its only sensors. Every rigid entity of such a scene gathers its accessors over the groups, its
-            quantities whose size depends on the variant padded to the largest one (see 'HeterogeneousEntity').
+            size and launching its own kernels at every step. Such an entity is a HeterogeneousEntity, gathering its
+            accessors over the groups, its quantities whose size depends on the variant padded to the largest one. The
+            scene then holds rigid entities alone, renders with the Rasterizer and takes the sensors supporting groups,
+            and a scene without parallel environments simulates the first variant of every entity.
         material : gs.materials.Material | None, optional
             The material of the entity. If None, use ``gs.materials.Rigid()``.
         surface : gs.surfaces.Surface | None, optional
@@ -2119,7 +2119,11 @@ class Scene(BuildableMixin, RBC):
 
     @property
     def rigid_solver(self):
-        """The scene's `rigid_solver`, managing all the `RigidEntity` in the scene."""
+        """The scene's `rigid_solver`, managing all the `RigidEntity` in the scene.
+
+        It is a GroupedRigidSolver once a rigid entity whose variants differ in structure is added, which simulates the
+        groups of environments apart (see 'Scene.add_entity').
+        """
         return self._sim.rigid_solver
 
     @property

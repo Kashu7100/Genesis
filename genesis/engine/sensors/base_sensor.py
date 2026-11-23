@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, ClassVar, Generic, NamedTuple, TypeVar, get_args, get_origin
@@ -318,15 +319,24 @@ class Sensor(BuildableMixin, RBC, Generic[OptionsT, SharedSensorContextT, Shared
         This method is called by SensorManager during the scene build phase. This is where any shared metadata should be
         initialized.
         """
-        # A rigid simulation split into groups of environments is read through the entity a sensor is attached to, and
-        # the markers of a sensor through its link in the solver of the whole scene, which simulates nothing then
-        if self._manager.sim.has_rigid_groups and (
-            not self.has_rigid_groups_support or self._options.entity_idx < 0 or self._options.draw_debug
-        ):
-            gs.raise_exception(
-                f"{type(self).__name__} does not support rigid entities that differ in structure from one environment "
-                "to another. Attach an IMU to a rigid entity, without 'draw_debug'."
-            )
+        # A rigid simulation split into groups is read from the solver of each group, which a sensor class supports by
+        # a pass over the groups, and its markers from the link of the sensor, which a HeterogeneousEntity holds in the
+        # solver of each group alone
+        sim = self._manager.sim
+        if sim.has_rigid_groups:
+            if not self.has_rigid_groups_support:
+                gs.raise_exception(
+                    f"{type(self).__name__} does not support rigid entities that differ in structure from one "
+                    "environment to another."
+                )
+            if (
+                self._options.draw_debug
+                and self._options.entity_idx >= 0
+                and isinstance(sim.entities[self._options.entity_idx], HeterogeneousEntity)
+            ):
+                gs.raise_exception(
+                    f"{type(self).__name__} draws no marker on a rigid entity whose variants differ in structure."
+                )
         # Set first, since the builds of the derived sensors call their own guarded accessors
         self._is_built = True
         self._shared_metadata.delays_ts = concat_with_tensor(
@@ -556,7 +566,11 @@ class Sensor(BuildableMixin, RBC, Generic[OptionsT, SharedSensorContextT, Shared
         """
         if self._options.entity_idx < 0:
             return ()
-        return (self._manager.sim.entities[self._options.entity_idx].solver,)
+        # The solver of each group of a rigid simulation split into groups notifies the changes of its environments
+        sim = self._manager.sim
+        if sim.has_rigid_groups:
+            return sim.rigid_solver.solvers
+        return (sim.entities[self._options.entity_idx].solver,)
 
     def _get_formatted_data(self, tensor: torch.Tensor, envs_idx=None) -> torch.Tensor:
         """
@@ -625,6 +639,23 @@ class _SolverLinkGroup(NamedTuple):
     solver: "KinematicSolver"
     links_idx: torch.Tensor  # solver-local link indices, one per sensor in this group
     sensor_cols: torch.Tensor  # which per-class sensor column each link pose lands in
+
+
+def update_groups_raw_data(
+    solver_groups: "Sequence[_SolverLinkGroup]",
+    raw_data_T: torch.Tensor,
+    update: "Callable[[_SolverLinkGroup, torch.Tensor], None]",
+) -> None:
+    """Write the raw data of the environments of each group of a rigid simulation split into groups.
+
+    'update(group, group_raw_data_T)' writes the raw data of the sensors of a group into 'group_raw_data_T', which holds
+    one column per environment of the group, which this function then writes into the columns of these environments.
+    """
+    for group in solver_groups:
+        envs_idx = group.solver.scene_envs_idx
+        group_raw_data_T = raw_data_T.new_empty((raw_data_T.shape[0], len(envs_idx)))
+        update(group, group_raw_data_T)
+        raw_data_T[:, envs_idx] = group_raw_data_T
 
 
 @dataclass
@@ -757,23 +788,30 @@ class RigidSensorMixin[RigidSensorMetadataMixinT: RigidSensorMetadataMixin](_Lin
             self._register_link(entity=None, link_idx=-1)
 
     def _register_link(self, entity, link_idx: int):
-        """Record the link of the sensor, 'link_idx' being local to the entity for a HeterogeneousEntity."""
-        if not isinstance(entity, HeterogeneousEntity):
+        """Record the link of the sensor, 'link_idx' being local to the entity for a HeterogeneousEntity.
+
+        A rigid simulation split into groups records the link in the solver of each group, every sensor taking the same
+        column in every group: a link of a RigidEntity keeps its index in every group, a link of a HeterogeneousEntity
+        takes the index of the variant of each group, and a sensor attached to no entity takes link -1 in all of them.
+        """
+        sim = self._manager.sim
+        if not sim.has_rigid_groups:
             self._shared_metadata.links_idx = concat_with_tensor(self._shared_metadata.links_idx, link_idx)
             return
-        # Every sensor of a rigid simulation split into groups is attached to an entity, which every group holds, so
-        # the sensors take the same columns in every group
         solver_groups = self._shared_metadata.solver_groups
-        for i_group, group_entity in enumerate(entity.entities):
-            if link_idx >= group_entity.n_links:
-                gs.raise_exception(
-                    f"Invalid link index {link_idx} for entity {entity.idx}, a variant of which has "
-                    f"{group_entity.n_links} links."
-                )
-            group_link_idx = link_idx + group_entity.link_start
+        for i_group, solver in enumerate(sim.rigid_solver.solvers):
+            group_link_idx = link_idx
+            if isinstance(entity, HeterogeneousEntity):
+                group_entity = entity.entities[i_group]
+                if link_idx >= group_entity.n_links:
+                    gs.raise_exception(
+                        f"Invalid link index {link_idx} for entity {entity.idx}, a variant of which has "
+                        f"{group_entity.n_links} links."
+                    )
+                group_link_idx = link_idx + group_entity.link_start
             if i_group == len(solver_groups):
                 links_idx = torch.empty(0, dtype=gs.tc_int, device=gs.device)
-                solver_groups.append(_SolverLinkGroup(group_entity.solver, links_idx, links_idx.clone()))
+                solver_groups.append(_SolverLinkGroup(solver, links_idx, links_idx.clone()))
             group = solver_groups[i_group]
             solver_groups[i_group] = _SolverLinkGroup(
                 solver=group.solver,

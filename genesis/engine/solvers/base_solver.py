@@ -11,6 +11,7 @@ import quadrants as qd
 
 import genesis as gs
 from genesis.engine.entities.base_entity import Entity
+from genesis.engine.entities.rigid_entity.description import EnvironmentsLayout
 from genesis.engine.force_fields import ForceField, ForceFields
 from genesis.engine.state_change import StateChange, Subscriber, mutates
 from genesis.engine.states import SolverCheckpoint
@@ -103,15 +104,15 @@ class TimeBasedMixin:
     _substeps: int
     _substep_dt: float
 
-    def __init__(self, sim, options, scene_envs_idx=None):
+    def __init__(self, sim, options, envs_layout=None):
         """Compute how many substeps this solver runs per scene step, from the interval it integrates over.
 
         The count is `SimOptions.dt` divided by the interval the options of this solver ask for. A solver whose `dt`
         was left unset takes `SimOptions.substeps` instead. Since the substep loop advances every solver together,
-        `Simulator.build` then checks that the active solvers all end up on the same count. 'scene_envs_idx' is passed
-        on to 'Solver'.
+        `Simulator.build` then checks that the active solvers all end up on the same count. 'envs_layout' is passed on
+        to 'Solver'.
         """
-        super().__init__(sim, options, scene_envs_idx)
+        super().__init__(sim, options, envs_layout)
         self._substeps = max(1, round(sim.dt / options.dt)) if "dt" in options.model_fields_set else sim.substeps
         self._substep_dt = sim.dt / self._substeps
 
@@ -563,16 +564,19 @@ class Solver(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, RBC):
     # The entity spec class whose entities the solver simulates, which the simulator dispatches on
     entity_spec_cls: ClassVar[type[gs.entities.Spec]]
 
-    def __init__(self, sim: "Simulator", options, scene_envs_idx: torch.Tensor | None = None):
-        """Create a solver of the given options, simulating the environments of the scene 'scene_envs_idx' names.
+    def __init__(self, sim: "Simulator", options, envs_layout: "EnvironmentsLayout | None" = None):
+        """Create a solver of the given options, simulating the environments of the scene 'envs_layout' names.
 
-        'scene_envs_idx' holds the index in the scene of each environment the solver simulates, in the order of its own,
+        'envs_layout' holds the batch size of the scene and the index in it of each environment the solver simulates,
         and None stands for every environment of the scene. The build of the solver then takes the number of entries.
         """
         self._uid = gs.UID()
         self._sim = sim
         self._options = options
-        self._scene_envs_idx = scene_envs_idx
+        self._envs_layout = envs_layout
+        self._scene_envs_idx: torch.Tensor | None = None
+        if envs_layout is not None:
+            self._scene_envs_idx = torch.as_tensor(envs_layout.envs_idx, dtype=gs.tc_int, device=gs.device)
         self._entities: list[Entity] = gs.List()
 
         # Whether the state of the solver tracks gradients, and the autograd graph of the simulator recording them
@@ -723,11 +727,13 @@ class Solver(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, RBC):
         calls it first, then sets `_is_built` once its own data is valid.
         """
         super().build(n_envs)
-        assert self._scene_envs_idx is None or len(self._scene_envs_idx) == self.n_envs_
+        if self._envs_layout is None:
+            self._envs_layout = EnvironmentsLayout(self.n_envs_, np.arange(self.n_envs_))
+        else:
+            assert len(self._envs_layout.envs_idx) == self.n_envs_
+            self._errno_envs_idx = self._envs_layout.envs_idx
 
         self.build_errno(self.n_envs_)
-        if self._scene_envs_idx is not None:
-            self._errno_envs_idx = tensor_to_array(self._scene_envs_idx)
         if self._requires_grad:
             self._error_reports = {
                 **self._error_reports,
@@ -922,6 +928,12 @@ class Solver(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, RBC):
     def scene_envs_idx(self) -> torch.Tensor | None:
         """The index in the scene of each environment the solver simulates, None when it simulates them all in order."""
         return self._scene_envs_idx
+
+    @property
+    def envs_layout(self) -> "EnvironmentsLayout":
+        """The environments the solver simulates among those of its scene, which the variants of an entity spread over
+        (see EnvironmentsLayout)."""
+        return self._envs_layout
 
     @property
     def options(self) -> "Options":

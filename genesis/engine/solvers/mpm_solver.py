@@ -275,7 +275,8 @@ class MPMData(Data):
                 grid_x=grid_x,
                 grid_y=grid_y,
                 grid_z=grid_z,
-                geoms=solver.sim.rigid_solver.n_geoms_,
+                # The geoms of the rigid solver collide with the particles of an active solver alone
+                geoms=solver.sim.rigid_solver.n_geoms_ if solver.is_active else 1,
                 # The slots of the hash grid hash the cells of the grid, one per particle
                 **hash_grid_sizes(max(solver.n_particles, 1)),
                 tiles=n_tiles,

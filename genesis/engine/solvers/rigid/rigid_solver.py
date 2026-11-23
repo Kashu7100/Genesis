@@ -11,7 +11,7 @@ import genesis.utils.geom as gu
 from genesis.constants import link_ref_frame
 from genesis.engine.entities import DroneEntity, RigidEntity, TerrainEntity
 from genesis.engine.entities.rigid_entity import RigidGeom
-from genesis.engine.entities.rigid_entity.description import RigidEntityDescription, _balanced_variant_mapping
+from genesis.engine.entities.rigid_entity.description import EnvironmentsLayout, RigidEntityDescription
 from genesis.engine.entities.rigid_entity.rigid_equality import RigidEquality
 from genesis.engine.render_context import (
     CONSTRAINT_COLOR,
@@ -230,8 +230,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     # --------------------------------- Initialization -----------------------------------
     # ------------------------------------------------------------------------------------
 
-    def __init__(self, sim: "Simulator", options: RigidOptions, scene_envs_idx: torch.Tensor | None = None) -> None:
-        super().__init__(sim, options, scene_envs_idx)
+    def __init__(self, sim: "Simulator", options: RigidOptions, envs_layout: EnvironmentsLayout | None = None) -> None:
+        super().__init__(sim, options, envs_layout)
 
         self._enable_collision = options.enable_collision
         self._enable_multi_contact = options.enable_multi_contact
@@ -453,7 +453,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 variants_default = np.array([variant.default_armature or 0.0 for variant in entity.desc.variants])
             else:
                 variants_default = np.array([entity.main_morph.default_armature or 0.0])
-            envs_default = variants_default[_balanced_variant_mapping(variants_default.size, self.n_envs_)]
+            envs_default = variants_default[self.envs_layout.get_variant_idx(variants_default.size)]
             if (envs_default <= 0.0).all():
                 continue
             dofs_idx.extend(link.dof_start for link in rotor_links)
@@ -1094,7 +1094,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 continue
 
             n_variants = len(link._variant_vgeom_ranges)
-            variant_idx = _balanced_variant_mapping(n_variants, self.n_envs_)
+            variant_idx = self.envs_layout.get_variant_idx(n_variants)
 
             # Build per-env arrays from link's variant data
             geom_starts = np.array([link._variant_geom_ranges[v][0] for v in variant_idx], dtype=gs.np_int)

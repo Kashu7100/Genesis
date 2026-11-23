@@ -391,7 +391,7 @@ class IPCCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, RBC)
         # Add rigid geoms and articulated entities to IPC based on per-entity coupling types
         if self.rigid_solver.is_active:
             links_pos, links_quat, _, _, joints_xanchor, joints_xaxis = compute_forward_kinematics(
-                self.rigid_solver.entities, n_envs=self.n_envs_
+                self.rigid_solver.entities, self.rigid_solver.envs_layout
             )
             self._add_rigid_geoms_to_ipc(links_pos, links_quat)
             self._add_articulation_entities_to_ipc(joints_xanchor, joints_xaxis)

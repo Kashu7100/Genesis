@@ -15,7 +15,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
 from itertools import chain
-from typing import Any, Self
+from typing import Any, NamedTuple, Self
 
 import numpy as np
 
@@ -355,6 +355,23 @@ def _balanced_variant_mapping(n_variants, B):
         return np.repeat(np.arange(n_variants), sizes)
     else:
         return np.arange(B)
+
+
+class EnvironmentsLayout(NamedTuple):
+    """The environments a solver simulates among those of its scene, over which the variants of an entity spread.
+
+    The variants of a heterogeneous entity take contiguous blocks of nearly equal size of the environments of the scene,
+    whichever solver simulates them, so that a solver simulating some of them carries the variants of the scene there.
+    """
+
+    n_envs: int
+    """The batch size of the scene, at least one."""
+    envs_idx: np.ndarray
+    """The index in the scene of each environment the solver simulates, in the order of its own."""
+
+    def get_variant_idx(self, n_variants: int) -> np.ndarray:
+        """Return the variant of an entity of 'n_variants' variants that each environment of the solver carries."""
+        return _balanced_variant_mapping(n_variants, self.n_envs)[self.envs_idx]
 
 
 @dataclass

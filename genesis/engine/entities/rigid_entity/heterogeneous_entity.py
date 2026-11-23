@@ -50,12 +50,18 @@ class HeterogeneousEntity(BuildableMixin, RBC):
         self._groups_n_dofs: tuple[int, ...] = ()
         self._groups_n_links: tuple[int, ...] = ()
         self._is_dofs_info_batched = False
+        self._is_batched = True
 
     @gs.assert_unbuilt
-    def build(self, entities: Sequence["RigidEntity"], partition: "EnvironmentPartition") -> None:
-        """Record the entity of each group, 'entities' following the order of the groups in 'partition'."""
+    def build(self, entities: Sequence["RigidEntity"], partition: "EnvironmentPartition", is_batched: bool) -> None:
+        """Record the entity of each group, 'entities' following the order of the groups in 'partition'.
+
+        'is_batched' states that the scene has parallel environments. A scene without them forms a single group, whose
+        entity the accessors call as they are given.
+        """
         self._entities = tuple(entities)
         self._partition = partition
+        self._is_batched = is_batched
         # Only the kinematic entities have degrees of freedom, and the accessors wrapped here are theirs alone
         if isinstance(self._entities[0], KinematicEntity):
             self._groups_n_qs = tuple(entity.n_qs for entity in self._entities)
@@ -99,6 +105,10 @@ class HeterogeneousEntity(BuildableMixin, RBC):
         n_outputs: int = 1,
         **kwargs,
     ):
+        if not self._is_batched:
+            if groups_size is None:
+                return getters[0](envs_idx=envs_idx, **kwargs)
+            return getters[0](idx_local, envs_idx=envs_idx, **kwargs)
         selection = self._partition.select(envs_idx)
         cols_shape, groups_cols = self._split_columns(idx_local, groups_size)
         n_envs = sum(rows.shape[0] for _, rows, _ in selection)
@@ -132,6 +142,12 @@ class HeterogeneousEntity(BuildableMixin, RBC):
     ) -> None:
         if not is_batched and envs_idx is not None:
             gs.raise_exception("`envs_idx` cannot be specified for non-batched dofs info.")
+        if not self._is_batched:
+            if groups_size is None:
+                setters[0](*values, envs_idx=envs_idx, **kwargs)
+            else:
+                setters[0](*values, idx_local, envs_idx=envs_idx, **kwargs)
+            return
         values = tuple(torch.as_tensor(value, dtype=gs.tc_float, device=gs.device) for value in values)
         selection = self._partition.select(envs_idx)
         cols_shape, groups_cols = self._split_columns(idx_local, groups_size)

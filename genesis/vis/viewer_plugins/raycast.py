@@ -47,6 +47,13 @@ class Raycaster:
     """
 
     def __init__(self, scene: "Scene", use_visual_geom: bool = False):
+        # The geometry of a rigid simulation split into groups lies in the scoped contexts of its groups, which the
+        # targets of the ray casting do not read
+        if scene.sim.has_rigid_groups:
+            gs.raise_exception(
+                "Ray casting in the viewer does not support rigid entities that differ in structure from one environment "
+                "to another."
+            )
         self.scene = scene
         self._envs_offset = torch.as_tensor(scene.envs_offset, dtype=gs.tc_float, device=gs.device)
         self.targets: list[RaycastTarget | RaycastWorldTarget] = []

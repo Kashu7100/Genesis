@@ -19,7 +19,6 @@ import quadrants as qd
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.engine.entities.rigid_entity.description import _balanced_variant_mapping
 from genesis.engine.entities.rigid_entity.rigid_entity import compute_forward_kinematics
 from genesis.engine.solvers.rigid.constraint.data import ConstraintState
 from genesis.engine.solvers.rigid.data import DynInfo, DynState, RigidInfo
@@ -560,9 +559,7 @@ class Collider:
                 for i_variant, (geom_start, geom_end) in enumerate(link._variant_geom_ranges):
                     geoms_variant_key[geom_start:geom_end] = n_variant_keys + i_variant
             n_variants = len(entity.desc.variants)
-            entities_envs_variant_key.append(
-                n_variant_keys + _balanced_variant_mapping(n_variants, self._solver.n_envs_)
-            )
+            entities_envs_variant_key.append(n_variant_keys + self._solver.envs_layout.get_variant_idx(n_variants))
             n_variant_keys += n_variants
         envs_variant_key = np.stack(entities_envs_variant_key)
         variant_keys_is_co_carried = np.zeros((n_variant_keys, n_variant_keys), dtype=bool)
@@ -591,7 +588,7 @@ class Collider:
             # same-root pair left belongs to a single variant of one entity, so the first environment carrying a geom
             # carries the other geom of its pair as well.
             _, _, geoms_pos, geoms_quat, _, _ = compute_forward_kinematics(
-                self._solver.entities, n_envs=self._solver.n_envs_
+                self._solver.entities, self._solver.envs_layout
             )
             for i_g in self_root_geom_idxs:
                 geom = geoms[i_g]

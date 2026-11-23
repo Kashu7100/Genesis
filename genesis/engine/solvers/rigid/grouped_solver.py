@@ -1,19 +1,27 @@
 import dataclasses
-from collections.abc import Iterator
-from typing import TYPE_CHECKING, ClassVar
+import inspect
+from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
 
 import genesis as gs
-from genesis.engine.entities.rigid_entity.description import RigidEntityDescription, _balanced_variant_mapping
-from genesis.engine.entities.rigid_entity.heterogeneous_entity import HeterogeneousEntity
+from genesis.engine.entities.rigid_entity import HeterogeneousEntity, RigidEntity
+from genesis.engine.entities.rigid_entity.description import (
+    EnvironmentsLayout,
+    RigidEntityDescription,
+    VariantStructureError,
+    _balanced_variant_mapping,
+)
+from genesis.engine.render_context import ScopedRenderContext
 from genesis.engine.state_change import Subscriber
 from genesis.engine.states import SolverCheckpoint
 from genesis.utils.data import ConfigItem, DataItem, namespace
 from genesis.utils.misc import indices_to_mask
 
 from ..base_solver import GravityMixin, Solver, TimeBasedMixin
+from ..kinematic_solver import KinematicSolver
 from .rigid_solver import RigidSolver
 
 if TYPE_CHECKING:
@@ -96,21 +104,139 @@ def split_groups_checkpoint(checkpoint: SolverCheckpoint, i_group: int) -> Solve
     )
 
 
+def is_dofs_info_batched(solver: RigidSolver, arguments: dict[str, Any]) -> bool:
+    """Whether the parameters of the degrees of freedom hold one value per environment."""
+    return solver.options.batch_dofs_info
+
+
+def is_links_info_batched(solver: RigidSolver, arguments: dict[str, Any]) -> bool:
+    """Whether the inertial parameters of the links hold one value per environment."""
+    return solver.options.batch_links_info
+
+
+def is_sol_params_batched(solver: RigidSolver, arguments: dict[str, Any]) -> bool:
+    """Whether the solver parameters of the constraints an accessor selects hold one value per environment.
+
+    Those of the equality constraints always do, those of the joints as the joint parameters do, those of the geoms
+    never do.
+    """
+    if arguments["eqs_idx"] is not None:
+        return True
+    if arguments["joints_idx"] is not None:
+        return solver.options.batch_joints_info
+    return False
+
+
+def dispatch_over_groups(
+    method: Callable,
+    values_ndim: dict[str, int] | None = None,
+    is_info_batched: Callable[[RigidSolver, dict[str, Any]], bool] | None = None,
+) -> Callable:
+    """Return the accessor of GroupedRigidSolver calling 'method', an accessor of RigidSolver, on the solver of each group.
+
+    Every group lays out the rigid entities of the layout solver first, in the same order, so the indices of their links,
+    degrees of freedom, geoms and every other item stand for the same items in every group (see
+    'GroupedRigidSolver.build'). The environments that 'envs_idx' selects are split by group, each group receiving its own
+    in its numbering, and a getter gathers the rows of every group in the order of the selection. 'values_ndim' marks a
+    setter, giving for each argument holding values the number of axes of the value of one item in one environment: an
+    argument holding the axes of the environments and of the items, or the axis of the environments alone for a single
+    item, holds one row per selected environment, split by group, and so does an argument of indices holding one row
+    per selected environment. 'is_info_batched' tells from the solver of a group and the arguments
+    whether the data accessed holds one entry per environment, always if None. A getter of data shared by every
+    environment, or of a scene without parallel environments, returns the reading of the first group, while a setter
+    writes every group.
+    """
+    signature = inspect.signature(method)
+    is_setter = values_ndim is not None
+
+    def accessor(self: "GroupedRigidSolver", *args, **kwargs):
+        bound = signature.bind(self._solvers[0], *args, **kwargs)
+        bound.apply_defaults()
+        arguments = bound.arguments
+        is_batched = (
+            self.n_envs > 0
+            and "envs_idx" in arguments
+            and (is_info_batched is None or is_info_batched(self._solvers[0], arguments))
+        )
+        if not is_batched:
+            outputs = []
+            for solver in self._solvers if is_setter else self._solvers[:1]:
+                arguments["self"] = solver
+                outputs.append(method(*bound.args, **bound.kwargs))
+            return outputs[0]
+
+        selection = self._partition.select(arguments["envs_idx"])
+        n_selected = sum(len(rows) for _, rows, _ in selection)
+        # A value holding the axis of the environments and the axis of the items holds one row per selected environment,
+        # as does a value holding a single extra axis when a single item is selected and that axis spans the selection
+        items_idx = [value for name, value in arguments.items() if name.endswith("_idx") and name != "envs_idx"]
+        items_idx = [value for value in items_idx if value is not None]
+        is_single_item = not items_idx or isinstance(items_idx[0], (int, np.integer)) or np.size(items_idx[0]) == 1
+        rows_values = {}
+        for name, value in tuple(arguments.items()):
+            if value is None:
+                continue
+            ndim = np.ndim(value)
+            if name in (values_ndim or {}):
+                is_per_env = ndim == values_ndim[name] + 2 or (
+                    is_single_item and ndim == values_ndim[name] + 1 and np.shape(value)[0] == n_selected
+                )
+            else:
+                is_per_env = name.endswith("_idx") and name != "envs_idx" and ndim == 2
+            if is_per_env:
+                rows_values[name] = torch.as_tensor(value, device=gs.device)
+        groups_output = []
+        for i_group, rows, envs_idx_local in selection:
+            arguments["self"] = self._solvers[i_group]
+            arguments["envs_idx"] = envs_idx_local
+            for name, value in rows_values.items():
+                arguments[name] = value[rows]
+            groups_output.append((rows, method(*bound.args, **bound.kwargs)))
+        if is_setter:
+            return None
+        is_tuple = isinstance(groups_output[0][1], tuple)
+        outputs = []
+        for i_output in range(len(groups_output[0][1]) if is_tuple else 1):
+            group_output = groups_output[0][1][i_output] if is_tuple else groups_output[0][1]
+            output = group_output.new_empty((n_selected, *group_output.shape[1:]))
+            for rows, group_outputs in groups_output:
+                output[rows] = group_outputs[i_output] if is_tuple else group_outputs
+            outputs.append(output)
+        return tuple(outputs) if is_tuple else outputs[0]
+
+    accessor.__name__ = method.__name__
+    accessor.__doc__ = f"Call '{method.__qualname__}' on the solver of each group (see 'dispatch_over_groups')."
+    return accessor
+
+
+def refuse_over_groups(name: str) -> Callable:
+    """Return the accessor of GroupedRigidSolver raising that a scene simulated by groups offers no 'name'."""
+
+    def accessor(self: "GroupedRigidSolver", *args, **kwargs):
+        gs.raise_exception(
+            f"'{name}' is not supported for rigid entities whose scene simulates its environments by groups, the rigid "
+            "entities of the scene differing in structure from one environment to another."
+        )
+
+    accessor.__name__ = name
+    return accessor
+
+
 class GroupedRigidSolver(GravityMixin, TimeBasedMixin, Solver):
     """The rigid solver of a scene holding a rigid entity whose variants differ in structure, simulating groups of
     environments apart.
 
-    The environments are partitioned into groups by the combination of variants of the rigid entities they carry, each
-    entity added with several morphs carrying one of them per environment, the environments being split into contiguous
-    blocks of nearly equal size. A rigid solver of its own simulates each group at the size of the group, holding one
-    variant of every rigid entity, so the variants may differ in anything a rigid solver accepts: the number of links and
-    degrees of freedom, the joint types, a fixed or a free base, the equality constraints. An environment takes the
-    memory and the time of the variants it carries, while the time of a step grows with the number of groups too, each
-    group launching its own kernels.
+    The environments are partitioned into groups by the combination of variants of those entities they carry, each
+    carrying one variant per environment, the environments being split into contiguous blocks of nearly equal size. A
+    rigid solver of its own simulates each group at the size of the group, so the variants may differ in anything a rigid
+    solver accepts: the number of links and degrees of freedom, the joint types, a fixed or a free base, the equality
+    constraints. An environment takes the memory and the time of the variants it carries, while the time of a step grows
+    with the number of groups too, each group launching its own kernels.
 
-    The rigid entities of the scene are HeterogeneousEntity, which gather and scatter their accessors over the groups.
-    The solver takes part in the simulation as one rigid solver: it steps, resets, reports errors and saves its state for
-    every group, its state holding that of each group.
+    Every other rigid entity stays a RigidEntity, simulated in every group with the same indices, whose accessors reach
+    the solver of each group through this one. An entity whose variants differ in structure is a HeterogeneousEntity,
+    which gathers and scatters its accessors over the groups. The solver takes part in the simulation as one rigid
+    solver: it steps, resets, reports errors and saves its state for every group, its state holding that of each group.
     """
 
     entity_spec_cls: ClassVar[type[gs.entities.Spec]] = gs.entities.Rigid
@@ -118,11 +244,16 @@ class GroupedRigidSolver(GravityMixin, TimeBasedMixin, Solver):
     # Its whole state lives in the solvers of its groups, whose data it yields (see 'data')
     is_checkpointable = True
 
-    # override typing
-    _entities: list[HeterogeneousEntity] = gs.List()
+    def __init__(self, sim: "Simulator", options: "RigidOptions", layout_solver: RigidSolver) -> None:
+        """Create the solver of the given options, taking over the rigid entities of 'layout_solver'.
 
-    def __init__(self, sim: "Simulator", options: "RigidOptions") -> None:
+        'layout_solver' is the rigid solver the rigid entities of the scene were added to so far, never built, which
+        keeps the entities whose variants share one structure and their layout (see 'build').
+        """
         super().__init__(sim, options)
+        self._layout_solver = layout_solver
+        self._heterogeneous_entities: list[HeterogeneousEntity] = []
+        self._entities.extend(layout_solver.entities)
         self._solvers: tuple[RigidSolver, ...] = ()
         self._partition: EnvironmentPartition | None = None
 
@@ -132,15 +263,23 @@ class GroupedRigidSolver(GravityMixin, TimeBasedMixin, Solver):
         surface: "Surface | None",
         spec: "gs.entities.Rigid | None",
         desc: RigidEntityDescription | None = None,
-    ) -> HeterogeneousEntity:
-        """Record a rigid entity of index 'idx' in the scene, which the solver of each group creates as the solver builds.
+    ) -> RigidEntity | HeterogeneousEntity:
+        """Add a rigid entity of index 'idx' in the scene, a RigidEntity unless its variants differ in structure.
 
-        The entity is created from the spec, each group taking the morph of the variant it carries, since the groups are
-        only known once the number of environments is.
+        A RigidEntity joins the layout solver, a HeterogeneousEntity is created in the solver of each group as the
+        solver builds, from the morph of the variant the group carries (see 'add_heterogeneous_entity').
         """
-        if desc is not None:
-            gs.raise_exception("A scene whose rigid entities differ in structure cannot be created from descriptions.")
+        try:
+            entity = self._layout_solver.add_entity(idx, surface, spec, desc)
+        except VariantStructureError:
+            return self.add_heterogeneous_entity(idx, surface, spec)
+        self._entities.append(entity)
+        return entity
+
+    def add_heterogeneous_entity(self, idx: int, surface: "Surface", spec: "gs.entities.Rigid") -> HeterogeneousEntity:
+        """Record a rigid entity of index 'idx' whose variants differ in structure, which the groups are split by."""
         entity = HeterogeneousEntity(idx, surface, spec)
+        self._heterogeneous_entities.append(entity)
         self._entities.append(entity)
         return entity
 
@@ -148,35 +287,48 @@ class GroupedRigidSolver(GravityMixin, TimeBasedMixin, Solver):
     def build(self, n_envs: int) -> None:
         """Partition the environments into groups, then create the solver of each group with its entities and build it.
 
-        The descriptions resolved for the first group holding a variant of an entity are shared by the next ones, so
-        that every variant reads its asset once.
+        Every group adds the entities of the layout solver first, in their order and from their descriptions, so that
+        they take the same indices in every group as in the layout solver, then the variant it carries of each entity
+        whose variants differ in structure. Those of the entities of the layout solver that hold variants spread them
+        over the environments of the scene in every group (see EnvironmentsLayout). A scene without parallel
+        environments forms one group carrying the first variant of every entity. The descriptions resolved for the first
+        group holding a variant are shared by the next ones, so that every variant reads its asset once.
         """
-        if n_envs < 1:
-            gs.raise_exception(
-                f"A scene whose rigid entities differ in structure has parallel environments, got 'n_envs={n_envs}'."
-            )
         super().build(n_envs)
+        layout_entities = self._layout_solver.entities
+        for entity in layout_entities:
+            if entity.desc.attachment is not None:
+                gs.raise_exception(
+                    f"Entity '{entity.name}' is attached to another one, which a scene whose rigid entities differ in "
+                    "structure from one environment to another does not support."
+                )
 
-        envs_variants_idx = np.empty((n_envs, len(self._entities)), dtype=gs.np_int)
-        for i_entity, entity in enumerate(self._entities):
-            envs_variants_idx[:, i_entity] = _balanced_variant_mapping(len(entity.morphs), n_envs)
+        envs_variants_idx = np.empty((self.n_envs_, len(self._heterogeneous_entities)), dtype=gs.np_int)
+        for i_entity, entity in enumerate(self._heterogeneous_entities):
+            envs_variants_idx[:, i_entity] = _balanced_variant_mapping(len(entity.morphs), self.n_envs_)
         groups_variants_idx, envs_group_idx = np.unique(envs_variants_idx, axis=0, return_inverse=True)
 
-        envs_local_idx = np.empty((n_envs,), dtype=gs.np_int)
+        envs_local_idx = np.empty((self.n_envs_,), dtype=gs.np_int)
+        # The entities of a group hold no name of their own, the scene naming those it holds alone
+        layout_descs = [
+            dataclasses.replace(entity.desc, spec=entity.desc.spec.model_copy(update={"name": None}))
+            for entity in layout_entities
+        ]
         variants_desc: dict[tuple[int, int], RigidEntityDescription] = {}
         groups_envs_idx, solvers, groups_entities = [], [], []
         for i_group, variants_idx in enumerate(groups_variants_idx):
             envs_idx = np.flatnonzero(envs_group_idx == i_group)
             envs_local_idx[envs_idx] = np.arange(len(envs_idx))
-            scene_envs_idx = torch.as_tensor(envs_idx, dtype=gs.tc_int, device=gs.device)
-            groups_envs_idx.append(scene_envs_idx)
+            groups_envs_idx.append(torch.as_tensor(envs_idx, dtype=gs.tc_int, device=gs.device))
             # Each group takes a copy of the options, which a rigid solver resolves in place as it builds
-            solver = RigidSolver(self._sim, self._options.model_copy(deep=True), scene_envs_idx)
+            envs_layout = EnvironmentsLayout(self.n_envs_, envs_idx)
+            solver = RigidSolver(self._sim, self._options.model_copy(deep=True), envs_layout)
+            for entity, desc in zip(layout_entities, layout_descs):
+                solver.add_entity(entity.idx, entity.surface, None, desc)
             entities = []
-            for i_entity, (entity, i_variant) in enumerate(zip(self._entities, variants_idx)):
+            for i_entity, (entity, i_variant) in enumerate(zip(self._heterogeneous_entities, variants_idx)):
                 desc = variants_desc.get((i_entity, i_variant))
                 if desc is None:
-                    # The entity of a group holds no name of its own, the scene naming the heterogeneous entity alone
                     spec = entity.spec.model_copy(update={"morph": entity.morphs[i_variant], "name": None})
                     entities.append(solver.add_entity(entity.idx, entity.surface, spec))
                     variants_desc[(i_entity, i_variant)] = entities[-1].desc
@@ -187,7 +339,7 @@ class GroupedRigidSolver(GravityMixin, TimeBasedMixin, Solver):
             solver._substeps, solver._substep_dt = self._substeps, self._substep_dt
             # The structs of each group are opted in and sized in a namespace of their own (see 'opt_in')
             with namespace(f"rigid_group_{i_group}"):
-                solver.build(len(envs_idx))
+                solver.build(len(envs_idx) if self.n_envs > 0 else 0)
             solvers.append(solver)
         self._solvers = tuple(solvers)
 
@@ -197,8 +349,12 @@ class GroupedRigidSolver(GravityMixin, TimeBasedMixin, Solver):
             envs_group_idx=torch.as_tensor(envs_group_idx, dtype=gs.tc_int, device=gs.device),
             envs_local_idx=torch.as_tensor(envs_local_idx, dtype=gs.tc_int, device=gs.device),
         )
-        for entity, entities in zip(self._entities, zip(*groups_entities)):
-            entity.build(entities, self._partition)
+        # The entities of the layout solver reach the solver of each group through this one, at the same indices
+        for entity in layout_entities:
+            entity._bind_solver(self)
+            entity._build()
+        for entity, entities in zip(self._heterogeneous_entities, zip(*groups_entities)):
+            entity.build(entities, self._partition, is_batched=self.n_envs > 0)
         self._is_built = True
 
     def destroy(self) -> None:
@@ -234,22 +390,143 @@ class GroupedRigidSolver(GravityMixin, TimeBasedMixin, Solver):
             solver.clear_external_force()
 
     # ------------------------------------------------------------------------------------
-    # ------------------------------------- gravity --------------------------------------
+    # ------------------------------------ accessors -------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def set_gravity(self, gravity, envs_idx=None) -> None:
-        """Set the gravity of the selected environments of the scene, in m/s^2 (see 'GravityMixin.set_gravity')."""
-        gravity = torch.as_tensor(gravity, dtype=gs.tc_float, device=gs.device)
-        for i_group, rows, envs_idx_local in self._partition.select(envs_idx):
-            self._solvers[i_group].set_gravity(gravity[rows] if gravity.ndim > 1 else gravity, envs_idx_local)
+    # The accessors that the entities of the layout solver, their links, joints, geoms and equality constraints call on
+    # their solver, which reach every group (see 'dispatch_over_groups')
+    set_gravity = dispatch_over_groups(RigidSolver.set_gravity, values_ndim={"gravity": 1})
+    get_gravity = dispatch_over_groups(RigidSolver.get_gravity)
+    set_qpos = dispatch_over_groups(RigidSolver.set_qpos, values_ndim={"qpos": 0})
+    get_qpos = dispatch_over_groups(RigidSolver.get_qpos)
+    set_dofs_position = dispatch_over_groups(RigidSolver.set_dofs_position, values_ndim={"position": 0})
+    set_dofs_velocity = dispatch_over_groups(RigidSolver.set_dofs_velocity, values_ndim={"velocity": 0})
+    get_dofs_position = dispatch_over_groups(RigidSolver.get_dofs_position)
+    get_dofs_velocity = dispatch_over_groups(RigidSolver.get_dofs_velocity)
+    get_dofs_acc = dispatch_over_groups(RigidSolver.get_dofs_acc)
+    get_dofs_force = dispatch_over_groups(RigidSolver.get_dofs_force)
+    get_dofs_control_force = dispatch_over_groups(RigidSolver.get_dofs_control_force)
+    get_dofs_actuator_force = dispatch_over_groups(RigidSolver.get_dofs_actuator_force)
+    control_dofs_force = dispatch_over_groups(RigidSolver.control_dofs_force, values_ndim={"force": 0})
+    control_dofs_velocity = dispatch_over_groups(RigidSolver.control_dofs_velocity, values_ndim={"velocity": 0})
+    control_dofs_position = dispatch_over_groups(RigidSolver.control_dofs_position, values_ndim={"position": 0})
+    control_dofs_position_velocity = dispatch_over_groups(
+        RigidSolver.control_dofs_position_velocity, values_ndim={"position": 0, "velocity": 0}
+    )
+    set_dofs_kp = dispatch_over_groups(RigidSolver.set_dofs_kp, {"kp": 0}, is_dofs_info_batched)
+    set_dofs_kv = dispatch_over_groups(RigidSolver.set_dofs_kv, {"kv": 0}, is_dofs_info_batched)
+    set_dofs_act_gain = dispatch_over_groups(RigidSolver.set_dofs_act_gain, {"act_gain": 0}, is_dofs_info_batched)
+    set_dofs_act_bias = dispatch_over_groups(
+        RigidSolver.set_dofs_act_bias, {"bias0": 0, "bias1": 0, "bias2": 0}, is_dofs_info_batched
+    )
+    set_dofs_force_range = dispatch_over_groups(
+        RigidSolver.set_dofs_force_range, {"lower": 0, "upper": 0}, is_dofs_info_batched
+    )
+    set_dofs_limit = dispatch_over_groups(RigidSolver.set_dofs_limit, {"lower": 0, "upper": 0}, is_dofs_info_batched)
+    set_dofs_stiffness = dispatch_over_groups(RigidSolver.set_dofs_stiffness, {"stiffness": 0}, is_dofs_info_batched)
+    set_dofs_armature = dispatch_over_groups(RigidSolver.set_dofs_armature, {"armature": 0}, is_dofs_info_batched)
+    set_dofs_damping = dispatch_over_groups(RigidSolver.set_dofs_damping, {"damping": 0}, is_dofs_info_batched)
+    set_dofs_frictionloss = dispatch_over_groups(
+        RigidSolver.set_dofs_frictionloss, {"frictionloss": 0}, is_dofs_info_batched
+    )
+    get_dofs_kp = dispatch_over_groups(RigidSolver.get_dofs_kp, is_info_batched=is_dofs_info_batched)
+    get_dofs_kv = dispatch_over_groups(RigidSolver.get_dofs_kv, is_info_batched=is_dofs_info_batched)
+    get_dofs_act_gain = dispatch_over_groups(RigidSolver.get_dofs_act_gain, is_info_batched=is_dofs_info_batched)
+    get_dofs_act_bias = dispatch_over_groups(RigidSolver.get_dofs_act_bias, is_info_batched=is_dofs_info_batched)
+    get_dofs_force_range = dispatch_over_groups(RigidSolver.get_dofs_force_range, is_info_batched=is_dofs_info_batched)
+    get_dofs_limit = dispatch_over_groups(RigidSolver.get_dofs_limit, is_info_batched=is_dofs_info_batched)
+    get_dofs_stiffness = dispatch_over_groups(RigidSolver.get_dofs_stiffness, is_info_batched=is_dofs_info_batched)
+    get_dofs_armature = dispatch_over_groups(RigidSolver.get_dofs_armature, is_info_batched=is_dofs_info_batched)
+    get_dofs_damping = dispatch_over_groups(RigidSolver.get_dofs_damping, is_info_batched=is_dofs_info_batched)
+    get_dofs_frictionloss = dispatch_over_groups(
+        RigidSolver.get_dofs_frictionloss, is_info_batched=is_dofs_info_batched
+    )
+    get_dofs_invweight = dispatch_over_groups(RigidSolver.get_dofs_invweight, is_info_batched=is_dofs_info_batched)
+    set_base_links_pos = dispatch_over_groups(RigidSolver.set_base_links_pos, values_ndim={"pos": 1})
+    set_base_links_quat = dispatch_over_groups(RigidSolver.set_base_links_quat, values_ndim={"quat": 1})
+    get_links_pos = dispatch_over_groups(RigidSolver.get_links_pos)
+    get_links_quat = dispatch_over_groups(RigidSolver.get_links_quat)
+    get_links_vel = dispatch_over_groups(RigidSolver.get_links_vel)
+    get_links_ang = dispatch_over_groups(RigidSolver.get_links_ang)
+    get_links_acc = dispatch_over_groups(RigidSolver.get_links_acc)
+    get_links_acc_ang = dispatch_over_groups(RigidSolver.get_links_acc_ang)
+    get_links_COM = dispatch_over_groups(RigidSolver.get_links_COM)
+    set_links_mass = dispatch_over_groups(RigidSolver.set_links_mass, {"mass": 0}, is_links_info_batched)
+    set_links_inertia = dispatch_over_groups(RigidSolver.set_links_inertia, {"inertia": 2}, is_links_info_batched)
+    set_links_COM = dispatch_over_groups(RigidSolver.set_links_COM, {"com": 1}, is_links_info_batched)
+    get_links_mass = dispatch_over_groups(RigidSolver.get_links_mass, is_info_batched=is_links_info_batched)
+    get_links_inertia = dispatch_over_groups(RigidSolver.get_links_inertia, is_info_batched=is_links_info_batched)
+    get_links_invweight = dispatch_over_groups(RigidSolver.get_links_invweight, is_info_batched=is_links_info_batched)
+    apply_links_external_wrench = dispatch_over_groups(
+        RigidSolver.apply_links_external_wrench, values_ndim={"force": 1, "torque": 1, "pos": 1}
+    )
+    get_joints_anchor_pos = dispatch_over_groups(RigidSolver.get_joints_anchor_pos)
+    get_joints_anchor_axis = dispatch_over_groups(RigidSolver.get_joints_anchor_axis)
+    get_geoms_pos = dispatch_over_groups(RigidSolver.get_geoms_pos)
+    get_geoms_quat = dispatch_over_groups(RigidSolver.get_geoms_quat)
+    get_vgeoms_pos = dispatch_over_groups(RigidSolver.get_vgeoms_pos)
+    get_vgeoms_quat = dispatch_over_groups(RigidSolver.get_vgeoms_quat)
+    set_geoms_friction_ratio = dispatch_over_groups(
+        RigidSolver.set_geoms_friction_ratio, values_ndim={"friction_ratio": 0}
+    )
+    get_geoms_friction_ratio = dispatch_over_groups(RigidSolver.get_geoms_friction_ratio)
+    set_geom_friction = dispatch_over_groups(RigidSolver.set_geom_friction, values_ndim={"friction": 0})
+    set_geom_friction_torsional = dispatch_over_groups(
+        RigidSolver.set_geom_friction_torsional, values_ndim={"friction_torsional": 0}
+    )
+    set_geom_friction_rolling = dispatch_over_groups(
+        RigidSolver.set_geom_friction_rolling, values_ndim={"friction_rolling": 0}
+    )
+    get_geoms_friction = dispatch_over_groups(RigidSolver.get_geoms_friction)
+    get_geoms_friction_torsional = dispatch_over_groups(RigidSolver.get_geoms_friction_torsional)
+    get_geoms_friction_rolling = dispatch_over_groups(RigidSolver.get_geoms_friction_rolling)
+    set_sol_params = dispatch_over_groups(RigidSolver.set_sol_params, {"sol_params": 1}, is_sol_params_batched)
+    get_sol_params = dispatch_over_groups(RigidSolver.get_sol_params, is_info_batched=is_sol_params_batched)
+    get_mass_mat = dispatch_over_groups(RigidSolver.get_mass_mat)
+    get_kinetic_energy = dispatch_over_groups(RigidSolver.get_kinetic_energy)
+    get_potential_energy = dispatch_over_groups(RigidSolver.get_potential_energy)
+    get_AABB = dispatch_over_groups(RigidSolver.get_AABB)
+    update_verts_for_geoms = dispatch_over_groups(RigidSolver.update_verts_for_geoms, values_ndim={})
+    # The queries reading the state of one solver at once, which no group answers for the others
+    inverse_kinematics = refuse_over_groups("inverse_kinematics")
+    forward_kinematics_query = refuse_over_groups("forward_kinematics_query")
+    get_terrain_height = refuse_over_groups("get_terrain_height")
+    set_drone_rpm = refuse_over_groups("set_drone_rpm")
 
-    def get_gravity(self, envs_idx=None) -> torch.Tensor:
-        """Get the gravity of the selected environments of the scene, in m/s^2 (see 'GravityMixin.get_gravity')."""
-        selection = self._partition.select(envs_idx)
-        gravity = torch.empty((sum(len(rows) for _, rows, _ in selection), 3), dtype=gs.tc_float, device=gs.device)
-        for i_group, rows, envs_idx_local in selection:
-            gravity[rows] = self._solvers[i_group].get_gravity(envs_idx_local)
-        return gravity
+    def get_links_jacobian(self, link_idx, dof_start, n_dofs, local_point=None) -> torch.Tensor:
+        """Return the Jacobian of a link in every environment (see 'KinematicSolver.get_links_jacobian')."""
+        groups_jacobian = [
+            solver.get_links_jacobian(link_idx, dof_start, n_dofs, local_point) for solver in self._solvers
+        ]
+        if self.n_envs == 0:
+            return groups_jacobian[0]
+        jacobian = groups_jacobian[0].new_empty((self.n_envs, *groups_jacobian[0].shape[1:]))
+        for solver, group_jacobian in zip(self._solvers, groups_jacobian):
+            jacobian[solver.scene_envs_idx] = group_jacobian
+        return jacobian
+
+    def detect_collision(self, env_idx: int = 0) -> np.ndarray:
+        """Return the pairs of geoms in contact in one environment (see 'RigidSolver.detect_collision')."""
+        ((i_group, _, envs_idx_local),) = self._partition.select([env_idx])
+        return self._solvers[i_group].detect_collision(int(envs_idx_local[0]))
+
+    @property
+    def dyn_state(self):
+        """The state of the solver of each group alone exists, which 'solvers' gives."""
+        gs.raise_exception(
+            "A scene simulating its environments by groups holds the state of each group in the rigid solver of the "
+            "group ('GroupedRigidSolver.solvers'), the rigid entities of the scene differing in structure from one "
+            "environment to another."
+        )
+
+    @property
+    def collider(self):
+        """The collider of the solver of each group alone exists, which 'solvers' gives."""
+        gs.raise_exception(
+            "A scene simulating its environments by groups holds the contacts of each group in the rigid solver of the "
+            "group ('GroupedRigidSolver.solvers'), the rigid entities of the scene differing in structure from one "
+            "environment to another."
+        )
 
     # ------------------------------------------------------------------------------------
     # -------------------------------------- errors --------------------------------------
@@ -319,3 +596,49 @@ class GroupedRigidSolver(GravityMixin, TimeBasedMixin, Solver):
     def partition(self) -> EnvironmentPartition:
         """The partition of the environments of the scene into groups."""
         return self._partition
+
+
+class GroupedRigidScopedRenderContext(ScopedRenderContext[GroupedRigidSolver]):
+    """The controls of the appearance of a grouped rigid solver, which reach the scoped context of each of its groups.
+
+    The scoped contexts of the groups draw the entities, each in the environments of its group.
+    """
+
+    def _groups(self) -> tuple[ScopedRenderContext, ...]:
+        return tuple(solver.render_context for solver in self.owner.solvers)
+
+    @property
+    def link_frames(self) -> bool:
+        """Whether the frames of the links are drawn (see ``KinematicVisOptions.link_frames``)."""
+        return all(scoped_context.link_frames for scoped_context in self._groups())
+
+    def set_link_frames(self, link_frames: bool) -> None:
+        """Draw the frames of the links in every group, or stop drawing them."""
+        for scoped_context in self._groups():
+            scoped_context.set_link_frames(link_frames)
+
+    @property
+    def link_frame_size(self) -> float:
+        """The length of the axes of the frames of the links (see ``KinematicVisOptions.link_frame_size``)."""
+        return self._groups()[0].link_frame_size
+
+    def set_link_frame_size(self, link_frame_size: float) -> None:
+        """Set the length of the axes of the frames of the links in every group."""
+        for scoped_context in self._groups():
+            scoped_context.set_link_frame_size(link_frame_size)
+
+    def get_visualize_contact(self, entity: RigidEntity) -> bool:
+        """Whether the contacts of an entity of the layout solver are drawn, in every group alike."""
+        return self._groups()[0].get_visualize_contact(entity)
+
+    def set_visualize_contact(self, entity: RigidEntity, visualize_contact: bool) -> None:
+        """Draw the contacts of an entity of the layout solver in every group, or stop drawing them."""
+        for scoped_context in self._groups():
+            scoped_context.set_visualize_contact(entity, visualize_contact)
+
+    def get_vverts(self, vgeoms, envs_idx=None) -> torch.Tensor:
+        """The vertices as drawn of the visual geoms of the scene, which the scoped context of each group holds."""
+        gs.raise_exception(
+            "The drawn vertices of the visual geoms are held by the scoped context of each group of a scene whose rigid "
+            "entities differ in structure from one environment to another ('GroupedRigidSolver.solvers')."
+        )

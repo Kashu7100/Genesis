@@ -8,7 +8,7 @@ import torch
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.entities.rigid_entity import DroneEntity, KinematicEntity, RigidGeom, RigidJoint, RigidVisGeom
-from genesis.engine.entities.rigid_entity.description import KinematicEntityDescription, _balanced_variant_mapping
+from genesis.engine.entities.rigid_entity.description import EnvironmentsLayout, KinematicEntityDescription
 from genesis.engine.entities.rigid_entity.rigid_entity import get_variants_kinematics
 from genesis.engine.entities.rigid_entity.rigid_equality import RigidEquality
 from genesis.engine.entities.rigid_entity.rigid_link import KinematicLink
@@ -188,9 +188,9 @@ class KinematicSolver(Solver):
     _entity_classes = ((Morph, KinematicEntity),)
 
     def __init__(
-        self, sim: "Simulator", options: "KinematicOptions", scene_envs_idx: torch.Tensor | None = None
+        self, sim: "Simulator", options: "KinematicOptions", envs_layout: EnvironmentsLayout | None = None
     ) -> None:
-        super().__init__(sim, options, scene_envs_idx)
+        super().__init__(sim, options, envs_layout)
 
         self._enable_collision = False
         self._enable_mujoco_compatibility = False
@@ -304,7 +304,7 @@ class KinematicSolver(Solver):
         vgeoms_offset_quat = np.tile(gu.identity_quat(), (self.n_vgeoms, 1))
         for entity in self._entities:
             if links_offset_per_env and entity._desc.variants:
-                variant_idx = _balanced_variant_mapping(len(entity._desc.variants), self.n_envs_)
+                variant_idx = self.envs_layout.get_variant_idx(len(entity._desc.variants))
                 links_offset_pos[np.arange(self.n_envs_), entity.base_link_idx] = np.stack(
                     [entity._desc.variants[v].offset_pos for v in variant_idx]
                 )
@@ -660,7 +660,7 @@ class KinematicSolver(Solver):
             for entity in self.entities:
                 if not entity._desc.variants:
                     continue
-                _, _, variants_qpos0, envs_variant_idx = get_variants_kinematics(entity, n_envs=self.n_envs_)
+                _, _, variants_qpos0, envs_variant_idx = get_variants_kinematics(entity, self.envs_layout)
                 init_qpos[entity.q_start : entity.q_end] = np.array(variants_qpos0)[envs_variant_idx].T
 
             self.qpos0.from_numpy(init_qpos)
@@ -710,7 +710,7 @@ class KinematicSolver(Solver):
         dofs_values = [qd_to_numpy(field, transpose=False, copy=True) for field, _ in dofs_fields]
 
         for entity in entities:
-            variants_links, variants_j_descs, _, envs_variant_idx = get_variants_kinematics(entity, n_envs=self.n_envs_)
+            variants_links, variants_j_descs, _, envs_variant_idx = get_variants_kinematics(entity, self.envs_layout)
             links_slice = slice(entity.link_start, entity.link_end)
             variants_links_pos = np.stack([[l_desc.pos for l_desc in links] for links in variants_links])
             variants_links_quat = np.stack([[l_desc.quat for l_desc in links] for links in variants_links])
@@ -759,7 +759,7 @@ class KinematicSolver(Solver):
                 continue
 
             n_variants = len(link._variant_vgeom_ranges)
-            variant_idx = _balanced_variant_mapping(n_variants, self.n_envs_)
+            variant_idx = self.envs_layout.get_variant_idx(n_variants)
 
             vgeom_starts = np.array([link._variant_vgeom_ranges[v][0] for v in variant_idx], dtype=gs.np_int)
             vgeom_ends = np.array([link._variant_vgeom_ranges[v][1] for v in variant_idx], dtype=gs.np_int)
